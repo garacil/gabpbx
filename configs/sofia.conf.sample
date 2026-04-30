@@ -1,0 +1,116 @@
+;
+; sofia.conf -- chan_sofia SIP channel driver configuration
+;
+; chan_sofia is a drop-in replacement for chan_sip.  The channel technology
+; is still registered as "SIP" so that all existing dialplan, CDR, and
+; management tools continue to work without modification.
+;
+; SIP protocol mechanics are handled by Sofia-SIP, a mature, RFC-conformant
+; SIP stack.  Configuration keys that chan_sip supports are accepted here
+; for backward compatibility.
+;
+; ──────────────────────────────────────────────────────────────────────────────
+; [general]
+; ──────────────────────────────────────────────────────────────────────────────
+[general]
+
+; IP address to bind to.  0.0.0.0 listens on all interfaces.
+; Default: 0.0.0.0
+bindaddr=0.0.0.0
+
+; UDP/TCP port to listen on.
+; Default: 5060
+bindport=5060
+
+; Session timers (RFC 4028) global default.
+;   originate  - always request session refresh (UAC role)
+;   accept     - honour remote session-timer requests (UAS role)  [default]
+;   refuse     - never enable session timers
+session-timers=accept
+
+; Default Session-Expires value in seconds when session-timers is active.
+; Default: 1800
+session-expires=1800
+
+; ──────────────────────────────────────────────────────────────────────────────
+; Peer / trunk sections
+;
+; Each section below (other than [general]) defines one SIP peer.  The
+; section name becomes the peer name used in the dialplan, e.g.:
+;   Dial(SIP/mytrunk)
+; ──────────────────────────────────────────────────────────────────────────────
+
+;
+; Example static peer (outbound trunk)
+;
+;[mytrunk]
+;
+; Host name or IP of the remote SIP server.
+; Use "dynamic" if the peer registers to us instead.
+;host=sip.example.com
+;
+; Authentication credentials.
+; Plaintext password (hashed at runtime):
+;secret=s3cr3t
+;
+; Pre-computed MD5 HA1 ( MD5(user:realm:password) ) as an alternative:
+;md5secret=<32 hex chars>
+;
+; SIP username used in From: and in authentication.
+;username=mytrunk
+;
+; Dialplan context incoming calls from this peer land in.
+;context=from-trunk
+;
+; Remote SIP port (default 5060).
+;port=5060
+;
+; NAT handling.
+;   yes  - force rport rewriting and symmetric RTP
+;   no   - trust the peer's advertised address           [default]
+;nat=no
+;
+; CallerID presented on outbound calls.
+;callerid=My PBX <+12025550100>
+;
+; Override the From: user on outbound calls.
+;fromuser=mytrunk
+;
+; Override the From: domain on outbound calls.
+;fromdomain=sip.example.com
+;
+; Reject registrations / INVITEs whose User-Agent does not start with this
+; string.  Leave empty (the default) to allow any User-Agent.
+;useragent_filter=
+;
+; Maximum simultaneous calls from/to this peer (0 = unlimited).
+;call-limit=10
+;
+; Session timers override (originate / accept / refuse).
+;session-timers=accept
+;
+; Session-Expires override in seconds.
+;session-expires=1800
+;
+; SRTP / SDES media encryption.
+;   no    - plain RTP                                     [default]
+;   yes   - SRTP with SDES key exchange
+;   sdes  - SDES only (no fallback to plain RTP)
+;encryption=no
+;
+; Insecure flags (comma-separated).
+;   port   - do not require the From: port to match
+;   invite - do not authenticate INVITEs from this peer
+;insecure=port,invite
+
+;
+; Example dynamic peer (softphone or desk phone that registers to us)
+;
+;[alice]
+;host=dynamic
+;secret=al1cePassw0rd
+;context=internal
+;callerid=Alice <1001>
+;nat=yes
+;call-limit=2
+;encryption=yes

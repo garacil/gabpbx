@@ -1,0 +1,22 @@
+# Build artifacts
+*.o
+*.so
+*.lo
+*.la
+*.a
+*.d
+
+# Editor temporaries
+*.swp
+*.swo
+*~
+.DS_Store
+
+# CLion / VSCode / Eclipse
+.idea/
+.vscode/
+*.cbp
+*.creator
+*.files
+*.includes
+*.user
