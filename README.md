@@ -274,6 +274,120 @@ sip blacklist delete <IP>
 sip blacklist clear
 ```
 
+Example `sip show peer test` output from a local GABPBX instance:
+
+```text
+*CLI> sip show peer test
+Setting max files open to 100000
+
+==============================================================================
+  SIP peer             : test
+  Registration         : registered
+==============================================================================
+  Endpoint             : test@dynamic:5060 via udp
+  Context / source     : killer / sofia.conf
+  Contact slots        : 1 used of 6 allowed
+  Media                : codecs=(opus|g722|alaw|g729) dtmf=rfc2833 nat=force_rport directmedia=No
+  Calls                : 0/1 active, 0 ringing, 0 on-hold
+  Qualify              : no
+  Session timers       : originate, expires=3600, minse=90, refresher=uac
+  Identity headers     : send=rpid, trust=No, presentation=allowed_not_screened
+
+-- Identity ------------------------------------------------------------------
+  Name                 : test
+  Username             : test
+  Type                 : peer
+  Host                 : dynamic
+  Port                 : 5060
+  Transport            : udp
+  Context              : killer
+  Registered           : Yes
+  Expires              : 360s
+  Secret               : (set)
+  Qualify              : no
+
+-- Network and media ---------------------------------------------------------
+  NAT                  : force_rport
+  DTMF mode            : rfc2833
+  Direct media         : No
+  Encryption           : No
+  Codecs               : (opus|g722|alaw|g729)
+  Max call BR          : 384 kbps
+
+-- Limits and features -------------------------------------------------------
+  Busy on active       : No
+  Max contacts         : 6 (used: 1)
+  Transfer mode        : open
+  Lock user-agent      : No
+  Language             : es
+  Default IP           : (null)
+  AMA flags            : Unknown
+  Subscribe MWI        : No
+  Preferred codec      : No
+  Ignore SDP ver       : No
+  Promisc redir        : No
+  Auto framing         : No
+  Fax detect           : no
+
+-- Fax and T.38 --------------------------------------------------------------
+  T38 support          : No
+  T38 EC mode          : FEC
+  T38 max datagram     : -1
+  T38 RTP source       : No
+
+-- Timers and RTP ------------------------------------------------------------
+  Timer B              : 32000
+  Timer T1             : 500
+  Overlap dial         : Yes
+  RTP timeout          : 30
+  RTP hold timeout     : 300
+  RTP keepalive        : 0
+
+-- Routing and dialplan ------------------------------------------------------
+  Parking lot          : default
+  User=Phone           : no
+  Max forwards         : 70 (from [general])
+  Mailbox              : (none)
+  Outbound proxy       : (none)
+  MOH interpret        : (none)
+  MOH suggest          : (none)
+  SRTP cipher          : (default AES_CM_128_HMAC_SHA1_80)
+
+-- Session and identity headers ----------------------------------------------
+  Session timers       : originate
+  Session expires      : 3600
+  Session Min-SE       : 90
+  Session refresher    : uac
+  Calling pres         : allowed_not_screened
+  Send RPID            : rpid
+  Trust RPID           : No
+  Concurrent calls     : 0/1 (0 ringing, 0 on-hold)
+
+-- Groups and source ---------------------------------------------------------
+  Call group           :
+  Pickup group         :
+  Subscribe context    : <Not set>
+
+-- Security and ACL ----------------------------------------------------------
+  Insecure             : port,invite
+  ACL                  : no
+  Contact ACL          : no
+  Direct media ACL     : no
+  DNS managed          : no
+
+-- Registration --------------------------------------------------------------
+  Source               : sofia.conf
+  Source addr          : 127.0.0.1:34549
+
+-- Contacts ------------------------------------------------------------------
+  Contact count        : 1
+  Contact 1 URI        : sip:test@127.0.1.1:100
+    State                : IDLE
+    TTL                  : 3488s
+    Source               : 127.0.0.1:34549
+    User-Agent           : sipsak 0.9.8.1
+```
+
 AMI actions:
 
 ```text
