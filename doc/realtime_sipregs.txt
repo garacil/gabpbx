@@ -1,0 +1,215 @@
+========================================
+chan_sofia Realtime Registration State (sipregs)
+========================================
+
+chan_sofia optionally separates per-peer config (sippeers) from per-peer
+registration state (sipregs) when extconfig.conf wires the sipregs family.
+Drop-in chan_sip-compatible: same schema + same auto-detection behavior.
+
+When to Use
+===========
+
+The sipregs split is useful for:
+
+- Federated gabpbx clusters where registration state is shared across nodes
+  (sipregs in a central DB) but per-peer config is local (sippeers per node)
+- Load-balanced deployments where a peer registers to one node + receives
+  calls from another via shared sipregs lookups
+- Audit / compliance scenarios where registration history is captured
+  separately from peer config (sipregs row write/clear timestamps)
+
+Single-node deployments without these requirements should leave sipregs
+unwired and chan_sofia stores everything in sippeers (default behavior).
+
+Configuration
+=============
+
+1. /etc/gabpbx/extconfig.conf — wire BOTH families:
+
+   [settings]
+   sippeers => sqlite3,/var/lib/gabpbx/sqlite3.db
+   sipregs  => sqlite3,/var/lib/gabpbx/sqlite3.db
+
+   chan_sofia auto-detects sipregs via ast_check_realtime("sipregs") at every
+   relevant access (chan_sip parity); no sofia.conf option keys required.
+
+2. /etc/gabpbx/res_config_sqlite3.conf — same as sippeers setup; see
+   doc/realtime_sippeers.txt for full reference.
+
+3. Module load order in modules.conf — preload res_config_sqlite3.so per
+   sippeers doc.
+
+Database Schema
+===============
+
+CREATE TABLE sipregs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- Registration key (peer identity)
+    name VARCHAR(80) NOT NULL DEFAULT '',      -- Peer name (FK to sippeers.name)
+
+    -- Registration network state
+    ipaddr VARCHAR(80) DEFAULT '',              -- Last registered IP (IPv6-safe up to 45 chars)
+    port INTEGER DEFAULT 0,                     -- Last registered port
+
+    -- Expiry
+    regseconds INTEGER DEFAULT 0,               -- Last register timestamp (unix epoch)
+
+    -- Contact descriptors (UPDATEd on REGISTER; cleared on unregister)
+    defaultuser VARCHAR(80) DEFAULT '',         -- Default user from registered Contact
+    fullcontact VARCHAR(255) DEFAULT '',        -- Full Contact header URI
+    regserver VARCHAR(80) DEFAULT '',           -- gabpbx node that processed register (cluster ID)
+    useragent VARCHAR(80) DEFAULT '',           -- User-Agent header from REGISTER
+    lastms INTEGER DEFAULT 0,                   -- Last qualify response time (ms)
+    path VARCHAR(255) DEFAULT ''                -- Path header (RFC 3327; multi-proxy registration)
+);
+
+Field Grouping
+==============
+
+Functional-grouping (operator-readability priority):
+
+- Registration key:    name (FK to sippeers.name)
+- Network state:       ipaddr + port
+- Expiry:              regseconds
+- Contact descriptors: defaultuser + fullcontact + regserver + useragent + lastms + path
+
+Behavior
+========
+
+- Auto-detection via ast_check_realtime("sipregs") — when extconfig.conf wires
+  the family, chan_sofia reads + writes registration state to sipregs.
+- When sipregs unwired, registration state stays in sippeers (default + chan_sip
+  parity behavior; backward-compatible).
+- Read path: sofia_find_peer_realtime sequential dual-load — sippeers config first,
+  then sipregs registration overlay (apply_peer_variables L1819 idempotent due to
+  skip-on-empty + field-replace semantics).
+- Write path: 5 ast_update_realtime sites in chan_sofia.c (sofia_process_register
+  no-auth + auth + outbound-register success branches) use the chan_sip-parity
+  inline ternary `ast_check_realtime("sipregs") ? "sipregs" : "sippeers"`.
+- CLEAR-fields semantics on register-expire (chan_sip parity verified at
+  chan_sip.c L15116/L22081/L27570) — empty ipaddr + 0 regseconds + empty
+  fullcontact UPDATEd; row stays for next register.
+- Per-peer config fields (secret, context, dtmfmode, callerid, etc.) ALWAYS
+  stay in sippeers regardless of sipregs wiring — the split is registration-state
+  only.
+
+Zero-Touch Migration
+====================
+
+Operators with existing chan_sofia deployments switching from sippeers-only to
+sipregs-split need NO data-migration step:
+
+1. CREATE TABLE sipregs (as above) — empty initial state
+2. Add `sipregs => …` line to extconfig.conf
+3. Reload chan_sofia (or restart gabpbx)
+4. On first successful register after the wiring change, registration state
+   writes naturally to sipregs (R3 ternary path detects the family + targets it)
+
+Existing sippeers registration data becomes stale-but-harmless until natural
+overwrite. Optional cleanup: clear sippeers.ipaddr/port/regseconds/fullcontact
+columns (all peers) once all peers have re-registered to sipregs.
+
+Example Usage
+=============
+
+-- View registered peers (joins sippeers config + sipregs state):
+SELECT p.name, r.ipaddr, r.port,
+       datetime(r.regseconds, 'unixepoch', 'localtime') AS reg_time
+FROM sippeers p
+LEFT JOIN sipregs r ON p.name = r.name
+WHERE r.regseconds > 0;
+
+-- Manually expire a peer (force re-register):
+UPDATE sipregs SET ipaddr = '', regseconds = 0, fullcontact = ''
+WHERE name = 'rt100';
+
+-- Check unregistered peers (no sipregs row):
+SELECT p.name FROM sippeers p
+LEFT JOIN sipregs r ON p.name = r.name
+WHERE r.name IS NULL;
+
+Relationship to sippeers
+=========================
+
+sippeers (always populated):
+- Identity + auth: name, secret, defaultuser, type
+- Network policy: host, port, transport, nat, permit, deny
+- Dialplan: context, callerid, regexten, fromuser, fromdomain
+- Codecs: disallow, allow
+- Features: dtmfmode, directmedia, busy_on_active, max_contacts, callgroup,
+  pickupgroup, encryption, mailbox, outboundproxy, callingpres, sendrpid, trustrpid
+
+sipregs (only when configured; otherwise these fields live in sippeers):
+- Registration state: ipaddr, port, regseconds, defaultuser, fullcontact,
+  regserver, useragent, lastms, path
+
+chan_sip Parity
+================
+
+Schema + behavior + auto-detection via ast_check_realtime are byte-equivalent
+to chan_sip (verified at chan_sip.c L5460 + L5503 + L5516 + L5546 read paths +
+L15116/L22081/L27570/L32443 write paths). Operators migrating chan_sip → chan_sofia
+with existing sipregs setup work zero-rewrite.
+
+Schema Migration
+================
+
+To create sipregs table from existing sippeers schema (sqlite3):
+
+CREATE TABLE sipregs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name VARCHAR(80) NOT NULL DEFAULT '',
+    ipaddr VARCHAR(80) DEFAULT '',
+    port INTEGER DEFAULT 0,
+    regseconds INTEGER DEFAULT 0,
+    defaultuser VARCHAR(80) DEFAULT '',
+    fullcontact VARCHAR(255) DEFAULT '',
+    regserver VARCHAR(80) DEFAULT '',
+    useragent VARCHAR(80) DEFAULT '',
+    lastms INTEGER DEFAULT 0,
+    path VARCHAR(255) DEFAULT ''
+);
+
+CREATE INDEX idx_sipregs_name ON sipregs (name);
+CREATE INDEX idx_sipregs_ipaddr ON sipregs (ipaddr, port);
+
+MySQL/PostgreSQL: dialect-equivalent CREATE TABLE; INTEGER → INT/BIGINT,
+VARCHAR widths same.
+
+Known Limitations
+=================
+
+- IP-based auth-bypass via insecure=port + sipregs IP-match: NOT implemented in
+  chan_sofia (deferred future task per post-T56 sipregs Phase 1 R6 option-(b)).
+  Operators using insecure=port + dynamic peer IPs should defer migration until
+  the standalone post-T56 insecure-auth-bypass parity fix lands; static-host
+  peers with insecure=port work today.
+- get_insecure_variable_from_sipregs equivalent helper deferred to same future
+  task. chan_sofia today does NOT walk sipregs by IP for auth-bypass.
+- Cluster-shared sipregs writes are last-write-wins; gabpbx core does not provide
+  multi-master conflict resolution. Use clustered DB locking if multiple gabpbx
+  nodes can register the same peer simultaneously.
+- INVITE auth NOT IMPLEMENTED (2026-04-27): the sipregs table provides registration
+  state for inbound auth lookups, but chan_sofia today does not authenticate
+  inbound INVITEs at SIP level (REGISTER auth IS implemented). The `insecure`
+  + `secret` fields in sippeers are parsed but unenforced for INVITE. Use peer
+  ACL + frontend SIP proxy + TLS for inbound INVITE protection. R6 deferred
+  spin-off (sofia_get_insecure_from_sipregs IP-based auth-bypass helper) is
+  also gated on the queued "post-T56 INVITE digest auth implementation" task —
+  cannot land independently without the consuming auth flow. See
+  CHAN_SOFIA_AUDIT.md operational note for full disclosure.
+- Transition-window stale-state risk: when an operator enables sipregs on a
+  deployment that previously stored registration state in sippeers, peers that
+  registered BEFORE the enable have populated sippeers.ipaddr/port/regseconds.
+  The dual-load overlay at sofia_find_peer_realtime applies sippeers first then
+  sipregs second; sofia_apply_peer_variables (L1819 `ast_strlen_zero(v->value)
+  continue;`) skips empty sipregs values, so STALE pre-enable sippeers.ipaddr
+  stays in the merged peer struct until the peer re-registers (which writes
+  fresh state to sipregs that overrides). Window-of-staleness symptom: peer
+  appears registered with old IP → outbound calls fail to that stale IP.
+  Mitigation: at migration time, clear pre-enable registration fields from
+  sippeers in one pass — `UPDATE sippeers SET ipaddr='', port=0, regseconds=0,
+  fullcontact='', useragent='', lastms=0;` — so subsequent dual-loads return
+  empty registration state for not-yet-re-registered peers (operator-correct
+  behavior: not-yet-registered peer shows as such, not as stale-IP-registered).

@@ -1,0 +1,64 @@
+#!/bin/bash
+#
+# Start/stop/restart GABpbx PBX
+#
+# Version: 0.1 by Sherif Nagy AKA DarKnesS_WolF <sherif.nagy@gmail.com> BASED ON THE SLACKWARE INIT SCRIPT
+#
+# 10.10.2008 - Initial Version
+#
+
+### BEGIN INIT INFO
+# Provides:		gabpbx
+# Required-Start:    $network $syslog $named $local_fs $remote_fs
+# Required-Stop:     $network $syslog $named $local_fs $remote_fs
+# Should-Start:      dahdi misdn lcr wanrouter mysql postgresql
+# Should-Stop:       dahdi misdn lcr wanrouter mysql postgresql
+# Default-Start:	2 3 4 5
+# Default-Stop:		0 1 6
+# Short-Description:	GABpbx PBX
+# Description:		the GABpbx Open Source PBX
+### END INIT INFO
+
+. /etc/rc.conf
+. /etc/rc.d/functions
+DAEMON=__GABPBX_SBIN_DIR__/gabpbx
+ASTVARRUNDIR=__GABPBX_VARRUN_DIR__
+
+case "$1" in
+  start)
+    stat_busy "Starting GABpbx..."
+	if [ ! -d $ASTVARRUNDIR ]; then
+		mkdir -p $ASTVARRUNDIR
+	fi
+    if [ -x $DAEMON ]; then
+      # Check if GABpbx is already running.  If it is, then bug out, because
+      # starting safe_gabpbx when GABpbx is running is very bad.
+      VERSION=`${DAEMON} -rx 'core show version'`
+      if [ "`echo $VERSION | cut -c 1-8`" = "GABpbx" ]; then
+         echo "GABpbx is already running.  $0 will exit now."
+         exit 1
+      fi
+	  ${DAEMON}
+      stat_done
+    fi
+    ;;
+  stop)
+    if [ -r ${ASTVARRUNDIR}/gabpbx.pid ]; then
+      stat_busy "Stopping GABpbx..."
+      ${DAEMON} -rx "core stop now" > /dev/null 2&>1
+      if [ $? -gt 0 ]; then
+        stat_fail
+      else
+        stat_done
+      fi
+    fi
+    ;;
+  restart)
+    $0 stop
+    sleep 2
+    $0 start
+    ;;
+  *)
+    echo "usage $0 start|stop|restart" ;;
+esac
+exit 0

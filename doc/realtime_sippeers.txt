@@ -1,0 +1,414 @@
+========================================
+chan_sofia Realtime Peers (sippeers)
+========================================
+
+chan_sofia uses the "sippeers" realtime family, compatible with
+chan_sip's realtime peer table. Both channel drivers can share
+the same database table.
+
+Configuration
+=============
+
+1. /etc/gabpbx/extconfig.conf:
+
+   [settings]
+   sippeers => sqlite3,/var/lib/gabpbx/sqlite3.db
+
+2. /etc/gabpbx/res_config_sqlite3.conf:
+
+   [general]
+   dbfile => /var/lib/gabpbx/sqlite3.db
+   config_table => ast_config
+   cdr_table => ast_cdr
+
+3. /etc/gabpbx/modules.conf (preload before other modules):
+
+   preload => res_config_sqlite3.so
+
+Database Schema
+===============
+
+CREATE TABLE sippeers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- Identity
+    name VARCHAR(80) NOT NULL DEFAULT '',      -- Peer name (unique identifier)
+    defaultuser VARCHAR(80) DEFAULT '',         -- Auth username (defaults to name)
+    secret VARCHAR(80) DEFAULT '',              -- Auth password
+    type VARCHAR(20) DEFAULT 'friend',          -- peer, user, or friend
+
+    -- Network
+    host VARCHAR(80) DEFAULT 'dynamic',         -- Hostname, IP, or "dynamic"
+    port INTEGER DEFAULT 0,                     -- Remote port
+    transport VARCHAR(10) DEFAULT 'udp',        -- udp, tcp, tls
+    nat VARCHAR(40) DEFAULT '',                 -- force_rport, comedia, force_rport,comedia
+
+    -- Dialplan
+    context VARCHAR(80) DEFAULT '',             -- Dialplan context for incoming calls
+    callerid VARCHAR(80) DEFAULT '',            -- Caller ID string
+    regexten VARCHAR(80) DEFAULT '',            -- Extension to register
+    callbackextension VARCHAR(40) DEFAULT '',   -- post-T56 callbackextension per-peer parity (chan_sip drop-in Option A FULL WIRE-IN via Pattern 16 sofia-sip-native 12th-instance NUTAG_M_USERNAME at 3 nua_register call sites). When chan_sofia registers AS A CLIENT to upstream provider, this user-portion of the Contact URI tells upstream which extension to call back into local dialplan. chan_sip parity chan_sip.c:28869-28870 verbatim per-peer parser via DIRECT build_peer (chan_sip uses local-var `char callback[256]` at L28578 + auto-builds reg_string + sip_register at L29240-29246 + transmit_register sets p->exten = r->callback at L14267-14269). chan_sofia uses sofia-sip native NUTAG_M_USERNAME tag (per nua_tag.c:1955+L1983) via TAG_IF gate at chan_sofia.c:9313 (auth-challenge re-REGISTER) + L12730 (qualify-cycle re-REGISTER) + L12782 (initial-REGISTER inside sofia_do_register) — chan_sofia helper-architecture-advantage NEW DIMENSION sofia-sip-native-tag-vs-state-machine. chan_sofia surpass over chan_sip CLI/AMI silent. Empty-default = chan_sip drop-in baseline (no callback).
+
+    -- SIP headers
+    fromuser VARCHAR(80) DEFAULT '',            -- From header user
+    fromdomain VARCHAR(80) DEFAULT '',          -- From header domain
+
+    -- Audio
+    disallow VARCHAR(40) DEFAULT 'all',         -- Codecs to disallow
+    allow VARCHAR(40) DEFAULT 'ulaw,alaw',      -- Codecs to allow
+
+    -- Features
+    dtmfmode VARCHAR(20) DEFAULT 'rfc2833',     -- rfc2833, info, inband, auto
+    directmedia VARCHAR(10) DEFAULT 'yes',      -- Allow direct RTP between endpoints
+    insecure VARCHAR(40) DEFAULT '',             -- port, invite, port,invite
+    busy_on_active VARCHAR(10) DEFAULT 'no',    -- yes/no: reject new calls with 486 when any device is in a call
+    max_contacts INTEGER DEFAULT 6,              -- Max simultaneous registered devices per peer; range [1, 6]
+    callgroup VARCHAR(80) DEFAULT '',            -- Call group bitmask; range syntax e.g. "1,3-5"
+    pickupgroup VARCHAR(80) DEFAULT '',          -- Pickup group bitmask; *8 picks up calls in matching group(s)
+    permit VARCHAR(95) DEFAULT '',               -- Per-peer ACL permit list, e.g. "192.168.0.0/24" (chan_sip-compat width)
+    deny VARCHAR(95) DEFAULT '',                 -- Per-peer ACL deny list, e.g. "0.0.0.0/0" — combine with permit
+    encryption VARCHAR(3) DEFAULT 'no',          -- T37 SDES-SRTP per RFC 4568; yes -> require RTP/SAVP + a=crypto or 488
+    srtpcipher VARCHAR(255) DEFAULT '',          -- post-T56 srtpcipher operator option: comma-separated outbound a=crypto suite preference (RFC 4568 §6.1 multi-line); e.g. "AEAD_AES_256_GCM,AES_CM_128_HMAC_SHA1_80"; empty inherits [general] default_srtpcipher or sdp_crypto.c default AES_CM_128_HMAC_SHA1_80
+    session_timers VARCHAR(16) DEFAULT '',       -- post-T56 session timers (RFC 4028): originate/accept/refuse; empty inherits [general] default (= accept per chan_sip parity); chan_sip dash-style key 'session-timers'; sofia-sip handles wire mechanics via NUTAG_SESSION_TIMER
+    session_expires INTEGER DEFAULT 0,           -- post-T56 session timers: Session-Expires seconds; 0 inherits [general] default (1800s); RFC 4028 §4 typical; chan_sip dash-style key 'session-expires'
+    session_minse INTEGER DEFAULT 0,             -- post-T56 session timers: Min-SE seconds; 0 inherits [general] default (90s); RFC 4028 §3 floor; chan_sip dash-style key 'session-minse'
+    session_refresher VARCHAR(8) DEFAULT '',     -- post-T56 session timers: refresher preference auto/uac/uas; empty inherits [general] default (= auto per sofia-sip nua_any_refresher); chan_sip dash-style key 'session-refresher'
+    mailbox VARCHAR(80) DEFAULT '',              -- T55 MWI message-summary subscription source(s); comma-separated "mbox@ctx" list (no @ defaults to "default" context)
+    outboundproxy VARCHAR(80) DEFAULT '',        -- T56 outbound proxy override; bare host / host:port / sip: URI; normalized to sip:HOST[:PORT];lr at use; empty inherits sofia.conf [general] outboundproxy
+    callingpres VARCHAR(32) DEFAULT '',          -- post-T56 identity-headers parity: AST_PRES_* presentation override (allowed_not_screened/allowed/prohib_*/etc.); chan_sip parity; empty inherits [general] callingpres
+    sendrpid VARCHAR(8) DEFAULT '',              -- post-T56 identity-headers parity: outbound RPID/PAI emission ("no" / "pai" / "rpid"); chan_sip SIP_SENDRPID parity; empty inherits [general] sendrpid
+    trustrpid VARCHAR(3) DEFAULT 'no',           -- post-T56 identity-headers parity: trust inbound PAI/RPID (yes/no); chan_sip SIP_TRUSTRPID parity; empty inherits [general] trustrpid
+    call_limit INTEGER DEFAULT 0,                -- post-T56 call-limit parity: max simultaneous calls; 0=unlimited; chan_sip parity; column name uses underscore (SQL convention); parser also accepts call-limit + callcounter
+    busy_level INTEGER DEFAULT 0,                -- post-T56 call-limit parity: soft-cap; outbound returns BUSY (486) when inUse>=busy_level; 0=disabled; chan_sip parity; parser key is busylevel (no separator)
+    allowtransfer VARCHAR(8) DEFAULT 'yes',      -- post-T56 allowtransfer per-peer parity (chan_sip drop-in): yes/no — gate inbound REFER. yes (default) accepts REFER per chan_sip backwards-compat (chan_sip.c:29476 "Merrily accept all transfers"); no rejects with 603 Declined (policy) + AMI TransferRejected event for NMS monitoring (chan_sofia surpass over chan_sip silent reject). Hardens trunks against REFER-abuse (call spam / redirect-to-attacker / premium-rate fraud).
+    allowsubscribe VARCHAR(8) DEFAULT 'yes',     -- post-T56 allowsubscribe per-peer parity (chan_sip drop-in): yes/no — gate inbound SUBSCRIBE (presence/MWI/dialog). yes (default per sip.h:478 SIP_PAGE2_ALLOWSUBSCRIBE TRUE — "Default for all devices: TRUE"); no rejects with 403 Forbidden (policy) + AMI SubscribeRejected event for NMS subscribe-abuse monitoring (chan_sofia surpass over chan_sip silent baseline). REQUEST-EVENT GATING dimension #6 sibling to allowtransfer.
+    buggymwi VARCHAR(8) DEFAULT 'no',            -- post-T56 buggymwi per-peer parity (chan_sip drop-in): no (default — RFC 3842 standard Voice-Message: %d/%d (0/0) format) / yes (Cisco-buggy-stack workaround — omits "(0/0)" suffix). chan_sip parity sip.h:338 SIP_PAGE2_BUGGY_MWI flag bit + chan_sip.c:13800-13802 verbatim Cisco-bug comment. Per-peer-only flag (no [general] default); set yes for Cisco peers exhibiting the bug.
+    lockuseragent VARCHAR(8) DEFAULT 'no',       -- post-T56 lockuseragent per-peer parity (chan_sip drop-in security feature): no (default) / yes (lock peer registration to first captured User-Agent string; subsequent REGISTERs with different UA silently rejected). chan_sip parity sip.h:1268 unsigned short lockuseragent:1 + chan_sip.c:28708-28712 realtime-only parser + chan_sip.c:15839-15843 use-site. chan_sofia surpass: extends parser to config-file too + AMI LockUserAgentReject event for NMS UA-spoofing-attack visibility (chan_sip silent baseline). Hardens against UA-spoofing attacks where attacker steals credentials but registers from different SIP client.
+    language VARCHAR(40) DEFAULT '',             -- post-T56 language per-peer parity (chan_sip drop-in): per-peer audio language locale (e.g. en, es, fr, de) propagated to ast_channel.language at sofia_new for prompts/sounds in peer's preferred locale. Empty inherits [general] language= or gabpbx-core default. chan_sip parity chan_sip.c:28865-28866 verbatim ast_string_field_set + L28447 inheritance. Bounded to channel.h:138 MAX_LANGUAGE=40.
+    defaultip VARCHAR(64) DEFAULT '',            -- post-T56 defaultip per-peer parity (chan_sip drop-in): fallback IP for host=dynamic peer when not yet registered. Outbound calls before peer registers route to defaultip; once peer registers src_addr takes precedence. Empty (default) = no fallback. chan_sip parity chan_sip.c:28814-28818 verbatim ast_get_ip + L5913-5915 dialog->sa fallback semantic. chan_sofia surpass: resolve-fail LOG_WARNING + skip (chan_sip hard-fails entire build_peer alloc).
+    maxcallbitrate INTEGER DEFAULT 384,          -- post-T56 maxcallbitrate per-peer parity (chan_sip drop-in): per-peer SDP video bandwidth ceiling (kbps) emitted as b=CT:%d media-level attribute per RFC 4566 §5.8. Default 384 per sip.h:218 DEFAULT_MAX_CALL_BITRATE. Set 0 to omit b=CT line. Audio calls unaffected (b=CT gated inside if (needvideo)). chan_sip parity chan_sip.c:28967-28970 verbatim atoi + bounds-clamp + L12285-12286 SDP emission.
+    cid_num VARCHAR(80) DEFAULT '',              -- post-T56 cid bundle per-peer parity (chan_sip drop-in): per-peer outbound CID number; chan_sip parity chan_sip.c:28752-28753 + L5957 dialog-inheritance Option 6-B semantic (peer-CID base/default; channel CID via dialplan CALLERID() overrides when set). Empty (default) = use channel CID.
+    cid_name VARCHAR(80) DEFAULT '',             -- post-T56 cid bundle per-peer parity (chan_sip drop-in): per-peer outbound CID name; chan_sip parity chan_sip.c:28747-28748 (fullname key) + L5958 dialog-inheritance. Settable via fullname/cid_name (chan_sofia surpass alias)/callerid combined-form. Empty (default) = use channel CID.
+    cid_tag VARCHAR(80) DEFAULT '',              -- post-T56 cid bundle per-peer parity (chan_sip drop-in): per-peer Asterisk-internal channel-id tag propagated to ast_channel.caller.id.tag at sofia_new per chan_sip parity chan_sip.c:7837 verbatim. NOT SIP From-tag (sofia-sip auto-generates SIP From-tag for RFC 3261 §8.1.1.3 dialog uniqueness).
+    amaflags VARCHAR(40) DEFAULT '',             -- post-T56 amaflags per-peer parity (chan_sip drop-in): per-peer CDR AMA-flags propagated to ast_channel.amaflags at sofia_new for cdr_sqlite3/pgsql/etc. recording. Valid values: "default" / "omit" / "billing" / "documentation" (case-insensitive; see cdr.h ast_cdr_amaflags2int). Empty (default) = channel-core default preserved (sofia_new gated on non-zero per chan_sip.c:7947-7948 verbatim). Invalid value → LOG_WARNING + skip. chan_sip parity chan_sip.c:28871-28877 verbatim parser.
+    parkinglot VARCHAR(80) DEFAULT '',           -- post-T56 parkinglot per-peer parity (chan_sip drop-in): per-peer parking-lot routing field propagated to ast_channel.parkinglot at sofia_new for Park()/transfer-to-park dialplan operations. Empty inherits [general] parkinglot= ("default" per chan_sip features.h:37 DEFAULT_PARKINGLOT). chan_sip parity chan_sip.c:28890-28891 verbatim ast_string_field_set + L8577 inheritance + L7943-7944 channel propagation.
+    subscribemwi VARCHAR(8) DEFAULT 'no',        -- post-T56 subscribemwi per-peer parity (chan_sip drop-in PARSE-COMPAT-ONLY): chan_sip dual-mode MWI subscription gate (no=unsolicited NOTIFY default; yes=SUBSCRIBE-only). chan_sofia is SUBSCRIBE-ONLY-BY-DESIGN via T55 architecture; subscribemwi=yes operators get drop-in compat; subscribemwi=no operators get parse-clean + LOG_NOTICE + KNOWN LIMITATION (no unsolicited NOTIFY). Pattern 12 17th-instance NEW sub-pattern chan_sofia-architectural-divergence. chan_sip parity chan_sip.c:28902-28903 verbatim ast_set2_flag + sip.h:324 SIP_PAGE2_SUBSCRIBEMWIONLY.
+    preferred_codec_only VARCHAR(8) DEFAULT 'no', -- post-T56 preferred_codec_only per-peer parity (chan_sip drop-in): SDP codec-list narrowing to single most-preferred codec for bandwidth-constrained scenarios + codec-locked trunks. Default no (full list offered). chan_sip parity chan_sip.c:28922-28923 verbatim ast_set2_flag SIP_PAGE2_PREFERRED_CODEC + sip.h:313 flag bit + L10076 use site. chan_sofia ARCHITECTURAL ADVANTAGE 12th-instance Option 6-A: applies narrowing to BOTH initial-INVITE-offer AND response.
+    ignoresdpversion VARCHAR(8) DEFAULT 'no',    -- post-T56 ignoresdpversion per-peer parity (chan_sip drop-in PARSE-COMPAT-ONLY ship; Pattern 12 23rd-instance + chan_sofia-architectural-divergence sub-pattern 4th-instance post-PROVEN). chan_sip semantic: bypass inbound SDP o-line session-version skip-on-no-change gate at process_sdp. chan_sofia processes EVERY inbound SDP unconditionally by design (ZERO sessionversion-tracking infrastructure); chan_sofia INTRINSIC behavior matches chan_sip ignoresdpversion=yes ALWAYS. ignoresdpversion=yes operators: drop-in compat zero-rewrite. ignoresdpversion=no operators: KNOWN LIMITATION (chan_sofia infrastructure ABSENT). chan_sip parity chan_sip.c:28199-28201 verbatim parser via handle_common_options + sip.h:325 SIP_PAGE2_IGNORESDPVERSION flag bit + chan_sip.c:10310-10330 use site at process_sdp.
+    promiscredir VARCHAR(8) DEFAULT 'no',        -- post-T56 promiscredir per-peer parity (chan_sip drop-in PARSE-COMPAT-ONLY ship; Pattern 12 29th-instance + chan_sofia-architectural-divergence sub-pattern 9th-sub-instance post-PROVEN). chan_sip semantic: when set + outbound INVITE returns 3xx Moved Temporarily → ast_string_field_build call_forward to "SIP/contact_number@host" format. Default no = chan_sip IGNORES 3xx Contact (security default). chan_sofia nua_r_redirect handler ABSENT; KNOWN LIMITATION promiscredir=yes operators get parse-clean migration but chan_sofia continues to ignore 3xx regardless. chan_sip parity chan_sip.c:28173-28175 verbatim parser via handle_common_options + sip.h:251 SIP_PROMISCREDIR (1<<11) flag bit + chan_sip.c:20907-20925 use site at 3xx Contact handler.
+    autoframing VARCHAR(8) DEFAULT 'no',         -- post-T56 autoframing per-peer parity (chan_sip drop-in PARSE-COMPAT-ONLY ship; Pattern 12 31st-instance + chan_sofia-architectural-divergence sub-pattern 11-sub-instances post-PROVEN). chan_sip semantic: when set, honor peer-advertised ptime in SDP via ast_codec_pref_setsize. Default no = chan_sip uses fixed ptime from format prefs. chan_sofia sofia_parse_sdp infrastructure PRESENT but autoframing wire-in not implemented today; KNOWN LIMITATION autoframing=yes operators get parse-clean migration but chan_sofia continues to use sofia-sip default ptime negotiation regardless. chan_sip parity chan_sip.c:28924-28925 verbatim per-peer parser (DIRECT build_peer NOT handle_common_options) + chan_sip.c:10415 use site at SDP parse + chan_sip.c:12663 use site at SDP generate.
+    faxdetect VARCHAR(16) DEFAULT 'no',          -- post-T56 faxdetect per-peer multi-mode parity (chan_sip drop-in PARSE-COMPAT-ONLY ship; Pattern 12 32nd-instance + chan_sofia-architectural-divergence sub-pattern 12-sub-instances post-PROVEN). 4-state values: no (default; NONE) / cng (1; CNG tone only) / t38 (2; T.38 reinvite only) / yes or cng,t38 (3; BOTH). chan_sip semantic: detect inband fax CNG via ast_dsp DSP_FEATURE_FAX_DETECT + T.38 reinvite from peer; auto-switch to fax handling. chan_sofia DSP infrastructure PRESENT (T26 inband DTMF) but T26 doxygen explicit fax-CNG deferral baseline; T.38 LARGE infrastructure ABSENT. KNOWN LIMITATION faxdetect=yes/cng/t38 operators get parse-clean migration but chan_sofia continues to ignore CNG + T.38 reinvites regardless. chan_sip parity chan_sip.c:28202-28221 verbatim multi-mode parser via handle_common_options + sip.h:341-344 verbatim 2-bit flag encoding + 5+ use sites.
+    timer_b INTEGER DEFAULT 32000,               -- post-T56 timerb per-peer parity (chan_sip drop-in FULL WIRE-IN at [general] via Pattern 16 sofia-sip-native 11th-instance NTATAG_SIP_T1X64 nua_create wire-in). RFC 3261 §17.1.1.2 INVITE transaction timeout (Timer B). Default 32000ms (64 * 500ms T1). chan_sofia parser-correctness surpass over chan_sip [general] parser-bug (chan_sip silently ignored valid values; chan_sofia adds missing else-branch). Per-peer dynamic override deferred per t1min ac8d1ef precedent. chan_sip parity chan_sip.c:28947-28952 verbatim DIRECT build_peer parser + L29601-29607 verbatim [general] parser (with chan_sip parser-bug discovered) + L29522 default-init = 64*T1.
+    allowoverlap VARCHAR(7) DEFAULT 'yes',       -- post-T56 allowoverlap per-peer + [general] parity (chan_sip drop-in FULL WIRE-IN Option A 3 sites: sofia_process_invite + sofia_indicate AST_CONTROL_INCOMPLETE + nua_r_invite 484 status special-case). RFC 3261 §3 digit-by-digit dialing tri-state. Default 'yes' per chan_sip.c:29479 verbatim drop-in critical default `ast_set_flag(&global_flags[1], SIP_PAGE2_ALLOWOVERLAP_YES); /* Default for all devices: Yes */`. Values: yes (484 Address Incomplete on partial-match) / no (404 Not Found on partial-match) / dtmf (parsed + stored + displayed but treated as fall-through per chan_sip own design at chan_sip.c:23937-23943 verbatim dialplan-deferral comment). chan_sip parity chan_sip.c:28188-28195 verbatim handle_common_options parser + sip.h:318-322 verbatim 2-bit-flag-encoding-at-position-13 + chan_sip.c:7661-7669 + L16491-16497 + L22508-22518 + L23930-23934 verbatim wire-in sites + L18689 + L19273 + L18123-18133 verbatim displays. chan_sofia helper-architecture-advantage NEW DIMENSION 3-site-additive-wire-in-without-infrastructure-rework (22 → 23 instances).
+    timer_t1 INTEGER DEFAULT 500,                -- post-T56 timert1 per-peer parity (chan_sip drop-in FULL WIRE-IN at [general] via Pattern 16 sofia-sip-native 7th-instance REWIRED NTATAG_SIP_T1 nua_create wire-in + LATENT BUG FIX 2026-04-28). RFC 3261 §17.1.1.1 T1 retransmission interval. Default 500ms (DEFAULT_TIMER_T1). chan_sofia parser-correctness surpass over chan_sip [general] no-range-validation parser. Per-peer triple-clamp (sscanf success + ≥ 200 + ≥ t1min) + fallback to t1min floor (chan_sip-faithful semantic). Per-peer dynamic override deferred per Pattern 12 sub-pattern 3rd-instance (NTATAG_*_T1 family deferral consistency: t1min + timerb + timert1). LATENT BUG FIX: prior chan_sofia commits passed sofia_cfg.t1min (100ms) as NTATAG_SIP_T1 argument; this commit REWIRES to sofia_cfg.default_timer_t1 (500ms) per nta_tag.c:497 docstring "Initial retransmission interval". 5× operational impact retransmit-rate change toward chan_sip drop-in baseline. chan_sip parity chan_sip.c:28941-28946 verbatim DIRECT build_peer parser + L29596-29600 verbatim [general] parser + L29521 default-init = DEFAULT_TIMER_T1 + L30038-30040 + L30043-30055 verbatim cross-validation.
+    progressinband VARCHAR(8) DEFAULT 'never',   -- post-T56 progressinband per-peer parity (chan_sip drop-in tri-state never/no/yes; Pattern 12 24th-instance + chan_sofia-architectural-divergence sub-pattern 5th-instance partial-feature-parity flavor). NEVER (default) = emit 180 only no in-band. YES = emit 180 + force in-band audio per chan_sip.c:7631 verbatim. NO = degrades to NEVER under chan_sofia Option B partial wire-in (KNOWN LIMITATION: chan_sofia lacks SIP_PROGRESS_SENT tracking; full chan_sip NO-state semantic requires ~30 LoC future-fix). chan_sip parity chan_sip.c:28166-28172 verbatim parser via handle_common_options + sip.h:282-285 verbatim 3 macros + chan_sip.c:7616-7637 use site at sip_indicate AST_CONTROL_RINGING.
+    rtptimeout INTEGER DEFAULT 0,                -- post-T56 rtp-timeout bundle per-peer parity (chan_sip drop-in): drop call after N seconds without inbound RTP. 0 = disabled. chan_sip parity chan_sip.c:28927-28930. Consumed at sofia_rtp_init via ast_rtp_instance_set_timeout (rtp_engine.h:1671).
+    rtpholdtimeout INTEGER DEFAULT 0,            -- post-T56 rtp-timeout bundle per-peer parity (chan_sip drop-in): same as rtptimeout but for on-hold state. 0 = disabled. chan_sip parity chan_sip.c:28932-28935. Consumed via ast_rtp_instance_set_hold_timeout (rtp_engine.h:1689).
+    rtpkeepalive INTEGER DEFAULT 0,              -- post-T56 rtp-timeout bundle per-peer parity (chan_sip drop-in): send keepalive RTP packet every N seconds. 0 = disabled. chan_sip parity chan_sip.c:28937-28940. Consumed via ast_rtp_instance_set_keepalive (rtp_engine.h:1707).
+    subscribecontext VARCHAR(80) DEFAULT '',     -- post-T56 subscribecontext per-peer parity (chan_sip drop-in PARSE-COMPAT today; effect-pending): SUBSCRIBE-method dispatch context override; chan_sip parity sip.h:714 char[AST_MAX_CONTEXT]. KNOWN LIMITATION: pivot-site override at sofia_process_subscribe deferred until presence/dialog event-package handler lands; field parsed + persisted + displayed today for drop-in chan_sip config-parse compat. Empty = inherit sofia.conf [general] default_subscribecontext.
+    usereqphone VARCHAR(3) DEFAULT 'no',         -- post-T56 usereqphone per-peer parity (chan_sip drop-in): yes/no — RFC 3966 telephone-uri ;user=phone parameter on outbound Request-URI + From URI when peer has usereqphone=yes AND user-part matches digit-only pattern (with optional leading +). chan_sip parity sip.h:253 SIP_USEREQPHONE flag bit. PSTN gateways requiring telephone-uri formatting for E.164 numbers get drop-in compat. Inherits sofia.conf [general] default_usereqphone when empty.
+    accountcode VARCHAR(20) DEFAULT '',          -- post-T56 accountcode per-peer parity (chan_sip drop-in): CDR billing-tag propagated to channel->accountcode at sofia_new for per-customer billing in CDR engines (cdr_sqlite3 / cdr_pgsql / etc.). chan_sip parity at chan_sip.c:28884-28885 + L7945-7946 + L17127. AST_MAX_ACCOUNT_CODE=20 (cdr.h:73 verbatim) — column sized to match CDR-write truncation point. Per-peer-only design (chan_sip [general] default_accountcode ABSENT; ast_default_accountcode lives at gabpbx-core cdr.conf level).
+    maxforwards INTEGER DEFAULT 70,              -- post-T56 maxforwards per-peer parity (chan_sip drop-in): RFC 3261 §20.22 Max-Forwards header initial value (1-255 valid range). Decremented by each proxy hop; reaching 0 returns 483 Too Many Hops. chan_sip parity sip.h:60 DEFAULT_MAX_FORWARDS=70 + L28878-28883 verbatim per-peer parser with sscanf %30d + bounds-check + clamp-to-default. Inherits sofia.conf [general] maxforwards default. Emitted via SIPTAG_MAX_FORWARDS_STR at outbound nua_invite + nua_register sites (Pattern 16 sofia-sip-native 6th-instance).
+    contactpermit VARCHAR(95) DEFAULT '',         -- post-T56 contactpermit per-peer parity (chan_sip drop-in): IP CIDR (e.g. "1.2.3.0/24") permitted in peer Contact-header URL host. chan_sip parity at chan_sip.c:28827-28832 + L15043 verbatim apply at REGISTER. Separate ACL chain from peer permit/deny (Task 32 source-IP). Multi-rule via multiple sippeers rows OR comma-separated entries (chan_sofia mirrors ast_append_ha sense="permit" semantic).
+    contactdeny VARCHAR(95) DEFAULT '',           -- post-T56 contactdeny per-peer parity (chan_sip drop-in): IP CIDR denied in peer Contact-header URL host. Pairs with contactpermit. chan_sip parity at chan_sip.c:28827-28832 + L15043 verbatim apply at REGISTER. Operator-honest hardening: prevents forwarding-via-attacker pattern when peer registers FROM allowed source-IP but with disallowed Contact-IP.
+    directmediapermit VARCHAR(95) DEFAULT '',     -- post-T56 directmediapermit per-peer parity (chan_sip drop-in): IP CIDR permitted as direct-media remote endpoint when this peer is the BRIDGE PARTNER. chan_sip parity at chan_sip.c:28835-28838 + L30362-30385 apply_directmedia_ha verbatim cross-peer cross-leg semantic. chan_sofia ARCHITECTURAL ADVANTAGE 6th-instance: single sofia_get_rtp_peer gate covers all media (chan_sip applies at 4 process_sdp callouts L30414+L30503+L30561+L30610 per-medium duplication). Per-peer-only (chan_sip [general] ABSENT).
+    directmediadeny VARCHAR(95) DEFAULT '',       -- post-T56 directmediadeny per-peer parity (chan_sip drop-in): IP CIDR denied as direct-media remote endpoint. Pairs with directmediapermit. Operator semantic: "peer X has directmediadeny=Y/24" means: when X is bridge partner, refuses direct-media if the OTHER leg's remote endpoint is in Y/24.
+    disallowed_methods VARCHAR(128) DEFAULT '',  -- post-T56 disallowed_methods per-peer parity (chan_sip drop-in PARSE-COMPAT-ONLY today; effect-deferred): comma-separated SIP method names blocked from outbound Allow header (PUBLISH,MESSAGE,etc.). chan_sip parity at chan_sip.c:29002-29004. Pattern 12 honest-disclosure 9th-instance: STRING-STORAGE SHORTCUT (avoids porting mark_parsed_methods + SIP_METHOD_* constants); full-feature dynamic NUTAG_ALLOW generation per-handle DEFERRED until operator demand surfaces. Inherits sofia.conf [general] disallowed_methods default.
+    mohinterpret VARCHAR(80) DEFAULT '',         -- post-T56 MOH per-peer parity (T26 deferred follow-up): MOH class to play when remote puts us on hold; chan_sip parity; empty inherits sofia.conf [general] default_mohinterpret
+    mohsuggest VARCHAR(80) DEFAULT '',           -- post-T56 MOH per-peer parity: suggested MOH class propagated to bridged channel via AST_CONTROL_HOLD data when this peer puts us on hold (R5 INBOUND-direction). OUTBOUND-direction Alert-Info signaling on chan_sofia-issued HOLD re-INVITE deferred (chan_sofia does NOT issue outbound HOLD re-INVITE today)
+
+    -- Registration
+    expiresecs INTEGER DEFAULT 120,             -- Registration expiry (seconds)
+
+    -- Qualify
+    qualify VARCHAR(10) DEFAULT 'no',           -- yes/no or timeout in ms
+    qualifyfreq INTEGER DEFAULT 60,             -- Qualify interval (seconds)
+    qualifytimeout INTEGER DEFAULT 3,           -- Qualify timeout (seconds)
+
+    -- Registration state — written by chan_sofia on REGISTER / unregister
+    ipaddr VARCHAR(80) DEFAULT '',              -- Last registered IP (UPDATEd on REGISTER)
+    regseconds INTEGER DEFAULT 0,               -- Last registration timestamp (UPDATEd on REGISTER; cleared to 0 on unregister)
+    fullcontact VARCHAR(255) DEFAULT '',        -- Full Contact header (UPDATEd on REGISTER; cleared on unregister)
+
+    -- Compat columns — shared with chan_sip when both drivers use the same table.
+    -- chan_sofia tracks these in memory but does NOT persist them to the DB.
+    useragent VARCHAR(80) DEFAULT '',           -- User-Agent header (in-memory only in chan_sofia)
+    lastms INTEGER DEFAULT 0,                   -- Last qualify response time (ms; in-memory only in chan_sofia)
+
+    -- Multi-server realtime deployment column — written by chan_sofia at REGISTER
+    -- when [general] rtsavesysname=yes + gabpbx.conf systemname= non-empty
+    -- (Pattern 12 26th-instance behavior-change-from-baseline 5th-sub-instance —
+    -- chan_sofia restores canonical Asterisk-upstream behavior per chan_sip.c.bk
+    -- :5103-5151 wire-in pattern; active chan_sip.c FuturePBX fork has DROPPED
+    -- this wire-in — flag dead in current chan_sip; chan_sofia parity-with-
+    -- canonical-source-where-current-chan_sip-fork-regressed flavor).
+    regserver VARCHAR(20) DEFAULT ''            -- Last gabpbx instance that handled REGISTER
+);
+
+Example Usage
+=============
+
+-- Add a realtime peer:
+INSERT INTO sippeers (name, secret, context, host, type, callerid)
+VALUES ('rt100', 'rt100', 'phones', 'dynamic', 'friend', '"Realtime 100" <100>');
+
+-- View registered peers:
+SELECT name, ipaddr, port, datetime(regseconds, 'unixepoch', 'localtime') AS reg_time
+FROM sippeers WHERE regseconds > 0;
+
+-- Remove a peer:
+DELETE FROM sippeers WHERE name = 'rt100';
+
+Behavior
+========
+
+- Config-file peers (sofia.conf) are checked first
+- If not found, chan_sofia queries the sippeers realtime table
+- Realtime peers are cached in memory after first lookup
+  (needed for digest auth nonce persistence)
+- On successful REGISTER, the database is updated with:
+  ipaddr, port, regseconds, fullcontact
+- On unregistration, these fields are cleared
+- Both chan_sip and chan_sofia can use the same sippeers table
+
+Migration
+=========
+
+To add the busy_on_active and max_contacts columns to an existing sippeers table:
+
+ALTER TABLE sippeers ADD COLUMN busy_on_active VARCHAR(10) DEFAULT 'no';
+ALTER TABLE sippeers ADD COLUMN max_contacts INTEGER DEFAULT 6;
+
+To add the callgroup and pickupgroup columns (T31, *8 call pickup):
+
+ALTER TABLE sippeers ADD COLUMN callgroup VARCHAR(80) DEFAULT '';
+ALTER TABLE sippeers ADD COLUMN pickupgroup VARCHAR(80) DEFAULT '';
+
+To add the permit and deny columns (T32, per-peer IP ACLs):
+
+ALTER TABLE sippeers ADD COLUMN permit VARCHAR(95) DEFAULT '';
+ALTER TABLE sippeers ADD COLUMN deny VARCHAR(95) DEFAULT '';
+
+To add the encryption column (T37, SDES-SRTP per RFC 4568):
+
+ALTER TABLE sippeers ADD COLUMN encryption VARCHAR(3) DEFAULT 'no';
+
+To add the mailbox column (T55, MWI message-summary per RFC 3842):
+
+ALTER TABLE sippeers ADD COLUMN mailbox VARCHAR(80) DEFAULT '';
+
+To add the outboundproxy column (T56, outbound INVITE+REGISTER routing via upstream proxy):
+
+ALTER TABLE sippeers ADD COLUMN outboundproxy VARCHAR(80) DEFAULT '';
+
+To add the identity-header columns (post-T56 identity-headers parity, RPID/PAI per RFC 3325 + Privacy per RFC 3323):
+
+ALTER TABLE sippeers ADD COLUMN callingpres VARCHAR(32) DEFAULT '';
+ALTER TABLE sippeers ADD COLUMN sendrpid    VARCHAR(8)  DEFAULT '';
+ALTER TABLE sippeers ADD COLUMN trustrpid   VARCHAR(3)  DEFAULT 'no';
+
+To add the call-limit columns (post-T56 call-limit parity, trunk capacity control + busy-level soft-cap per chan_sip parity):
+
+ALTER TABLE sippeers ADD COLUMN call_limit INTEGER DEFAULT 0;
+ALTER TABLE sippeers ADD COLUMN busy_level INTEGER DEFAULT 0;
+
+To add the MOH per-peer columns (post-T56 mohinterpret/mohsuggest per-peer parity, T26 deferred follow-up):
+
+ALTER TABLE sippeers ADD COLUMN mohinterpret VARCHAR(80) DEFAULT '';
+ALTER TABLE sippeers ADD COLUMN mohsuggest   VARCHAR(80) DEFAULT '';
+
+To add the srtpcipher column (post-T56 srtpcipher operator option, outbound a=crypto cipher preference per RFC 4568 §6.1 + RFC 6188 + RFC 7714):
+
+ALTER TABLE sippeers ADD COLUMN srtpcipher VARCHAR(255) DEFAULT '';
+
+To add the session-timer columns (post-T56 session timers per RFC 4028, chan_sip-parity drop-in):
+
+ALTER TABLE sippeers ADD COLUMN session_timers    VARCHAR(16) DEFAULT '';
+ALTER TABLE sippeers ADD COLUMN session_expires   INTEGER     DEFAULT 0;
+ALTER TABLE sippeers ADD COLUMN session_minse     INTEGER     DEFAULT 0;
+ALTER TABLE sippeers ADD COLUMN session_refresher VARCHAR(8)  DEFAULT '';
+
+To add the allowtransfer column (post-T56 allowtransfer per-peer parity, REFER policy gate per chan_sip drop-in):
+
+ALTER TABLE sippeers ADD COLUMN allowtransfer VARCHAR(8) DEFAULT 'yes';
+
+To add the allowsubscribe column (post-T56 allowsubscribe per-peer parity, SUBSCRIBE policy gate per chan_sip drop-in; REQUEST-EVENT GATING dimension #6 sibling to allowtransfer):
+
+ALTER TABLE sippeers ADD COLUMN allowsubscribe VARCHAR(8) DEFAULT 'yes';
+
+To add the buggymwi column (post-T56 buggymwi per-peer parity, Cisco-buggy-stack MWI workaround per chan_sip drop-in):
+
+ALTER TABLE sippeers ADD COLUMN buggymwi VARCHAR(8) DEFAULT 'no';
+
+To add the lockuseragent column (post-T56 lockuseragent per-peer parity, chan_sip drop-in security feature locking peer registration to first captured User-Agent string):
+
+ALTER TABLE sippeers ADD COLUMN lockuseragent VARCHAR(8) DEFAULT 'no';
+
+To add the language column (post-T56 language per-peer parity, chan_sip drop-in per-peer audio locale for prompts/sounds):
+
+ALTER TABLE sippeers ADD COLUMN language VARCHAR(40) DEFAULT '';
+
+To add the defaultip column (post-T56 defaultip per-peer parity, chan_sip drop-in fallback IP for host=dynamic peers before registration):
+
+ALTER TABLE sippeers ADD COLUMN defaultip VARCHAR(64) DEFAULT '';
+
+To add the maxcallbitrate column (post-T56 maxcallbitrate per-peer parity, chan_sip drop-in SDP video bandwidth ceiling):
+
+ALTER TABLE sippeers ADD COLUMN maxcallbitrate INTEGER DEFAULT 384;
+
+To add the cid_num + cid_name + cid_tag columns (post-T56 cid bundle per-peer parity, chan_sip drop-in outbound CID override for trunk peers + Asterisk-internal channel-id tag):
+
+ALTER TABLE sippeers ADD COLUMN cid_num VARCHAR(80) DEFAULT '';
+ALTER TABLE sippeers ADD COLUMN cid_name VARCHAR(80) DEFAULT '';
+ALTER TABLE sippeers ADD COLUMN cid_tag VARCHAR(80) DEFAULT '';
+
+To add the amaflags column (post-T56 amaflags per-peer parity, chan_sip drop-in CDR AMA-flags propagation per-peer):
+
+ALTER TABLE sippeers ADD COLUMN amaflags VARCHAR(40) DEFAULT '';
+
+To add the parkinglot column (post-T56 parkinglot per-peer parity, chan_sip drop-in Park()/transfer routing per-peer):
+
+ALTER TABLE sippeers ADD COLUMN parkinglot VARCHAR(80) DEFAULT '';
+
+To add the subscribemwi column (post-T56 subscribemwi per-peer parity, chan_sip drop-in PARSE-COMPAT-ONLY ship; Pattern 12 17th-instance chan_sofia-architectural-divergence sub-pattern):
+
+ALTER TABLE sippeers ADD COLUMN subscribemwi VARCHAR(8) DEFAULT 'no';
+
+To add the preferred_codec_only column (post-T56 preferred_codec_only per-peer parity, chan_sip drop-in SDP codec-list narrowing; chan_sofia ARCHITECTURAL ADVANTAGE 12th-instance Option 6-A direction-symmetric):
+
+ALTER TABLE sippeers ADD COLUMN preferred_codec_only VARCHAR(8) DEFAULT 'no';
+
+To add the ignoresdpversion column (post-T56 ignoresdpversion per-peer parity, chan_sip drop-in PARSE-COMPAT-ONLY ship; Pattern 12 23rd-instance + chan_sofia-architectural-divergence sub-pattern 4th-instance post-PROVEN; chan_sofia processes every SDP unconditionally — flag has no behavioral effect; ignoresdpversion=yes operators get drop-in compat zero-rewrite):
+
+ALTER TABLE sippeers ADD COLUMN ignoresdpversion VARCHAR(8) DEFAULT 'no';
+
+To add the promiscredir column (post-T56 promiscredir per-peer parity, chan_sip drop-in PARSE-COMPAT-ONLY ship; Pattern 12 29th-instance + chan_sofia-architectural-divergence sub-pattern 9th-sub-instance post-PROVEN; chan_sofia nua_r_redirect handler ABSENT — flag has no behavioral effect; promiscredir=yes operators get parse-clean migration but chan_sofia continues to ignore 3xx redirects regardless):
+
+ALTER TABLE sippeers ADD COLUMN promiscredir VARCHAR(8) DEFAULT 'no';
+
+To add the autoframing column (post-T56 autoframing per-peer parity, chan_sip drop-in PARSE-COMPAT-ONLY ship; Pattern 12 31st-instance + chan_sofia-architectural-divergence sub-pattern 11-sub-instances post-PROVEN; chan_sofia sofia_parse_sdp infrastructure PRESENT but autoframing wire-in not implemented today — flag has no behavioral effect; autoframing=yes operators get parse-clean migration but chan_sofia continues to use sofia-sip default ptime negotiation regardless):
+
+ALTER TABLE sippeers ADD COLUMN autoframing VARCHAR(8) DEFAULT 'no';
+
+To add the faxdetect column (post-T56 faxdetect per-peer multi-mode parity, chan_sip drop-in PARSE-COMPAT-ONLY ship; Pattern 12 32nd-instance + chan_sofia-architectural-divergence sub-pattern 12-sub-instances post-PROVEN; 4-state values no/cng/t38/cng,t38 — chan_sofia DSP fax-CNG + T.38 reinvite gates not wired today; faxdetect=yes/cng/t38 operators get parse-clean migration but chan_sofia continues to ignore regardless; future-fix within T.38 LARGE dedicated task):
+
+ALTER TABLE sippeers ADD COLUMN faxdetect VARCHAR(16) DEFAULT 'no';
+
+To add the timer_b column (post-T56 timerb per-peer parity, chan_sip drop-in FULL WIRE-IN at [general] via Pattern 16 sofia-sip-native 11th-instance NTATAG_SIP_T1X64; RFC 3261 §17.1.1.2 INVITE transaction timeout; default 32000ms 64*T1; chan_sofia parser-correctness surpass over chan_sip parser-bug; per-peer dynamic override deferred per t1min ac8d1ef precedent):
+
+ALTER TABLE sippeers ADD COLUMN timer_b INTEGER DEFAULT 32000;
+
+To add the timer_t1 column (post-T56 timert1 per-peer parity, chan_sip drop-in FULL WIRE-IN at [general] via Pattern 16 sofia-sip-native 7th-instance REWIRED NTATAG_SIP_T1 + LATENT BUG FIX 2026-04-28; RFC 3261 §17.1.1.1 T1 retransmission interval; default 500ms; chan_sofia parser-correctness surpass over chan_sip parser-class no-range-validation; per-peer dynamic override deferred per Pattern 12 sub-pattern 3rd-instance NTATAG_*_T1 family deferral consistency):
+
+ALTER TABLE sippeers ADD COLUMN timer_t1 INTEGER DEFAULT 500;
+
+To add the allowoverlap column (post-T56 allowoverlap per-peer + [general] parity, chan_sip drop-in FULL WIRE-IN Option A 3 sites: sofia_process_invite ast_canmatch_extension + sofia_indicate AST_CONTROL_INCOMPLETE + nua_r_invite 484 status special-case; RFC 3261 §3 digit-by-digit dialing tri-state yes/no/dtmf; default 'yes' per chan_sip.c:29479 verbatim drop-in critical default; chan_sofia helper-architecture-advantage NEW DIMENSION 3-site-additive-wire-in-without-infrastructure-rework 22 → 23 instances; Pattern 5 helper #32 sofia_allowoverlap_str; CLI infrastructure 18th-task dividend post-21-FIELD MILESTONE; sofia_cli_show_settings 22nd field):
+
+ALTER TABLE sippeers ADD COLUMN allowoverlap VARCHAR(7) DEFAULT 'yes';
+
+To add the callbackextension column (post-T56 callbackextension per-peer parity, chan_sip drop-in Option A FULL WIRE-IN via Pattern 16 sofia-sip-native 12th-instance NUTAG_M_USERNAME at 3 nua_register call sites: chan_sofia.c:9313 auth-challenge re-REGISTER + L12730 qualify-cycle re-REGISTER + L12782 initial-REGISTER inside sofia_do_register; per-peer-only ship — chan_sip [general] parser absence verified; empty-default = chan_sip drop-in baseline; chan_sofia surpass over chan_sip CLI/AMI silent — chan_sip stores in build_peer local-var + discards never displayed; chan_sofia helper-architecture-advantage 23 → 24 TWO surpass dimensions: A=Pattern 16 sofia-sip-native NUTAG_M_USERNAME 1-tag wire-in vs chan_sip p->exten state-machine + B=CLI/AMI-exposure-where-chan_sip-silent dimension):
+
+ALTER TABLE sippeers ADD COLUMN callbackextension VARCHAR(40) DEFAULT '';
+
+To add the progressinband column (post-T56 progressinband per-peer parity, chan_sip drop-in tri-state never/no/yes early-media in-band audio control; Pattern 12 24th-instance + chan_sofia-architectural-divergence sub-pattern 5th-instance partial-feature-parity flavor; Option B partial wire-in honors NEVER + YES exactly + NO degrades to NEVER; REAL OPERATOR DRIVER on .193 progressinband=no):
+
+ALTER TABLE sippeers ADD COLUMN progressinband VARCHAR(8) DEFAULT 'never';
+
+To add the regserver column (post-T56 rtsavesysname [general] parity, multi-server gabpbx realtime tracking; Pattern 12 26th-instance behavior-change-from-chan_sofia-baseline sub-pattern 5th-sub-instance — chan_sofia restores canonical Asterisk-upstream behavior per chan_sip.c.bk:5103-5151 wire-in pattern; active chan_sip.c FuturePBX fork has DROPPED this wire-in — flag dead in current chan_sip; chan_sofia parity-with-canonical-source-where-current-chan_sip-fork-regressed flavor; REAL OPERATOR DRIVER on .193 rtsavesysname=yes):
+
+ALTER TABLE sippeers ADD COLUMN regserver VARCHAR(20) DEFAULT '';
+
+To add the rtp-timeout bundle 3 columns (post-T56 rtp-timeout bundle per-peer parity, chan_sip drop-in RTP-stream no-traffic detection + dead-call cleanup + keepalive emission; REAL OPERATOR DRIVER on .193):
+
+ALTER TABLE sippeers ADD COLUMN rtptimeout INTEGER DEFAULT 0;
+ALTER TABLE sippeers ADD COLUMN rtpholdtimeout INTEGER DEFAULT 0;
+ALTER TABLE sippeers ADD COLUMN rtpkeepalive INTEGER DEFAULT 0;
+
+To add the usereqphone column (post-T56 usereqphone per-peer parity, RFC 3966 telephone-uri ;user=phone parameter for E.164 numbers via PSTN gateways):
+
+ALTER TABLE sippeers ADD COLUMN usereqphone VARCHAR(3) DEFAULT 'no';
+
+usereqphone values: yes (append ;user=phone parameter to outbound Request-URI + From URI when user-part matches digit-only pattern with optional leading +) / no (default — no parameter). Bare key in [general] also accepted as default_usereqphone. PSTN gateways requiring RFC 3966 telephone-uri formatting for E.164 number transmission rely on this option. Per-peer override of [general] default supported.
+
+To add the accountcode column (post-T56 accountcode per-peer parity, CDR billing-tag for per-customer billing):
+
+ALTER TABLE sippeers ADD COLUMN accountcode VARCHAR(20) DEFAULT '';
+
+To add the maxforwards column (post-T56 maxforwards per-peer parity, RFC 3261 §20.22 Max-Forwards initial value):
+
+ALTER TABLE sippeers ADD COLUMN maxforwards INTEGER DEFAULT 70;
+
+To add the contactpermit + contactdeny columns (post-T56 contactpermit/contactdeny per-peer parity, security ACL on peer Contact-header URL host):
+
+ALTER TABLE sippeers ADD COLUMN contactpermit VARCHAR(95) DEFAULT '';
+ALTER TABLE sippeers ADD COLUMN contactdeny VARCHAR(95) DEFAULT '';
+
+To add the directmediapermit + directmediadeny columns (post-T56 directmediapermit/directmediadeny per-peer parity, cross-peer cross-leg ACL gating direct-media at sofia_get_rtp_peer):
+
+ALTER TABLE sippeers ADD COLUMN directmediapermit VARCHAR(95) DEFAULT '';
+ALTER TABLE sippeers ADD COLUMN directmediadeny VARCHAR(95) DEFAULT '';
+
+directmediapermit/directmediadeny values: IP CIDR strings applied cross-peer cross-leg per chan_sip parity at chan_sip.c:30362-30385 verbatim. When this peer is the BRIDGE PARTNER (p2 in chan_sip terms), the OTHER leg's RTP REMOTE addr is gated against this peer's directmediaha. If DENY, direct-media path is forced LOCAL (RTP relays through PBX). chan_sofia ARCHITECTURAL ADVANTAGE 6th-instance: single sofia_get_rtp_peer gate vs chan_sip 4 process_sdp callouts per-medium. Per-peer-only (chan_sip [general] ABSENT). Closes Pattern 12 11th-instance deferral from commit e9d6cb1 contactpermit/contactdeny ship.
+
+contactpermit/contactdeny values: IP CIDR strings (e.g. "192.168.0.0/24" / "10.0.0.0/8") permitted/denied in peer Contact-header URL host at REGISTER processing. Separate ACL chain from peer permit/deny (Task 32 source-IP). chan_sip parity at chan_sip.c:28827-28832 (per-peer parser) + L15043-15044 (apply at REGISTER) verbatim. [general] contactpermit/contactdeny in sofia.conf.sample for cross-peer default. Hardening pattern: peer registers FROM allowed source-IP but with disallowed Contact-IP — security against forwarding-via-attacker.
+
+To add the disallowed_methods column (post-T56 disallowed_methods per-peer parity, PARSE-COMPAT-ONLY ship per Pattern 12 9th-instance):
+
+ALTER TABLE sippeers ADD COLUMN disallowed_methods VARCHAR(128) DEFAULT '';
+
+disallowed_methods values: comma-separated SIP method names (PUBLISH,MESSAGE,OPTIONS) blocked from outbound Allow header. KNOWN LIMITATION: chan_sofia today PARSE-COMPAT-ONLY (string parsed + persisted but full-feature dynamic NUTAG_ALLOW generation per-handle deferred per Pattern 15 — no operator driver since chan_sofia hardcoded NUTAG_ALLOW already restrictive). Operators with chan_sip configs containing disallowed_methods= reload cleanly without parse errors. Future task IF operator demand surfaces.
+
+maxforwards values: 1-255 valid range (chan_sip parity bounds-check); default 70 per RFC 3261 §20.22 (sip.h:60 DEFAULT_MAX_FORWARDS verbatim). Decremented by each proxy hop; reaching 0 returns 483 Too Many Hops. Operators with stateful proxy chains may lower to 20-30 for tighter loop-detection. [general] maxforwards default + per-peer override both supported (chan_sip parity).
+
+accountcode is propagated to channel->accountcode at sofia_new (channel allocation). CDR engines (cdr_sqlite3 / cdr_pgsql / etc.) record per-channel accountcode for per-customer billing. Column size VARCHAR(20) matches AST_MAX_ACCOUNT_CODE=20 (cdr.h:73) — CDR write-time truncation point. Operators putting >20 char values get truncated at CDR write (chan_sip-equivalent behavior). Per-peer-only — chan_sip has no [general] default_accountcode parser; gabpbx-core ast_default_accountcode at cdr.conf level provides cross-channel default if needed.
+
+allowtransfer values: yes (accept REFER, chan_sip default backwards-compat) / no (reject with 603 Declined (policy) + AMI TransferRejected event). Recommended "no" on untrusted/external trunks to block REFER-abuse vectors. Bare key in [general] also accepted as default_allowtransfer (operator-friendly leniency).
+
+To add the subscribecontext column (post-T56 subscribecontext per-peer parity, SUBSCRIBE-method dispatch context override per chan_sip drop-in):
+
+ALTER TABLE sippeers ADD COLUMN subscribecontext VARCHAR(80) DEFAULT '';
+
+KNOWN LIMITATION (chan_sofia today, parsed-but-effect-pending): chan_sofia's SUBSCRIBE-handling path (sofia_process_subscribe) currently routes message-summary to MWI handler (T55) + auto-202s all other events. There is no generalized SUBSCRIBE-to-dialplan dispatch infrastructure today, so subscribecontext is parsed + persisted + displayed (sip show peer Subscr.Cont. + this column) but does not yet route SUBSCRIBE dispatch. The pivot-site override (chan_sip.c:16427-16429 equivalent) lands paired with a future presence/dialog event-package handler task. Drop-in chan_sip config-parse compat ships today; runtime effect arrives with the presence handler.
+
+session-timers values: originate (initiate Session-Expires on outbound INVITE), accept (honor inbound peer requests, no initiate; chan_sip default), refuse (explicit-disable; sofia-sip emits 422 Session Interval Too Small if peer offers).
+session-expires: Session-Expires header seconds; recommended 1800 (RFC 4028 §4 typical); minimum 90 (rejected if smaller).
+session-minse: Min-SE header seconds; minimum acceptable refresh interval; rejects peer offers smaller than this with 422 + Min-SE header.
+session-refresher: refresher preference (auto = sofia-sip nua_any_refresher negotiation-decided; uac = we refresh; uas = peer refreshes). chan_sip parity values.
+
+Operator drivers: stateful-NAT/firewall idle-timeout (long calls dropped silently when SIP-layer mapping evicts despite RTP keepalive); dead-peer detection (crash-mid-call discovery within session_expires/2 interval).
+
+Operator value is a comma-separated list of suite names in preference order. Recognized suites:
+  AES_CM_128_HMAC_SHA1_80    (RFC 4568 default; widest interop)
+  AES_CM_128_HMAC_SHA1_32    (RFC 4568 short-tag)
+  AES_CM_192_HMAC_SHA1_80    (RFC 6188)
+  AES_CM_192_HMAC_SHA1_32    (RFC 6188)
+  AES_CM_256_HMAC_SHA1_80    (RFC 6188; strongest CM)
+  AES_CM_256_HMAC_SHA1_32    (RFC 6188)
+  AEAD_AES_128_GCM           (RFC 7714; WebRTC interop)
+  AEAD_AES_256_GCM           (RFC 7714; strongest AEAD)
+Unknown names are skipped at offer-emit time with LOG_WARNING (lenient validation). Empty value inherits sofia.conf [general] default_srtpcipher; if also empty, sdp_crypto.c falls back to single-line AES_CM_128_HMAC_SHA1_80 for chan_sip backwards-compat.
+
+Inbound a=crypto answer mirrors the negotiated suite regardless of srtpcipher= preference (peer's choice wins per RFC 4568 §6.1.1).
+
+Note: mohsuggest is INBOUND-only today (peer puts us on hold → mohsuggest propagates to bridged channel via AST_CONTROL_HOLD data). OUTBOUND-direction Alert-Info signaling on chan_sofia-issued HOLD re-INVITE is deferred to a separate "outbound HOLD re-INVITE" feature task. Operators relying on OUTBOUND mohsuggest signaling should defer migration until that feature lands.
+
+Note: inUse / inRinging / onHold counters are runtime-only state tracked in memory; NOT
+persisted to the realtime table (chan_sip parity at chan_sip.c:6570 — counters reset on
+gabpbx restart). Operator monitoring should use AMI SIPshowpeer or sip show inuse CLI
+for live counts.
+
+Known Limitations
+=================
+
+max_contacts enforcement is per-add: a single REGISTER with multiple new Contact
+headers that exceeds the limit will commit bindings for contacts before the over-limit
+one, then reject the remainder with 403. In practice all common UAs send one Contact
+per REGISTER, so this is a theoretical edge case only.
+
+INVITE auth NOT IMPLEMENTED (2026-04-27): the `secret`, `md5secret`, and `insecure`
+fields in sippeers are PARSED but NOT ENFORCED at runtime for inbound INVITE.
+chan_sofia today accepts ALL inbound INVITEs without SIP-level auth regardless of
+secret config. REGISTER auth IS implemented. Use peer ACL (permit/deny columns)
++ frontend SIP proxy (Kamailio) + TLS for inbound INVITE protection. Queued task
+"post-T56 INVITE digest auth implementation" closes this gap; see CHAN_SOFIA_AUDIT.md
+operational note for full disclosure.

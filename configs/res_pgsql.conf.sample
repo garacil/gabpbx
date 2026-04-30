@@ -1,0 +1,155 @@
+;
+; res_pgsql.conf
+;
+; PostgreSQL RealTime driver for GABPBX.
+;
+; This file configures res_config_pgsql.so, the PostgreSQL backend used by
+; extconfig.conf realtime families such as sippeers, sipregs, voicemail,
+; queues, queue_members, extensions and other dynamic configuration tables.
+;
+; Typical extconfig.conf examples:
+;
+;   sippeers       => pgsql,general,sippeers
+;   sipregs        => pgsql,general,sipregs
+;   voicemail      => pgsql,general,voicemail
+;   extensions     => pgsql,general,extensions
+;   queues         => pgsql,general,queues
+;   queue_members  => pgsql,general,queue_members
+;
+; Runtime CLI:
+;
+;   realtime show pgsql status
+;   realtime show pgsql cache clear ram
+;
+
+[general]
+;
+; Primary PostgreSQL connection.
+;
+; dbhost may be a hostname or IP address. Use 127.0.0.1 for TCP localhost.
+; If dbhost is empty, libpq uses its default local Unix socket behavior.
+;
+dbhost=127.0.0.1
+dbport=5432
+dbname=gabpbx
+dbuser=gabpbx
+dbpass=password
+;
+; requirements controls how the driver reacts when a realtime table does not
+; match the columns requested by a module:
+;
+;   warn        - log warnings only. Recommended for production.
+;   createclose - add missing columns with the closest PostgreSQL type.
+;   createchar  - add missing columns as character fields.
+;
+requirements=warn
+
+[failover]
+;
+; Optional backup PostgreSQL connection.
+;
+; The driver first tries [general]. If the primary connection cannot be opened
+; or restored, it tries this failover connection. Configure it explicitly when
+; a standby database exists. Keep it commented when not used.
+;
+;dbhost=192.0.2.20
+;dbport=5432
+;dbname=gabpbx
+;dbuser=gabpbx
+;dbpass=password
+
+[cache]
+;
+; Local RAM cache for realtime SELECT results.
+;
+; The driver keeps cached results indexed by the full SQL query text. This is
+; especially useful for high-frequency realtime reads such as SIP peer lookups,
+; registrations, dialplan reads, queue/member queries and voicemail metadata.
+;
+; Defaults in the source:
+;
+;   max_items = 8000
+;   max_size  = 5120000 bytes
+;
+; max_items limits the number of cached SQL result sets.
+; max_size limits the approximate memory used by cached result sets.
+;
+; When the cache is full, new results are not cached and a warning is logged.
+; Existing cached data remains valid until explicitly cleared or marked for
+; update by the network invalidation listener.
+;
+max_items=8000
+max_size=5120000
+
+[networkupd]
+;
+; Network cache invalidation listener.
+;
+; res_config_pgsql starts a UDP listener on this port. Sending a datagram whose
+; payload is exactly the cached SQL query marks that cache entry as stale.
+; The next realtime read for that SQL refreshes the entry from PostgreSQL.
+;
+; Default in the source: 3300
+;
+; Example invalidation packet:
+;
+;   printf "%s" "SELECT * FROM sippeers WHERE (name = '100') AND (root = 1)" | nc -u -w1 127.0.0.1 3300
+;
+; In multi-server deployments, send the same invalidation packet to every PBX
+; node that keeps its own local cache.
+;
+port=3300
+
+[selectfunc]
+;
+; Optional per-table SELECT function mapping.
+;
+; Format:
+;
+;   any_name=table,function_name
+;
+; The left side is only a label. The value must be "table,function".
+;
+; For a mapped table, realtime SELECT is executed as:
+;
+;   SELECT * FROM function_name(E'<generated SQL>', '<systemname>')
+;
+; This allows database-side routing, filtering, logging, partitioning or
+; normalization while keeping the GABPBX realtime API unchanged.
+;
+; Single-row realtime lookups are cached only when a table has a selectfunc.
+; Multi-row realtime lookups use the cache path directly.
+;
+; Example:
+;
+;sippeers=sippeers,gabpbx_realtime_select
+;sipregs=sipregs,gabpbx_realtime_select
+;extensions=extensions,gabpbx_realtime_select
+
+[updatefunc]
+;
+; Reserved compatibility section.
+;
+; The current source parses this section into memory, but UPDATE operations are
+; still executed as direct SQL by res_config_pgsql.c. Keep entries commented
+; unless your local branch wires update functions explicitly.
+;
+; Format:
+;
+;   any_name=table,function_name
+;
+;sippeers=sippeers,gabpbx_realtime_update
+
+[insertfunc]
+;
+; Reserved compatibility section.
+;
+; The current source parses this section into memory, but INSERT operations are
+; still executed as direct SQL by res_config_pgsql.c. Keep entries commented
+; unless your local branch wires insert functions explicitly.
+;
+; Format:
+;
+;   any_name=table,function_name
+;
+;sippeers=sippeers,gabpbx_realtime_insert

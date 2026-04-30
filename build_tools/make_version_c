@@ -1,0 +1,36 @@
+#!/bin/sh
+if test ! -f .flavor ; then
+    EXTRA=""
+elif test ! -f .version ; then
+	aadkflavor=`cat .flavor`
+    EXTRA=" (${aadkflavor})"
+else
+    aadkver=`cat .version`
+    aadkflavor=`cat .flavor`
+    EXTRA=" (${aadkflavor} ${aadkver})"
+fi
+cat << END
+/*
+ * version.c
+ * Automatically generated
+ */
+
+#include "gabpbx.h"
+
+#include "gabpbx/ast_version.h"
+
+static const char gabpbx_version[] = "${GABPBXVERSION}${EXTRA}";
+
+static const char gabpbx_version_num[] = "${GABPBXVERSIONNUM}";
+
+const char *ast_get_version(void)
+{
+	return gabpbx_version;
+}
+
+const char *ast_get_version_num(void)
+{
+	return gabpbx_version_num;
+}
+
+END

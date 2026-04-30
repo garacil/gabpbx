@@ -1,0 +1,835 @@
+#
+# Copyright (c) 2007-2009 Suretec Systems Ltd. - <http://www.suretecsystems.com/>
+#
+# Version: 3.2.0
+#
+# Changes:
+# - Fixed typo - 13/08/2009
+# - https://issues.gabpbx.org/view.php?id=13725 - 12/08/2009
+# - Added GABpbxVoiceMail Object class and AstAccountCallLimit attribute - 28/05/2009
+#   https://issues.gabpbx.org/view.php?id=15155
+# - Added AstAccountLastQualifyMilliseconds - 28/05/2009
+#   https://issues.gabpbx.org/view.php?id=15156
+# - https://issues.gabpbx.org/view.php?id=12860 - 04/07/2008
+# - Fixed wrong DESC - 07/05/2008
+#
+# Author: Gavin Henry - <ghenry@suretecsystems.com>
+#
+# GABpbx LDAP Schema ldif
+#
+# Digium root OID (http://www.iana.org/assignments/enterprise-numbers)
+#
+#  1.3.6.1.4.1.22736
+#  1.3.6.1.4.1.22736.5      LDAP elements
+#  1.3.6.1.4.1.22736.5.4    Attribute Types
+#  1.3.6.1.4.1.22736.5.5    Object Classes
+#
+dn: cn=gabpbx,cn=schema,cn=config
+objectClass: olcSchemaConfig
+cn: gabpbx
+#
+olcObjectIdentifier: GABpbxRoot 1.3.6.1.4.1.22736
+olcObjectIdentifier: GABpbxLDAP GABpbxRoot:5
+#
+#############################################################################
+# Attribute group OIDs.  e.g.: olcObjectIdentifier: AstAttrType GABpbxLDAP:4
+#############################################################################
+olcObjectIdentifier: AstAttrType GABpbxLDAP:4
+#
+#
+#############################################################################
+# Attribute OIDs e.g.: olcObjectIdentifier: AstContext AstAttrType:1
+#############################################################################
+olcObjectIdentifier: AstContext AstAttrType:1
+olcObjectIdentifier: AstExtension AstAttrType:2
+olcObjectIdentifier: AstPriority AstAttrType:3
+olcObjectIdentifier: AstApplication AstAttrType:4
+olcObjectIdentifier: AstApplicationData AstAttrType:5
+olcObjectIdentifier: AstAccountAMAFlags AstAttrType:6
+olcObjectIdentifier: AstAccountCallerID AstAttrType:7
+olcObjectIdentifier: AstAccountContext AstAttrType:8
+olcObjectIdentifier: AstAccountMailbox AstAttrType:9
+olcObjectIdentifier: AstMD5secret AstAttrType:10
+olcObjectIdentifier: AstAccountDeny AstAttrType:11
+olcObjectIdentifier: AstAccountPermit AstAttrType:12
+olcObjectIdentifier: AstAccountQualify AstAttrType:13
+olcObjectIdentifier: AstAccountType AstAttrType:14
+olcObjectIdentifier: AstAccountDisallowedCodec AstAttrType:15
+olcObjectIdentifier: AstAccountExpirationTimestamp AstAttrType:16
+olcObjectIdentifier: AstAccountRegistrationContext AstAttrType:17
+olcObjectIdentifier: AstAccountRegistrationExten AstAttrType:18
+olcObjectIdentifier: AstAccountNoTransfer AstAttrType:19
+olcObjectIdentifier: AstAccountCallGroup AstAttrType:20
+olcObjectIdentifier: AstAccountCanReinvite AstAttrType:21
+olcObjectIdentifier: AstAccountDTMFMode AstAttrType:22
+olcObjectIdentifier: AstAccountFromUser AstAttrType:23
+olcObjectIdentifier: AstAccountFromDomain AstAttrType:24
+olcObjectIdentifier: AstAccountFullContact AstAttrType:25
+olcObjectIdentifier: AstAccountHost AstAttrType:26
+olcObjectIdentifier: AstAccountInsecure AstAttrType:27
+olcObjectIdentifier: AstAccountNAT AstAttrType:28
+olcObjectIdentifier: AstAccountPickupGroup AstAttrType:29
+olcObjectIdentifier: AstAccountPort AstAttrType:30
+olcObjectIdentifier: AstAccountRestrictCID AstAttrType:31
+olcObjectIdentifier: AstAccountRTPTimeout AstAttrType:32
+olcObjectIdentifier: AstAccountRTPHoldTimeout AstAttrType:33
+olcObjectIdentifier: AstAccountRealmedPassword AstAttrType:34
+olcObjectIdentifier: AstAccountAllowedCodec AstAttrType:35
+olcObjectIdentifier: AstAccountMusicOnHold AstAttrType:36
+olcObjectIdentifier: AstAccountCanCallForward AstAttrType:37
+olcObjectIdentifier: AstAccountSecret AstAttrType:38
+olcObjectIdentifier: AstAccountName AstAttrType:39
+olcObjectIdentifier: AstConfigFilename AstAttrType:40
+olcObjectIdentifier: AstConfigCategory AstAttrType:41
+olcObjectIdentifier: AstConfigCategoryMetric AstAttrType:42
+olcObjectIdentifier: AstConfigVariableName AstAttrType:43
+olcObjectIdentifier: AstConfigVariableValue AstAttrType:44
+olcObjectIdentifier: AstConfigCommented AstAttrType:45
+olcObjectIdentifier: AstAccountIPAddress AstAttrType:46
+olcObjectIdentifier: AstAccountDefaultUser AstAttrType:47
+olcObjectIdentifier: AstAccountRegistrationServer AstAttrType:48
+olcObjectIdentifier: AstAccountLastQualifyMilliseconds AstAttrType:49
+olcObjectIdentifier: AstAccountCallLimit AstAttrType:50
+olcObjectIdentifier: AstVoicemailMailbox AstAttrType:51
+olcObjectIdentifier: AstVoicemailPassword AstAttrType:52
+olcObjectIdentifier: AstVoicemailFullname AstAttrType:53
+olcObjectIdentifier: AstVoicemailEmail AstAttrType:54
+olcObjectIdentifier: AstVoicemailPager AstAttrType:55
+olcObjectIdentifier: AstVoicemailOptions AstAttrType:56
+olcObjectIdentifier: AstVoicemailTimestamp AstAttrType:57
+olcObjectIdentifier: AstVoicemailContext AstAttrType:58
+olcObjectIdentifier: AstAccountSubscribeContext AstAttrType:59
+olcObjectIdentifier: AstAccountUserAgent AstAttrType:61
+olcObjectIdentifier: AstAccountLanguage AstAttrType:62
+olcObjectIdentifier: AstAccountTransport AstAttrType:63
+olcObjectIdentifier: AstAccountPromiscRedir AstAttrType:64
+olcObjectIdentifier: AstAccountAccountCode AstAttrType:65
+olcObjectIdentifier: AstAccountSetVar AstAttrType:66
+olcObjectIdentifier: AstAccountAllowOverlap AstAttrType:67
+olcObjectIdentifier: AstAccountVideoSupport AstAttrType:68
+olcObjectIdentifier: AstAccountIgnoreSDPVersion AstAttrType:69
+#
+#
+#############################################################################
+# Object Class OIDs
+#############################################################################
+olcObjectIdentifier: AstObjectClass GABpbxLDAP:2
+olcObjectIdentifier: GABpbxExtension AstObjectClass:1
+olcObjectIdentifier: GABpbxIAXUser AstObjectClass:2
+olcObjectIdentifier: GABpbxSIPUser AstObjectClass:3
+olcObjectIdentifier: GABpbxConfig AstObjectClass:4
+olcObjectIdentifier: GABpbxVoiceMail AstObjectClass:5
+olcObjectIdentifier: GABpbxDialplan AstObjectClass:6
+olcObjectIdentifier: GABpbxAccount AstObjectClass:7
+olcObjectIdentifier: GABpbxMailbox AstObjectClass:8
+#
+#
+#############################################################################
+# attribute definitions
+#
+# OID (the first arg) comes from the olcObjectIdentifier: defined above
+#
+# NAME should be the same as olcObjectIdentifier:
+#
+# DESC should be the description of the attribute
+#
+# EQUALITY is the rule to use when doing a search/compare for an
+# attribute value.
+#
+# SUBSTR is the rule to use when doing a substring search (*foo*)
+#
+# SYNTAX is the syntax (i.e., type) of the attribute. We should
+# probably stick to syntaxes:
+#
+#       1.3.6.1.4.1.1466.115.121.1.15   -> directoryString (UTF-8 string)
+#       1.3.6.1.4.1.1466.115.121.1.26   -> IA5String (ASCII String)
+#       1.3.6.1.4.1.1466.115.121.1.27   -> integer (Integer value)
+#
+# SINGLE-VALUE should be present if only one instance of this
+# attribute is allowed within an entry.
+#
+# {32} is the allowed length
+#
+# e.g.:
+# 
+# olcAttributeTypes: ( AstExample
+#    NAME ( 'AstExample' )
+#    DESC 'GABpbx Example Attribute'
+#    EQUALITY caseIgnoreMatch
+#    SUBSTR caseIgnoreSubstringsMatch
+#    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15{32} 
+#    SINGLE-VALUE )
+#
+#############################################################################
+#
+olcAttributeTypes: ( AstContext
+        NAME 'AstContext'
+        DESC 'GABpbx Context'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstExtension
+        NAME 'AstExtension'
+        DESC 'GABpbx Extension'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#       
+olcAttributeTypes: ( AstPriority
+        NAME 'AstPriority'
+        DESC 'GABpbx Priority'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstApplication 
+        NAME 'AstApplication'
+        DESC 'GABpbx Application'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstApplicationData 
+        NAME 'AstApplicationData'
+        DESC 'GABpbx Application Data'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#        
+olcAttributeTypes: ( AstAccountAMAFlags 
+        NAME 'AstAccountAMAFlags'
+        DESC 'GABpbx Account AMA Flags'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountCallerID 
+        NAME 'AstAccountCallerID'
+        DESC 'GABpbx Account CallerID'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountContext 
+        NAME 'AstAccountContext'
+        DESC 'GABpbx Account Context'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#        
+olcAttributeTypes: ( AstAccountMailbox 
+        NAME 'AstAccountMailbox'
+        DESC 'GABpbx Account Mailbox'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstMD5secret
+        NAME 'AstMD5secret'
+        DESC 'GABpbx Account MD5 Secret'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountDeny 
+        NAME 'AstAccountDeny'
+        DESC 'GABpbx Account Deny'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountPermit 
+        NAME 'AstAccountPermit'
+        DESC 'GABpbx Account Permit'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#       
+olcAttributeTypes: ( AstAccountQualify 
+        NAME 'AstAccountQualify'
+        DESC 'GABpbx Account Qualify'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountType 
+        NAME 'AstAccountType'
+        DESC 'GABpbx Account Type'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountDisallowedCodec 
+        NAME 'AstAccountDisallowedCodec'
+        DESC 'GABpbx Account Disallowed Codec'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountExpirationTimestamp 
+        NAME 'AstAccountExpirationTimestamp'
+        DESC 'GABpbx Account Expiration Timestamp'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountRegistrationContext 
+        NAME 'AstAccountRegistrationContext'
+        DESC 'GABpbx Account Registration Context'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountRegistrationExten 
+        NAME 'AstAccountRegistrationExten'
+        DESC 'GABpbx Account Registration Extension'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountNoTransfer 
+        NAME 'AstAccountNoTransfer'
+        DESC 'GABpbx Account No Transfer'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#        
+olcAttributeTypes: ( AstAccountCallGroup 
+        NAME 'AstAccountCallGroup'
+        DESC 'GABpbx Account Call Group'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountCanReinvite 
+        NAME 'AstAccountCanReinvite'
+        DESC 'GABpbx Account Can Reinvite'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#    
+olcAttributeTypes: ( AstAccountDTMFMode 
+        NAME 'AstAccountDTMFMode'
+        DESC 'GABpbx Account DTMF Flags'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#            
+olcAttributeTypes: ( AstAccountFromUser 
+        NAME 'AstAccountFromUser'
+        DESC 'GABpbx Account From User'
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#        
+olcAttributeTypes: ( AstAccountFromDomain
+        NAME 'AstAccountFromDomain'
+        DESC 'GABpbx Account From Domain'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#        
+olcAttributeTypes: ( AstAccountFullContact 
+        NAME 'AstAccountFullContact'
+        DESC 'GABpbx Account Full Contact'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountHost 
+        NAME 'AstAccountHost'
+        DESC 'GABpbx Account Host'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountInsecure
+        NAME 'AstAccountInsecure'
+        DESC 'GABpbx Account Insecure'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountNAT 
+        NAME 'AstAccountNAT'
+        DESC 'GABpbx Account NAT'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#     
+olcAttributeTypes: ( AstAccountPickupGroup 
+        NAME 'AstAccountPickupGroup'
+        DESC 'GABpbx Account PickupGroup'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#      
+olcAttributeTypes: ( AstAccountPort 
+        NAME 'AstAccountPort'
+        DESC 'GABpbx Account Port'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#      
+olcAttributeTypes: ( AstAccountRestrictCID 
+        NAME 'AstAccountRestrictCID'
+        DESC 'GABpbx Account Restrict CallerID'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#            
+olcAttributeTypes: ( AstAccountRTPTimeout 
+        NAME 'AstAccountRTPTimeout'
+        DESC 'GABpbx Account RTP Timeout'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#      
+olcAttributeTypes: ( AstAccountRTPHoldTimeout 
+        NAME 'AstAccountRTPHoldTimeout'
+        DESC 'GABpbx Account RTP Hold Timeout'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#      
+olcAttributeTypes: ( AstAccountRealmedPassword 
+        NAME 'AstAccountRealmedPassword'
+        DESC 'GABpbx Account Realmed Password'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountAllowedCodec 
+        NAME 'AstAccountAllowedCodec' 
+        DESC 'GABpbx Account Allowed Codec'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountMusicOnHold 
+        NAME 'AstAccountMusicOnHold'
+        DESC 'GABpbx Account Music On Hold'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountCanCallForward 
+        NAME 'AstAccountCanCallForward'
+        DESC 'GABpbx Account Can Call Forward' 
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountSecret 
+        NAME 'AstAccountSecret'
+        DESC 'GABpbx Account Secret' 
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#         
+olcAttributeTypes: ( AstAccountName 
+        NAME 'AstAccountName'
+        DESC 'GABpbx Account Username'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstConfigFilename 
+        NAME 'AstConfigFilename'
+        DESC 'GABpbx LDAP Configuration Filename'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstConfigCategory
+        NAME 'AstConfigCategory'
+        DESC 'GABpbx LDAP Configuration Category'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstConfigCategoryMetric
+        NAME 'AstConfigCategoryMetric'
+        DESC 'GABpbx LDAP Configuration Category Metric'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstConfigVariableName
+        NAME 'AstConfigVariableName'
+        DESC 'GABpbx LDAP Configuration Variable Name'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstConfigVariableValue
+        NAME 'AstConfigVariableValue'
+        DESC 'GABpbx LDAP Configuration Variable Value'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstConfigCommented
+        NAME 'AstConfigCommented'
+        DESC 'GABpbx LDAP Configuration Commented'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountIPAddress
+        NAME 'AstAccountIPAddress'
+        DESC 'GABpbx Account IP Address' 
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#  
+olcAttributeTypes: ( AstAccountDefaultUser
+        NAME 'AstAccountDefaultUser'
+        DESC 'GABpbx Account Default User'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountRegistrationServer
+        NAME 'AstAccountRegistrationServer'
+        DESC 'GABpbx Account Registration Server' 
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountLastQualifyMilliseconds
+        NAME 'AstAccountLastQualifyMilliseconds'
+        DESC 'GABpbx Account Last Qualify Milliseconds'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountCallLimit
+        NAME 'AstAccountCallLimit'
+        DESC 'GABpbx Account Call Limit'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstVoicemailMailbox
+        NAME 'AstVoicemailMailbox'
+        DESC 'GABpbx voicemail mailbox'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstVoicemailPassword
+        NAME 'AstVoicemailPassword'
+        DESC 'GABpbx voicemail password'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstVoicemailFullname
+        NAME 'AstVoicemailFullname'
+        DESC 'GABpbx voicemail fullname'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstVoicemailEmail
+        NAME 'AstVoicemailEmail'
+        DESC 'GABpbx voicemail email'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstVoicemailPager
+        NAME 'AstVoicemailPager'
+        DESC 'GABpbx voicemail pager'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstVoicemailOptions
+        NAME 'AstVoicemailOptions'
+        DESC 'GABpbx voicemail options'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstVoicemailTimestamp
+        NAME 'AstVoicemailTimestamp'
+        DESC 'GABpbx voicemail timestamp'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstVoicemailContext
+        NAME 'AstVoicemailContext'
+        DESC 'GABpbx voicemail context'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountSubscribeContext
+        NAME 'AstAccountSubscribeContext'
+        DESC 'GABpbx subscribe context'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountUserAgent
+        NAME 'AstAccountUserAgent'
+        DESC 'GABpbx account user context'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountLanguage
+         NAME 'AstAccountLanguage'
+         DESC 'GABpbx account user language'
+         EQUALITY caseIgnoreMatch
+         SUBSTR caseIgnoreSubstringsMatch
+         SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountTransport
+        NAME 'AstAccountTransport'
+        DESC 'GABpbx account transport type'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountPromiscRedir
+        NAME 'AstAccountPromiscRedir'
+        DESC 'GABpbx account promiscous redirects'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountAccountCode
+        NAME 'AstAccountAccountCode'
+        DESC 'GABpbx account billing code'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountSetVar
+        NAME 'AstAccountSetVar'
+        DESC 'GABpbx account setvar'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountAllowOverlap
+        NAME 'AstAccountAllowOverlap'
+        DESC 'GABpbx account allow overlap dialing'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountVideoSupport
+        NAME 'AstAccountVideoSupport'
+        DESC 'GABpbx account video support'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+olcAttributeTypes: ( AstAccountIgnoreSDPVersion
+        NAME 'AstAccountIgnoreSDPVersion'
+        DESC 'GABpbx account ignore SDP version'
+        EQUALITY caseIgnoreMatch
+        SUBSTR caseIgnoreSubstringsMatch
+        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15)
+#
+#############################################################################
+# Object Class definitions
+#
+# This is where to define the object classes. Object classes are used
+# to define which attribute MAY (optional) or MUST (required) belong
+# to an entry.
+#
+# Classes can be AUXILIARY or STRUCTURAL. An entry in the directory
+# must have one and only one structural class, but can have many
+# AUXILIARY classes.
+#
+#############################################################################
+#
+olcObjectClasses: ( GABpbxExtension 
+    NAME 'GABpbxExtension'
+    DESC 'PBX Extension Information for GABpbx'
+    SUP top AUXILIARY
+    MUST cn
+    MAY ( 
+        AstContext $ 
+        AstExtension $ 
+        AstPriority $
+        AstApplication $ 
+        AstApplicationData
+    ) 
+    )
+#
+#############################################################################
+#
+# GABpbxIAXUser and GABpbxSIPUser extend GABpbxExtension. These
+# represent real accounts in GABpbx.
+#
+# NOTE: They are defined as AUXILIARY in case they need to be mixed with an
+# existing directory deployment.
+#
+#############################################################################
+#       
+olcObjectClasses: ( GABpbxIAXUser 
+    NAME 'GABpbxIAXUser'
+    DESC 'IAX2 User information for GABpbx'
+    SUP GABpbxExtension AUXILIARY
+    MUST cn
+    MAY ( 
+        AstAccountAMAFlags $ 
+        AstAccountCallerID $ 
+        AstAccountContext $ 
+        AstAccountFullContact $ 
+        AstAccountHost $ 
+        AstAccountMailbox $ 
+        AstMD5secret $ 
+        AstAccountDeny $
+        AstAccountPermit $ 
+        AstAccountPort $ 
+        AstAccountQualify $ 
+        AstAccountType $
+        AstAccountLanguage $
+        AstAccountDisallowedCodec $ 
+        AstAccountExpirationTimestamp $ 
+        AstAccountRegistrationContext $
+        AstAccountRegistrationExten $ 
+        AstAccountNoTransfer $ 
+        AstAccountName $
+        AstAccountLastQualifyMilliseconds $
+        AstAccountCallLimit $
+        AstAccountSubscribeContext $
+        AstAccountIPAddress $
+        AstAccountUserAgent
+    )
+    )
+#       
+olcObjectClasses: ( GABpbxSIPUser 
+    NAME 'GABpbxSIPUser'
+    DESC 'SIP User information for GABpbx'
+    SUP GABpbxExtension AUXILIARY
+    MUST cn
+    MAY (
+        AstAccountAccountCode $
+        AstAccountAllowOverlap $
+        AstAccountAllowedCodec $
+        AstAccountAMAFlags $
+        AstAccountCallGroup $
+        AstAccountCallLimit $
+        AstAccountCallerID $
+        AstAccountCanCallForward $
+        AstAccountCanReinvite $
+        AstAccountContext $
+        AstAccountDTMFMode $
+        AstAccountDefaultUser $
+        AstAccountDeny $
+        AstAccountDisallowedCodec $
+        AstAccountExpirationTimestamp $
+        AstAccountFromDomain $
+        AstAccountFromUser $
+        AstAccountFullContact $
+        AstAccountHost $
+        AstAccountIgnoreSDPVersion $
+        AstAccountInsecure $
+        AstAccountIPAddress $
+        AstAccountLanguage $
+        AstAccountLastQualifyMilliseconds $
+        AstAccountMailbox $
+        AstAccountMusicOnHold $
+        AstAccountNAT $
+        AstAccountName $
+        AstAccountPermit $
+        AstAccountPickupGroup $
+        AstAccountPort $
+        AstAccountPromiscRedir $
+        AstAccountQualify $
+        AstAccountRTPHoldTimeout $
+        AstAccountRTPTimeout $
+        AstAccountRealmedPassword $
+        AstAccountRegistrationContext $
+        AstAccountRegistrationExten $
+        AstAccountRegistrationServer $
+        AstAccountRestrictCID $
+        AstAccountSecret $
+        AstAccountSetVar $
+        AstAccountSubscribeContext $
+        AstAccountTransport $
+        AstAccountType $
+        AstAccountUserAgent $
+        AstAccountVideoSupport
+    )
+    )
+#
+#############################################################################
+#
+# GABpbxConfig and GABpbxVoiceMail extend GABpbxExtension. These
+# represent real accounts in GABpbx.
+#
+# NOTE: They are defined as AUXILIARY in case they need to be mixed with an
+# existing directory deployment.
+#
+#############################################################################
+#        
+olcObjectClasses: ( GABpbxConfig 
+    NAME 'GABpbxConfig'
+    DESC 'GABpbx configuration Information'
+    SUP top AUXILIARY
+    MUST cn
+    MAY ( 
+        AstConfigFilename $ 
+        AstConfigCategory $ 
+        AstConfigCategoryMetric $
+        AstConfigVariableName $ 
+        AstConfigVariableValue $ 
+        AstConfigCommented
+    ) 
+    )
+#
+olcObjectClasses: ( GABpbxVoiceMail
+    NAME 'GABpbxVoiceMail'
+    DESC 'GABpbx voicemail information'
+    SUP top AUXILIARY
+    MUST (
+    cn $
+    AstContext $
+    AstVoicemailMailbox $
+    AstVoicemailPassword
+    ) 
+    MAY (
+    AstVoicemailFullname $
+    AstVoicemailEmail $
+    AstVoicemailPager $
+    AstVoicemailOptions $
+    AstVoicemailTimestamp $
+    AstVoicemailContext
+    )
+    )
+#
+olcObjectClasses: ( GABpbxDialplan
+    NAME 'GABpbxDialplan'
+    DESC 'GABpbx Dialplan Information'
+    SUP top STRUCTURAL
+    MUST ( 
+    AstExtension
+    )
+    )
+#
+olcObjectClasses: ( GABpbxAccount
+    NAME 'GABpbxAccount'
+    DESC 'GABpbx Account Information'
+    SUP top STRUCTURAL
+    MUST ( 
+    AstAccountName
+    )
+    )
+#
+olcObjectClasses: ( GABpbxMailbox
+    NAME 'GABpbxMailbox'
+    DESC 'GABpbx Mailbox Information'
+    SUP top STRUCTURAL
+    MUST (
+    AstVoicemailMailbox
+    )
+    )

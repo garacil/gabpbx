@@ -1,0 +1,20 @@
+# T52.2: editline auto-generated build artifacts.
+# These files are produced by the build (chared.c + common.c + emacs.c + vi.c
+# + help.c source-of-truth → makelist scripts emit common.h / editline.c /
+# emacs.h / fcns.c / fcns.h / help.c / help.h / vi.h). Tracking the generated
+# copies caused merge churn and false-bug-noise (regenerated on every clean
+# build with timestamp/signature drift). Generated source headers + the np/*.o_a
+# object archives are ignored here so the working tree stays clean.
+
+# Generated headers + sources from makelist
+common.h
+editline.c
+emacs.h
+fcns.c
+fcns.h
+help.c
+help.h
+vi.h
+
+# np/ archive objects from build
+np/*.o_a

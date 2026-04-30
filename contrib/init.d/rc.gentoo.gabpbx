@@ -1,0 +1,38 @@
+#!/sbin/runscript
+# $Id: rc.gentoo.gabpbx 239270 2010-01-11 23:53:32Z tilghman $
+
+### BEGIN INIT INFO
+# Provides:		gabpbx
+# Required-Start:    $network $syslog $named $local_fs $remote_fs
+# Required-Stop:     $network $syslog $named $local_fs $remote_fs
+# Should-Start:      dahdi misdn lcr wanrouter mysql postgresql
+# Should-Stop:       dahdi misdn lcr wanrouter mysql postgresql
+# Default-Start:	2 3 4 5
+# Default-Stop:		0 1 6
+# Short-Description:	GABpbx PBX
+# Description:		the GABpbx Open Source PBX
+### END INIT INFO
+
+depend() {
+	need net logger
+}
+
+start() {
+	# Check if GABpbx is already running.  If it is, then bug out, because
+	# starting safe_gabpbx when GABpbx is running is very bad.
+	VERSION=`${ASTSBINDIR}/gabpbx -rx 'core show version'`
+	if [ "`echo $VERSION | cut -c 1-8`" = "GABpbx" ]; then
+		echo "GABpbx is already running.  $0 will exit now."
+		exit 1
+	fi
+
+	ebegin "Starting GABpbx"
+	/usr/sbin/gabpbx
+	eend $? "Failed to start GABpbx"
+}
+
+stop() {
+	ebegin "Stopping GABpbx"
+	kill $(cat /var/run/gabpbx.pid)
+	eend $? "Failed to stop GABpbx"
+}

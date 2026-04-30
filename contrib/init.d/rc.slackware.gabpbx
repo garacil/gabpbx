@@ -1,0 +1,63 @@
+#!/bin/sh
+#
+# Start/stop/restart GABpbx PBX
+#
+# Version: 1.0 - Paul Belanger <pabelanger@gmail.com>
+#
+# 03.29.2005 - Initial Version
+#
+# $Id: rc.slackware.gabpbx 239270 2010-01-11 23:53:32Z tilghman $
+
+### BEGIN INIT INFO
+# Provides:		gabpbx
+# Required-Start:    $network $syslog $named $local_fs $remote_fs
+# Required-Stop:     $network $syslog $named $local_fs $remote_fs
+# Should-Start:      dahdi misdn lcr wanrouter mysql postgresql
+# Should-Stop:       dahdi misdn lcr wanrouter mysql postgresql
+# Default-Start:	2 3 4 5
+# Default-Stop:		0 1 6
+# Short-Description:	GABpbx PBX
+# Description:		the GABpbx Open Source PBX
+### END INIT INFO
+
+gabpbx_start() {
+   if [ -x /usr/sbin/gabpbx ]; then
+      # Check if GABpbx is already running.  If it is, then bug out, because
+      # starting safe_gabpbx when GABpbx is running is very bad.
+      VERSION=`/usr/sbin/gabpbx -rx 'core show version'`
+	  if [ "`echo $VERSION | cut -c 1-8`" = "GABpbx" ]; then
+         echo "GABpbx is already running.  $0 will exit now."
+         exit 1
+      fi
+
+      echo "Starting GABpbx   /usr/sbin/gabpbx"
+      /usr/sbin/gabpbx
+   fi
+}
+
+gabpbx_stop() {
+    # If there is no PID file, ignore this request...
+    if [ -r /var/run/gabpbx.pid ]; then
+      killall gabpbx
+    fi
+}
+
+gabpbx_restart() {
+   gabpbx_stop
+   gabpbx_start
+}
+
+case "$1" in
+   'start')
+      gabpbx_start
+      ;;
+   'stop')
+      gabpbx_stop
+      ;;
+   'restart')
+      gabpbx_restart
+      ;;
+   *)
+      echo "usage $0 start|stop|restart" ;;
+esac
+

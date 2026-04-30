@@ -1,0 +1,8 @@
+[general]
+
+; The database file.
+dbfile => /var/lib/gabpbx/sqlite3.db
+
+; Both config_table and cdr_table are optional.
+config_table => ast_config
+cdr_table => ast_cdr

@@ -1,0 +1,53 @@
+/*
+ * GABPBX -- Germán Aracil Boned PBX.
+ *
+ * Copyright (C) 2008 - present, Germán Luis Aracil Boned <garacilb@gmail.com>
+ *
+ * GABPBX was first created in 2008 by
+ * Germán Luis Aracil Boned <garacilb@gmail.com>.
+ *
+ * GABPBX as a project is based on Asterisk 1.8 and was later updated
+ * to the final stable Asterisk 1.8 release.
+ *
+ * Copyleft: GABPBX is free software, distributed under the terms of
+ * the GNU General Public License Version 2.
+ *
+ * Existing copyright, authorship, Asterisk/Digium notices,
+ * third-party notices, and GPL licensing terms are preserved when present.
+ *
+ * Written by Thorsten Lockert <tholo@trollphone.org>
+ *
+ * Funding provided by Troll Phone Networks AS
+ *
+ * See http://www.gabpbx.org for more information about
+ * the GABPBX project. Please do not directly contact
+ * any of the maintainers of this project for assistance;
+ * the project provides a web site, mailing lists and IRC
+ * channels for your use.
+ *
+ * This program is free software, distributed under the terms of
+ * the GNU General Public License Version 2. See the LICENSE file
+ * at the top of the source tree.
+ */
+
+/*! \file
+ * \brief DNS support for GABpbx
+ * \author Thorsten Lockert <tholo@trollphone.org>
+ */
+
+#ifndef _GABPBX_DNS_H
+#define _GABPBX_DNS_H
+
+/*!	\brief	Perform DNS lookup (used by DNS, enum and SRV lookups)
+	\param	context
+	\param	dname	Domain name to lookup (host, SRV domain, TXT record name)
+	\param	class	Record Class (see "man res_search")
+	\param	type	Record type (see "man res_search")
+	\param	callback Callback function for handling DNS result
+	\note   GABpbx DNS is synchronus at this time. This means that if your DNS
+		services does not work, GABpbx may lock while waiting for response.
+*/
+int ast_search_dns(void *context, const char *dname, int class, int type,
+	 int (*callback)(void *context, unsigned char *answer, int len, unsigned char *fullanswer));
+
+#endif /* _GABPBX_DNS_H */

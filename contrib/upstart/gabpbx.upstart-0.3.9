@@ -1,0 +1,37 @@
+# gabpbx
+#
+# Upstart control file for the GABpbx PBX
+#
+# To install, rename this file to 'gabpbx' and copy it to /etc/event.d/
+#
+# To start gabpbx manually:
+#     sudo start gabpbx
+#
+# To stop gabpbx manually:
+#     sudo stop gabpbx
+
+description "GABpbx PBX"
+version     "1.8"
+
+start on runlevel 2
+start on runlevel 3
+start on runlevel 4
+start on runlevel 5
+
+stop on runlevel 0
+stop on runlevel 1
+stop on runlevel 6
+
+pre-start script
+  # Since Ubuntu clears /var/run on reboot, create this before we try to start
+  mkdir -p /var/run/gabpbx
+end script
+
+console output
+respawn
+exec /usr/sbin/gabpbx -vvvvvvvg -cf
+
+post-stop script
+  # Might as well clean up after ourselves, too.
+  rm -rf /var/run/gabpbx
+end script

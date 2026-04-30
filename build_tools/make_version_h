@@ -1,0 +1,36 @@
+#!/bin/sh
+if test ! -f .flavor ; then
+    cat << END
+/*
+ * version.h 
+ * Automatically generated
+ */
+#define GABPBX_VERSION "${GABPBXVERSION}"
+#define GABPBX_VERSION_NUM ${GABPBXVERSIONNUM}
+
+END
+elif test ! -f .version ; then
+    aadkflavor=`cat .flavor`
+    cat << END
+/*
+ * version.h 
+ * Automatically generated
+ */
+#define GABPBX_VERSION "${GABPBXVERSION} (${aadkflavor})"
+#define GABPBX_VERSION_NUM ${GABPBXVERSIONNUM}
+
+END
+else
+    aadkver=`cat .version`
+    aadkflavor=`cat .flavor`
+    cat << END
+/*
+ * version.h 
+ * Automatically generated
+ */
+#define GABPBX_VERSION "${GABPBXVERSION} (${aadkflavor} ${aadkver})"
+#define GABPBX_VERSION_NUM ${GABPBXVERSIONNUM}
+
+END
+fi
+
