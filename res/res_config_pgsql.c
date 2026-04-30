@@ -279,8 +279,8 @@ PGresult *execsql(char *sql, char *func, char *keyfield, int pgsqlCurrent)
                 if (!keyfield)
                         snprintf(cmd, sizeof(cmd), "SELECT * FROM %s(E'%s', '%s')", func, sql2, ast_config_AST_SYSTEM_NAME);
                 else
-                        snprintf(cmd, sizeof(cmd), "SELECT * FROM %s(E'%s', '%s', %i, '%s')", func, sql2, \
-                          ast_config_AST_SYSTEM_NAME, (int) *ast_config_AST_SYSTEM_ROOT, keyfield);
+                        snprintf(cmd, sizeof(cmd), "SELECT * FROM %s(E'%s', '%s', '%s')", func, sql2,
+                          ast_config_AST_SYSTEM_NAME, keyfield);
         } else {
                 ast_copy_string(cmd, sql, sizeof(cmd));
         }
@@ -412,7 +412,6 @@ void *do_pgsql_cache_update(void *data)
         char buf[1024];
         int unsigned inicio;
         int unsigned fin;
-	char cmd[128];
 
         sock=socket(AF_INET, SOCK_DGRAM, 0);
         if (sock < 0) {
@@ -436,43 +435,33 @@ void *do_pgsql_cache_update(void *data)
                 memset(buf, 0, sizeof(buf));
                 n = recvfrom(sock,buf,1024,0,(struct sockaddr *)&from,&fromlen);
                 if (n > 0) {
-			if (!strncmp(buf, "FAX", 3)) {
-				if (option_verbose > 4)
-                                        ast_verbose(VERBOSE_PREFIX_2 "START NEW FAX\n");
-                                memset(cmd, 0, sizeof(cmd));
-                                sprintf(cmd, "/usr/bin/nice -n 19 /home/tucall/pbx/utils/emails/putfax.py %i &", *ast_config_AST_SYSTEM_ROOT);
-				if (option_verbose > 5)
-                                        ast_verbose(VERBOSE_PREFIX_2 "FAX CMD: %s\n", cmd);
-                                system(cmd);
-			} else {
-	                        ast_mutex_lock(&pgsql_cache_flag);
-	                        if (pgsql_cache) {
-	                                item = -1;
-	                                inicio = 0;
-	                                fin = pgsql_cache_items - 1;
-	                                while (inicio <= fin) {
-	                                        item = (inicio + fin) / 2;
-	                                        if (!strcmp(pgsql_cache[item]->sql, buf)) {
-	                                                break;
-	                                        }
-	                                        if (strcmp(pgsql_cache[item]->sql, buf) > 0) {
-	                                                if (item == 0)
-	                                                        break;
-	                                                fin = item - 1;
-	                                        } else
-	                                               inicio = item + 1;
-	                                }
-	                                if (strcmp(pgsql_cache[item]->sql, buf) != 0)
-	                                        item = -1;
-	                                if ((item >= 0) && (item < pgsql_cache_items)) {
-	                                        pgsql_cache[item]->update = 1;
-	                                        if (option_verbose > 5)
-	                                                ast_verbose(VERBOSE_PREFIX_1 "Setting item for update %08u\n", item);
-	                                }
-        	                }
-	                        ast_mutex_unlock(&pgsql_cache_flag);
-	                        usleep(1000);
+			ast_mutex_lock(&pgsql_cache_flag);
+			if (pgsql_cache) {
+				item = -1;
+				inicio = 0;
+				fin = pgsql_cache_items - 1;
+				while (inicio <= fin) {
+					item = (inicio + fin) / 2;
+					if (!strcmp(pgsql_cache[item]->sql, buf)) {
+						break;
+					}
+					if (strcmp(pgsql_cache[item]->sql, buf) > 0) {
+						if (item == 0)
+							break;
+						fin = item - 1;
+					} else
+						inicio = item + 1;
+				}
+				if (strcmp(pgsql_cache[item]->sql, buf) != 0)
+					item = -1;
+				if ((item >= 0) && (item < pgsql_cache_items)) {
+					pgsql_cache[item]->update = 1;
+					if (option_verbose > 5)
+						ast_verbose(VERBOSE_PREFIX_1 "Setting item for update %08u\n", item);
+				}
 			}
+			ast_mutex_unlock(&pgsql_cache_flag);
+			usleep(1000);
                 }
         }
         return NULL;
@@ -896,7 +885,6 @@ static struct ast_variable *realtime_pgsql(const char *database, const char *tab
 
 		ast_str_append(&sql, 0, " AND (%s%s '%s')", newparam, op, ast_str_buffer(escapebuf));
 	}
-	ast_str_append(&sql, 0, " AND (root = %i)", *ast_config_AST_SYSTEM_ROOT);
 	va_end(ap);
 
 //	ast_log(LOG_WARNING, "Postgresql RealTime: SQL %s\n", ast_str_buffer(sql));
@@ -1065,7 +1053,6 @@ static struct ast_config *realtime_multi_pgsql(const char *database, const char 
 
 		ast_str_append(&sql, 0, " AND (%s%s '%s')", newparam, op, ast_str_buffer(escapebuf));
 	}
-	ast_str_append(&sql, 0, " AND (root = %i)", *ast_config_AST_SYSTEM_ROOT);
 	if (initfield) {
 		ast_str_append(&sql, 0, " ORDER BY %s", initfield);
 	}
@@ -1231,7 +1218,7 @@ static int update_pgsql(const char *database, const char *tablename, const char 
 		return -1;
 	}
 
-	ast_str_append(&sql, 0, " WHERE (%s = '%s') AND (root = %i)", keyfield, ast_str_buffer(escapebuf), *ast_config_AST_SYSTEM_ROOT);
+	ast_str_append(&sql, 0, " WHERE (%s = '%s')", keyfield, ast_str_buffer(escapebuf));
 
 	ast_debug(1, "PostgreSQL RealTime: Update SQL\n");
 
@@ -1282,7 +1269,7 @@ static int update2_pgsql(const char *database, const char *tablename, va_list ap
 	}
 
 	ast_str_set(&sql, 0, "UPDATE %s SET ", tablename);
-	ast_str_set(&where, 0, "WHERE (root = %i) AND ", *ast_config_AST_SYSTEM_ROOT);
+	ast_str_set(&where, 0, "WHERE ");
 
 	while ((newparam = va_arg(ap, const char *))) {
 		if (!find_column(table, newparam)) {
@@ -1386,9 +1373,9 @@ static int store_pgsql(const char *database, const char *table, va_list ap)
 	/* Create the first part of the query using the first parameter/value pairs we just extracted
 	   If there is only 1 set, then we have our query. Otherwise, loop thru the list and concat */
 	ESCAPE_STRING(buf, newparam);
-	ast_str_set(&sql1, 0, "INSERT INTO %s (root, %s", table, ast_str_buffer(buf));
+	ast_str_set(&sql1, 0, "INSERT INTO %s (%s", table, ast_str_buffer(buf));
 	ESCAPE_STRING(buf, newval);
-	ast_str_set(&sql2, 0, ") VALUES (%i, '%s'", *ast_config_AST_SYSTEM_ROOT, ast_str_buffer(buf));
+	ast_str_set(&sql2, 0, ") VALUES ('%s'", ast_str_buffer(buf));
 	while ((newparam = va_arg(ap, const char *))) {
 		newval = va_arg(ap, const char *);
 		if (newval) {
@@ -1453,7 +1440,7 @@ static int destroy_pgsql(const char *database, const char *table, const char *ke
 
 	ESCAPE_STRING(buf1, keyfield);
 	ESCAPE_STRING(buf2, lookup);
-	ast_str_set(&sql, 0, "DELETE FROM %s WHERE (root = %i) AND %s = '%s'", table, *ast_config_AST_SYSTEM_ROOT, ast_str_buffer(buf1), ast_str_buffer(buf2));
+	ast_str_set(&sql, 0, "DELETE FROM %s WHERE %s = '%s'", table, ast_str_buffer(buf1), ast_str_buffer(buf2));
 	while ((newparam = va_arg(ap, const char *))) {
 		newval = va_arg(ap, const char *);
 		ESCAPE_STRING(buf1, newparam);
@@ -1506,8 +1493,8 @@ static struct ast_config *config_pgsql(const char *database, const char *table,
 	}
 
 	ast_str_set(&sql, 0, "SELECT category, var_name, var_val, cat_metric FROM %s "
-			"WHERE (root = %i AND systemname = '%s') AND filename='%s' and commented=0"
-			"ORDER BY cat_metric DESC, var_metric ASC, category, var_name ", table, *ast_config_AST_SYSTEM_ROOT, ast_config_AST_SYSTEM_NAME, file);
+			"WHERE systemname = '%s' AND filename='%s' and commented=0"
+			"ORDER BY cat_metric DESC, var_metric ASC, category, var_name ", table, ast_config_AST_SYSTEM_NAME, file);
 
 	ast_debug(1, "PostgreSQL RealTime: Static SQL\n");
 
@@ -2129,4 +2116,3 @@ AST_MODULE_INFO(GABPBX_GPL_KEY, AST_MODFLAG_LOAD_ORDER, "PostgreSQL RealTime Con
 		.reload = reload,
 		.load_pri = AST_MODPRI_REALTIME_DRIVER,
 	       );
-

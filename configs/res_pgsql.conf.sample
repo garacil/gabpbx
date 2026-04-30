@@ -93,7 +93,7 @@ max_size=5120000
 ;
 ; Example invalidation packet:
 ;
-;   printf "%s" "SELECT * FROM sippeers WHERE (name = '100') AND (root = 1)" | nc -u -w1 127.0.0.1 3300
+;   printf "%s" "SELECT * FROM sippeers WHERE (name = '100')" | nc -u -w1 127.0.0.1 3300
 ;
 ; In multi-server deployments, send the same invalidation packet to every PBX
 ; node that keeps its own local cache.
