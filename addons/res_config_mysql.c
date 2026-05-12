@@ -17,7 +17,7 @@
  *
  * Copyright (C) 1999-2005, Digium, Inc.
  *
- * Mark Spencer <markster@digium.com>  - Asterisk Author (project this code originated from)
+ * Mark Spencer <markster@digium.com>  - Asterisk Author
  * Matthew Boehm <mboehm@cytelcom.com> - MySQL RealTime Driver Author
  *
  * See http://www.gabpbx.org for more information about
