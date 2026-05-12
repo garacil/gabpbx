@@ -405,10 +405,10 @@ headers that exceeds the limit will commit bindings for contacts before the over
 one, then reject the remainder with 403. In practice all common UAs send one Contact
 per REGISTER, so this is a theoretical edge case only.
 
-INVITE auth NOT IMPLEMENTED (2026-04-27): the `secret`, `md5secret`, and `insecure`
-fields in sippeers are PARSED but NOT ENFORCED at runtime for inbound INVITE.
-chan_sofia today accepts ALL inbound INVITEs without SIP-level auth regardless of
-secret config. REGISTER auth IS implemented. Use peer ACL (permit/deny columns)
-+ frontend SIP proxy (Kamailio) + TLS for inbound INVITE protection. Queued task
-"post-T56 INVITE digest auth implementation" closes this gap; see CHAN_SOFIA_AUDIT.md
-operational note for full disclosure.
+INVITE digest auth: the `secret`, `md5secret`, and `insecure` fields in sippeers
+are enforced at runtime for inbound INVITE. chan_sofia challenges INVITE with MD5
+or SHA-256 digest, supports `qop=auth` with nonce-count replay protection, honors
+`insecure=invite` for per-peer bypass, and exposes a global `force_invite_auth`
+override in `[general]` to require auth regardless of per-peer `insecure`. Peer
+ACL (permit/deny columns) and a frontend SIP proxy (Kamailio) with TLS remain
+recommended for additional layers of defense.

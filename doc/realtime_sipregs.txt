@@ -190,15 +190,12 @@ Known Limitations
 - Cluster-shared sipregs writes are last-write-wins; gabpbx core does not provide
   multi-master conflict resolution. Use clustered DB locking if multiple gabpbx
   nodes can register the same peer simultaneously.
-- INVITE auth NOT IMPLEMENTED (2026-04-27): the sipregs table provides registration
-  state for inbound auth lookups, but chan_sofia today does not authenticate
-  inbound INVITEs at SIP level (REGISTER auth IS implemented). The `insecure`
-  + `secret` fields in sippeers are parsed but unenforced for INVITE. Use peer
-  ACL + frontend SIP proxy + TLS for inbound INVITE protection. R6 deferred
-  spin-off (sofia_get_insecure_from_sipregs IP-based auth-bypass helper) is
-  also gated on the queued "post-T56 INVITE digest auth implementation" task —
-  cannot land independently without the consuming auth flow. See
-  CHAN_SOFIA_AUDIT.md operational note for full disclosure.
+- INVITE digest auth: chan_sofia enforces inbound INVITE digest authentication
+  using the `secret` / `md5secret` / `insecure` fields in sippeers. MD5 and
+  SHA-256 algorithms are supported, `qop=auth` is honored with nonce-count
+  replay protection, and a global `force_invite_auth` switch in `[general]`
+  can override per-peer `insecure=invite` bypass. Peer ACL (permit/deny) plus
+  a frontend SIP proxy with TLS are still recommended additional defenses.
 - Transition-window stale-state risk: when an operator enables sipregs on a
   deployment that previously stored registration state in sippeers, peers that
   registered BEFORE the enable have populated sippeers.ipaddr/port/regseconds.

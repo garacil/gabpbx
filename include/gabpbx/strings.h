@@ -119,12 +119,10 @@ char * attribute_pure ast_skip_blanks_mut(char *str),
 }
 )
 
-/* T54 (2026-04-27): _Generic dispatch — preserves caller-name compatibility while
- * eliminating the T42.5 union-pattern type-pun. C11 6.5.1.1 keyword; available
- * since GCC 4.9. Build assumes >=C11 (gnu23 default in GCC 15.2.1+). If a future
- * build target downgrades to <C11, this macro breaks — see CHAN_SOFIA_AUDIT.md
- * operational note for context. Dispatches by input const-ness: const char * input
- * → const char * return; char * input → char * return. */
+/* _Generic dispatch (C11 6.5.1.1, GCC >= 4.9): preserves caller-name
+ * compatibility while keeping the input/return const-ness aligned. Build
+ * assumes >= C11. Dispatches by input const-ness: const char * input →
+ * const char * return; char * input → char * return. */
 #define ast_skip_blanks(s) _Generic((s), \
 	const char *: ast_skip_blanks_const, \
 	char *:       ast_skip_blanks_mut \

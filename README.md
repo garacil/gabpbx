@@ -250,13 +250,26 @@ Subscribe, MWI and presence-related behavior:
 
 Fax and T.38 related behavior:
 
-- T.38 and fax-related configuration fields are present for `chan_sip`
-  migration compatibility.
-- T.38 state transition AMI visibility exists where the current implementation
-  drives those transitions.
-- `faxdetect` accepts the documented modes and is displayed.
-- Some fax/T.38 behavior is intentionally staged; see the roadmap and
-  `configs/sofia.conf.sample` for the most precise operational status.
+- T.38 fax UDPTL relay through the GABPBX `ast_udptl` engine.
+- 4-state T.38 negotiation machine (disabled, local-reinvite, peer-reinvite,
+  enabled) with peer-reinvite abort timer.
+- SDP T.38 attribute negotiation: `T38FaxVersion`, `T38MaxBitRate`,
+  `T38FaxRateManagement`, `T38FaxMaxBuffer`, `T38FaxMaxDatagram` and
+  `T38FaxUdpEC` (FEC / redundancy / none).
+- Per-peer `t38pt_udptl` configuration for enable, EC mode and
+  `maxdatagram=` override.
+- `[general]` `t38_maxdatagram` for the global default.
+- Per-peer `t38pt_usertpsource` for symmetric-RTP UDPTL destination behavior
+  on NAT'd peers.
+- `AST_OPTION_T38_STATE` `queryoption` handler so applications such as
+  `SendFAX` and `ReceiveFAX` can drive T.38 negotiation.
+- AMI `T38FaxNegotiation` event on each state transition.
+- `faxdetect` modes wired in: `no` (default), `cng` (DSP CNG tone detection),
+  `t38` (peer T.38 reINVITE detection), `cng,t38` / `yes` (both). On detection
+  the channel is async-redirected to the `fax` extension where the dialplan
+  runs `SendFAX` / `ReceiveFAX`.
+- `t38pt_udptl=no` peers stay on classic audio and the T.38 engine remains
+  inactive for them.
 
 CLI commands:
 
@@ -446,8 +459,6 @@ Planned or staged work:
 - Per-peer dynamic T1 timer adjustment based on qualify RTT.
 - Text RTP QoS handling for `tos_text` and `cos_text`.
 - Video direct-media support after audio/direct-media behavior remains stable.
-- Additional fax/T.38 completion work where `configs/sofia.conf.sample`
-  documents staged behavior.
 - Better clean-reload and clean-unload behavior where Sofia-SIP thread ownership
   permits it. For now, restarting GABPBX is the correct operational method after
   changing the active SIP channel driver.

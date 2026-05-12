@@ -106,7 +106,7 @@
 #include "gabpbx/rtp_engine.h"
 #include "gabpbx/dsp.h"  /* post-T56 inband DTMF detect parity (2026-04-27): ast_dsp_new + ast_dsp_process + ast_dsp_set_features for inbound DTMF tone detection */
 #include "gabpbx/dnsmgr.h"  /* post-T56 dnsmgr per-peer parity (2026-04-27): ast_dnsmgr_lookup_cb + ast_dnsmgr_release for async hostname-tracking on peers with host=hostname (non-IP) */
-#include "gabpbx/udptl.h"  /* post-T56 Task #8 T.38 fax UDPTL parity SS2 (2026-04-28): ast_udptl_protocol + ast_udptl_proto_register/unregister + ast_udptl_destroy public API + struct ast_control_t38_parameters via frame.h. Skeleton + lifecycle this SS; SDP/state-machine/relay/queryoption arriving SS3a-SS5 per CHAN_SOFIA_T38_DESIGN.md §3 */
+#include "gabpbx/udptl.h"  /* T.38 fax UDPTL: ast_udptl_protocol + ast_udptl_proto_register/unregister + ast_udptl_destroy + struct ast_control_t38_parameters via frame.h. */
 #include "gabpbx/sched.h"  /* post-T56 Task #8 T.38 fax UDPTL parity SS4 (2026-04-28): ast_sched_thread_create/destroy/add/del for sofia_t38_abort 5s reINVITE timeout per SS1.5 N2 LOAD-BEARING (chan_sip.c:24288 ast_sched_add 5000ms). chan_sofia uses ast_sched_thread managed-thread API (sched.h:316-403) — sofia owns separate sched-thread vs chan_sip's monitor-thread sched_runq pattern; equivalent semantic + cleaner thread-ownership */
 #include "gabpbx/causes.h"
 #include "gabpbx/acl.h"
@@ -190,14 +190,12 @@
 #define SOFIA_FAX_DETECT_T38    2
 #define SOFIA_FAX_DETECT_BOTH   3
 
-/* post-T56 Task #8 T.38 fax UDPTL parity SS2 (2026-04-28, skeleton + lifecycle;
- * full state machine SS4 per CHAN_SOFIA_T38_DESIGN.md §1.4):
+/* T.38 fax UDPTL 4-state negotiation machine:
  *
- * 4-state T.38 negotiation machine mirroring chan_sip.c:5765-5811 verbatim
- * semantic. State transitions queue AST_CONTROL_T38_PARAMETERS for 3 of 4
- * states (LOCAL_REINVITE deliberately silent — waits for peer 200 OK per
- * chan_sip.c:5803). SS2 only declares the enum + zero-initializes pvt->t38_state
- * to DISABLED at sofia_pvt_alloc; transition logic ships at SS4 in the
+ * State transitions queue AST_CONTROL_T38_PARAMETERS for 3 of 4 states
+ * (LOCAL_REINVITE deliberately silent — waits for peer 200 OK). pvt->t38_state
+ * is zero-initialized to DISABLED at sofia_pvt_alloc; transition logic lives
+ * in the
  * sofia_change_t38_state Pattern 5 helper (#43 candidate). */
 #define SOFIA_T38_DISABLED          0
 #define SOFIA_T38_LOCAL_REINVITE    1
@@ -228,6 +226,12 @@
  * at SS4 with sched-context creation (chan_sip.c:32330 verbatim sched_context_create
  * pattern; chan_sofia's own sched-context to be added at SS4). */
 #define SOFIA_T38_ABORT_TIMEOUT_MS  5000
+/* REFER transferer-leg BYE deferral. After we send the terminal NOTIFY 200 OK on a
+ * blind/attended transfer the transferer's UA is expected to send BYE per
+ * RFC 5589 §6.1. If it does not within this window, fire nua_bye ourselves so the
+ * dialog does not leak. 32 s mirrors chan_sip DEFAULT_TRANS_TIMEOUT
+ * (sip_scheddestroy path at chan_sip.c:7058). */
+#define SOFIA_DEFER_BYE_TIMEOUT_MS  32000
 /* post-T56 allowoverlap [general]+per-peer parity (2026-04-28, Option A FULL WIRE-IN
  * 3 sites: sofia_process_invite ast_canmatch_extension + sofia_indicate AST_CONTROL_
  * INCOMPLETE + nua_r_invite 484 status special-case): 3 named constants for
@@ -1784,9 +1788,7 @@ struct sofia_pvt {
 	int ring_inc_done; /* post-T56 call-limit parity SS1 (2026-04-27): 1 = this pvt incremented peer->inRinging — race-prevention; chan_sip SIP_INC_RINGING parity */
 	struct ast_dsp *dsp; /* Allocated by sofia_enable_dsp_detect when inband/auto DTMF or fax-CNG detection is enabled; freed in destructor. */
 
-	/* post-T56 Task #8 T.38 fax UDPTL parity SS2 (2026-04-28, skeleton +
-	 * lifecycle; full state machine + 6-op interpret + max_ifp wiring +
-	 * t38id 5s timer arrive at SS4 per CHAN_SOFIA_T38_DESIGN.md §1.4):
+	/* T.38 fax UDPTL per-dialog state:
 	 *
 	 *   udptl: per-dialog UDPTL session pointer; NULL when no T.38 in flight.
 	 *     Allocated lazily (chan_sip pattern at chan_sip.c:7591 verbatim) on
@@ -1848,6 +1850,16 @@ struct sofia_pvt {
 	int session_negotiated_expires; /* negotiated Session-Expires (seconds); 0 = no timer active */
 	time_t session_last_refresh_at; /* time of most recent refresh; 0 = never refreshed */
 	int allowtransfer; /* post-T56 allowtransfer per-peer parity (2026-04-27): per-call REFER policy; inherits peer->allowtransfer at sofia_request_call (outbound) or sofia_process_invite (inbound); chan_sip parity sip.h:1065 (dialog->allowtransfer); gated at sofia_process_refer entry */
+	/* Blind/attended-transfer BYE deferral (chan_sip parity for SIP_DEFER_BYE_ON_TRANSFER
+	 * at chan_sip.c:24949 + L7051-7067). After we send the terminal NOTIFY 200 OK for a
+	 * REFER, RFC 5589 §6.1 expects the transferer's UA to send BYE on its own; we must
+	 * not race the UA with our own nua_bye, otherwise sofia-sip drops the pending
+	 * terminal NOTIFY and the UA never sees the transfer complete. When set,
+	 * sofia_hangup skips its nua_bye, and a sched-thread timer (defer_bye_sched_id)
+	 * fires nua_bye after SOFIA_DEFER_BYE_TIMEOUT_MS as the safety net for UAs that do
+	 * not auto-BYE. The incoming-BYE handler cancels the timer. */
+	int defer_bye;
+	int defer_bye_sched_id;
 };
 
 /* post-T56 call-limit parity SS2 (2026-04-27): centralized counter helper.
@@ -1943,6 +1955,48 @@ static void sofia_uri_user_from_contact(const char *uri, const char *fallback,
 	}
 	memcpy(buf, start, user_len);
 	buf[user_len] = '\0';
+}
+
+/* Build NAT-traversal proxy URL from peer->src_addr for outbound in-dialog
+ * messages when peer has nat=force_rport (or comedia). Used by sofia_call to
+ * disable sofia-sip's auto-ACK and the nua_r_invite 200-OK handler to emit
+ * a manual ACK with NUTAG_PROXY override — without this, sofia-sip routes
+ * the 2xx-ACK to the dialog's remote_target (= Contact URI from the 200 OK),
+ * which for NAT'd phones typically carries the unroutable private LAN IP
+ * (the phone advertises its LAN address even when registered from a public
+ * NAT-mapped source). The ACK never arrives, leaving the phone
+ * to retransmit 200 OK forever and the call to die silently. peer->src_addr
+ * holds the registered public source (set on REGISTER for dynamic peers,
+ * by sofia_dnsmgr_setup_peer for static host=<ip> peers). Returns 1 if the
+ * proxy URL was filled, 0 if peer doesn't need NAT routing. */
+static int sofia_build_nat_proxy_url_from_peer(const struct sofia_peer *peer,
+                                                char *buf, size_t len)
+{
+	char host_buf[80];
+	int port;
+
+	if (!peer || !buf || len < 16) {
+		return 0;
+	}
+	buf[0] = '\0';
+
+	if (!(peer->nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA))) {
+		return 0;
+	}
+	if (ast_sockaddr_isnull(&peer->src_addr)) {
+		return 0;
+	}
+
+	port = ast_sockaddr_port(&peer->src_addr);
+	if (!port) {
+		port = peer->port ? peer->port : 5060;
+	}
+
+	snprintf(buf, len, "sip:%s:%d",
+		sofia_uri_format_host(ast_sockaddr_stringify_host(&peer->src_addr),
+			host_buf, sizeof(host_buf)),
+		port);
+	return 1;
 }
 
 static int sofia_pvt_build_nat_target_url(struct sofia_pvt *pvt, char *buf, size_t len)
@@ -2811,6 +2865,47 @@ static int sofia_t38_abort(const void *data)
 	return 0;
 }
 
+/* Safety-net timer for REFER transferer-leg BYE deferral. Mirrors the
+ * `sip_scheddestroy(p, DEFAULT_TRANS_TIMEOUT)` path at chan_sip.c:7058. After
+ * we send the terminal NOTIFY 200 OK for a transfer, sofia_hangup leaves the
+ * SIP dialog alive so the transferer's UA can BYE per RFC 5589 §6.1. If no
+ * BYE arrives within SOFIA_DEFER_BYE_TIMEOUT_MS this callback fires nua_bye
+ * itself so we don't leak the dialog. Returns 0 = one-shot. Drops the ao2 ref
+ * taken at ast_sched_thread_add. */
+static int sofia_defer_bye_cb(const void *data)
+{
+	struct sofia_pvt *pvt = (struct sofia_pvt *)data;
+
+	if (!pvt) {
+		return 0;
+	}
+
+	ast_mutex_lock(&pvt->lock);
+	pvt->defer_bye_sched_id = -1;
+	if (pvt->defer_bye && pvt->nh) {
+		char target_url[256];
+		int use_target = sofia_pvt_build_nat_target_url(pvt, target_url, sizeof(target_url));
+		ast_log(LOG_NOTICE, "Sofia: transferer-leg BYE deferral timed out (%dms) — "
+			"sending nua_bye on call-id %s\n",
+			SOFIA_DEFER_BYE_TIMEOUT_MS,
+			pvt->callid ? pvt->callid : "(none)");
+		nua_bye(pvt->nh,
+			TAG_IF(use_target, NUTAG_PROXY(target_url)),
+			TAG_END());
+	}
+	pvt->defer_bye = 0;
+	pvt->state = SOFIA_DIALOG_STATE_DOWN;
+	ast_mutex_unlock(&pvt->lock);
+
+	/* Drop the dialog-container ref so the pvt is collected once sofia-sip
+	 * finishes processing the outbound BYE we just queued. */
+	ao2_unlink(dialogs, pvt);
+
+	/* Drop the ref we took when we scheduled. */
+	ao2_ref(pvt, -1);
+	return 0;
+}
+
 /* post-T56 inband DTMF/fax tone detect parity (2026-04-27/2026-04-28):
  * allocate ast_dsp and configure it for incoming audio tone detection.
  * Mirrors chan_sip enable_dsp_detect at chan_sip.c:4929-4961 for DTMF,
@@ -3494,6 +3589,19 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 				struct ast_sockaddr remote;
 				ast_sockaddr_parse(&remote, addr, 0);
 				ast_sockaddr_set_port(&remote, media->m_port);
+				/* NAT override (chan_sip parity): if the peer is behind NAT,
+				 * the SDP c= line usually leaks its private LAN IP. Replace
+				 * the host portion with peer->src_addr (registered public IP
+				 * or DNS-resolved address) while keeping the SDP-advertised
+				 * media port. Symmetric-RTP / comedia will further refine
+				 * the port when the first inbound packet arrives. */
+				if (pvt->peer
+				    && (pvt->peer->nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA))
+				    && !ast_sockaddr_isnull(&pvt->peer->src_addr)) {
+					struct ast_sockaddr nat_remote = pvt->peer->src_addr;
+					ast_sockaddr_set_port(&nat_remote, media->m_port);
+					remote = nat_remote;
+				}
 				ast_rtp_instance_set_remote_address(pvt->rtp, &remote);
 			}
 
@@ -3598,6 +3706,16 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 
 				ast_sockaddr_parse(&remote, addr, 0);
 				ast_sockaddr_set_port(&remote, media->m_port);
+				/* NAT override (chan_sip parity): mirror audio-side reasoning
+				 * for video — SDP c= from a NAT'd peer typically leaks the
+				 * private LAN IP; use peer->src_addr instead. */
+				if (pvt->peer
+				    && (pvt->peer->nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA))
+				    && !ast_sockaddr_isnull(&pvt->peer->src_addr)) {
+					struct ast_sockaddr nat_remote = pvt->peer->src_addr;
+					ast_sockaddr_set_port(&nat_remote, media->m_port);
+					remote = nat_remote;
+				}
 				ast_rtp_instance_set_remote_address(pvt->vrtp, &remote);
 
 				ast_rtp_codecs_payloads_clear(&newvideortp, NULL);
@@ -4101,6 +4219,7 @@ static struct sofia_pvt *sofia_pvt_alloc(void)
 	 * verbatim ("no scheduler entry pending" — distinct from valid sched ID 0). */
 	pvt->t38_state = SOFIA_T38_DISABLED;
 	pvt->t38id = -1;
+	pvt->defer_bye_sched_id = -1;
 
 	/* post-T56 Task #8 T.38 fax UDPTL parity SS3b (2026-04-28): chan_sofia
 	 * default OUR T.38 capabilities per chan_sip drop-in baseline. version=0
@@ -4479,8 +4598,15 @@ static void sofia_dnsmgr_setup_peer(struct sofia_peer *peer)
 	if (peer->dnsmgr) {
 		return; /* already registered (idempotent for reload paths) */
 	}
-	/* IP-literal pre-check — if peer->host parses as an address, no DNS managment needed. */
+	/* IP-literal pre-check — if peer->host parses as an address, no DNS managment needed.
+	 * Still copy the parsed address into peer->src_addr so downstream consumers
+	 * (sofia_find_peer_by_ip IP-fallback, sofia_generate_sdp externaddr-substitution
+	 * gate at chan_sofia.c:3031) see a populated canonical "where to reach this peer"
+	 * value. Without this, static host=<ip-literal> trunks have src_addr left at the
+	 * zero-init value: IP-based peer match misses them (inbound INVITE → 401) and SDP
+	 * c= line stays at the bound 0.0.0.0 (no audio). */
 	if (ast_sockaddr_parse(&probe, peer->host, PARSE_PORT_FORBID)) {
+		ast_sockaddr_copy(&peer->src_addr, &probe);
 		return;
 	}
 	/* ao2_bump peer ref for callback-time-safe access; ast_dnsmgr_release at cleanup
@@ -5554,6 +5680,51 @@ static struct sofia_peer *sofia_find_peer(const char *name)
 	return found;
 }
 
+/* chan_sip parity: IP-based fallback peer match.
+ * Used by sofia_process_invite after the From-username lookup fails — typical
+ * for trunk gateways whose From-user is the caller-ID number rather than the
+ * peer name configured in sofia.conf (host=<ip> trunks where the upstream PBX
+ * sends From: <sip:<dialled-number>@…> with no relation to the local peer
+ * stanza). Matches peer->src_addr (set both by dnsmgr for static host=<ip>
+ * peers and by REGISTER for dynamic
+ * peers) or, if that is unset, peer->defaddr. Port is ignored on purpose so
+ * the existing SOFIA_INSECURE_PORT semantic stays the only port-mismatch
+ * knob. First match wins (chan_sip find_peer(NULL,&addr,…) parity). */
+static struct sofia_peer *sofia_find_peer_by_ip(const struct ast_sockaddr *src)
+{
+	struct ao2_iterator i;
+	struct sofia_peer *peer, *found = NULL;
+
+	if (!src || ast_sockaddr_isnull(src)) {
+		return NULL;
+	}
+
+	i = ao2_iterator_init(peers, 0);
+	while ((peer = ao2_iterator_next(&i))) {
+		struct ast_sockaddr parsed;
+		const struct ast_sockaddr *candidate = NULL;
+		if (!ast_sockaddr_isnull(&peer->src_addr)) {
+			candidate = &peer->src_addr;
+		} else if (!ast_strlen_zero(peer->host)
+		           && strcasecmp(peer->host, "dynamic")
+		           && ast_sockaddr_parse(&parsed, peer->host, PARSE_PORT_FORBID)) {
+			/* Static host=<ip-literal> peers never get src_addr populated by
+			 * sofia_dnsmgr_setup_peer (it returns early at the IP-literal
+			 * pre-check, chan_sofia.c:4483), so parse it on-the-fly here. */
+			candidate = &parsed;
+		} else if (!ast_sockaddr_isnull(&peer->defaddr)) {
+			candidate = &peer->defaddr;
+		}
+		if (candidate && !ast_sockaddr_cmp_addr(candidate, src)) {
+			found = peer;
+			break;
+		}
+		ao2_ref(peer, -1);
+	}
+	ao2_iterator_destroy(&i);
+	return found;
+}
+
 /* Direct media (audit bug #4): ast_rtp_glue plumbing.
  * Surpasses chan_sip's tangled flag set with a single reinvite_pending guard. */
 
@@ -6251,6 +6422,13 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		/* post-T56 maxforwards parity (2026-04-27): RFC 3261 §20.22 outbound emission. */
 		char mf_str_call[8];
 		snprintf(mf_str_call, sizeof(mf_str_call), "%d", pvt->peer ? pvt->peer->maxforwards : sofia_cfg.default_max_forwards);
+		/* NAT auto-ACK suppression: if peer is behind NAT, the 200 OK Contact
+		 * URI carries the LAN IP and sofia-sip's auto-ACK would route there
+		 * (unroutable). We disable auto-ACK and emit a manual ACK with
+		 * NUTAG_PROXY in the nua_r_invite 200 handler. */
+		char nat_proxy_probe[128];
+		int needs_manual_ack = sofia_build_nat_proxy_url_from_peer(pvt->peer,
+			nat_proxy_probe, sizeof(nat_proxy_probe));
 		if (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf))) {
 			nua_invite(pvt->nh,
 				SIPTAG_FROM_STR(from_buf),
@@ -6261,6 +6439,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				TAG_IF(st_seconds >= 0, NUTAG_SESSION_TIMER(st_seconds)),
 				TAG_IF(st_min_se > 0, NUTAG_MIN_SE(st_min_se)),
 				TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
+				TAG_IF(needs_manual_ack, NUTAG_AUTOACK(0)),
 				SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 				SIPTAG_PAYLOAD_STR(sdp_buf),
 				SIPTAG_MAX_FORWARDS_STR(mf_str_call),
@@ -6275,6 +6454,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				TAG_IF(st_seconds >= 0, NUTAG_SESSION_TIMER(st_seconds)),
 				TAG_IF(st_min_se > 0, NUTAG_MIN_SE(st_min_se)),
 				TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
+				TAG_IF(needs_manual_ack, NUTAG_AUTOACK(0)),
 				SIPTAG_MAX_FORWARDS_STR(mf_str_call),
 				TAG_END());
 		}
@@ -6369,6 +6549,19 @@ static int sofia_hangup(struct ast_channel *ast)
 		ao2_ref(fork, -1);
 		pvt->fork = NULL;
 		pvt->is_fork_master = 0;
+	}
+
+	/* chan_sip parity (SIP_DEFER_BYE_ON_TRANSFER at chan_sip.c:7051-7067). When the
+	 * REFER handler has armed defer_bye, the transferer's UA owns the dialog teardown:
+	 * detach the channel side here but leave the SIP dialog alive (no nua_bye, no
+	 * ao2_unlink). The safety-net timer sofia_defer_bye_cb or the incoming-BYE handler
+	 * (sofia_process_bye) tears the pvt down later. */
+	if (pvt->defer_bye) {
+		pvt->owner = NULL;
+		ast->tech_pvt = NULL;
+		ast_mutex_unlock(&pvt->lock);
+		ao2_ref(pvt, -1);
+		return 0;
 	}
 
 	if (pvt->nh) {
@@ -6641,7 +6834,37 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 		 * dialplan explicit Progress() call. operator-key "prematuremedia=yes" reads
 		 * counter-intuitively but matches chan_sip drop-in compat exactly. */
 		if (!sofia_cfg.prematuremediafilter) {
-			nua_respond(pvt->nh, SIP_183_SESSION_PROGRESS, TAG_END());
+			/* chan_sip parity (chan_sip.c:7710 transmit_provisional_response with_sdp=TRUE):
+			 * emit 183 Session Progress with an SDP body so the INVITE offer is
+			 * properly answered at the early-media stage.
+			 *
+			 * Without SDP the offer recorded by sofia-sip at sr_offer_recv stays
+			 * unanswered when the UAC PRACKs the reliable 183. Require: 100rel is
+			 * auto-added by sofia-sip per nua_session.c:2493 for status==183 whenever
+			 * the UAC's INVITE advertised Supported: 100rel, and there is no NUTAG
+			 * to suppress it for 183. sofia-sip's nua_prack_server_report then
+			 * fires an empty 200 OK on the INVITE milliseconds after the PRACK; the
+			 * UAC ACKs the bogus 2xx, sees no media, and BYEs.
+			 *
+			 * Including SDP here sets sr_answer_sent at nua_session.c:2435 (because
+			 * NUTAG_MEDIA_ENABLE(0) makes sofia-sip read the body directly from the
+			 * response message at nua_session.c:2364-2370), so offer/answer is
+			 * settled in the 183 itself. The spurious 200 OK no longer fires;
+			 * PRACK is harmless and RFC-3262-correct. sofia_generate_sdp is the
+			 * same helper sofia_answer uses below. */
+			char sdp_buf[2048];
+			if (pvt->rtp && sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf))) {
+				nua_respond(pvt->nh, SIP_183_SESSION_PROGRESS,
+					SIPTAG_CONTENT_TYPE_STR("application/sdp"),
+					SIPTAG_PAYLOAD_STR(sdp_buf),
+					TAG_END());
+			} else {
+				/* RTP not yet bound — fall back to bodyless 183. Should be rare
+				 * in practice: sofia_rtp_init runs in sofia_process_invite
+				 * (inbound) and sofia_request_call (outbound) before
+				 * AST_CONTROL_PROGRESS can reach the channel. */
+				nua_respond(pvt->nh, SIP_183_SESSION_PROGRESS, TAG_END());
+			}
 		}
 		break;
 	case AST_CONTROL_ANSWER:
@@ -6976,11 +7199,33 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 					route_buf[0] ? route_buf : "");
 			}
 
+			/* NAT in-dialog routing override (chan_sip parity): when peer is
+			 * behind NAT (force_rport / comedia), sofia-sip's auto-generated
+			 * ACK and BYE would honor the 200 OK Contact URI which usually
+			 * carries the peer's private LAN IP rather than the public
+			 * NAT-mapped address it actually registered from. NUTAG_PROXY pins all
+			 * outgoing dialog messages to peer->src_addr — the registered/
+			 * resolved public address — so ACK reaches the phone, suppressing
+			 * the 200 OK retransmit loop and unblocking the call. */
+			char proxy_url[128] = "";
+			if (peer && (peer->nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA))
+			    && !ast_sockaddr_isnull(&peer->src_addr)) {
+				char host_buf[80];
+				int port = ast_sockaddr_port(&peer->src_addr);
+				if (!port) {
+					port = peer->port ? peer->port : 5060;
+				}
+				snprintf(proxy_url, sizeof(proxy_url), "sip:%s:%d",
+					sofia_uri_format_host(ast_sockaddr_stringify_host(&peer->src_addr),
+						host_buf, sizeof(host_buf)),
+					port);
+			}
 			if (sofia_nua) {
 				pvt->nh = nua_handle(sofia_nua, pvt,
 					NUTAG_URL(url),
 					SIPTAG_TO_STR(url),
 					TAG_IF(route_buf[0], NUTAG_INITIAL_ROUTE_STR(route_buf)),
+					TAG_IF(proxy_url[0], NUTAG_PROXY(proxy_url)),
 					TAG_END());
 			}
 		}
@@ -7310,8 +7555,22 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	/* Peer lookup runs BEFORE sofia_parse_sdp so the SDP encryption-policy check
 	 * (T37) sees pvt->peer attached. ACL also runs before SDP parse so banned IPs
 	 * never trigger SRTP key generation. */
-	if (cid_num[0]) {
-		struct sofia_peer *caller_peer = sofia_find_peer(cid_num);
+	{
+		struct sofia_peer *caller_peer = NULL;
+		if (cid_num[0]) {
+			caller_peer = sofia_find_peer(cid_num);
+		}
+		if (!caller_peer) {
+			/* chan_sip parity: From-username lookup failed, fall back to
+			 * source-IP match so host=<ip> trunks (typically insecure=invite,
+			 * whose From-user is the caller-ID number not the peer-name) get
+			 * identified. Without this fallback unknown-peer + alwaysauthreject
+			 * below emits a 401 the trunk cannot answer, breaking inbound
+			 * calls from gateways that don't carry the local peer-name in From. */
+			struct ast_sockaddr src;
+			sofia_get_source_addr(sip, &src);
+			caller_peer = sofia_find_peer_by_ip(&src);
+		}
 		if (caller_peer) {
 			if (caller_peer->ha) {
 				struct ast_sockaddr src;
@@ -7630,6 +7889,26 @@ static void sofia_process_bye(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op
 	 * Flag-gated so the eventual sofia_hangup DEC is a no-op (call_inc_done=0). */
 	if (op) {
 		sofia_update_call_counter(op, SOFIA_DEC_CALL_LIMIT);
+	}
+
+	/* REFER transferer-leg BYE arrived as expected (RFC 5589 §6.1). Cancel the
+	 * safety-net timer that sofia_process_refer armed and unlink the pvt so it
+	 * gets collected. The channel side was already detached in sofia_hangup
+	 * (op->owner == NULL), so no ast_queue_hangup is needed. chan_sip parity:
+	 * handle_request_bye relies on `needdestroy` + the scheduled destroy fired
+	 * in sip_hangup at chan_sip.c:7058. */
+	if (op && op->defer_bye) {
+		ast_mutex_lock(&op->lock);
+		if (op->defer_bye_sched_id != -1 && sofia_sched
+				&& ast_sched_thread_del(sofia_sched, op->defer_bye_sched_id) == 0) {
+			ao2_ref(op, -1);
+		}
+		op->defer_bye_sched_id = -1;
+		op->defer_bye = 0;
+		op->state = SOFIA_DIALOG_STATE_DOWN;
+		ast_mutex_unlock(&op->lock);
+		ao2_unlink(dialogs, op);
+		return;
 	}
 
 	if (op && op->owner) {
@@ -11622,6 +11901,35 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 			 * is async-fire-and-forget; operator semantic = REFER successfully
 			 * accepted + routed (chan_sip.c:22665 parking parity). */
 			sofia_send_refer_notify(op, "200 OK", 1);
+
+			/* chan_sip parity (SIP_DEFER_BYE_ON_TRANSFER at chan_sip.c:24949
+			 * + L7051-7067 + comment "Do not hangup call, the other side do that
+			 * when we say 200 OK"). RFC 5589 §6.1 — after the terminal NOTIFY
+			 * 200 OK, the transferer's UA owns the dialog teardown via BYE.
+			 * Issuing our own nua_bye now would race the pending terminal NOTIFY
+			 * inside sofia-sip and silently drop it, leaving the UA stuck on a
+			 * dialog with no audio.
+			 *
+			 * Mark the pvt as defer-bye so sofia_hangup skips its nua_bye when
+			 * the channel core eventually tears the leg down (which happens
+			 * naturally once Dial returns after ast_async_goto breaks the
+			 * bridge). Arm a SOFIA_DEFER_BYE_TIMEOUT_MS safety-net timer that
+			 * fires nua_bye if the UA misbehaves and never BYEs us. */
+			ast_mutex_lock(&op->lock);
+			if (sofia_sched && op->defer_bye_sched_id == -1) {
+				op->defer_bye = 1;
+				ao2_ref(op, +1);
+				op->defer_bye_sched_id = ast_sched_thread_add(sofia_sched,
+					SOFIA_DEFER_BYE_TIMEOUT_MS, sofia_defer_bye_cb, op);
+				if (op->defer_bye_sched_id < 0) {
+					/* sched_add failed — drop the speculative ref and fall
+					 * through to the natural sofia_hangup nua_bye path. */
+					ao2_ref(op, -1);
+					op->defer_bye = 0;
+					op->defer_bye_sched_id = -1;
+				}
+			}
+			ast_mutex_unlock(&op->lock);
 		} else {
 			ast_log(LOG_WARNING, "Sofia: %s transfer to %s — no bridged channel found "
 				"(tried _bridge, BRIDGEPEER, linkedid); transferee will not be redirected\n",
@@ -11630,12 +11938,11 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 			 * chan_sip.c:24929 verbatim paren-tail preserved for operator-script
 			 * grep compat. */
 			sofia_send_refer_notify(op, "503 Service Unavailable (cant handle one-legged xfers)", 1);
+			/* No bridged peer to redirect — tear the transferer leg down
+			 * immediately (chan_sip parity: failure path does not set
+			 * SIP_DEFER_BYE_ON_TRANSFER at chan_sip.c:25002). */
+			ast_queue_hangup(op->owner);
 		}
-
-		/* Release the transferer leg via channel-tech.hangup (which itself
-		 * sequences nua_bye internally via sofia_hangup); MUST come AFTER
-		 * find-bridged + ast_async_goto + all NOTIFY emissions. */
-		ast_queue_hangup(op->owner);
 	}
 }
 
@@ -12178,6 +12485,21 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 						ast_queue_control(pvt->owner, AST_CONTROL_HANGUP);
 					}
 					break;
+				}
+				/* NAT-aware manual ACK (chan_sip parity): for peers with
+				 * nat=force_rport/comedia, sofia-sip's auto-ACK was disabled
+				 * at nua_invite via NUTAG_AUTOACK(0). Emit the ACK ourselves
+				 * with NUTAG_PROXY pointing at peer->src_addr (the registered
+				 * public source) so the request bypasses the LAN-IP Contact
+				 * URI sofia-sip would otherwise route to. Phones that don't
+				 * see the ACK keep retransmitting 200 OK until they BYE the
+				 * dialog — exactly the symptom this fix removes. */
+				{
+					char nat_proxy_url[128];
+					if (sofia_build_nat_proxy_url_from_peer(pvt->peer,
+							nat_proxy_url, sizeof(nat_proxy_url))) {
+						nua_ack(nh, NUTAG_PROXY(nat_proxy_url), TAG_END());
+					}
 				}
 				pvt->state = SOFIA_DIALOG_STATE_UP;
 				if (pvt->owner) {

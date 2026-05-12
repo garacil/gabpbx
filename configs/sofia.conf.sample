@@ -2747,7 +2747,7 @@ srvlookup=yes
 ;     mid-fax or rapid REINVITE/CANCEL races, AMI consumers may see duplicate
 ;     state transitions — design-preserved-vs-chan_sip.
 ;
-; Test infrastructure for live-fax verification (per CHAN_SOFIA_T38_DESIGN.md §11):
+; Test infrastructure for live-fax verification:
 ;   (a) spandsp soft-fax (sendfax/recvfax CLI from spandsp-utils package)
 ;   (b) hardware fax + ATA (Cisco SPA112 / Grandstream HT813)
 ;   (c) Asterisk-with-chan_sip+spandsp peer for fork-test (chan_sofia ↔
