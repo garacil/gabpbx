@@ -7664,9 +7664,16 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			char addr_buf[80];
 			sofia_get_source_addr(sip, &src);
 			ast_copy_string(addr_buf, ast_sockaddr_stringify(&src), sizeof(addr_buf));
-			ast_log(LOG_NOTICE, "Sofia: INVITE auth bypassed per insecure=invite "
-				"for peer '%s' from %s\n",
-				pvt->peer->name, addr_buf);
+			/* Cosmetic bypass trace: every INVITE from an insecure=invite peer
+			 * (typical for IP-validated SBC trunks) used to fire LOG_NOTICE here,
+			 * flooding production logs on busy trunks. Gate behind `sip set
+			 * debug` so production runs silent; the AMI InsecureInviteBypass
+			 * event immediately below stays the auditable surface for SIEM/NMS. */
+			if (sofia_debug_match(pvt->peer->name, addr_buf)) {
+				ast_verbose("Sofia: INVITE auth bypassed per insecure=invite "
+					"for peer '%s' from %s\n",
+					pvt->peer->name, addr_buf);
+			}
 			manager_event(EVENT_FLAG_SYSTEM, "InsecureInviteBypass",
 				"Peer: SIP/%s\r\n"
 				"RemoteAddr: %s\r\n"
