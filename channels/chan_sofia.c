@@ -1287,6 +1287,7 @@ struct sofia_peer {
 		AST_STRING_FIELD(mohsuggest);		/* post-T56 MOH per-peer parity (2026-04-27): suggested MOH class propagated to bridged channel when this peer puts us on hold (R5 INBOUND-direction: ast_queue_control_data data param at sofia_process_reinvite); OUTBOUND-direction Alert-Info signaling deferred to outbound-HOLD-re-INVITE feature task */
 		AST_STRING_FIELD(language);		/* post-T56 language per-peer parity (2026-04-27): per-peer audio language locale propagated to ast_channel.language at sofia_new for prompts/sounds in peer's preferred locale. chan_sip parity sip.h peer.language AST_STRING_FIELD + chan_sip.c:28865-28866 verbatim parser + L28447 inheritance from default_language. Bounded to channel.h:138 MAX_LANGUAGE=40 at consumption (ast_channel.language is also AST_STRING_FIELD per channel.h:776). Empty = inherit sofia_cfg.default_language or gabpbx-core default. */
 		AST_STRING_FIELD(parkinglot);	/* post-T56 parkinglot per-peer parity (2026-04-28): per-peer parking-lot routing field propagated to ast_channel.parkinglot at sofia_new for Park()/transfer routing. chan_sip parity sip.h:1212 peer.parkinglot AST_STRING_FIELD + chan_sip.c:28890-28891 verbatim parser + L8577 inheritance from default_parkinglot + L5961-5962 + L17046-17047 dialog inheritance + L7943-7944 channel propagation. Empty = inherit sofia_cfg.default_parkinglot. Pattern 12 16th-instance behavior-change-from-chan_sofia-baseline-disclosure: chan_sip default_parkinglot = "default" per features.h:37 DEFAULT_PARKINGLOT (string non-empty). */
+		AST_STRING_FIELD(lockuseragent_prefixes);	/* per-peer comma-separated User-Agent prefix allowlist. When lockuseragent=yes AND this list is non-empty, an inbound REGISTER passes when its User-Agent: header starts (case-insensitive) with ANY listed prefix; first-REGISTER auto-capture into locked_user_agent is bypassed. Empty value preserves the original strict capture-on-first-REGISTER semantics verbatim. Targets the multi-device-per-peer use case (desk phone + softphone) and vendor-family allowlists. */
 	);
 	int type;
 	int port;
@@ -4775,6 +4776,9 @@ static struct sofia_peer *sofia_peer_alloc(const char *name)
 	 * successful REGISTER captures the User-Agent string under the lock. */
 	peer->lockuseragent = 0;
 	peer->locked_user_agent[0] = '\0';
+	/* lockuseragent_prefixes per-peer allowlist: default empty — empty value
+	 * preserves the strict capture-on-first-REGISTER semantics. */
+	ast_string_field_set(peer, lockuseragent_prefixes, "");
 	/* post-T56 usereqphone parity (2026-04-27): inherit ;user=phone policy default
 	 * from [general]; chan_sip parity at chan_sip.c:29660-29661 global_flags[0]
 	 * SIP_USEREQPHONE; default 0 (off) per chan_sip flag-bit static-zero. */
@@ -5494,6 +5498,13 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			 * preserves operator-script compat — chan_sip strcasecmp "0" treats
 			 * 0/no/false equivalently behaviorally. */
 			peer->lockuseragent = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "lockuseragent_prefixes")) {
+			/* lockuseragent_prefixes per-peer parity: comma-separated User-Agent
+			 * prefix allowlist consulted by sofia_check_lockuseragent when
+			 * lockuseragent=yes. Storage is verbatim; tokenization/trim/match
+			 * happens at REGISTER-time so operators can edit the list via `sip
+			 * reload` or realtime UPDATE without a restart. */
+			ast_string_field_set(peer, lockuseragent_prefixes, v->value);
 		} else if (!strcasecmp(v->name, "usereqphone")) {
 			/* post-T56 usereqphone parity (2026-04-27): chan_sip parity at
 			 * chan_sip.c:28781-28782 (flag-bit) → chan_sofia int field. RFC 3966
@@ -9636,6 +9647,7 @@ static int sofia_check_lockuseragent(nua_t *nua, nua_handle_t *nh,
 	const char *realm;
 	struct ast_sockaddr src;
 	char addr_buf[80];
+	int prefix_mode = 0;	/* 1 when lockuseragent_prefixes is non-empty — suppresses capture/anchor logic and tags rejection AMI with MatchPolicy: prefix-list */
 
 	if (!peer->lockuseragent) {
 		return 0;
@@ -9645,23 +9657,55 @@ static int sofia_check_lockuseragent(nua_t *nua, nua_handle_t *nh,
 		current_ua = sip->sip_user_agent->g_string;
 	}
 
-	/* First-registration capture: empty lock-anchor + non-empty current UA.
-	 * Lock under peer->lock for write race-safety vs concurrent REGISTERs. */
-	if (peer->locked_user_agent[0] == '\0') {
+	/* Prefix-list mode: when peer->lockuseragent_prefixes is non-empty, the
+	 * operator has pre-declared which UA families may register — skip the
+	 * first-REGISTER auto-capture entirely and walk the comma-separated
+	 * allowlist. Any prefix that matches (case-insensitive, length of token)
+	 * the inbound User-Agent passes the gate. No match falls through to the
+	 * shared rejection path below with MatchPolicy: prefix-list. Tokenizing
+	 * per REGISTER (a rare event vs INVITE) keeps config-load O(1) and lets
+	 * `sip reload` or realtime UPDATE on the lockuseragent_prefixes column
+	 * take effect on the very next REGISTER with no restart. Empty list
+	 * preserves the strict capture-on-first-REGISTER behaviour verbatim
+	 * (else-branch). */
+	if (!ast_strlen_zero(peer->lockuseragent_prefixes)) {
+		prefix_mode = 1;
 		if (current_ua && current_ua[0]) {
-			ast_mutex_lock(&peer->lock);
-			ast_copy_string(peer->locked_user_agent, current_ua,
-				sizeof(peer->locked_user_agent));
-			ast_mutex_unlock(&peer->lock);
-			ast_verbose("Sofia: lockuseragent captured \"%s\" for peer '%s'\n",
-				current_ua, peer->name);
+			char *list_dup = ast_strdupa(peer->lockuseragent_prefixes);
+			char *tok, *next = list_dup;
+			while ((tok = strsep(&next, ","))) {
+				size_t toklen;
+				tok = ast_strip(tok);
+				if (ast_strlen_zero(tok)) {
+					continue;
+				}
+				toklen = strlen(tok);
+				if (!strncasecmp(current_ua, tok, toklen)) {
+					return 0;
+				}
+			}
 		}
-		return 0;
-	}
+		/* No prefix matched — fall through to rejection block. */
+	} else {
+		/* Strict-anchor mode (chan_sip parity, behaviour preserved verbatim). */
+		/* First-registration capture: empty lock-anchor + non-empty current UA.
+		 * Lock under peer->lock for write race-safety vs concurrent REGISTERs. */
+		if (peer->locked_user_agent[0] == '\0') {
+			if (current_ua && current_ua[0]) {
+				ast_mutex_lock(&peer->lock);
+				ast_copy_string(peer->locked_user_agent, current_ua,
+					sizeof(peer->locked_user_agent));
+				ast_mutex_unlock(&peer->lock);
+				ast_verbose("Sofia: lockuseragent captured \"%s\" for peer '%s'\n",
+					current_ua, peer->name);
+			}
+			return 0;
+		}
 
-	/* Lock-anchor set: compare current UA. Match → pass; mismatch → reject. */
-	if (current_ua && !strcasecmp(current_ua, peer->locked_user_agent)) {
-		return 0;
+		/* Lock-anchor set: compare current UA. Match → pass; mismatch → reject. */
+		if (current_ua && !strcasecmp(current_ua, peer->locked_user_agent)) {
+			return 0;
+		}
 	}
 
 	/* Mismatch — silent 401 challenge (chan_sip-faithful AUTH_SECRET_FAILED-
@@ -9681,20 +9725,33 @@ static int sofia_check_lockuseragent(nua_t *nua, nua_handle_t *nh,
 
 	manager_event(EVENT_FLAG_SYSTEM, "LockUserAgentReject",
 		"Peer: SIP/%s\r\n"
+		"MatchPolicy: %s\r\n"
 		"LockedUserAgent: %s\r\n"
+		"Prefixes: %s\r\n"
 		"AttemptedUserAgent: %s\r\n"
 		"RemoteAddr: %s\r\n"
 		"ChannelType: SIP\r\n",
 		peer->name,
+		prefix_mode ? "prefix-list" : "strict-anchor",
 		peer->locked_user_agent,
+		prefix_mode ? peer->lockuseragent_prefixes : "",
 		current_ua ? current_ua : "",
 		addr_buf);
 
-	ast_log(LOG_NOTICE,
-		"Sofia: REGISTER from peer '%s' rejected — lockuseragent mismatch "
-		"(locked=\"%s\", attempted=\"%s\")\n",
-		peer->name, peer->locked_user_agent,
-		current_ua ? current_ua : "(none)");
+	if (prefix_mode) {
+		ast_log(LOG_NOTICE,
+			"Sofia: REGISTER from peer '%s' rejected — User-Agent \"%s\" "
+			"does not match any prefix in lockuseragent_prefixes=\"%s\"\n",
+			peer->name,
+			current_ua ? current_ua : "(none)",
+			peer->lockuseragent_prefixes);
+	} else {
+		ast_log(LOG_NOTICE,
+			"Sofia: REGISTER from peer '%s' rejected — lockuseragent mismatch "
+			"(locked=\"%s\", attempted=\"%s\")\n",
+			peer->name, peer->locked_user_agent,
+			current_ua ? current_ua : "(none)");
+	}
 
 	return -1;
 }
@@ -13347,6 +13404,9 @@ static char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cl
 	if (peer->lockuseragent && peer->locked_user_agent[0]) {
 		sofia_cli_peer_line(a->fd, "Locked UA", "%s", peer->locked_user_agent);
 	}
+	if (peer->lockuseragent && !ast_strlen_zero(peer->lockuseragent_prefixes)) {
+		sofia_cli_peer_line(a->fd, "UA prefixes", "%s", peer->lockuseragent_prefixes);
+	}
 	/* post-T56 language per-peer parity (2026-04-27): chan_sip-parity per-peer audio
 	 * locale display ("Language" wording). Empty string preserved (operators see
 	 * unset state). */
@@ -15732,6 +15792,11 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			 * branch (config-file). chan_sofia surpass over chan_sip realtime-only
 			 * parser-quirk — config-file operators get same lock semantic. */
 			peer->lockuseragent = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "lockuseragent_prefixes")) {
+			/* lockuseragent_prefixes per-peer parity: config-file dual-parser
+			 * branch. Mirrors sofia_apply_peer_variables realtime branch so
+			 * sofia.conf and voip_sip_conf consumers share identical semantics. */
+			ast_string_field_set(peer, lockuseragent_prefixes, v->value);
 		} else if (!strcasecmp(v->name, "usereqphone")) {
 			/* post-T56 usereqphone parity (2026-04-27): T46.3 dual-parser branch
 			 * (config-file). Same chan_sip-verbatim semantic as realtime branch. */
@@ -16744,6 +16809,7 @@ static int manager_sofia_show_peer(struct mansession *s, const struct message *m
 	 * locked UA string for compliance audit / UA-spoofing investigation). */
 	astman_append(s, "Lockuseragent: %s\r\n", peer->lockuseragent ? "yes" : "no");
 	astman_append(s, "LockedUserAgent: %s\r\n", peer->locked_user_agent);
+	astman_append(s, "LockUserAgentPrefixes: %s\r\n", S_OR(peer->lockuseragent_prefixes, ""));
 	/* post-T56 language per-peer parity (2026-04-27): per-peer audio-locale field. */
 	astman_append(s, "Language: %s\r\n", peer->language);
 	/* post-T56 defaultip per-peer parity (2026-04-28): chan_sip parity at
