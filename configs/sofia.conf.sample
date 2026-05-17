@@ -2455,7 +2455,7 @@ srvlookup=yes
 ;defaultuser=test
 ;fromuser=test
 ;fromdomain=192.168.1.47
-;transport=udp
+;transport=udp                ; chan_sofia: accepted for chan_sip drop-in template compatibility but otherwise ignored. Server-accepted transports are controlled per-listener at [general] bindport / tcpbindaddr / tlsbindaddr / wsbindaddr / wssbindaddr; per-Contact transport is derived from the Contact URL at REGISTER-time. For operators who need transport-based security, separate listeners + IP allowlists (host=<ip> / permit / deny) at the peer level are the real gate.
 ;disallow=all                ; Reset codec list
 ;allow=ulaw                  ; Allow specific codecs
 ;allow=alaw
@@ -2565,8 +2565,12 @@ srvlookup=yes
 ; --- Network ---
 ; host          - hostname, IP, or "dynamic" (default: dynamic)
 ; port          - remote port (default: 5060)
-; transport     - udp, tcp, tls (default: udp). Requires matching listener in [general]
-;                 (tlsbindport for tls; ws/wss listeners auto-accept browser UAs).
+; transport     - accepted for chan_sip drop-in template compatibility; chan_sofia
+;                 does not gate per-peer inbound transport. Server-accepted transports
+;                 are controlled per-listener at [general] bindport / tcpbindaddr /
+;                 tlsbindaddr / wsbindaddr / wssbindaddr; per-Contact transport is
+;                 derived from the Contact URL scheme at REGISTER-time. Use separate
+;                 listeners + IP allowlists for transport-based security.
 ; nat           - force_rport, comedia, force_rport,comedia (default: none)
 ;
 ; --- Dialplan ---

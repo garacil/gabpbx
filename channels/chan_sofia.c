@@ -4647,6 +4647,14 @@ static struct sofia_peer *sofia_peer_alloc(const char *name)
 	ast_mutex_init(&peer->lock);
 	peer->type = 0;
 	peer->port = DEFAULT_SIP_PORT;
+	/* peer->transport is decorative in chan_sofia: per-listener bindings
+	 * control which transports the server accepts, per-Contact transport is
+	 * derived from the Contact URL scheme at REGISTER-time (sofia_contact at
+	 * L8704-8712), and the parsers no longer write this field — the operator's
+	 * `transport=` value is accepted for chan_sip drop-in template compatibility
+	 * and otherwise ignored. Defensive explicit init so CLI/AMI display and the
+	 * outbound-extern-port switch at sofia_build_ourip see a defined value. */
+	peer->transport = SOFIA_TRANSPORT_UDP;
 	/* post-T56 defaultip per-peer parity (2026-04-28): chan_sip parity at
 	 * chan_sip.c:28452 verbatim ast_sockaddr_setnull(peer->defaddr) default-init.
 	 * Set non-empty by per-peer parser via ast_get_ip(peer->defaddr, v->value). */
@@ -5555,24 +5563,18 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 		} else if (!strcasecmp(v->name, "expiresecs")) {
 			peer->expiresecs = atoi(v->value);
 		} else if (!strcasecmp(v->name, "transport")) {
-			/* post-T56 Task #2 D-3 SS1 (2026-04-28, GAP-1 fix): per-peer
-			 * transport= parser extended to accept ws/wss values per T36 Stage A
-			 * WS/WSS listener infrastructure. Without these branches operators
-			 * configuring transport=ws got silent SOFIA_TRANSPORT_UDP fallback
-			 * (peer->transport stays at peer_alloc init value). chan_sofia
-			 * surpass over chan_sip silent unknown-value: LOG_WARNING fires for
-			 * unrecognized transport= values (chan_sip is silent). */
-			if (!strcasecmp(v->value, "udp"))      peer->transport = SOFIA_TRANSPORT_UDP;
-			else if (!strcasecmp(v->value, "tcp")) peer->transport = SOFIA_TRANSPORT_TCP;
-			else if (!strcasecmp(v->value, "tls")) peer->transport = SOFIA_TRANSPORT_TLS;
-			else if (!strcasecmp(v->value, "ws"))  peer->transport = SOFIA_TRANSPORT_WS;
-			else if (!strcasecmp(v->value, "wss")) peer->transport = SOFIA_TRANSPORT_WSS;
-			else {
-				ast_log(LOG_WARNING, "Sofia: peer '%s' unknown transport '%s' "
-					"(valid: udp/tcp/tls/ws/wss); using default UDP\n",
-					peer->name, v->value);
-				peer->transport = SOFIA_TRANSPORT_UDP;
-			}
+			/* Silently accept for chan_sip drop-in template compatibility.
+			 * chan_sofia does not gate per-peer inbound transport (the chan_sip
+			 * check_request_transport allowlist has no security value — the
+			 * check runs after socket accept + parse + peer lookup, it is
+			 * policy not attack-surface reduction; FreeSWITCH's mod_sofia does
+			 * not implement it). The transports the server accepts are
+			 * controlled per-listener via [general] bindport / tcpbindaddr /
+			 * tlsbindaddr / wsbindaddr / wssbindaddr, and per-Contact transport
+			 * is derived from the Contact URL scheme at REGISTER-time
+			 * (sofia_contact at L8704-8712). The value here is read but not
+			 * applied; operators upgrading from chan_sip can leave their
+			 * existing `transport=udp` / `transport=udp,tcp` rows in place. */
 		} else if (!strcasecmp(v->name, "allow")) {
 			ast_parse_allow_disallow(&peer->prefs, &peer->capability, v->value, 1);
 		} else if (!strcasecmp(v->name, "disallow")) {
@@ -10173,7 +10175,17 @@ static void sofia_resolve_ourip(struct sofia_pvt *pvt, const struct ast_sockaddr
 		 * port substitution. Mirrors chan_sip L4034-4052 switch on transport.
 		 * UDP keeps externaddr port (or bindport fallback below). TCP/WS use
 		 * externtcpport (with externaddr-port fallback when externtcpport==0).
-		 * TLS/WSS use externtlsport. */
+		 * TLS/WSS use externtlsport.
+		 *
+		 * NOTE: since the per-peer transport= parsers now silent-accept without
+		 * writing peer->transport (the field stays at the SOFIA_TRANSPORT_UDP
+		 * init from sofia_peer_alloc), the TCP/TLS branches below are
+		 * unreachable for normally-configured peers. Kept structurally so the
+		 * switch + SOFIA_TRANSPORT_* enum remain available for the listener-
+		 * level paths. For static TCP/TLS peers that previously relied on
+		 * externtcpport/externtlsport substitution here, set the listener port
+		 * explicitly via port=<listener-port> or use a dedicated TLS-only
+		 * listener profile. */
 		if (pvt->peer) {
 			switch (pvt->peer->transport) {
 			case SOFIA_TRANSPORT_TCP:
@@ -15861,25 +15873,11 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "expiresecs") || !strcasecmp(v->name, "defaultexpiry")) {
 			peer->expiresecs = atoi(v->value);
 		} else if (!strcasecmp(v->name, "transport")) {
-			/* post-T56 Task #2 D-3 SS1 (2026-04-28, GAP-1 fix): T46.3 dual-parser
-			 * realtime branch — same chan_sip-faithful semantic as config-file
-			 * branch. Accepts udp/tcp/tls/ws/wss + LOG_WARNING on unknown. */
-			if (!strcasecmp(v->value, "udp")) {
-				peer->transport = SOFIA_TRANSPORT_UDP;
-			} else if (!strcasecmp(v->value, "tcp")) {
-				peer->transport = SOFIA_TRANSPORT_TCP;
-			} else if (!strcasecmp(v->value, "tls")) {
-				peer->transport = SOFIA_TRANSPORT_TLS;
-			} else if (!strcasecmp(v->value, "ws")) {
-				peer->transport = SOFIA_TRANSPORT_WS;
-			} else if (!strcasecmp(v->value, "wss")) {
-				peer->transport = SOFIA_TRANSPORT_WSS;
-			} else {
-				ast_log(LOG_WARNING, "Sofia: peer '%s' unknown transport '%s' "
-					"(valid: udp/tcp/tls/ws/wss); using default UDP\n",
-					peer->name, v->value);
-				peer->transport = SOFIA_TRANSPORT_UDP;
-			}
+			/* Silently accept for chan_sip drop-in template compatibility — see
+			 * sofia_apply_peer_variables transport= branch for rationale. The
+			 * value is not applied to peer->transport; transports are controlled
+			 * per-listener at [general] bindport / tcpbindaddr / tlsbindaddr /
+			 * wsbindaddr / wssbindaddr, and per-Contact at REGISTER-time. */
 		} else if (!strcasecmp(v->name, "allow")) {
 			ast_parse_allow_disallow(&peer->prefs, &peer->capability, v->value, 1);
 		} else if (!strcasecmp(v->name, "disallow")) {
