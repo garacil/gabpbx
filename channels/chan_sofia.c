@@ -1029,6 +1029,7 @@ static struct {
 
 static int sofia_debug;
 static char sofia_debug_filter[64];
+static int sofia_debug_match(const char *peer_name, const char *src_ip);
 /* post-T56 timert1 [general] parity (2026-04-28): cross-validation flags per
  * chan_sip.c:29607 + chan_sip.c:28946 verbatim. Set when respective [general]
  * key parsed; consumed at sofia_load_config conclusion R5 cross-validation
@@ -8733,8 +8734,14 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 					ao2_iterator_destroy(&i);
 
 					if (oldest) {
-						ast_log(LOG_NOTICE, "Sofia: peer '%s' at max_contacts=%d \xe2\x80\x94 evicting oldest contact %s\n",
-							peer->name, peer->max_contacts, oldest->contact_uri);
+						/* Cosmetic eviction trace: gated by `sip set debug` so
+						 * production runs silent. AMI/verbose registration
+						 * summary at sofia_verbose_register_update still
+						 * reports per-REGISTER `contacts_removed` counts. */
+						if (sofia_debug_match(peer->name, NULL)) {
+							ast_verbose("Sofia: peer '%s' at max_contacts=%d \xe2\x80\x94 evicting oldest contact %s\n",
+								peer->name, peer->max_contacts, oldest->contact_uri);
+						}
 						if (update) {
 							update->contacts_removed++;
 						}
@@ -12196,8 +12203,6 @@ static void *sofia_qualify_thread(void *data)
 
 	return NULL;
 }
-
-static int sofia_debug_match(const char *peer_name, const char *src_ip);
 
 static void sofia_event_callback(nua_event_t event, int status, char const *phrase,
 		nua_t *nua, nua_magic_t *magic,
