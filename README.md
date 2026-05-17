@@ -30,6 +30,69 @@ includes:
   Speex and signed linear formats, depending on selected modules and local
   libraries.
 
+## Why chan_sofia instead of chan_sip
+
+`chan_sofia` is the recommended SIP driver for new GABPBX deployments. The
+short version of the case:
+
+- **Threads are constant.** `chan_sofia` spawns exactly four module-level
+  threads at load (NUA event loop, scheduler, outbound REGISTER refresh,
+  qualify) and never creates additional threads per peer, per call, per
+  registered contact, or per TCP/TLS connection. `chan_sip` spawns one thread
+  per TCP/TLS connection on top of its monitor thread plus transient detached
+  threads for park and pickup operations, so a deployment with thousands of
+  TLS endpoints carries thousands of pthread stacks and the kernel context-
+  switch cost that goes with them.
+- **Lower per-entity memory.** The peer and dialog structs in `chan_sofia`
+  are smaller than their `chan_sip` equivalents because much of the per-peer
+  configuration uses pooled string fields and because the dialog object does
+  not duplicate state that Sofia-SIP already tracks. Registered contacts are
+  stored in a separate compact object instead of an inline slot, so a peer
+  with no contacts costs less and a peer with many contacts pays only for
+  what is in use.
+- **Multi-contact fork ringing.** When a peer is registered from more than
+  one device on the same credentials (desk phone plus softphone, or vendor
+  family allowlisted), `chan_sofia` forks the outbound INVITE to every live
+  contact in parallel and the first device that answers wins. `chan_sip`
+  does not do this natively; you have to encode the parallel ring at the
+  dialplan layer.
+- **A real SIP stack underneath.** `chan_sofia` delegates SIP message
+  parsing, transaction handling, NAT keepalives, retransmit timers, TCP/TLS
+  framing and SDP/SDES negotiation to Sofia-SIP, instead of carrying that
+  logic by hand. The result is fewer hand-rolled corner cases and a clearer
+  separation between PBX policy and SIP protocol mechanics.
+- **Drop-in compatibility.** The channel technology stays `SIP`, the
+  realtime family stays `sippeers`, the `sip show ...` and `sip set debug`
+  CLI commands stay, and `sofia.conf` follows the `sip.conf` style. Most
+  existing dialplans, AMI scripts and operator habits keep working without
+  changes.
+
+The high-level resource comparison, with every figure traceable to the source
+of each driver:
+
+| Dimension | chan_sip | chan_sofia |
+| :-- | :-- | :-- |
+| Threads at load | 1 monitor thread (`do_monitor`, `chan_sip.c:27246`) | 4 (`sofia_thread`, `sofia_sched`, `sofia_reg_thread`, `sofia_qualify_tid` — `chan_sofia.c:17370-17457`) |
+| Per call threads | 0 normally, +1 detached per Park / Pickup (`chan_sip.c:22777`, `:22818`) | 0 |
+| Per TCP/TLS connection threads | +1 per persistent SIP TCP/TLS connection (`sip_tcp_worker_fn` at `chan_sip.c:26924`) | 0 — Sofia-SIP multiplexes all transports on the NUA event loop |
+| Per peer memory (bare, not registered) | ~3-4 KB on `sip_peer` plus its string buffers | ~2-3 KB on `sofia_peer` plus its pooled string field area |
+| Per registered contact memory | inlined into `sip_peer` | ~640 B per `sofia_contact` (`chan_sofia.c:1112-1121`), refcounted in an `ao2_container` on the peer |
+| Per active call memory | ~5-8 KB on `sip_pvt` | ~3-5 KB on `sofia_pvt` |
+| Multi-contact ring | dialplan only (`Dial(SIP/a&SIP/b&...)`) | automatic when the peer has more than one live contact (`chan_sofia.c:6151-6353`) |
+
+Threads are the most visible scaling difference. A deployment that needs to
+support a few thousand registered SIP endpoints over TLS will see the
+`chan_sip` thread count grow linearly with the TLS session count; on
+`chan_sofia` it stays at 4. Memory savings per peer and per call are smaller
+in absolute terms but compound at deployment scale.
+
+The SIP throughput ceiling per CPU core is similar between the two drivers:
+both serialise SIP request dispatch through a single thread (the monitor
+thread in `chan_sip`, the NUA event loop in `chan_sofia`). Scaling SIP
+throughput beyond one CPU core is not a goal of either driver today and is
+not part of the `chan_sip` parity surface; deployments that need that go
+through fronting SBCs.
+
 ## chan_sofia
 
 `chan_sofia` is the modern SIP channel driver for GABPBX. It is built on the
