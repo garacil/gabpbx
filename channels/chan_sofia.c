@@ -8790,7 +8790,7 @@ static void sofia_verbose_register_update(const struct sofia_peer *peer,
 {
 	const char *new_src;
 
-	if (!peer || !update || !VERBOSITY_ATLEAST(2)) {
+	if (!peer || !update || !VERBOSITY_ATLEAST(6)) {
 		return;
 	}
 
