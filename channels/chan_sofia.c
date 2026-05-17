@@ -8696,11 +8696,40 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				memcpy(&c->src_addr, &src, sizeof(src));
 				ao2_lock(peer->contacts);
 				if (ao2_container_count(peer->contacts) >= peer->max_contacts) {
-					ao2_unlock(peer->contacts);
-					ast_log(LOG_NOTICE, "Sofia: REGISTER rejected \xe2\x80\x94 peer '%s' reached max_contacts=%d\n",
-						peer->name, peer->max_contacts);
-					ao2_ref(c, -1);
-					return -1;
+					/* chan_sip parity: peer is at max_contacts and a NEW Contact
+					 * URI just arrived (the refresh branch above didn't match).
+					 * chan_sip never rejected in this case — it replaced the
+					 * existing binding. Mirror that here by evicting the contact
+					 * with the earliest expiry (LRU by `expires`), then link the
+					 * new one. The phone keeps a valid registration; only the
+					 * stale row goes away. Holding peer->contacts lock across the
+					 * iteration is safe because ao2_iterator with flags=0 does
+					 * not re-take the lock. */
+					struct ao2_iterator i;
+					struct sofia_contact *cand, *oldest = NULL;
+
+					i = ao2_iterator_init(peer->contacts, 0);
+					while ((cand = ao2_iterator_next(&i))) {
+						if (!oldest || cand->expires < oldest->expires) {
+							if (oldest) {
+								ao2_ref(oldest, -1);
+							}
+							oldest = cand;
+						} else {
+							ao2_ref(cand, -1);
+						}
+					}
+					ao2_iterator_destroy(&i);
+
+					if (oldest) {
+						ast_log(LOG_NOTICE, "Sofia: peer '%s' at max_contacts=%d \xe2\x80\x94 evicting oldest contact %s\n",
+							peer->name, peer->max_contacts, oldest->contact_uri);
+						if (update) {
+							update->contacts_removed++;
+						}
+						ao2_unlink(peer->contacts, oldest);
+						ao2_ref(oldest, -1);
+					}
 				}
 				ao2_link(peer->contacts, c);
 				ao2_unlock(peer->contacts);
