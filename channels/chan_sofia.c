@@ -4122,6 +4122,15 @@ static struct ast_channel *sofia_new(struct sofia_pvt *pvt, int state, const cha
 	return chan;
 }
 
+/* Forward declarations used by sofia_pvt_destructor for the hmagic UAF
+ * closure on pvt-bound handles.  The definitions live further down
+ * (sofia_dispatch_to_root_thread region, sofia_nh_destroy_cleanup
+ * adjacent to the peer destructor).  The forward declaration already
+ * existing later in the file is below us in source order; without these
+ * the implicit-decl error fires at -Werror. */
+static int sofia_dispatch_to_root_thread(void (*callback)(void *), void *data);
+static void sofia_nh_destroy_cleanup(void *arg);
+
 static void sofia_pvt_destructor(void *obj)
 {
 	struct sofia_pvt *pvt = obj;
@@ -4146,9 +4155,50 @@ static void sofia_pvt_destructor(void *obj)
 		pvt->peer = NULL;
 	}
 
+	/* hmagic UAF closure for pvt-bound handles — same discipline as
+	 * peer-bound handles below.
+	 *
+	 * pvt->nh was bound to pvt via one of:
+	 *   - nua_handle(sofia_nua, pvt, ...)   in sofia_request_call
+	 *                                       (or fork-child equivalent)
+	 *     — auto-bind sets nh->nh_magic = pvt at handle creation.
+	 *   - nua_handle_bind(nh, pvt)          in sofia_process_invite
+	 *     — explicit bind for an inbound INVITE handle.
+	 *   - master->nh = child->nh + nua_handle_bind(master->nh, master)
+	 *                                       in sofia_pick_winner
+	 *     — handle ownership transfer on fork winner-pick.
+	 *
+	 * This destructor can run on any thread — wherever the last ao2 ref
+	 * drops (sofia_thread on an event-driven hangup, ast_pbx_thread on
+	 * channel teardown after the bridge ends, etc.).  nua_handle_destroy
+	 * is async: it posts an "rdestroy" su_msg into sofia-sip's queue and
+	 * returns; the actual handle teardown happens on sofia_thread some
+	 * time later when sofia-sip processes the message.  Between that
+	 * post and the actual destroy, sofia-sip may deliver an in-flight
+	 * event for this handle (late ACK, retransmit, in-dialog CANCEL)
+	 * into sofia_event_callback — which would deref nh->nh_magic and
+	 * find a freed pvt.  nua_handle_bind(nh, NULL) is synchronous (just
+	 * writes a pointer in sofia-sip's handle struct, no I/O) and runs
+	 * here before the destroy is dispatched, so any event arriving in
+	 * the window reads hmagic == NULL and the existing `if (hmagic)`
+	 * gates in sofia_event_callback short-circuit it cleanly.
+	 *
+	 * The destroy itself is dispatched via sofia_dispatch_to_root_thread
+	 * + sofia_nh_destroy_cleanup (the same helper used by the peer
+	 * destructor) so destruction always runs on sofia_thread.  This is
+	 * belt-and-braces over sofia-sip's own internal dispatch — if the
+	 * dispatch fails (sofia_root being torn down, su_msg alloc OOM) we
+	 * log and leak the handle instead of crashing.  Leaked handles are
+	 * cleared on the next gabpbx restart. */
 	if (pvt->nh) {
-		nua_handle_destroy(pvt->nh);
+		nua_handle_t *nh = pvt->nh;
 		pvt->nh = NULL;
+		nua_handle_bind(nh, NULL);
+		if (sofia_dispatch_to_root_thread(sofia_nh_destroy_cleanup, nh) < 0) {
+			ast_log(LOG_NOTICE,
+				"Sofia: pvt destructor — sofia_thread dispatch failed for "
+				"pvt->nh; leaking handle (cleared on next gabpbx restart)\n");
+		}
 	}
 
 	/* post-T56 inband DTMF detect parity SS1 R5 (2026-04-27): single-site
@@ -11587,6 +11637,19 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 			SIPTAG_EVENT_STR("message-summary"),
 			SIPTAG_SUBSCRIPTION_STATE_STR("terminated;reason=deactivated"),
 			TAG_END());
+		/* Detach hmagic from the old handle before destroying it.  We are
+		 * already on sofia_thread, so the destroy is effectively serialised
+		 * against event dispatch — but the bind(NULL) is still the right
+		 * discipline: a late event arriving for old_nh between the destroy
+		 * dispatch and its execution would otherwise reach
+		 * sofia_event_callback with magic = peer (peer is still alive — we
+		 * just swapped peer->mwi_subscription_handle to the new nh) and
+		 * the callback would treat the stale subscription as if it were
+		 * current.  The nh-mismatch checks in the callback catch this in
+		 * practice, but detaching the magic up-front makes the invariant
+		 * explicit and mirrors the discipline used by the peer destructor
+		 * (peer-handle cleanup branches further down). */
+		nua_handle_bind(old_nh, NULL);
 		nua_handle_destroy(old_nh);
 	}
 
@@ -12964,8 +13027,21 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				}
 			}
 			if (peer->qualify_nh) {
-				nua_handle_destroy(peer->qualify_nh);
+				/* Detach hmagic before destroying the previous qualify
+				 * cycle's handle.  Same rationale as the MWI re-subscribe
+				 * branch: we're on sofia_thread and peer is alive, so
+				 * this is not a UAF — but a late response (delayed
+				 * 200/4xx for the previous OPTIONS) arriving on old
+				 * qualify_nh between the destroy dispatch and execution
+				 * would reach sofia_event_callback with magic = peer; the
+				 * callback would then run sofia_qualify_response against
+				 * the wrong handle.  bind(NULL) makes the old handle inert
+				 * so the late event sees magic == NULL and the gates
+				 * short-circuit it cleanly. */
+				nua_handle_t *old_qnh = peer->qualify_nh;
 				peer->qualify_nh = NULL;
+				nua_handle_bind(old_qnh, NULL);
+				nua_handle_destroy(old_qnh);
 			}
 			/* Reset qualify_sent so next cycle calculates fresh pingtime */
 			memset(&peer->qualify_sent, 0, sizeof(peer->qualify_sent));
@@ -16863,7 +16939,23 @@ static void sofia_do_register(void)
 				sofia_format_outboundproxy(peer, route_buf, sizeof(route_buf));
 
 				if (peer->nh) {
-					nua_handle_destroy(peer->nh);
+					/* Detach hmagic before destroying the previous register
+					 * cycle's handle.  Same rationale as the MWI / qualify
+					 * branches above: we're on sofia_thread and peer is
+					 * alive (we're about to bind a fresh nh to it on the
+					 * next line), so this is not a UAF — but a late 401/
+					 * 200 for the previous REGISTER arriving on old
+					 * peer->nh between dispatch and destroy would reach
+					 * sofia_event_callback with magic = peer; the callback
+					 * would then re-enter the register state machine
+					 * against a handle that is no longer peer->nh.
+					 * bind(NULL) makes the old handle inert so any late
+					 * event sees magic == NULL and the existing
+					 * `if (hmagic)` gates short-circuit it. */
+					nua_handle_t *old_rnh = peer->nh;
+					peer->nh = NULL;
+					nua_handle_bind(old_rnh, NULL);
+					nua_handle_destroy(old_rnh);
 				}
 
 				peer->nh = nua_handle(sofia_nua, peer,
@@ -18122,20 +18214,39 @@ static int manager_sofia_notify(struct mansession *s, const struct message *m)
 
 static int load_module(void)
 {
+	int rc = AST_MODULE_LOAD_SUCCESS;
+	int sofia_thread_started = 0;
+
 	ast_verbose("Sofia-SIP channel loading...\n");
 
+	/* Container allocation.  Each is independent — check individually so
+	 * an OOM on the second or third doesn't leak the first two.  The
+	 * `goto err_cleanup` ladder at the bottom of the function unwinds in
+	 * reverse-construction order. */
 	peers = ao2_container_alloc(MAX_PEER_BUCKETS, NULL, NULL);
+	if (!peers) {
+		ast_log(LOG_ERROR, "Unable to create Sofia peers container\n");
+		rc = AST_MODULE_LOAD_FAILURE;
+		goto err_cleanup;
+	}
 	dialogs = ao2_container_alloc(MAX_DIALOG_BUCKETS, NULL, NULL);
+	if (!dialogs) {
+		ast_log(LOG_ERROR, "Unable to create Sofia dialogs container\n");
+		rc = AST_MODULE_LOAD_FAILURE;
+		goto err_cleanup;
+	}
 	sofia_blacklist = ao2_container_alloc(SOFIA_BLACKLIST_BUCKETS,
 		sofia_blacklist_hash_fn, sofia_blacklist_cmp_fn);
-	if (!peers || !dialogs || !sofia_blacklist) {
-		ast_log(LOG_ERROR, "Unable to create Sofia containers\n");
-		return AST_MODULE_LOAD_FAILURE;
+	if (!sofia_blacklist) {
+		ast_log(LOG_ERROR, "Unable to create Sofia blacklist container\n");
+		rc = AST_MODULE_LOAD_FAILURE;
+		goto err_cleanup;
 	}
 
 	if (sofia_load_config(0)) {
 		ast_log(LOG_ERROR, "Unable to load config %s\n", SOFIA_CONFIG);
-		return AST_MODULE_LOAD_DECLINE;
+		rc = AST_MODULE_LOAD_DECLINE;
+		goto err_cleanup;
 	}
 
 	if (!ast_rtp_engine_srtp_is_registered()) {
@@ -18145,8 +18256,10 @@ static int load_module(void)
 
 	if (ast_pthread_create(&sofia_thread, NULL, sofia_thread_func, NULL)) {
 		ast_log(LOG_ERROR, "Failed to create Sofia event thread\n");
-		return AST_MODULE_LOAD_FAILURE;
+		rc = AST_MODULE_LOAD_FAILURE;
+		goto err_cleanup;
 	}
+	sofia_thread_started = 1;
 
 	/* Wait for the thread to create NUA */
 	{
@@ -18156,23 +18269,15 @@ static int load_module(void)
 		}
 		if (!sofia_nua) {
 			ast_log(LOG_ERROR, "Sofia NUA failed to initialize\n");
-			return AST_MODULE_LOAD_FAILURE;
+			rc = AST_MODULE_LOAD_FAILURE;
+			goto err_cleanup;
 		}
 	}
 
 	if (ast_channel_register(&sofia_tech)) {
 		ast_log(LOG_ERROR, "Unable to register channel type '%s'\n", SOFIA_CHANNEL_TYPE);
-		/* T40: same-thread-affinity rule for su_root_destroy applies here too —
-		 * sofia_thread is already spawned, so signal+join lets it tear down
-		 * sofia_root + nua + su_deinit in its own context. */
-		if (sofia_nua) {
-			nua_shutdown(sofia_nua);
-		}
-		if (sofia_root) {
-			su_root_break(sofia_root);
-			pthread_join(sofia_thread, NULL);
-		}
-		return AST_MODULE_LOAD_FAILURE;
+		rc = AST_MODULE_LOAD_FAILURE;
+		goto err_cleanup;
 	}
 
 	ast_rtp_glue_register(&sofia_rtp_glue);
@@ -18235,6 +18340,74 @@ static int load_module(void)
 	ast_verbose("Sofia-SIP channel driver loaded successfully\n");
 
 	return AST_MODULE_LOAD_SUCCESS;
+
+err_cleanup:
+	/* Reverse-order unwind for module-load failures.  Only reachable when
+	 * `rc != AST_MODULE_LOAD_SUCCESS` was set above.  Each cleanup step
+	 * is guarded against not-yet-constructed state so a failure at any
+	 * point in load_module can `goto err_cleanup` safely.
+	 *
+	 * The runtime unload path (`unload_module` below) is intentionally a
+	 * no-op for live modules (chan_sofia doesn't support runtime unload —
+	 * see comment in unload_module), so this is the ONLY cleanup
+	 * discipline that runs on a failed load.  Without it, partial state
+	 * (containers, parsed peers/domain_list, ACLs, the started
+	 * sofia_thread) would leak on every failed load attempt — and
+	 * AST_MODULE_LOAD_DECLINE lets gabpbx retry the load later, so a
+	 * stuck DECLINE loop would accumulate the leak. */
+
+	if (sofia_thread_started) {
+		/* sofia_thread may still be running (waiting on su_root_create /
+		 * nua_create) or already exited (if those calls failed).  In
+		 * either case, pthread_join is safe.  Signal the event loop to
+		 * exit first if it is alive. */
+		if (sofia_nua) {
+			nua_shutdown(sofia_nua);
+		}
+		if (sofia_root) {
+			su_root_break(sofia_root);
+		}
+		pthread_join(sofia_thread, NULL);
+		/* sofia_thread_func sets sofia_nua/sofia_root globally; do not
+		 * NULL them here — the thread itself tears them down on exit. */
+	}
+
+	/* domain_list — populated by sofia_parse_general_config during
+	 * sofia_load_config.  Drain to prevent leak on retry-after-DECLINE. */
+	{
+		struct sofia_domain *d;
+		AST_LIST_LOCK(&domain_list);
+		while ((d = AST_LIST_REMOVE_HEAD(&domain_list, list))) {
+			ast_free(d);
+		}
+		AST_LIST_UNLOCK(&domain_list);
+	}
+
+	/* ACLs — sofia_parse_general_config may have allocated localha and
+	 * contact_ha; release both unconditionally (ast_free_ha is NULL-safe). */
+	ast_free_ha(sofia_cfg.localha);
+	sofia_cfg.localha = NULL;
+	if (sofia_cfg.contact_ha) {
+		ast_free_ha(sofia_cfg.contact_ha);
+		sofia_cfg.contact_ha = NULL;
+	}
+
+	/* Containers — their destructors release any peers/dialogs/blacklist
+	 * entries the config-parse populated. */
+	if (sofia_blacklist) {
+		ao2_ref(sofia_blacklist, -1);
+		sofia_blacklist = NULL;
+	}
+	if (dialogs) {
+		ao2_ref(dialogs, -1);
+		dialogs = NULL;
+	}
+	if (peers) {
+		ao2_ref(peers, -1);
+		peers = NULL;
+	}
+
+	return rc;
 }
 
 static int unload_module(void)
