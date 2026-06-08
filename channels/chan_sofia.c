@@ -2867,6 +2867,24 @@ static int sofia_t38_abort(const void *data)
 	return 0;
 }
 
+/* Mark this dialog as "already gone" so a late 2xx arriving for it can be
+ * recognised in the nua_r_invite status==200 branch and handled via the
+ * orphan ACK+BYE path per RFC 3261 §13.2.2.4 / RFC 6026.  Mirrors chan_sip's
+ * sip_alreadygone() helper at chan_sip.c:3637-3640.  Called from the non-2xx
+ * final response paths in sofia_event_callback case nua_r_invite (status 484
+ * special-case + status >= 300 catch-all) so the flag is set BEFORE the
+ * channel hangup races with the late 2xx, and from anywhere else the dialog
+ * has been irrevocably abandoned (e.g. local pre-answer hangup). */
+static void sofia_alreadygone(struct sofia_pvt *pvt)
+{
+	if (!pvt) {
+		return;
+	}
+	ast_debug(3, "Sofia: setting alreadygone on dialog %s\n",
+		pvt->callid ? pvt->callid : "(no-callid)");
+	pvt->alreadygone = 1;
+}
+
 /* Safety-net timer for REFER transferer-leg BYE deferral. Mirrors the
  * `sip_scheddestroy(p, DEFAULT_TRANS_TIMEOUT)` path at chan_sip.c:7058. After
  * we send the terminal NOTIFY 200 OK for a transfer, sofia_hangup leaves the
@@ -12568,6 +12586,32 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					ast_setstate(pvt->owner, AST_STATE_RINGING);
 				}
 			} else if (status == 200) {
+				/* RFC 3261 13.2.2.4 / RFC 6026: a 200 OK for an INVITE we have
+				 * already abandoned (a forking proxy sent 486 Busy Here and then
+				 * 200 OK on the same dialog, or we already hung up the leg) must
+				 * be ACKed and then BYEd, not turned into an answered call.
+				 * Dropping it leaves the UAS retransmitting its 200 OK for 64*T1
+				 * with a ghost media leg.
+				 * NOTE: this only fires if the late 2xx is still delivered to us,
+				 * i.e. the pvt / nua handle survived the orphan window.  The
+				 * handle is released in sofia_pvt_destructor (nua_handle_destroy)
+				 * when the last pvt ref drops; verify by test that teardown is
+				 * deferred long enough to receive the late 2xx (RFC 6026 Timer M
+				 * = 64*T1).  If not, also defer the pvt teardown on outbound
+				 * final-failure (mirror chan_sip sip_scheddestroy DEFAULT_TRANS_TIMEOUT). */
+				if (pvt->alreadygone || !pvt->owner) {
+					char orphan_proxy_url[128];
+					ast_log(LOG_NOTICE,
+						"Sofia: orphan 200 OK on terminated INVITE %s: ACK + BYE per RFC 3261 13.2.2.4\n",
+						pvt->callid ? pvt->callid : "(no-callid)");
+					/* sofia-sip auto-ACKs unless AUTOACK(0) was set for a NAT
+					 * peer; in that case emit the ACK ourselves (same condition
+					 * as the answered path below). */
+					if (sofia_build_nat_proxy_url_from_peer(pvt->peer, orphan_proxy_url, sizeof(orphan_proxy_url)))
+						nua_ack(nh, NUTAG_PROXY(orphan_proxy_url), TAG_END());
+					nua_bye(nh, TAG_END());
+					break;
+				}
 				int sdp_rc = 0;
 				if (sip && sip->sip_payload && sip->sip_payload->pl_data) {
 					sdp_rc = sofia_parse_sdp(pvt, sip);
@@ -12648,6 +12692,12 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				 * (404 semantic per chan_sip hangup_sip2cause at L6836-6837 — hides
 				 * overlap-dial reality from caller). Effective mode = peer when
 				 * bound; else sofia_cfg.default_allowoverlap_mode. */
+				/* Mark dialog as gone BEFORE the channel hangup races, so a late
+				 * 2xx (RFC 3261 §16.7-violating proxy) can be ACK+BYE'd by the
+				 * orphan guard at the status==200 branch above. chan_sip parity:
+				 * chan_sip.c:22570 sip_alreadygone(p) after the final-response
+				 * switch. */
+				sofia_alreadygone(pvt);
 				if (pvt->owner) {
 					int overlap_mode = pvt->peer ? pvt->peer->allowoverlap_mode : sofia_cfg.default_allowoverlap_mode;
 					ast_queue_hangup_with_cause(pvt->owner,
@@ -12656,6 +12706,13 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 							: AST_CAUSE_UNALLOCATED);
 				}
 			} else if (status >= 300) {
+				/* Mark dialog as gone for the same reason as the 484 branch
+				 * above: a forking proxy may relay a non-2xx final and then a
+				 * 2xx on the same transaction (RFC 3261 §16.7 violation in the
+				 * field). Setting alreadygone here lets the status==200 orphan
+				 * guard recognise the late 2xx and emit ACK+BYE per RFC 3261
+				 * §13.2.2.4 / RFC 6026 instead of dropping it silently. */
+				sofia_alreadygone(pvt);
 				if (pvt->owner) {
 					ast_queue_control(pvt->owner, AST_CONTROL_HANGUP);
 				}

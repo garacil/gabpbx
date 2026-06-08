@@ -21228,6 +21228,33 @@ static void handle_response_invite(struct sip_pvt *p, int resp, const char *rest
 		ast_debug(4, "SIP response %d to standard invite\n", resp);
 
 	if (p->alreadygone) { /* This call is already gone */
+		/* RFC 3261 13.2.2.4 / RFC 6026: a 2xx for an INVITE transaction we have
+		 * already abandoned (e.g. a forking proxy returned 486 Busy Here and
+		 * *then* a 200 OK on the same dialog) MUST still be acknowledged, and
+		 * the dialog the 2xx just established MUST be torn down with a BYE.
+		 * Silently dropping it (the historical behaviour) leaves the answering
+		 * UA retransmitting its 200 OK for 64*T1 with a stuck media leg, and we
+		 * later reject its BYE with 481.  We emit only ACK + BYE here: the
+		 * channel and RTP for this call are already gone, so the normal media /
+		 * connected-line / session-timer processing of "case 200" is skipped.
+		 * This reuses the same path as the well-tested "200 OK after CANCEL"
+		 * case below (SIP_PENDINGBYE -> check_pendings -> BYE). */
+		if (resp >= 200 && resp < 300) {
+			ast_log(LOG_NOTICE, "Got 2xx (%d) on already-terminated INVITE %s: ACK + BYE per RFC 3261 13.2.2.4\n", resp, p->callid);
+			if (p->pendinginvite && seqno == p->pendinginvite)
+				p->pendinginvite = 0;
+			parse_ok_contact(p, req);        /* remote target (Contact) for ACK/BYE */
+			build_route(p, req, 1, resp);    /* route set from Record-Route          */
+			set_address_from_contact(p);     /* where to send the ACK/BYE            */
+			p->invitestate = INV_TERMINATED;
+			ast_set_flag(&p->flags[1], SIP_PAGE2_DIALOG_ESTABLISHED);
+			xmitres = transmit_request(p, SIP_ACK, seqno, XMIT_UNRELIABLE, TRUE);
+			if (xmitres == XMIT_ERROR)
+				ast_log(LOG_WARNING, "Could not transmit ACK in dialog %s\n", p->callid);
+			ast_set_flag(&p->flags[0], SIP_PENDINGBYE);
+			check_pendings(p);               /* fires the BYE (SIP_PENDINGBYE)        */
+			return;
+		}
 		ast_debug(1, "Got response on call that is already terminated: %s (ignoring)\n", p->callid);
 		return;
 	}
