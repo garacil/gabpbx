@@ -5635,7 +5635,19 @@ static struct sofia_peer *sofia_find_peer_realtime(const char *name)
 	 * L1819 has `if (ast_strlen_zero(v->value)) continue;` skip-on-empty +
 	 * `ast_string_field_set` field-replace; second application is idempotent.
 	 * R5b: NULL sipregs result (peer not yet registered) silently continues
-	 * with sippeers-only data — normal first-time state, not an error. */
+	 * with sippeers-only data — normal first-time state, not an error.
+	 *
+	 * Operator contract — sipregs MUST carry only registration-state columns
+	 * (ipaddr, port, regseconds, fullcontact, etc.).  Never permit/deny,
+	 * never contactpermit/contactdeny, never directmediapermit/
+	 * directmediadeny, never setvar=, never header=.  Those columns belong
+	 * in sippeers exclusively.  Putting any of them in sipregs would
+	 * silently leak (the overlay's sofia_apply_peer_variables APPENDS to
+	 * peer->ha / peer->contactha / peer->directmediaha / peer->chanvars
+	 * already populated by the sippeers parse — per-row inside one apply
+	 * call the append is correct; across two consecutive applies on the
+	 * same struct it is duplication).  schema-design responsibility, not
+	 * enforced in code. */
 	if (ast_check_realtime("sipregs")) {
 		struct ast_variable *regvar = ast_load_realtime("sipregs", "name", name, SENTINEL);
 		if (regvar) {
@@ -5678,6 +5690,15 @@ static struct sofia_peer *sofia_find_peer_realtime(const char *name)
 	}
 
 	peer->is_realtime = 1;
+	/* NOTE: this function is now called ONLY with ao2_lock(peers) held by
+	 * sofia_find_peer (see the atomicity comment there).  That serialises
+	 * concurrent realtime-cache-miss builds so no two threads can ever
+	 * link duplicate peer structs for the same name into the container.
+	 * Avoids the rollback problem an "optimistic build + post-lock dup-
+	 * check" approach would have: by the time we get here we have ALREADY
+	 * registered a dialplan hint, an ast_dnsmgr_entry with a peer ao2
+	 * ref-bump, and possibly appended a dynamic_exclude_static entry to
+	 * sofia_cfg.contact_ha — none of which can be cleanly unwound. */
 	ao2_link(peers, peer);
 
 	/* post-T56 allowsubscribe derive (2026-04-27): runtime-added realtime peer —
@@ -5695,6 +5716,29 @@ static struct sofia_peer *sofia_find_peer(const char *name)
 	struct ao2_iterator i;
 	struct sofia_peer *peer, *found = NULL;
 
+	/* Atomically: check the in-memory cache, and on miss build via
+	 * realtime — BOTH under ao2_lock(peers) so two concurrent misses for
+	 * the same name cannot both run sofia_find_peer_realtime and link
+	 * duplicate peer structs into the container.  The peers container
+	 * was allocated with hash_fn=NULL (chan_sofia.c:17445) so it does
+	 * not natively refuse duplicates by name — name uniqueness must be
+	 * enforced by the callers, here.
+	 *
+	 * Holding the lock through the realtime DB query (sippeers +
+	 * optional sipregs overlay + hint create + dnsmgr setup) briefly
+	 * serialises realtime cache-miss work across threads.  This is the
+	 * correct trade-off: the alternative — optimistic-build outside the
+	 * lock + post-lock dup-check — would leak the LOSER thread's hint
+	 * extension, dnsmgr entry and any sofia_cfg.contact_ha append (from
+	 * dynamic_exclude_static) because those side effects cannot be
+	 * cleanly rolled back.  Cache hits (the common case for live peers)
+	 * never invoke the realtime path so concurrency on hot peers is
+	 * unaffected.  Container locks in gabpbx ao2 are recursive, so
+	 * helpers invoked under the lock (sofia_create_peer_hint,
+	 * sofia_dnsmgr_setup_peer) that re-enter ao2 on the same container
+	 * do not deadlock. */
+	ao2_lock(peers);
+
 	i = ao2_iterator_init(peers, 0);
 	while ((peer = ao2_iterator_next(&i))) {
 		if (!strcasecmp(peer->name, name)) {
@@ -5705,7 +5749,10 @@ static struct sofia_peer *sofia_find_peer(const char *name)
 	}
 	ao2_iterator_destroy(&i);
 
-	if (found) return found;
+	if (found) {
+		ao2_unlock(peers);
+		return found;
+	}
 
 	if (ast_check_realtime("sippeers")) {
 		found = sofia_find_peer_realtime(name);
@@ -5715,6 +5762,7 @@ static struct sofia_peer *sofia_find_peer(const char *name)
 		}
 	}
 
+	ao2_unlock(peers);
 	return found;
 }
 
@@ -14614,23 +14662,47 @@ static void sofia_parse_register_line(const char *value)
 		return;
 	}
 
-	peer = sofia_peer_alloc(user);
-	if (!peer) {
-		ast_log(LOG_ERROR, "Sofia: Failed to allocate peer for register=> line\n");
-		return;
+	/* Find-or-alloc, like sofia_parse_peer_config does for [section] peers.
+	 * Without this, every reload that re-parses a `register =>` line would
+	 * sofia_peer_alloc + ao2_link a SECOND struct with the same name into
+	 * the peers container — the peers container has no name-based hash
+	 * (allocated with hash_fn=NULL at chan_sofia.c:17445), so duplicates
+	 * by name are silently allowed.  The mark-and-sweep sweep would then
+	 * race to remove the OLD struct (marked at reload-start) while the
+	 * NEW one (allocated with _reload_marked = 0) survives, but during
+	 * the worker's parse window BOTH would coexist and sofia_find_peer
+	 * would return whichever ao2 happened to put first — unpredictable. */
+	{
+		int new_alloc = 0;
+		peer = sofia_find_peer(user);
+		if (!peer) {
+			peer = sofia_peer_alloc(user);
+			if (!peer) {
+				ast_log(LOG_ERROR, "Sofia: Failed to allocate peer for register=> line\n");
+				return;
+			}
+			new_alloc = 1;
+		}
+
+		ast_mutex_lock(&peer->lock);
+		ast_string_field_set(peer, secret, secret);
+		ast_string_field_set(peer, host, host);
+		ast_string_field_set(peer, defaultuser, user);
+		peer->port = port;
+		peer->type = SOFIA_TYPE_PEER;
+		peer->is_register_line = 1;
+		ast_mutex_unlock(&peer->lock);
+
+		/* Survives this reload — must not be swept. */
+		peer->_reload_marked = 0;
+
+		if (new_alloc) {
+			ao2_link(peers, peer);
+			ast_verbose("Sofia: register=> peer '%s' created (target %s:%d)\n",
+				user, host, port);
+		}
+		ao2_ref(peer, -1);
 	}
-
-	ast_string_field_set(peer, secret, secret);
-	ast_string_field_set(peer, host, host);
-	ast_string_field_set(peer, defaultuser, user);
-	peer->port = port;
-	peer->type = SOFIA_TYPE_PEER;
-	peer->is_register_line = 1;
-
-	ao2_link(peers, peer);
-	ast_verbose("Sofia: register=> peer '%s' created (target %s:%d)\n",
-		user, host, port);
-	ao2_ref(peer, -1);
 }
 
 static void sofia_parse_general_config(struct ast_config *cfg)
