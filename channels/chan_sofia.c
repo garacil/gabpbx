@@ -1378,6 +1378,11 @@ struct sofia_peer {
 	nua_handle_t *qualify_nh;
 	int is_realtime;
 		int is_register_line;
+	/* Transient flag used only by sofia_reload_worker for mark-and-sweep
+	 * (chan_sofia.c sofia_peer_mark_cb / sofia_peer_sweep_cb). Set/cleared
+	 * exclusively on sofia_thread inside the reload critical section, so it
+	 * never needs a lock. Outside reload, always 0. */
+	int _reload_marked;
 	struct ast_sockaddr src_addr;
 	/* post-T56 maxcallbitrate per-peer parity (2026-04-28): per-peer SDP video
 	 * bandwidth ceiling emitted as b=CT:%d media-level attribute per RFC 4566
@@ -4851,6 +4856,7 @@ static struct sofia_peer *sofia_peer_alloc(const char *name)
 	peer->qualifyfreq = 60;
 	peer->is_realtime = 0;
 		peer->is_register_line = 0;
+	peer->_reload_marked = 0;
 	peer->contacts = ao2_container_alloc(8, contact_hash_fn, contact_cmp_fn);
 	if (!peer->contacts) {
 		ao2_ref(peer, -1);
@@ -14148,23 +14154,36 @@ static char *sofia_set_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_ar
  * same config-reread path that AST_MODULE_INFO's .reload hook uses. The
  * full definition lives at sofia_load_config() much further down the file. */
 static int sofia_load_config(int reload);
+static int sofia_reload_request_sync(char *errmsg, size_t errmsglen, int timeout_ms);
 
 /* chan_sip-parity `sip reload` CLI alias. chan_sip exposes a dedicated
  * `sip reload` command at chan_sip.c:31171; operators and reload-scripts
  * historically type `sip reload` rather than `module reload chan_sofia.so`.
- * This alias invokes the same config-reread path used by the AST_MODULE_INFO
- * .reload hook (sofia_load_config(1)), so the two forms are equivalent.
- * No SIP traffic is paused — only the static config (sofia.conf and the
- * peers/trunks built from it) is re-read. */
+ * The two are equivalent — both go through sofia_reload_request_sync,
+ * which posts the work onto sofia_thread (the NUA event loop) via
+ * sofia_dispatch_to_root_thread.  Running the reload there eliminates
+ * the UAF races on sofia_cfg.localha / sofia_cfg.contact_ha and the
+ * peer->chanvars UAF that the historical "run on the caller's thread"
+ * model carried.  Listener-config changes are detected and refused with
+ * a clear error.  No SIP traffic is paused beyond the brief
+ * defaults-reset + parse window. */
 static char *sofia_cli_reload(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
+	char errmsg[256] = "";
+
 	if (cmd == CLI_INIT) {
 		e->command = "sip reload";
 		e->usage =
 			"Usage: sip reload\n"
 			"       Re-read /etc/gabpbx/sofia.conf and apply changes to peers,\n"
 			"       trunks and [general] settings without restarting GABPBX.\n"
-			"       chan_sip-parity alias for `module reload chan_sofia.so`.\n";
+			"       chan_sip-parity alias for `module reload chan_sofia.so`.\n"
+			"       Listener-level settings (bindaddr/bindport/tlsbindaddr/\n"
+			"       tlsbindport/tlscertfile/wsbindaddr/wsbindport/wssbindaddr/\n"
+			"       wssbindport/timert1/timerb) are baked into the SIP listener\n"
+			"       at module load and require `systemctl restart gabpbx` to\n"
+			"       take effect; the reload reports `listener config changed`\n"
+			"       and aborts if any of these differs from the running value.\n";
 		return NULL;
 	} else if (cmd == CLI_GENERATE) {
 		return NULL;
@@ -14172,10 +14191,11 @@ static char *sofia_cli_reload(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 	if (a->argc != 2) {
 		return CLI_SHOWUSAGE;
 	}
-	if (sofia_load_config(1) == 0) {
+	if (sofia_reload_request_sync(errmsg, sizeof(errmsg), 30000) == 0) {
 		ast_cli(a->fd, "Sofia: sofia.conf reloaded\n");
 	} else {
-		ast_cli(a->fd, "Sofia: reload failed — see log\n");
+		ast_cli(a->fd, "Sofia: reload failed — %s\n",
+			errmsg[0] ? errmsg : "see log");
 	}
 	return CLI_SUCCESS;
 }
@@ -15413,6 +15433,14 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			return;
 		}
 	} else {
+		/* Take peer->lock around the reset-and-repopulate window.  The
+		 * reload worker runs on sofia_thread, so the primary SIP-event
+		 * reader cannot race here — but the auxiliary threads
+		 * (sofia_sched / sofia_reg_thread / sofia_qualify_tid) legitimately
+		 * read peer fields outside sofia_thread and would otherwise see
+		 * the transient empty-string window for secret/context/host/...
+		 * and the freed-mid-iteration chanvars list. */
+		ast_mutex_lock(&peer->lock);
 		ast_string_field_set(peer, secret, "");
 		ast_string_field_set(peer, context, "");
 		ast_string_field_set(peer, host, "");
@@ -15428,7 +15456,12 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			ast_variables_destroy(peer->chanvars);
 			peer->chanvars = NULL;
 		}
+		ast_mutex_unlock(&peer->lock);
 	}
+
+	/* Clear the reload-sweep mark: this peer survived the new config and
+	 * must not be swept at the end of the reload worker. */
+	peer->_reload_marked = 0;
 
 	for (v = ast_variable_browse(cfg, cat); v; v = v->next) {
 		if (!strcasecmp(v->name, "secret") || !strcasecmp(v->name, "password")) {
@@ -16057,21 +16090,17 @@ static void sofia_post_config_derive_allowsubscribe(void)
 	ao2_callback(peers, OBJ_NODATA, sofia_derive_allowsubscribe_cb, NULL);
 }
 
-static int sofia_load_config(int reload)
+/* Apply a parsed sofia.conf to the live sofia_cfg + peers state.  Extracted
+ * from the historical sofia_load_config body so both the init path
+ * (sofia_load_config wraps this with ast_config_load/destroy) and the
+ * reload worker (sofia_reload_worker) can share the same defaults-reset +
+ * [general] parse + per-peer parse + cross-validate + autodomain +
+ * derive_allowsubscribe logic.  Caller owns the cfg lifetime — do NOT
+ * destroy it here.  Returns 0 on success, -1 on a hard failure that
+ * leaves the live state partially mutated (caller should log + bail). */
+static int sofia_apply_config(struct ast_config *cfg)
 {
-	struct ast_config *cfg;
 	char *cat;
-	struct ast_flags config_flags = { reload ? CONFIG_FLAG_FILEUNCHANGED : 0 };
-
-	cfg = ast_config_load(SOFIA_CONFIG, config_flags);
-	if (!cfg || cfg == CONFIG_STATUS_FILEUNCHANGED) {
-		return 0;
-	}
-
-	if (cfg == CONFIG_STATUS_FILEINVALID) {
-		ast_log(LOG_ERROR, "Config file %s is invalid\n", SOFIA_CONFIG);
-		return -1;
-	}
 
 	ast_copy_string(sofia_cfg.bindaddr, DEFAULT_BINDADDR, sizeof(sofia_cfg.bindaddr));
 	sofia_cfg.bindport = DEFAULT_SIP_PORT;
@@ -16459,8 +16488,34 @@ static int sofia_load_config(int reload)
 	 * duplication). */
 	sofia_post_config_derive_allowsubscribe();
 
-	ast_config_destroy(cfg);
 	return 0;
+}
+
+/* Init-path wrapper: load sofia.conf from disk and hand it to
+ * sofia_apply_config.  Only called from load_module() during module init.
+ * The reload path goes through sofia_reload_request_sync /
+ * sofia_reload_worker (defined alongside sofia_dispatch_to_root_thread).
+ * The `reload` parameter is retained for back-compat with the existing
+ * load_module call site but on a clean init it is always 0; passing 1
+ * here would short-circuit on FILEUNCHANGED which is not the intent. */
+static int sofia_load_config(int reload)
+{
+	struct ast_config *cfg;
+	struct ast_flags config_flags = { reload ? CONFIG_FLAG_FILEUNCHANGED : 0 };
+	int rc;
+
+	cfg = ast_config_load(SOFIA_CONFIG, config_flags);
+	if (!cfg || cfg == CONFIG_STATUS_FILEUNCHANGED) {
+		return 0;
+	}
+	if (cfg == CONFIG_STATUS_FILEINVALID) {
+		ast_log(LOG_ERROR, "Config file %s is invalid\n", SOFIA_CONFIG);
+		return -1;
+	}
+
+	rc = sofia_apply_config(cfg);
+	ast_config_destroy(cfg);
+	return rc;
 }
 
 static void *sofia_reg_thread_func(void *data)
@@ -16644,7 +16699,339 @@ static int sofia_dispatch_to_root_thread(void (*callback)(void *), void *data)
 	return 0;
 }
 
-/* T47.1 (2026-04-27): AMI Action: SIPpeers — list every peer (one PeerEntry event per
+/* =========================================================================
+ *  Thread-safe `sip reload` infrastructure
+ *
+ *  The historical reload path called sofia_load_config(1) directly on the
+ *  CLI / AMI / module-manager caller's thread, while sofia_thread (the NUA
+ *  event loop) read sofia_cfg / peers / peer->fields concurrently from
+ *  inbound SIP processing. That model had real UAF races (sofia_cfg.localha
+ *  and sofia_cfg.contact_ha freed while sofia_thread iterated them;
+ *  peer->chanvars destroyed without peer->lock while sofia_call iterated
+ *  them) plus silent misconfigs (listener-baked fields like bindport were
+ *  re-read into sofia_cfg but never re-applied to the live NUA listener).
+ *
+ *  The new design dispatches the reload work into sofia_thread via the
+ *  existing sofia_dispatch_to_root_thread IPC. The reader becomes the
+ *  writer; there is no concurrent access to sofia_cfg / peers because the
+ *  single consumer of those (sofia_thread) is now blocked inside the
+ *  worker. The CLI caller posts the request, blocks on a condvar with a
+ *  30-second deadline, and reports the worker's verdict.
+ *
+ *  Listener-config changes (the 11 fields baked into nua_create at
+ *  sofia_thread startup — bindaddr, bindport, tlsbindaddr, tlsbindport,
+ *  tlscertfile, wsbindaddr, wsbindport, wssbindaddr, wssbindport,
+ *  timert1, timerb) are pre-validated BEFORE any sofia_cfg mutation:
+ *  sofia_reload_listener_changed reads them from the parsed config via
+ *  ast_variable_retrieve and compares against the live sofia_cfg. Any
+ *  diff aborts the reload with a clear error — silent recreation of the
+ *  NUA listener would either lie (no effect on running sockets) or kill
+ *  every active call and TLS connection.
+ *
+ *  Stale peers (present in the running container but removed from
+ *  sofia.conf) are handled by mark-and-sweep inside the worker: every
+ *  peer marked before re-parsing, unmarked as each [section] is parsed,
+ *  swept (ao2_unlink + hint removal) at the end. Realtime peers are
+ *  exempt because their lifecycle is per-lookup, not config-file driven.
+ * ========================================================================= */
+
+AST_MUTEX_DEFINE_STATIC(sofia_reload_lock);
+
+/* Forward declaration of the apply-config helper that does the actual
+ * defaults-reset + parse + cross-validate work. Extracted from
+ * sofia_load_config so both the init path (load_module) and the reload
+ * worker can share it. Defined alongside sofia_load_config below. */
+static int sofia_apply_config(struct ast_config *cfg);
+
+struct sofia_reload_req {
+	ast_mutex_t mutex;
+	ast_cond_t  cond;
+	int         done;
+	int         result;     /* 0 = OK, -1 = error */
+	char       *errmsg;     /* points at caller's buffer; NULL = no buffer */
+	size_t      errmsglen;
+};
+
+static void sofia_reload_req_destructor(void *obj)
+{
+	struct sofia_reload_req *req = obj;
+	ast_cond_destroy(&req->cond);
+	ast_mutex_destroy(&req->mutex);
+}
+
+/* Compare the 11 listener-baked fields in the freshly-parsed cfg against
+ * the live sofia_cfg. Returns 1 if any differs (reload must be refused),
+ * 0 if all match. Does NOT mutate sofia_cfg — reads the new values
+ * straight from ast_variable_retrieve so the abort path is safe even if
+ * the operator screwed up half the listener config.
+ *
+ * On change, fills `errmsg` with a comma-separated list of changed keys
+ * so the operator can see exactly which knob requires the restart. */
+static int sofia_reload_listener_changed(struct ast_config *cfg,
+		char *errmsg, size_t errmsglen)
+{
+	struct {
+		const char *key;
+		const char *alt_key;        /* secondary key name (e.g. tlscertfile / tlscertdir) */
+		int  is_string;
+		void *current_value;        /* pointer into sofia_cfg */
+		size_t string_size;         /* for string fields, size of the sofia_cfg buffer */
+	} fields[] = {
+		{ "bindaddr",      NULL,         1, sofia_cfg.bindaddr,     sizeof(sofia_cfg.bindaddr) },
+		{ "bindport",      NULL,         0, &sofia_cfg.bindport,    0 },
+		{ "tlsbindaddr",   NULL,         1, sofia_cfg.tlsbindaddr,  sizeof(sofia_cfg.tlsbindaddr) },
+		{ "tlsbindport",   NULL,         0, &sofia_cfg.tlsbindport, 0 },
+		{ "tlscertfile",   "tlscertdir", 1, sofia_cfg.tlscertfile,  sizeof(sofia_cfg.tlscertfile) },
+		{ "wsbindaddr",    NULL,         1, sofia_cfg.wsbindaddr,   sizeof(sofia_cfg.wsbindaddr) },
+		{ "wsbindport",    NULL,         0, &sofia_cfg.wsbindport,  0 },
+		{ "wssbindaddr",   NULL,         1, sofia_cfg.wssbindaddr,  sizeof(sofia_cfg.wssbindaddr) },
+		{ "wssbindport",   NULL,         0, &sofia_cfg.wssbindport, 0 },
+		{ "timert1",       NULL,         0, &sofia_cfg.default_timer_t1, 0 },
+		{ "timerb",        NULL,         0, &sofia_cfg.default_timer_b,  0 },
+	};
+	const size_t nfields = sizeof(fields) / sizeof(fields[0]);
+	size_t i;
+	char buf[256];
+	int changed = 0;
+	int written = 0;
+
+	buf[0] = '\0';
+
+	for (i = 0; i < nfields; i++) {
+		const char *new_val = ast_variable_retrieve(cfg, "general", fields[i].key);
+		if (!new_val && fields[i].alt_key) {
+			new_val = ast_variable_retrieve(cfg, "general", fields[i].alt_key);
+		}
+		/* Absent key means the operator did not touch this knob — treat
+		 * as "no change" rather than comparing to a synthetic zero/empty,
+		 * which would false-alarm on every reload for keys whose runtime
+		 * defaults are non-zero (timert1=500, timerb=32000, ...). */
+		if (!new_val) {
+			continue;
+		}
+		if (fields[i].is_string) {
+			const char *cur = (const char *)fields[i].current_value;
+			if (strcmp(cur, new_val) != 0) {
+				changed = 1;
+				if (written < (int)sizeof(buf) - 16) {
+					written += snprintf(buf + written, sizeof(buf) - written,
+						"%s%s", written ? "," : "", fields[i].key);
+				}
+			}
+		} else {
+			int cur_int = *((int *)fields[i].current_value);
+			int new_int = atoi(new_val);
+			if (cur_int != new_int) {
+				changed = 1;
+				if (written < (int)sizeof(buf) - 16) {
+					written += snprintf(buf + written, sizeof(buf) - written,
+						"%s%s", written ? "," : "", fields[i].key);
+				}
+			}
+		}
+	}
+
+	if (changed && errmsg && errmsglen > 0) {
+		snprintf(errmsg, errmsglen,
+			"listener config changed (%s) — `systemctl restart gabpbx` required",
+			buf);
+	}
+	return changed;
+}
+
+/* Mark-and-sweep callbacks for reloading the peers container.  Marking is
+ * an O(N) ao2 walk that sets a transient flag on every peer.  The peer
+ * re-parse path (sofia_parse_peer_config) clears the flag for every peer
+ * that survived the new config.  Sweep then ao2_unlinks the still-marked
+ * (= disappeared) non-realtime peers.  Realtime peers are skipped because
+ * their lifecycle is per-lookup, not file-driven. */
+static int sofia_peer_mark_cb(void *obj, void *arg, int flags)
+{
+	struct sofia_peer *peer = obj;
+	peer->_reload_marked = 1;
+	return 0;
+}
+
+static int sofia_peer_sweep_cb(void *obj, void *arg, int flags)
+{
+	struct sofia_peer *peer = obj;
+	if (!peer->_reload_marked || peer->is_realtime) {
+		return 0;
+	}
+	/* Drop the dialplan hint extension this peer created, if any.  The
+	 * registrar string here matches what sofia_create_peer_hint passed
+	 * (chan_sofia.c sofia_create_peer_hint) so we remove only the
+	 * extension we own. */
+	if (!ast_strlen_zero(peer->subscribecontext) && !ast_strlen_zero(peer->regexten)) {
+		ast_context_remove_extension(peer->subscribecontext,
+			peer->regexten, PRIORITY_HINT, "sofia_config_peer");
+	}
+	ast_log(LOG_NOTICE, "Sofia: peer '%s' removed by reload sweep "
+		"(no longer present in sofia.conf)\n", peer->name);
+	/* CMP_MATCH tells ao2_callback to ao2_unlink this entry.  The
+	 * sofia_peer_destructor runs on the final ao2 ref drop and frees
+	 * dnsmgr, contactha, ha, directmediaha, contacts container, etc. */
+	return CMP_MATCH;
+}
+
+/* Forward declaration for the worker.  Body defined alongside the
+ * sync-invoker further down. */
+static void sofia_reload_worker(void *data);
+
+/* Synchronous reload invoker — called from CLI / AMI / .reload hook.
+ * Posts the request into sofia_thread's event queue via
+ * sofia_dispatch_to_root_thread, then blocks on a condvar (with a
+ * 30-second deadline) until the worker signals completion.  Returns 0
+ * on success or -1 on failure (the worker fills errmsg with the
+ * specific reason).
+ *
+ * Refcount discipline: the request struct is ao2_alloc'd with initial
+ * refcount 1 (caller's).  Before dispatch we ao2_ref(req,+1) for the
+ * worker.  On dispatch failure we drop both refs.  After cond_timedwait
+ * returns (whether by signal or timeout), the caller drops its ref.
+ * The worker drops its ref at the very end of its body.  Whichever
+ * runs last frees the struct via the destructor — safe under timeout
+ * because cond/mutex live inside the ref-protected struct. */
+static int sofia_reload_request_sync(char *errmsg, size_t errmsglen, int timeout_ms)
+{
+	struct sofia_reload_req *req;
+	struct timespec deadline;
+	int result;
+	int dispatched;
+
+	if (errmsg && errmsglen > 0) {
+		errmsg[0] = '\0';
+	}
+
+	if (ast_mutex_trylock(&sofia_reload_lock) != 0) {
+		if (errmsg && errmsglen > 0) {
+			snprintf(errmsg, errmsglen, "another reload is in progress");
+		}
+		return -1;
+	}
+
+	req = ao2_alloc(sizeof(*req), sofia_reload_req_destructor);
+	if (!req) {
+		if (errmsg && errmsglen > 0) {
+			snprintf(errmsg, errmsglen, "out of memory");
+		}
+		ast_mutex_unlock(&sofia_reload_lock);
+		return -1;
+	}
+	ast_mutex_init(&req->mutex);
+	ast_cond_init(&req->cond, NULL);
+	req->done = 0;
+	req->result = -1;
+	req->errmsg = errmsg;
+	req->errmsglen = errmsglen;
+
+	ao2_ref(req, +1);   /* worker's ref */
+
+	dispatched = sofia_dispatch_to_root_thread(sofia_reload_worker, req);
+	if (dispatched != 0) {
+		if (errmsg && errmsglen > 0) {
+			snprintf(errmsg, errmsglen, "failed to dispatch reload to sofia_thread");
+		}
+		ao2_ref(req, -1);  /* drop worker's ref — worker won't run */
+		ao2_ref(req, -1);  /* drop caller's ref */
+		ast_mutex_unlock(&sofia_reload_lock);
+		return -1;
+	}
+
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec  += timeout_ms / 1000;
+	deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec++;
+		deadline.tv_nsec -= 1000000000L;
+	}
+
+	ast_mutex_lock(&req->mutex);
+	while (!req->done) {
+		int rc = ast_cond_timedwait(&req->cond, &req->mutex, &deadline);
+		if (rc == ETIMEDOUT) {
+			if (errmsg && errmsglen > 0 && errmsg[0] == '\0') {
+				snprintf(errmsg, errmsglen,
+					"reload timed out after %d ms (sofia_thread busy)", timeout_ms);
+			}
+			break;
+		}
+	}
+	result = req->done ? req->result : -1;
+	ast_mutex_unlock(&req->mutex);
+
+	ao2_ref(req, -1);  /* drop caller's ref; worker drops its own when it runs */
+	ast_mutex_unlock(&sofia_reload_lock);
+	return result;
+}
+
+/* The actual reload work — runs on sofia_thread.  Because sofia_thread is
+ * the SINGLE consumer of sofia_cfg / peers / peer->fields during normal
+ * SIP event dispatch, and that thread is now blocked inside this function
+ * for the duration of the reload, there is no concurrent reader.  ast_ha
+ * lists can be freed safely; sofia_cfg fields can be overwritten in-place.
+ * Per-peer mutations still take peer->lock as a defence against the
+ * auxiliary threads (sofia_sched / sofia_reg_thread / sofia_qualify_tid)
+ * that legitimately read peer state from outside sofia_thread. */
+static void sofia_reload_worker(void *data)
+{
+	struct sofia_reload_req *req = data;
+	struct ast_config *cfg;
+	struct ast_flags config_flags = { 0 };
+	int result = -1;
+	char local_errmsg[256] = "";
+
+	cfg = ast_config_load(SOFIA_CONFIG, config_flags);
+	if (!cfg) {
+		snprintf(local_errmsg, sizeof(local_errmsg),
+			"sofia.conf could not be loaded");
+		goto signal_done;
+	}
+	if (cfg == CONFIG_STATUS_FILEINVALID) {
+		snprintf(local_errmsg, sizeof(local_errmsg),
+			"sofia.conf is invalid (parse error)");
+		goto signal_done;
+	}
+
+	if (sofia_reload_listener_changed(cfg, local_errmsg, sizeof(local_errmsg))) {
+		ast_config_destroy(cfg);
+		goto signal_done;
+	}
+
+	/* Mark every existing peer.  Surviving peers will clear their mark in
+	 * sofia_parse_peer_config; remaining marked peers get swept below. */
+	ao2_callback(peers, OBJ_NODATA, sofia_peer_mark_cb, NULL);
+
+	if (sofia_apply_config(cfg) < 0) {
+		/* sofia_apply_config already logged the specifics.  Don't sweep —
+		 * the peer state may be partially populated, sweeping could remove
+		 * live peers that the partial parse didn't get to. */
+		snprintf(local_errmsg, sizeof(local_errmsg),
+			"sofia_apply_config failed — see log; no peers swept");
+		ast_config_destroy(cfg);
+		goto signal_done;
+	}
+
+	/* Sweep peers that disappeared from sofia.conf. */
+	ao2_callback(peers, OBJ_NODATA | OBJ_UNLINK | OBJ_MULTIPLE,
+		sofia_peer_sweep_cb, NULL);
+
+	ast_config_destroy(cfg);
+	result = 0;
+
+signal_done:
+	ast_mutex_lock(&req->mutex);
+	req->done = 1;
+	req->result = result;
+	if (req->errmsg && req->errmsglen > 0 && local_errmsg[0] != '\0') {
+		ast_copy_string(req->errmsg, local_errmsg, req->errmsglen);
+	}
+	ast_cond_signal(&req->cond);
+	ast_mutex_unlock(&req->mutex);
+	ao2_ref(req, -1);   /* drop worker's ref */
+}
+
+/* T47.1 (2026-04-27): AMI Action: SIPpeers — list every peer (one PeerEntry per
  * peer, plus a final PeerlistComplete with ListItems count). chan_sip parity
  * (chan_sip.c:17701 manager_sip_show_peers + chan_sip.c:17984 PeerEntry format).
  * Filters out is_register_line==1 entries (those are outbound-register peers
@@ -17661,10 +18048,22 @@ static int unload_module(void)
 	return 0;
 }
 
+/* AST_MODULE_INFO .reload hook — invoked by `module reload chan_sofia.so`
+ * from the module manager (CLI / AMI ModuleLoad).  Routed through the
+ * same sofia_reload_request_sync path as the `sip reload` CLI alias, so
+ * both invocations share the thread-safe reload-on-sofia_thread flow,
+ * the 30-second deadline, the listener-change refusal, and the mark-
+ * and-sweep peer cleanup.  Returns 0 on success or -1 on failure so the
+ * module manager surfaces the result. */
 static int reload(void)
 {
-	sofia_load_config(1);
-	return 0;
+	char errmsg[256] = "";
+	int rc = sofia_reload_request_sync(errmsg, sizeof(errmsg), 30000);
+	if (rc != 0) {
+		ast_log(LOG_WARNING, "Sofia: module reload failed — %s\n",
+			errmsg[0] ? errmsg : "see log");
+	}
+	return rc;
 }
 
 AST_MODULE_INFO(GABPBX_GPL_KEY, AST_MODFLAG_LOAD_ORDER, "Sofia-SIP Channel Driver",

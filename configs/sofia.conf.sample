@@ -18,6 +18,27 @@
 
 [general]
 ;
+; Reload behaviour
+;
+; `sip reload` (and the equivalent `module reload chan_sofia.so`) re-reads
+; this file and applies changes to peers, trunks and [general] settings
+; without restarting GABPBX. The reload runs on the Sofia-SIP NUA event
+; thread itself (no concurrent-traffic crash risk), is serialised against
+; itself by a module-level lock, and is bounded by a 30-second timeout.
+;
+; Listener-level settings are baked into the SIP listener at module load
+; and CANNOT be changed by a reload — they require `systemctl restart
+; gabpbx` to take effect. The reload reports "listener config changed —
+; restart required" and aborts without mutating live state if any of these
+; differs from the running value:
+;
+;   bindaddr, bindport, tlsbindaddr, tlsbindport, tlscertfile,
+;   wsbindaddr, wsbindport, wssbindaddr, wssbindport, timert1, timerb
+;
+; Peers removed from this file are removed from the in-memory directory on
+; reload (mark-and-sweep). Realtime peers are exempt — their lifecycle is
+; per-lookup, not file-driven.
+;
 ; Default context for incoming calls
 ;
 context=default
