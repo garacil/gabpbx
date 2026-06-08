@@ -15441,6 +15441,39 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		 * the transient empty-string window for secret/context/host/...
 		 * and the freed-mid-iteration chanvars list. */
 		ast_mutex_lock(&peer->lock);
+		/* Drop the existing dialplan hint extension BEFORE wiping
+		 * subscribecontext / regexten — we need the OLD values to locate
+		 * the right extension to remove.  The subsequent
+		 * sofia_create_peer_hint call at the end of this function adds a
+		 * fresh hint based on the new values.  Without this, an operator
+		 * changing regexten= from one number to another on reload would
+		 * leak the old hint extension; an unchanged regexten= would
+		 * accumulate a duplicate hint on every reload (depending on
+		 * ast_add_extension2 dedup semantics, the dialplan extension
+		 * table grows linearly with reload count). */
+		if (!ast_strlen_zero(peer->subscribecontext) && !ast_strlen_zero(peer->regexten)) {
+			ast_context_remove_extension(peer->subscribecontext,
+				peer->regexten, PRIORITY_HINT, "sofia_config_peer");
+		}
+		/* Reset ACL chains so the permit/deny parsers below append onto a
+		 * fresh list instead of stacking on top of the previous load's
+		 * rules.  Without these resets, every reload of an existing peer
+		 * with permit/deny grows peer->ha linearly; an N-th reload would
+		 * have N copies of every rule, slowing ast_apply_ha O(N*rules)
+		 * and leaking ~24 bytes per rule per reload.  Same reasoning for
+		 * peer->contactha and peer->directmediaha. */
+		if (peer->ha) {
+			ast_free_ha(peer->ha);
+			peer->ha = NULL;
+		}
+		if (peer->contactha) {
+			ast_free_ha(peer->contactha);
+			peer->contactha = NULL;
+		}
+		if (peer->directmediaha) {
+			ast_free_ha(peer->directmediaha);
+			peer->directmediaha = NULL;
+		}
 		ast_string_field_set(peer, secret, "");
 		ast_string_field_set(peer, context, "");
 		ast_string_field_set(peer, host, "");
@@ -16101,6 +16134,21 @@ static void sofia_post_config_derive_allowsubscribe(void)
 static int sofia_apply_config(struct ast_config *cfg)
 {
 	char *cat;
+
+	/* Drain the global domain_list before we re-populate it from the new
+	 * config (domain= directives + autodomain auto-add).  Without this,
+	 * a domain removed from sofia.conf would stay in the allowed-domains
+	 * set until module unload — both a stale-state correctness bug and a
+	 * security concern (deleted domain still accepted as local).  On
+	 * initial load the list is already empty so the drain is a no-op. */
+	{
+		struct sofia_domain *d;
+		AST_LIST_LOCK(&domain_list);
+		while ((d = AST_LIST_REMOVE_HEAD(&domain_list, list))) {
+			ast_free(d);
+		}
+		AST_LIST_UNLOCK(&domain_list);
+	}
 
 	ast_copy_string(sofia_cfg.bindaddr, DEFAULT_BINDADDR, sizeof(sofia_cfg.bindaddr));
 	sofia_cfg.bindport = DEFAULT_SIP_PORT;
@@ -16866,11 +16914,27 @@ static int sofia_peer_sweep_cb(void *obj, void *arg, int flags)
 		ast_context_remove_extension(peer->subscribecontext,
 			peer->regexten, PRIORITY_HINT, "sofia_config_peer");
 	}
+	/* Release the dnsmgr entry FIRST, and drop the ao2 ref that
+	 * sofia_dnsmgr_setup_peer bumped at chan_sofia.c:4642 for callback
+	 * safety.  The destructor would otherwise never run: dnsmgr's held
+	 * ref would keep refcount >= 1 even after ao2_unlink drops the
+	 * container's ref.  Pattern documented at the destructor comment
+	 * (chan_sofia.c:4537-4538: "explicit reload-sweep does
+	 * ast_dnsmgr_release THEN ao2_ref(-1) BEFORE refcount drops to 0").
+	 * ast_dnsmgr_release is synchronous — waits for in-flight callbacks
+	 * to complete with the peer pointer before returning, so no UAF
+	 * window when ao2_unlink runs next. */
+	if (peer->dnsmgr) {
+		ast_dnsmgr_release(peer->dnsmgr);
+		peer->dnsmgr = NULL;
+		ao2_ref(peer, -1);
+	}
 	ast_log(LOG_NOTICE, "Sofia: peer '%s' removed by reload sweep "
 		"(no longer present in sofia.conf)\n", peer->name);
 	/* CMP_MATCH tells ao2_callback to ao2_unlink this entry.  The
-	 * sofia_peer_destructor runs on the final ao2 ref drop and frees
-	 * dnsmgr, contactha, ha, directmediaha, contacts container, etc. */
+	 * sofia_peer_destructor runs on the final ao2 ref drop (now reachable
+	 * because dnsmgr's ref was just released above) and frees contactha,
+	 * ha, directmediaha, contacts container, chanvars, mailboxes, etc. */
 	return CMP_MATCH;
 }
 
