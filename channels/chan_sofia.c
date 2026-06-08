@@ -14144,6 +14144,42 @@ static char *sofia_set_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_ar
 	return CLI_SHOWUSAGE;
 }
 
+/* Forward declaration so the `sip reload` CLI alias below can invoke the
+ * same config-reread path that AST_MODULE_INFO's .reload hook uses. The
+ * full definition lives at sofia_load_config() much further down the file. */
+static int sofia_load_config(int reload);
+
+/* chan_sip-parity `sip reload` CLI alias. chan_sip exposes a dedicated
+ * `sip reload` command at chan_sip.c:31171; operators and reload-scripts
+ * historically type `sip reload` rather than `module reload chan_sofia.so`.
+ * This alias invokes the same config-reread path used by the AST_MODULE_INFO
+ * .reload hook (sofia_load_config(1)), so the two forms are equivalent.
+ * No SIP traffic is paused — only the static config (sofia.conf and the
+ * peers/trunks built from it) is re-read. */
+static char *sofia_cli_reload(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	if (cmd == CLI_INIT) {
+		e->command = "sip reload";
+		e->usage =
+			"Usage: sip reload\n"
+			"       Re-read /etc/gabpbx/sofia.conf and apply changes to peers,\n"
+			"       trunks and [general] settings without restarting GABPBX.\n"
+			"       chan_sip-parity alias for `module reload chan_sofia.so`.\n";
+		return NULL;
+	} else if (cmd == CLI_GENERATE) {
+		return NULL;
+	}
+	if (a->argc != 2) {
+		return CLI_SHOWUSAGE;
+	}
+	if (sofia_load_config(1) == 0) {
+		ast_cli(a->fd, "Sofia: sofia.conf reloaded\n");
+	} else {
+		ast_cli(a->fd, "Sofia: reload failed — see log\n");
+	}
+	return CLI_SUCCESS;
+}
+
 /* post-T56 sip prune realtime CLI parity (2026-04-27): tab-completion helper.
  * Mirrors chan_sip complete_sip_peer at chan_sip.c:19640 — walks peers ao2
  * container with optional realtime filter; returns ast_strdup(peer->name) on
@@ -14503,6 +14539,7 @@ static struct ast_cli_entry cli_sofia[] = {
 	AST_CLI_DEFINE(sofia_cli_show_settings, "Show Sofia-SIP global settings"),
 	AST_CLI_DEFINE(sofia_cli_prune_realtime, "Prune cached Realtime users/peers"),
 	AST_CLI_DEFINE(sofia_set_debug, "Enable Sofia debug logging"),
+	AST_CLI_DEFINE(sofia_cli_reload, "Reload sofia.conf (chan_sip-parity alias for `module reload chan_sofia.so`)"),
 	AST_CLI_DEFINE(sofia_cli_show_blacklist, "List local SIP blacklist"),
 	AST_CLI_DEFINE(sofia_cli_blacklist_search, "Search an IP in local SIP blacklist"),
 	AST_CLI_DEFINE(sofia_cli_blacklist_delete, "Delete an IP from local SIP blacklist"),
