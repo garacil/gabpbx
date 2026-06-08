@@ -8635,9 +8635,50 @@ static int sofia_blacklist_check_ip(const char *ip, int add, const char *reason)
 	entry = ao2_find(sofia_blacklist, &key, OBJ_POINTER);
 	if (!entry && add) {
 		if (ao2_container_count(sofia_blacklist) >= sofia_blacklist_max) {
-			ast_log(LOG_ERROR, "Sofia blacklist FULL\n");
-			ast_mutex_unlock(&sofia_blacklist_lock);
-			return 0;
+			/* LRU eviction — find the entry with the oldest last_seen
+			 * and remove it to make room for the new offender.  Without
+			 * this, the historical "Sofia blacklist FULL" rejection meant
+			 * any attacker rotating IPs beyond the cap (default 1024)
+			 * would escape blacklisting entirely, converting a working
+			 * defence into a "first 1024 wins" race that the attacker
+			 * always wins.  The walk is O(N) bounded by sofia_blacklist_
+			 * max and only fires on overflow, so per-INVITE/REGISTER cost
+			 * stays at the normal ao2_find.  Held under sofia_blacklist_
+			 * lock so the iterator + the eviction + the new alloc + link
+			 * are atomic against concurrent blacklist mutations. */
+			struct sofia_blacklist_entry *oldest = NULL;
+			struct sofia_blacklist_entry *cand;
+			struct ao2_iterator i = ao2_iterator_init(sofia_blacklist, 0);
+			while ((cand = ao2_iterator_next(&i))) {
+				if (!oldest || cand->last_seen < oldest->last_seen) {
+					if (oldest) {
+						ao2_ref(oldest, -1);
+					}
+					oldest = cand;
+				} else {
+					ao2_ref(cand, -1);
+				}
+			}
+			ao2_iterator_destroy(&i);
+			if (oldest) {
+				ast_log(LOG_NOTICE,
+					"Sofia blacklist at cap (%d) — evicting LRU entry %s "
+					"(first_seen=%ld last_seen=%ld counter=%d) to make room\n",
+					sofia_blacklist_max, oldest->ip,
+					(long)oldest->first_seen, (long)oldest->last_seen,
+					oldest->counter);
+				ao2_unlink(sofia_blacklist, oldest);
+				ao2_ref(oldest, -1);
+			} else {
+				/* Should not happen — container_count >= max but iterator
+				 * found nothing.  Bail honestly. */
+				ast_log(LOG_ERROR,
+					"Sofia blacklist at cap (%d) but LRU walk found "
+					"nothing to evict — refusing new entry for %s\n",
+					sofia_blacklist_max, ip);
+				ast_mutex_unlock(&sofia_blacklist_lock);
+				return 0;
+			}
 		}
 		entry = ao2_alloc(sizeof(*entry), NULL);
 		if (!entry) {
