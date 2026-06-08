@@ -502,6 +502,7 @@ static AST_LIST_HEAD_STATIC(vmstates, vmstate);
 #define VM_MOVEHEARD     (1 << 16)  /*!< Move a "heard" message to Old after listening to it */
 #define VM_MESSAGEWRAP   (1 << 17)  /*!< Wrap around from the last message to the first, and vice-versa */
 #define VM_FWDURGAUTO    (1 << 18)  /*!< Autoset of Urgent flag on forwarded Urgent messages set globally */
+#define VM_OVERWRITEOLDEST (1 << 19) /*!< When mailbox is full, delete the oldest message (by origtime) and accept the new one instead of rejecting with vm-mailboxfull */
 #define ERROR_LOCK_PATH  -100
 #define OPERATOR_EXIT     300
 
@@ -1124,7 +1125,9 @@ static void apply_option(struct ast_vm_user *vmu, const char *var, const char *v
 	} else if (!strcasecmp(var, "tempgreetwarn")){
 		ast_set2_flag(vmu, ast_true(value), VM_TEMPGREETWARN);	
 	} else if (!strcasecmp(var, "messagewrap")){
-		ast_set2_flag(vmu, ast_true(value), VM_MESSAGEWRAP);	
+		ast_set2_flag(vmu, ast_true(value), VM_MESSAGEWRAP);
+	} else if (!strcasecmp(var, "overwriteoldest")){
+		ast_set2_flag(vmu, ast_true(value), VM_OVERWRITEOLDEST);
 	} else if (!strcasecmp(var, "operator")) {
 		ast_set2_flag(vmu, ast_true(value), VM_OPERATOR);	
 	} else if (!strcasecmp(var, "envelope")){
@@ -4274,6 +4277,99 @@ static int vm_delete(char *file)
 }
 
 /*!
+ * \brief Evict the message with the smallest origtime and cascade-renumber
+ *        the tail so the slot opens at index maxmsg-1.
+ *
+ * Cascade is required because last_message_index assumes contiguous numbering.
+ * Held under vm_lock_path so the scan, delete and rename are atomic against
+ * a concurrent leave_voicemail.
+ *
+ * \return zero on success, -1 on error (caller falls back to historical reject).
+ */
+static int vm_rotate_oldest_file(struct ast_vm_user *vmu, char *dir)
+{
+	DIR *vmdir;
+	struct dirent *vment;
+	int oldest_idx = -1;
+	long oldest_time = LONG_MAX;
+	char path[PATH_MAX];
+	int x;
+
+	if (vm_lock_path(dir)) {
+		return ERROR_LOCK_PATH;
+	}
+
+	if (!(vmdir = opendir(dir))) {
+		ast_unlock_path(dir);
+		return -1;
+	}
+
+	while ((vment = readdir(vmdir))) {
+		int idx;
+		char ext[8];
+		FILE *fp;
+		char line[256];
+		long origtime = 0;
+		int got = 0;
+
+		if (sscanf(vment->d_name, "msg%30d.%7s", &idx, ext) != 2 ||
+		    strcmp(ext, "txt") != 0 ||
+		    idx < 0 || idx >= MAXMSGLIMIT) {
+			continue;
+		}
+
+		snprintf(path, sizeof(path), "%s/%s", dir, vment->d_name);
+		if (!(fp = fopen(path, "r"))) {
+			continue;
+		}
+		while (fgets(line, sizeof(line), fp)) {
+			if (sscanf(line, "origtime=%ld", &origtime) == 1) {
+				got = 1;
+				break;
+			}
+		}
+		fclose(fp);
+
+		if (!got) {
+			/* Missing origtime → evict first (corrupt info file). */
+			origtime = 0;
+		}
+		if (origtime < oldest_time) {
+			oldest_time = origtime;
+			oldest_idx = idx;
+		}
+	}
+	closedir(vmdir);
+
+	if (oldest_idx < 0) {
+		ast_unlock_path(dir);
+		return -1;
+	}
+
+	snprintf(path, sizeof(path), "%s/msg%04d", dir, oldest_idx);
+	vm_delete(path);
+
+	/* Stop the cascade at the first gap so we don't rename through holes. */
+	for (x = oldest_idx + 1; x < vmu->maxmsg; x++) {
+		char sfn[PATH_MAX];
+		char dfn[PATH_MAX];
+		char stxt[PATH_MAX];
+		struct stat st;
+
+		snprintf(stxt, sizeof(stxt), "%s/msg%04d.txt", dir, x);
+		if (stat(stxt, &st) != 0) {
+			break;
+		}
+		snprintf(sfn, sizeof(sfn), "%s/msg%04d", dir, x);
+		snprintf(dfn, sizeof(dfn), "%s/msg%04d", dir, x - 1);
+		rename_file(sfn, dfn);
+	}
+
+	ast_unlock_path(dir);
+	return 0;
+}
+
+/*!
  * \brief utility used by inchar(), for base_encode()
  */
 static int inbuf(struct baseio *bio, FILE *fi)
@@ -5966,34 +6062,32 @@ static int leave_voicemail(struct ast_channel *chan, char *ext, struct leave_vm_
 		}
 #else
 
- 		/* FIFO germanico */
-/*		if (count_messages(vmu, dir) >= vmu->maxmsg) {
-			ast_mutex_lock(&fifo_lock);
-			struct vm_state vmsfifo;
-			memset(&vmsfifo, 0, sizeof(vmsfifo));
-			// First message
-			res = open_mailbox(&vmsfifo, vmu, NEW_FOLDER);
-			if (res < 0)
-				goto fifo_out;
-			//vmsfifo.newmessages = vmsfifo.lastmsg + 1;
-			vmsfifo.curmsg = 0;
-			// Delete the current message
-			vmsfifo.deleted[vmsfifo.curmsg] = !vmsfifo.deleted[vmsfifo.curmsg];
-			close_mailbox(&vmsfifo, vmu);
-			fifo_out:
-			ast_mutex_unlock(&fifo_lock);
+		if (count_messages(vmu, dir) >= vmu->maxmsg - inprocess_count(vmu->mailbox, vmu->context, +1)) {
+			if (ast_test_flag(vmu, VM_OVERWRITEOLDEST)) {
+				if (vm_rotate_oldest_file(vmu, dir) == 0) {
+					ast_verb(3, "Voicemail %s@%s full — rotated oldest message to accept new arrival\n",
+						vmu->mailbox, vmu->context);
+				} else {
+					ast_log(AST_LOG_WARNING,
+						"Voicemail %s@%s full and rotate-oldest failed — falling back to reject\n",
+						vmu->mailbox, vmu->context);
+					res = ast_streamfile(chan, "vm-mailboxfull", chan->language);
+					if (!res)
+						res = ast_waitstream(chan, "");
+					pbx_builtin_setvar_helper(chan, "VMSTATUS", "FAILED");
+					inprocess_count(vmu->mailbox, vmu->context, -1);
+					goto leave_vm_out;
+				}
+			} else {
+				res = ast_streamfile(chan, "vm-mailboxfull", chan->language);
+				if (!res)
+					res = ast_waitstream(chan, "");
+				ast_log(AST_LOG_WARNING, "No more messages possible\n");
+				pbx_builtin_setvar_helper(chan, "VMSTATUS", "FAILED");
+				inprocess_count(vmu->mailbox, vmu->context, -1);
+				goto leave_vm_out;
+			}
 		}
-*/
-/*		if (count_messages(vmu, dir) >= vmu->maxmsg - inprocess_count(vmu->mailbox, vmu->context, +1)) {
-			res = ast_streamfile(chan, "vm-mailboxfull", chan->language);
-			if (!res)
-				res = ast_waitstream(chan, "");
-			ast_log(AST_LOG_WARNING, "No more messages possible\n");
-			pbx_builtin_setvar_helper(chan, "VMSTATUS", "FAILED");
-			inprocess_count(vmu->mailbox, vmu->context, -1);
-			goto leave_vm_out;
-		}
-*/
 #endif
 		snprintf(tmptxtfile, sizeof(tmptxtfile), "%s/XXXXXX", tmpdir);
 		txtdes = mkstemp(tmptxtfile);
@@ -12006,6 +12100,11 @@ static int actual_load_config(int reload, struct ast_config *cfg, struct ast_con
 		if (!(val = ast_variable_retrieve(cfg, "general", "searchcontexts")))
 			val = "no";
 		ast_set2_flag((&globalflags), ast_true(val), VM_SEARCH);
+
+		/* Default ON: see VM_OVERWRITEOLDEST. */
+		if (!(val = ast_variable_retrieve(cfg, "general", "overwriteoldest")))
+			val = "yes";
+		ast_set2_flag((&globalflags), ast_true(val), VM_OVERWRITEOLDEST);
 
 		volgain = 0.0;
 		if ((val = ast_variable_retrieve(cfg, "general", "volgain")))
