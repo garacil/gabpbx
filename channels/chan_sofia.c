@@ -4574,9 +4574,25 @@ static void sofia_peer_destructor(void *obj)
 	 * IN the destructor (peer refcount already 0); cleanup carries only nh.
 	 * If sofia_root is torn down (shutdown path), dispatch fails — leak the nh,
 	 * cleared on next gabpbx restart (operationally identical to T40 fallback). */
+	/* CRITICAL — detach hmagic before dispatching async destroy.  The
+	 * destructor may run on a thread other than sofia_thread (any path
+	 * that drops the last ao2 ref to the peer); the actual
+	 * nua_handle_destroy is dispatched into sofia_thread and runs LATER.
+	 * Between this destructor finishing (peer struct freed) and the
+	 * dispatched destroy executing, sofia-sip may deliver an inbound
+	 * event for the still-alive handle into sofia_event_callback — and
+	 * the callback would dereference nh->hmagic, which still points at
+	 * the now-freed peer struct.  nua_handle_bind(nh, NULL) is
+	 * synchronous and thread-safe (just updates a field in sofia-sip's
+	 * handle struct, no I/O); calling it BEFORE the dispatch detaches
+	 * the backpointer so any event arriving in the window reads hmagic
+	 * == NULL, which the existing `if (hmagic)` gates in
+	 * sofia_event_callback (chan_sofia.c:12463/:12502/:12557/:12855)
+	 * handle gracefully. */
 	if (peer->mwi_subscription_handle) {
 		nua_handle_t *nh = peer->mwi_subscription_handle;
 		peer->mwi_subscription_handle = NULL;
+		nua_handle_bind(nh, NULL);
 		if (sofia_dispatch_to_root_thread(mwi_handle_cleanup, nh) < 0) {
 			ast_log(LOG_NOTICE,
 				"Sofia MWI: peer %s destructor — sofia_thread dispatch failed; "
@@ -4596,10 +4612,15 @@ static void sofia_peer_destructor(void *obj)
 	 * sees NULLs and skips the dispatch.  These defensive branches catch
 	 * orphan paths where the peer ref drops without going through sweep
 	 * (e.g. realtime peer cache rebuild after `sip prune realtime peer
-	 * <name>` while a register/qualify is in flight). */
+	 * <name>` while a register/qualify is in flight).
+	 *
+	 * nua_handle_bind(nh, NULL) detaches the hmagic backpointer before
+	 * the async destroy is dispatched — see the comment on the MWI
+	 * handle above for the UAF rationale. */
 	if (peer->nh) {
 		nua_handle_t *nh = peer->nh;
 		peer->nh = NULL;
+		nua_handle_bind(nh, NULL);
 		if (sofia_dispatch_to_root_thread(sofia_nh_destroy_cleanup, nh) < 0) {
 			ast_log(LOG_NOTICE,
 				"Sofia: peer %s destructor — sofia_thread dispatch failed for "
@@ -4610,6 +4631,7 @@ static void sofia_peer_destructor(void *obj)
 	if (peer->qualify_nh) {
 		nua_handle_t *nh = peer->qualify_nh;
 		peer->qualify_nh = NULL;
+		nua_handle_bind(nh, NULL);
 		if (sofia_dispatch_to_root_thread(sofia_nh_destroy_cleanup, nh) < 0) {
 			ast_log(LOG_NOTICE,
 				"Sofia: peer %s destructor — sofia_thread dispatch failed for "
@@ -17076,18 +17098,27 @@ static int sofia_peer_sweep_cb(void *obj, void *arg, int flags)
 	 * sofia_thread (invoked by the reload worker which is itself
 	 * dispatched into sofia_thread), so nua_handle_destroy's same-
 	 * thread-as-create constraint is satisfied without needing a
-	 * dispatch.  Closing the handles before ao2_unlink also detaches
-	 * sofia-sip's hmagic backpointer to this peer struct, so no later
-	 * event can deliver into an event_callback that would dereference
-	 * a freed peer.  The destructor's defensive dispatch branches then
-	 * see NULL and skip. */
+	 * dispatch.
+	 *
+	 * nua_handle_bind(nh, NULL) before each destroy detaches sofia-sip's
+	 * hmagic backpointer to this peer struct.  Belt-and-braces against
+	 * UAF: even though sweep destroys synchronously on sofia_thread (so
+	 * sofia-sip cannot interleave another event for the same handle in
+	 * between), clearing hmagic first is the same idiom we use in the
+	 * destructor's async-dispatch path, and matches what nua_handle_
+	 * destroy does internally before tearing down the handle.  The
+	 * destructor's defensive dispatch branches then see NULL and skip. */
 	if (peer->nh) {
-		nua_handle_destroy(peer->nh);
+		nua_handle_t *nh = peer->nh;
 		peer->nh = NULL;
+		nua_handle_bind(nh, NULL);
+		nua_handle_destroy(nh);
 	}
 	if (peer->qualify_nh) {
-		nua_handle_destroy(peer->qualify_nh);
+		nua_handle_t *nh = peer->qualify_nh;
 		peer->qualify_nh = NULL;
+		nua_handle_bind(nh, NULL);
+		nua_handle_destroy(nh);
 	}
 	ast_log(LOG_NOTICE, "Sofia: peer '%s' removed by reload sweep "
 		"(no longer present in sofia.conf)\n", peer->name);
