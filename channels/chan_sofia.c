@@ -4385,6 +4385,25 @@ static void mwi_handle_cleanup(void *arg)
 	nua_handle_destroy(nh);
 }
 
+/* Generic deferred nua_handle_destroy — runs on sofia_thread.  Used by the
+ * peer destructor for peer->nh (outbound REGISTER) and peer->qualify_nh
+ * (OPTIONS qualify ping) when the destructor itself may run on a non-
+ * sofia_thread context (last ao2_ref drop can fire from any caller).
+ * Unlike mwi_handle_cleanup this does NOT emit a terminal NOTIFY first —
+ * REGISTER and OPTIONS handles do not carry a subscription dialog.
+ *
+ * The handle MUST already be detached from any owning struct (the caller
+ * NULLs peer->nh / peer->qualify_nh before dispatching) so sofia-sip
+ * cannot deliver events back to a freed peer via nh->hmagic. */
+static void sofia_nh_destroy_cleanup(void *arg)
+{
+	nua_handle_t *nh = arg;
+	if (!nh) {
+		return;
+	}
+	nua_handle_destroy(nh);
+}
+
 /* T55.5 (2026-04-27): AST_EVENT_MWI callback fired by gabpbx core when a
  * mailbox's voicemail state changes. Runs on event-bus thread (NOT
  * sofia_thread); per T40 same-thread-as-create contract, nua_notify must
@@ -4562,6 +4581,40 @@ static void sofia_peer_destructor(void *obj)
 			ast_log(LOG_NOTICE,
 				"Sofia MWI: peer %s destructor — sofia_thread dispatch failed; "
 				"leaking nh (cleared on next gabpbx restart)\n", peer->name);
+		}
+	}
+	/* Outbound REGISTER handle (peer->nh) and qualify OPTIONS handle
+	 * (peer->qualify_nh).  Same same-thread-as-create constraint as
+	 * mwi_subscription_handle: nua_handle_destroy MUST run on sofia_thread.
+	 * Without these cleanups a peer swept by the reload worker (or freed
+	 * by any other path that drops the last ao2 ref to a non-realtime
+	 * peer with an active outbound register / pending qualify) would
+	 * leak the sofia-sip nua_handle and its su_home arena.
+	 *
+	 * The normal sweep path (sofia_peer_sweep_cb) destroys these handles
+	 * synchronously before dropping the container ref so the destructor
+	 * sees NULLs and skips the dispatch.  These defensive branches catch
+	 * orphan paths where the peer ref drops without going through sweep
+	 * (e.g. realtime peer cache rebuild after `sip prune realtime peer
+	 * <name>` while a register/qualify is in flight). */
+	if (peer->nh) {
+		nua_handle_t *nh = peer->nh;
+		peer->nh = NULL;
+		if (sofia_dispatch_to_root_thread(sofia_nh_destroy_cleanup, nh) < 0) {
+			ast_log(LOG_NOTICE,
+				"Sofia: peer %s destructor — sofia_thread dispatch failed for "
+				"peer->nh; leaking handle (cleared on next gabpbx restart)\n",
+				peer->name);
+		}
+	}
+	if (peer->qualify_nh) {
+		nua_handle_t *nh = peer->qualify_nh;
+		peer->qualify_nh = NULL;
+		if (sofia_dispatch_to_root_thread(sofia_nh_destroy_cleanup, nh) < 0) {
+			ast_log(LOG_NOTICE,
+				"Sofia: peer %s destructor — sofia_thread dispatch failed for "
+				"peer->qualify_nh; leaking handle (cleared on next gabpbx "
+				"restart)\n", peer->name);
 		}
 	}
 	ast_string_field_free_memory(peer);
@@ -15546,6 +15599,23 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			ast_free_ha(peer->directmediaha);
 			peer->directmediaha = NULL;
 		}
+		/* Drain the mailbox list — sofia_peer_parse_mailboxes appends via
+		 * AST_LIST_INSERT_TAIL without checking for duplicates, so every
+		 * reload of a peer with mailbox= would otherwise accumulate
+		 * mailbox structs (each carrying an ast_event_subscribe handle).
+		 * Mirror the destructor's drain pattern (chan_sofia.c:4548-4553):
+		 * unsubscribe synchronously (waits for in-flight mwi_event_cb
+		 * before returning, closing the race against concurrent event-bus
+		 * delivery) then ast_free the struct. */
+		{
+			struct sofia_mailbox *mb;
+			while ((mb = AST_LIST_REMOVE_HEAD(&peer->mailboxes, list))) {
+				if (mb->event_sub) {
+					mb->event_sub = ast_event_unsubscribe(mb->event_sub);
+				}
+				ast_free(mb);
+			}
+		}
 		ast_string_field_set(peer, secret, "");
 		ast_string_field_set(peer, context, "");
 		ast_string_field_set(peer, host, "");
@@ -17000,6 +17070,24 @@ static int sofia_peer_sweep_cb(void *obj, void *arg, int flags)
 		ast_dnsmgr_release(peer->dnsmgr);
 		peer->dnsmgr = NULL;
 		ao2_ref(peer, -1);
+	}
+	/* Destroy the outbound REGISTER handle and the qualify OPTIONS
+	 * handle synchronously HERE — the sweep callback runs on
+	 * sofia_thread (invoked by the reload worker which is itself
+	 * dispatched into sofia_thread), so nua_handle_destroy's same-
+	 * thread-as-create constraint is satisfied without needing a
+	 * dispatch.  Closing the handles before ao2_unlink also detaches
+	 * sofia-sip's hmagic backpointer to this peer struct, so no later
+	 * event can deliver into an event_callback that would dereference
+	 * a freed peer.  The destructor's defensive dispatch branches then
+	 * see NULL and skip. */
+	if (peer->nh) {
+		nua_handle_destroy(peer->nh);
+		peer->nh = NULL;
+	}
+	if (peer->qualify_nh) {
+		nua_handle_destroy(peer->qualify_nh);
+		peer->qualify_nh = NULL;
 	}
 	ast_log(LOG_NOTICE, "Sofia: peer '%s' removed by reload sweep "
 		"(no longer present in sofia.conf)\n", peer->name);
