@@ -6247,6 +6247,31 @@ static int sofia_app_removeheader(struct ast_channel *chan, const char *data)
 	return 0;
 }
 
+/* Sanitize a string for use inside a SIP quoted display-name. Drops the two
+ * characters that terminate or escape a quoted-string (" and \) plus any control
+ * character (incl. CR/LF), so the resulting "name" <sip:...> token is always
+ * well-formed. A display name carrying one of these characters (e.g. inherited
+ * verbatim from a caller's From or a dialplan-set CallerID) would otherwise make
+ * the assembled From / Remote-Party-ID / P-Asserted-Identity unparseable, and
+ * sofia-sip then rejects the entire outbound request. The display name is
+ * cosmetic, so dropping the offending bytes is safe and cannot itself produce a
+ * malformed header. */
+static void sofia_quoted_name_sanitize(char *s)
+{
+	char *r, *w;
+	if (!s) {
+		return;
+	}
+	for (r = w = s; *r; r++) {
+		unsigned char c = (unsigned char)*r;
+		if (c == '"' || c == '\\' || c < 0x20 || c == 0x7f) {
+			continue;
+		}
+		*w++ = *r;
+	}
+	*w = '\0';
+}
+
 /* Build a concatenated "Name: value\r\nName2: value2\r\n..." string from the
  * channel's __SIPADDHEADER* vars. Returns 1 if any headers were added, 0 if none.
  * Caller passes a buffer (typically 2048+) and uses the result via SIPTAG_HEADER_STR. */
@@ -6267,7 +6292,20 @@ static int sofia_build_addheader_str(struct ast_channel *chan, char *out_buf, si
 		if (strncasecmp(name, "SIPADDHEADER", 12) != 0 || ast_strlen_zero(value)) {
 			continue;
 		}
-		int written = snprintf(out_buf + used, out_len - used, "%s\r\n", value);
+		/* A SIPAddHeader value must be exactly one header line. An embedded or
+		 * trailing CR/LF (a stray terminator, or a value copied verbatim from an
+		 * inbound header) would make the assembled SIPTAG_HEADER_STR unparseable,
+		 * and sofia-sip then rejects the ENTIRE INVITE (nua_client internal error,
+		 * zero packets sent). Emit only the first line; drop anything from the
+		 * first CR/LF onward. This also closes a header-injection vector. */
+		size_t vlen = strcspn(value, "\r\n");
+		if (vlen == 0) {
+			continue;
+		}
+		if (vlen < strlen(value) && sofia_debug) {
+			ast_log(LOG_NOTICE, "Sofia: stripped embedded CR/LF from SIPAddHeader value\n");
+		}
+		int written = snprintf(out_buf + used, out_len - used, "%.*s\r\n", (int)vlen, value);
 		if (written < 0 || (size_t)written >= out_len - used) {
 			break;
 		}
@@ -6625,6 +6663,18 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		/* post-T56 identity-headers parity SS3 (2026-04-27): outbound Diversion
 		 * header per RFC 5806 when channel redirecting chain present. */
 		sofia_add_diversion(pvt, diversion_buf, sizeof(diversion_buf));
+
+		/* Diagnostic: dump the header strings handed to nua_invite. A malformed
+		 * value in any of these makes sofia-sip reject the request at construction
+		 * (nua_client internal error) before a single packet leaves. Gated on
+		 * `sip set debug`. */
+		if (sofia_debug) {
+			ast_verbose("Sofia: outbound INVITE headers to '%s' from=[%s] contact=[%s] addhdr=[%s] rpid=[%s] diversion=[%s]\n",
+				pvt->peer ? pvt->peer->name : "(none)",
+				from_buf, contact_buf,
+				has_addheaders ? addheader_buf : "",
+				rpid_buf, diversion_buf);
+		}
 
 		/* post-T56 session timers (RFC 4028) (2026-04-27): single-contact outbound
 		 * NUTAG_* wire-in; helper computes per-peer + outbound values. */
@@ -7700,6 +7750,18 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 
 	/* T46.4: capture transport-source for ${SIPCHANINFO(peerip|recvip)} */
 	sofia_get_source_addr(sip, &pvt->last_src_addr);
+
+	/* Resolve our per-interface source IP for this inbound dialog. sofia_generate_sdp
+	 * and the Contact/From builders fall back to the bound socket address, which on a
+	 * box bound to a wildcard address (bindaddr=0.0.0.0) and reachable on more than one
+	 * interface yields 0.0.0.0 — so an inbound leg would advertise c=IN IP4 0.0.0.0 and
+	 * receive no RTP. Mirror chan_sip, which sets the dialog source address for every
+	 * dialog (inbound and outbound): kernel-route toward the signaling peer and adopt
+	 * the source address that actually reaches it. Outbound dialogs already do this in
+	 * sofia_request_call; this closes the inbound gap. */
+	if (!ast_sockaddr_isnull(&pvt->last_src_addr)) {
+		sofia_resolve_ourip(pvt, &pvt->last_src_addr);
+	}
 
 	/* T46.4: capture Request-URI for ${SIPCHANINFO(uri)} on inbound calls
 	 * (outbound path sets pvt->ruri at sofia_call time). */
@@ -10648,6 +10710,11 @@ static int sofia_resolve_identity(struct sofia_pvt *pvt, char **lid_num_out,
 
 	ast_uri_encode(lid_num_src, lid_num_buf, sizeof(lid_num_buf), 0);
 	ast_copy_string(lid_name_buf, lid_name_src, sizeof(lid_name_buf));
+	/* The display name is stamped verbatim inside a quoted-string by the From /
+	 * RPID / PAI builders; strip any character that would break that quoted-string
+	 * so a hostile or malformed caller name can never make the outbound request
+	 * unparseable. */
+	sofia_quoted_name_sanitize(lid_name_buf);
 
 	*lid_num_out = lid_num_buf;
 	*lid_name_out = lid_name_buf;
