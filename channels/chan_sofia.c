@@ -6872,8 +6872,24 @@ static int sofia_answer(struct ast_channel *ast)
 		 * when peer's INVITE carried Session-Expires + our mode != REFUSE. */
 		int st_seconds, st_min_se, st_refresher;
 		sofia_session_timer_values(pvt->peer, 0 /* inbound */, &st_seconds, &st_min_se, &st_refresher);
+		/* Stamp Contact from the per-leg kernel-routed source address
+		 * (pvt->ourip), exactly as the outbound INVITE does. On a box bound to a
+		 * wildcard address (bindaddr=0.0.0.0) that is reachable on more than one
+		 * interface (e.g. a LAN interface for phones plus a tunnel interface for
+		 * an upstream trunk), letting sofia-sip auto-generate the Contact picks
+		 * one interface address for every dialog; a leg whose peer is on the
+		 * other interface then receives a Contact it cannot route back to, so the
+		 * ACK and all in-dialog requests never reach us and the dialog never
+		 * completes even though media flowed. pvt->ourip is resolved toward the
+		 * signaling peer on the inbound INVITE path (sofia_process_invite), so the
+		 * Contact host:port is always the address that actually reaches this leg.
+		 * RFC 3261 §12.1.1 (UAS dialog Contact) / §8.1.1.8; mirrors chan_sip,
+		 * which sets the Contact from the dialog source address on every leg. */
+		char contact_buf[256];
+		sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
 		if (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf))) {
 			nua_respond(pvt->nh, SIP_200_OK,
+				SIPTAG_CONTACT_STR(contact_buf),
 				TAG_IF(st_seconds >= 0, NUTAG_SESSION_TIMER(st_seconds)),
 				TAG_IF(st_min_se > 0, NUTAG_MIN_SE(st_min_se)),
 				TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
@@ -6882,6 +6898,7 @@ static int sofia_answer(struct ast_channel *ast)
 				TAG_END());
 		} else {
 			nua_respond(pvt->nh, SIP_200_OK,
+				SIPTAG_CONTACT_STR(contact_buf),
 				TAG_IF(st_seconds >= 0, NUTAG_SESSION_TIMER(st_seconds)),
 				TAG_IF(st_min_se > 0, NUTAG_MIN_SE(st_min_se)),
 				TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
@@ -7045,7 +7062,15 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 
 	switch (condition) {
 	case AST_CONTROL_RINGING:
-		nua_respond(pvt->nh, SIP_180_RINGING, TAG_END());
+	{
+		/* Contact from the per-leg kernel-routed source address; see the note in
+		 * sofia_answer. The early dialog target must match the interface that
+		 * reaches this leg on a multihomed wildcard bind. */
+		char contact_buf[256];
+		sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
+		nua_respond(pvt->nh, SIP_180_RINGING,
+			SIPTAG_CONTACT_STR(contact_buf), TAG_END());
+	}
 		/* post-T56 progressinband per-peer + [general] tri-state parity (2026-04-28,
 		 * Option B partial wire-in): YES → return -1 to force core in-band audio
 		 * playback per chan_sip.c:7631 verbatim semantic. NEVER (default) + NO
@@ -7114,8 +7139,14 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 			 * PRACK is harmless and RFC-3262-correct. sofia_generate_sdp is the
 			 * same helper sofia_answer uses below. */
 			char sdp_buf[2048];
+			/* Contact from the per-leg kernel-routed source address; see the note
+			 * in sofia_answer. Keeps the early-dialog target on the interface that
+			 * reaches this leg on a multihomed wildcard bind. */
+			char contact_buf[256];
+			sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
 			if (pvt->rtp && sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf))) {
 				nua_respond(pvt->nh, SIP_183_SESSION_PROGRESS,
+					SIPTAG_CONTACT_STR(contact_buf),
 					SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 					SIPTAG_PAYLOAD_STR(sdp_buf),
 					TAG_END());
@@ -7124,7 +7155,8 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 				 * in practice: sofia_rtp_init runs in sofia_process_invite
 				 * (inbound) and sofia_request_call (outbound) before
 				 * AST_CONTROL_PROGRESS can reach the channel. */
-				nua_respond(pvt->nh, SIP_183_SESSION_PROGRESS, TAG_END());
+				nua_respond(pvt->nh, SIP_183_SESSION_PROGRESS,
+					SIPTAG_CONTACT_STR(contact_buf), TAG_END());
 			}
 		}
 		break;
