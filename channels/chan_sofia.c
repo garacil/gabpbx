@@ -67,6 +67,65 @@
 	<support_level>core</support_level>
  ***/
 
+/* =====================================================================
+ * chan_sofia LOCKING & CONCURRENCY INVARIANT  (authoritative reference —
+ * every inline "LOCK ORDER" note in this file is an instance of the rules
+ * below; cite this block, do not re-derive the model ad hoc)
+ * =====================================================================
+ *
+ * THREAD MODEL.  A SINGLE sofia_thread (the sofia-sip su_root event loop)
+ * runs ALL SIP signaling: every nua_* callback (sofia_event_callback and the
+ * sofia_process_* handlers) AND config reload (a "sip reload" is dispatched
+ * onto sofia_thread via sofia_dispatch_to_root_thread).  So sofia_thread
+ * OWNS all mutable peer/dialog signaling state; two code paths that BOTH run
+ * on sofia_thread are mutually serialized for free.  Everyone else only
+ * READS that state and must do so under a lock:
+ *   - the channel/PBX/bridge thread (tech callbacks: sofia_call/_answer/
+ *     _hangup/_indicate/_fixup/_write/_read, sofia_get/set_rtp_peer),
+ *   - the dialplan thread           (func_sofia_sippeer / sipchaninfo, ...),
+ *   - CLI / AMI threads,
+ *   - the ast_sched scheduler thread (timer cbs: t38 abort, defer-bye, ...),
+ *   - the registration/qualify aux threads (sofia_reg_thread, sofia_qualify_tid),
+ *   - dnsmgr.
+ * RACE DISCRIMINATOR: a data race exists only if at least one party runs OFF
+ * sofia_thread.  State the thread of each party when reasoning about a lock.
+ *
+ * LOCK ORDER (HARD, never invert):
+ *     channel-lock  ->  pvt->lock  ->  peer-family  ->  fork->lock
+ * peer-family = ao2_lock(peer) and the dedicated peer->lock (an ast_mutex_t
+ * struct field, DISTINCT from ao2_lock(peer)).  ast_channel locks and the
+ * ast_mutex_t locks (pvt->lock, peer->lock) are RECURSIVE, so a thread
+ * re-entering its own held lock is safe.  The reload writer
+ * (sofia_parse_peer_config) holds peer->lock as a LEAF — it never takes a
+ * channel or pvt lock under it — so widening a reader's hold of peer->lock
+ * cannot invert against it.
+ *
+ * GLOBAL config lists are not per-object-lockable, so they have dedicated
+ * rwlocks (both leaves): sofia_localha_lock guards sofia_cfg.localha (read by
+ * the channel-thread SDP build), sofia_contactha_lock guards
+ * sofia_cfg.contact_ha (read off-thread on the realtime peer build).
+ *
+ * THE SNAPSHOT IDIOM (mandatory by default for any FREEABLE peer/owner data
+ * touched off sofia_thread):
+ *   - stringfields/lists: take peer->lock, ast_copy_string into a local
+ *     (peer stringfields are UNBOUNDED -> size >= 256) or deep-copy a list,
+ *     release, then use the local.  ast_string_field_set frees the old pool
+ *     on growth, so a lock-free off-thread read is a use-after-free.
+ *   - owner/channel: ref owner under pvt->lock, drop pvt->lock,
+ *     ast_channel_lock(owner), re-lock pvt->lock, REVALIDATE pvt->owner==owner
+ *     (masquerade/hangup window), unref on every path  (sip_pvt_lock_full).
+ *   - NEVER hold pvt->lock or peer->lock across a channel-locking or blocking
+ *     call (nua_*, su_*, DNS, ast_moh_start, pbx_builtin_setvar_helper,
+ *     ast_cli, ast_request).  Snapshot first, release, then call.
+ *
+ * DIALOG TEARDOWN RACE.  An in-dialog nua_i_* or nua_r_* event carries the
+ * dialog pvt as hmagic, but sofia_hangup (channel thread) can free that pvt
+ * concurrently.  sofia_event_callback re-validates the hmagic against the
+ * dialogs container and pins a +1 ref for the whole dispatch
+ * (sofia_pvt_ref_if_linked, dropped once at function exit) for every such
+ * event; per-handler `if (pvt)` guards and op->owner snapshots cover the rest.
+ * ===================================================================== */
+
 #include "gabpbx.h"
 
 #include <stdio.h>
