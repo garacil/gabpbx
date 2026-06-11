@@ -526,7 +526,7 @@ static struct {
 	/* post-T56 ignoreregexpire [general] parity (2026-04-28): when set, expired
 	 * SIP registrations are NOT removed from peer->contacts — preserves last-known
 	 * contact across short upstream-trunk outages (e.g., stable PSTN gateway with
-	 * intermittent network drops; SoftX3000-style scenarios). chan_sip parity at
+	 * intermittent network drops; carrier-softswitch-style scenarios). chan_sip parity at
 	 * chan_sip.c:29594-29595 verbatim [general] parser ast_true + L14625-14637
 	 * destroy_association cleanup-skip-when-set + L29197-29204 realtime peer-load
 	 * expired-contact-preserve-when-set. chan_sip default = implicit sip_cfg
@@ -1004,7 +1004,7 @@ static struct {
 	 * automatically once tag set on nua handle; chan_sofia helper-architecture-
 	 * advantage 13th-instance: single emit-site vs chan_sip 5-site add_header
 	 * duplication 11132/11307/12986/14331/+others). REAL OPERATOR DRIVER:
-	 * production sofia.conf useragent=Huawei SoftX3000 V300R011 silently-ignored
+	 * production sofia.conf useragent=a carrier softswitch silently-ignored
 	 * prior to this commit; finally honored on next reload. */
 	char useragent[AST_MAX_EXTENSION];
 		int default_qualify;
@@ -1290,7 +1290,7 @@ struct sofia_peer {
 		AST_STRING_FIELD(mohsuggest);		/* post-T56 MOH per-peer parity (2026-04-27): suggested MOH class propagated to bridged channel when this peer puts us on hold (R5 INBOUND-direction: ast_queue_control_data data param at sofia_process_reinvite); OUTBOUND-direction Alert-Info signaling deferred to outbound-HOLD-re-INVITE feature task */
 		AST_STRING_FIELD(language);		/* post-T56 language per-peer parity (2026-04-27): per-peer audio language locale propagated to ast_channel.language at sofia_new for prompts/sounds in peer's preferred locale. chan_sip parity sip.h peer.language AST_STRING_FIELD + chan_sip.c:28865-28866 verbatim parser + L28447 inheritance from default_language. Bounded to channel.h:138 MAX_LANGUAGE=40 at consumption (ast_channel.language is also AST_STRING_FIELD per channel.h:776). Empty = inherit sofia_cfg.default_language or gabpbx-core default. */
 		AST_STRING_FIELD(parkinglot);	/* post-T56 parkinglot per-peer parity (2026-04-28): per-peer parking-lot routing field propagated to ast_channel.parkinglot at sofia_new for Park()/transfer routing. chan_sip parity sip.h:1212 peer.parkinglot AST_STRING_FIELD + chan_sip.c:28890-28891 verbatim parser + L8577 inheritance from default_parkinglot + L5961-5962 + L17046-17047 dialog inheritance + L7943-7944 channel propagation. Empty = inherit sofia_cfg.default_parkinglot. Pattern 12 16th-instance behavior-change-from-chan_sofia-baseline-disclosure: chan_sip default_parkinglot = "default" per features.h:37 DEFAULT_PARKINGLOT (string non-empty). */
-		AST_STRING_FIELD(lockuseragent_prefixes);	/* per-peer comma-separated User-Agent prefix allowlist (2026-05-17): when lockuseragent=yes AND this list is non-empty, an inbound REGISTER passes when its User-Agent: header starts (case-insensitive) with ANY listed prefix; first-REGISTER auto-capture into locked_user_agent is bypassed. Empty value preserves the original strict capture-on-first-REGISTER semantics verbatim. Targets the multi-device-per-peer use case (desk phone + softphone) and vendor-family allowlists (any Yealink, any Grandstream). */
+		AST_STRING_FIELD(lockuseragent_prefixes);	/* per-peer comma-separated User-Agent prefix allowlist (2026-05-17): when lockuseragent=yes AND this list is non-empty, an inbound REGISTER passes when its User-Agent: header starts (case-insensitive) with ANY listed prefix; first-REGISTER auto-capture into locked_user_agent is bypassed. Empty value preserves the original strict capture-on-first-REGISTER semantics verbatim. Targets the multi-device-per-peer use case (desk phone + softphone) and vendor-family allowlists (by useragent vendor family). */
 	);
 	int type;
 	int port;
@@ -1323,10 +1323,10 @@ struct sofia_peer {
 	/* post-T56 buggymwi per-peer parity (2026-04-27): chan_sip parity sip.h:338
 	 * SIP_PAGE2_BUGGY_MWI flag bit (1<<22) "Buggy CISCO MWI fix". When set, the
 	 * Voice-Message: NOTIFY body line OMITS the trailing " (0/0)" suffix per
-	 * chan_sip.c:13800-13802 verbatim comment "Cisco has a bug in the SIP stack
+	 * chan_sip.c:13800-13802 verbatim comment "some endpoints have a bug in the SIP stack
 	 * where it can't accept the (0/0) notification. This can temporarily be
 	 * disabled in sip.conf with the 'buggymwi' option". Per-peer-only flag
-	 * (no [general] default — operators set per-Cisco-peer); default 0 (FALSE)
+	 * (no [general] default — operators set per-affected-peer); default 0 (FALSE)
 	 * = chan_sip drop-in standard RFC 3842 behavior. Consumed at
 	 * transmit_mwi_notify_for_peer Voice-Message body emission. */
 	int buggymwi;
@@ -1973,7 +1973,7 @@ static void sofia_uri_user_from_contact(const char *uri, const char *fallback,
  * disable sofia-sip's auto-ACK and the nua_r_invite 200-OK handler to emit
  * a manual ACK with NUTAG_PROXY override — without this, sofia-sip routes
  * the 2xx-ACK to the dialog's remote_target (= Contact URI from the 200 OK),
- * which for NAT'd phones (e.g. Yealink behind home router) carries the
+ * which for NAT'd phones (e.g. a phone behind a home router) carries the
  * unroutable private LAN IP and the ACK never arrives, leaving the phone
  * to retransmit 200 OK forever and the call to die silently. peer->src_addr
  * holds the registered public source (set on REGISTER for dynamic peers,
@@ -5001,7 +5001,7 @@ static struct sofia_peer *sofia_peer_alloc(const char *name)
 	 * SIP_PAGE2_ALLOWSUBSCRIBE default TRUE (sip.h:478). */
 	peer->allowsubscribe = sofia_cfg.default_allowsubscribe;
 	/* post-T56 buggymwi per-peer parity (2026-04-27): default 0 (FALSE) — chan_sip
-	 * per-peer-only flag with no [general] default. Operators with Cisco-buggy phones
+	 * per-peer-only flag with no [general] default. Operators with buggy-stack phones
 	 * explicitly set buggymwi=yes; standard RFC 3842 phones use the (0/0) suffix. */
 	peer->buggymwi = 0;
 	/* post-T56 lockuseragent per-peer parity (2026-04-27): default 0 (FALSE) — chan_sip
@@ -5744,7 +5744,7 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 		} else if (!strcasecmp(v->name, "buggymwi")) {
 			/* post-T56 buggymwi per-peer parity (2026-04-27): chan_sip parity at
 			 * chan_sip.c:28225-28227 verbatim ast_set2_flag SIP_PAGE2_BUGGY_MWI →
-			 * chan_sofia int field. Cisco-buggy-stack MWI workaround — gates the
+			 * chan_sofia int field. buggy-stack MWI workaround — gates the
 			 * Voice-Message " (0/0)" suffix at transmit_mwi_notify_for_peer. */
 			peer->buggymwi = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "lockuseragent")) {
@@ -5993,7 +5993,7 @@ static struct sofia_peer *sofia_find_peer(const char *name)
 /* chan_sip parity: IP-based fallback peer match.
  * Used by sofia_process_invite after the From-username lookup fails — typical
  * for trunk gateways whose From-user is the caller-ID number, not the peer
- * name (e.g. Huawei SoftX3000 sending From: <sip:CALLERID@…> while the peer
+ * name (e.g. a carrier softswitch sending From: <sip:CALLERID@…> while the peer
  * is configured as [trunkX] host=<carrier-ip>). Matches peer->src_addr
  * (set both by dnsmgr for static host=<ip> peers and by REGISTER for dynamic
  * peers) or, if that is unset, peer->defaddr. Port is ignored on purpose so
@@ -7736,7 +7736,7 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 			/* NAT in-dialog routing override (chan_sip parity): when peer is
 			 * behind NAT (force_rport / comedia), sofia-sip's auto-generated
 			 * ACK and BYE would honor the 200 OK Contact URI which usually
-			 * carries the peer's LAN IP (e.g. Yealink advertising 192.168.x.x
+			 * carries the peer's LAN IP (e.g. a phone advertising 192.168.x.x
 			 * even when registered from a public address). NUTAG_PROXY pins all
 			 * outgoing dialog messages to peer->src_addr — the registered/
 			 * resolved public address — so ACK reaches the phone, suppressing
@@ -8164,7 +8164,7 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			 * whose From-user is the caller-ID number not the peer-name) get
 			 * identified. Without this fallback unknown-peer + alwaysauthreject
 			 * below emits a 401 the trunk cannot answer, breaking inbound
-			 * calls from gateways like Huawei SoftX3000. */
+			 * calls from gateways like a carrier softswitch. */
 			struct ast_sockaddr src;
 			sofia_get_source_addr(sip, &src);
 			caller_peer = sofia_find_peer_by_ip(&src);
@@ -11959,7 +11959,7 @@ static void transmit_mwi_notify_for_peer(struct sofia_peer *peer)
 	ast_str_append(&body, 0, "Message-Account: sip:%s@%s\r\n",
 		vmexten, fromdomain);
 	/* post-T56 buggymwi per-peer parity (2026-04-27): chan_sip parity at
-	 * chan_sip.c:13800-13804 verbatim — Cisco SIP stack rejects Voice-Message
+	 * chan_sip.c:13800-13804 verbatim — buggy SIP stack rejects Voice-Message
 	 * lines containing the "(0/0)" tally suffix. Per-peer buggymwi=yes omits
 	 * the suffix as a workaround. Default behavior (suffix included) preserves
 	 * RFC 3842-compliant phones unchanged. */
@@ -13866,7 +13866,7 @@ static void *sofia_thread_func(void *data)
 			 * advantage 13th-instance: single emit-site vs chan_sip 5-site
 			 * add_header duplication (chan_sip.c:11132 response Server +
 			 * L11307+12986+14331 outbound User-Agent + others). REAL OPERATOR
-			 * DRIVER: production useragent=Huawei SoftX3000 V300R011 finally honored
+			 * DRIVER: production useragent=a carrier softswitch finally honored
 			 * on next reload. Empty-string default-init guard via TAG_IF skips
 			 * tag (sofia-sip falls back to library default). */
 			TAG_IF(!ast_strlen_zero(sofia_cfg.useragent),
@@ -18548,7 +18548,7 @@ static int manager_sofia_show_peer(struct mansession *s, const struct message *m
 	ast_str_append(&buf, 0, "AllowSubscribe: %s\r\n", peer->allowsubscribe ? "yes" : "no");
 	/* post-T56 buggymwi per-peer parity (2026-04-27): chan_sip parity field
 	 * (chan_sip flag SIP_PAGE2_BUGGY_MWI → operator-visible yes/no for verifying
-	 * Cisco-buggy-stack workaround applied per-peer). */
+	 * buggy-stack workaround applied per-peer). */
 	ast_str_append(&buf, 0, "BuggyMWI: %s\r\n", peer->buggymwi ? "yes" : "no");
 	/* post-T56 lockuseragent per-peer parity (2026-04-27): chan_sip parity Lockuseragent
 	 * field (yes/no) + chan_sofia surpass LockedUserAgent display field (current
