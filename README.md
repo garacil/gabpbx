@@ -13,6 +13,52 @@ carrier-grade PBX deployments.
 Existing Asterisk, Digium, third-party copyright notices and GPL licensing
 terms are preserved in the source files where they apply.
 
+## GABPBX 1.0 — a modern, hardened SIP driver you can drop in today
+
+GABPBX 1.0 is the first tagged release, and it has one headline: **`chan_sofia`
+is ready for production.**
+
+If you run Asterisk-style SIP today, `chan_sofia` is the upgrade path that
+does not ask you to rewrite anything. It keeps the public `SIP` channel
+technology, the `sip show ...` CLI, the `SIPpeers` / `SIPshowpeer` AMI
+surface, the `sippeers` realtime family and the `SIPPEER` / `SIP_HEADER`
+dialplan functions. In most deployments the migration is a single line:
+
+```ini
+noload => chan_sip.so
+load   => chan_sofia.so
+```
+
+Your dialplans, realtime schemas and AMI integrations keep working — now on a
+modern, maintained Sofia-SIP stack instead of the aging `chan_sip`.
+
+**Why 1.0, and why now.** The 1.0 effort was a deep correctness and
+concurrency pass over the SIP signalling and configuration-reload paths, so
+the driver stays up under real load:
+
+- **One clear locking model, written down.** A single authoritative block at
+  the top of `channels/chan_sofia.c` states the rule the whole driver
+  follows: one SIP event-loop thread owns the mutable peer and dialog state,
+  and everything else reads it under the `channel -> pvt -> peer` lock order.
+- **No dialog use-after-free.** Every in-dialog request and response
+  (re-INVITE, REFER, INFO, ACK, MESSAGE, BYE, CANCEL) is revalidated and
+  reference-counted against a concurrent hangup.
+- **`sip reload` is safe under traffic.** Peer fields and the global localnet
+  and contact ACL lists are read under locks, so reloading configuration
+  while calls are active never trips over half-rebuilt state.
+- **Lock order and lifetimes audited end to end** — T.38 timeouts, transfers,
+  multi-contact forking, and bridged-channel and SIP-handle teardown.
+
+These paths were hammered with a SIP call flood and a `sip reload` loop
+running at the same time, under a thread-debug build, with no crash, deadlock
+or memory error. The full story is in the
+[chan_sofia wiki page][wiki-chan-sofia] and the [CHANGELOG](CHANGELOG.md).
+
+**Get started** with the [Build Requirements](#build-requirements) and the
+[Minimal chan_sofia Peer Example](#minimal-chan_sofia-peer-example) below.
+
+[wiki-chan-sofia]: https://github.com/garacil/gabpbx/wiki/Chan-Sofia
+
 ## What GABPBX Provides
 
 GABPBX is a complete PBX platform for VoIP and traditional telephony. It
