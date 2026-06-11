@@ -7604,6 +7604,9 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 		nua_handle_t *nh, sip_t const *sip)
 {
 	char sdp_buf[2048];
+	struct ast_channel *owner = NULL;
+	char own_name[80] = "";
+	char own_uniqueid[150] = "";
 	int old_hold;
 	int new_hold;
 	int trans;
@@ -7641,11 +7644,38 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	if (trans && pvt->peer && sofia_cfg.notifyhold) {
 		ast_atomic_fetchadd_int(&pvt->peer->onHold, new_hold ? +1 : -1);
 	}
+	/* Re-acquire in canonical channel->pvt order (mirrors chan_sip
+	 * sip_pvt_lock_full): ref owner, drop pvt lock, lock the channel, relock pvt,
+	 * revalidate identity. With the channel lock held first, sofia_parse_sdp's
+	 * set_format channel lock (and the HOLD/UNHOLD queue below) becomes a
+	 * recursive re-entry rather than an out-of-order acquire that would deadlock
+	 * against ast_hangup. The owner may be swapped by a masquerade or cleared by
+	 * a concurrent hangup during the window, hence the revalidation. */
+	for (;;) {
+		owner = pvt->owner;
+		if (!owner) {
+			break;
+		}
+		ast_channel_ref(owner);
+		ast_mutex_unlock(&pvt->lock);
+		ast_channel_lock(owner);
+		ast_mutex_lock(&pvt->lock);
+		if (pvt->owner == owner) {
+			break;
+		}
+		ast_channel_unlock(owner);
+		ast_channel_unref(owner);
+		owner = NULL;
+	}
 	if (sip && sip->sip_payload && sip->sip_payload->pl_data) {
 		if (sofia_parse_sdp(pvt, sip) < 0) {
 			/* T37: in-dialog re-INVITE encryption downgrade — reject 488,
 			 * leave existing crypto context + call up (RFC 3261 §14). */
 			ast_mutex_unlock(&pvt->lock);
+			if (owner) {
+				ast_channel_unlock(owner);
+				ast_channel_unref(owner);
+			}
 			ast_log(LOG_NOTICE, "Sofia: in-dialog re-INVITE rejected — encryption mismatch on '%s'\n",
 				pvt->callid ? pvt->callid : "(no-callid)");
 			nua_respond(nh, SIP_488_NOT_ACCEPTABLE,
@@ -7653,7 +7683,7 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 			return;
 		}
 	}
-	if (trans && pvt->owner) {
+	if (trans && owner) {
 		if (new_hold) {
 			/* post-T56 MOH per-peer parity R5 INBOUND (2026-04-27): peer puts
 			 * us on hold via re-INVITE sendonly; propagate peer->mohsuggest as
@@ -7664,15 +7694,23 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 			 * does NOT issue outbound HOLD re-INVITE today). */
 			const char *suggest = (pvt->peer && !ast_strlen_zero(pvt->peer->mohsuggest))
 				? pvt->peer->mohsuggest : NULL;
-			ast_queue_control_data(pvt->owner, AST_CONTROL_HOLD,
+			ast_queue_control_data(owner, AST_CONTROL_HOLD,
 				S_OR(suggest, NULL),
 				suggest ? strlen(suggest) + 1 : 0);
 		} else {
-			ast_queue_control(pvt->owner, AST_CONTROL_UNHOLD);
+			ast_queue_control(owner, AST_CONTROL_UNHOLD);
 		}
 	}
 	sdp_ok = (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf)) != NULL);
 	ast_mutex_unlock(&pvt->lock);
+	if (owner) {
+		/* Snapshot the channel identity under the channel lock so the AMI events
+		 * below cannot race a concurrent rename freeing the stringfield pool
+		 * after the lock is dropped. */
+		ast_copy_string(own_name, owner->name, sizeof(own_name));
+		ast_copy_string(own_uniqueid, owner->uniqueid, sizeof(own_uniqueid));
+		ast_channel_unlock(owner);
+	}
 
 	if (sdp_ok) {
 		/* A re-INVITE 200 OK is a target-refresh response (RFC 3261 §12.2.1.2):
@@ -7698,14 +7736,14 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	if (trans) {
 		ast_verbose("Sofia: in-dialog re-INVITE on '%s' - hold=%d\n",
 			pvt->callid ? pvt->callid : "(no-callid)", new_hold);
-		if (pvt->owner) {
+		if (owner) {
 			manager_event(EVENT_FLAG_CALL, "Hold",
 				"Status: %s\r\n"
 				"Channel: %s\r\n"
 				"Uniqueid: %s\r\n",
 				new_hold ? "On" : "Off",
-				pvt->owner->name,
-				pvt->owner->uniqueid);
+				own_name,
+				own_uniqueid);
 		}
 	}
 
@@ -7724,11 +7762,15 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 			"SessionExpires: %d\r\n"
 			"Refresher: %s\r\n"
 			"Direction: uas\r\n",
-			pvt->owner ? pvt->owner->name : "",
-			pvt->owner ? pvt->owner->uniqueid : "",
+			own_name,
+			own_uniqueid,
 			pvt->peername,
 			st_refresh_seconds,
 			st_refresher_str ? st_refresher_str : "auto");
+	}
+
+	if (owner) {
+		ast_channel_unref(owner);
 	}
 }
 
@@ -12907,7 +12949,32 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			 * bridge thread (sofia_set_rtp_peer); guard with pvt->lock. */
 			int rejected = (status >= 300);
 			int has_sdp = (!rejected && sip && sip->sip_payload && sip->sip_payload->pl_data);
+			struct ast_channel *owner = NULL;
 			ast_mutex_lock(&pvt->lock);
+			/* Re-acquire in canonical channel->pvt order (mirrors chan_sip
+			 * sip_pvt_lock_full): ref owner, drop pvt lock, lock the channel,
+			 * relock pvt, revalidate identity. With the channel lock held first,
+			 * sofia_parse_sdp's set_format channel lock becomes a recursive
+			 * re-entry rather than an out-of-order acquire that would deadlock
+			 * against ast_hangup. The owner may be swapped by a masquerade or
+			 * cleared by a concurrent hangup during the window, hence the
+			 * revalidation. */
+			for (;;) {
+				owner = pvt->owner;
+				if (!owner) {
+					break;
+				}
+				ast_channel_ref(owner);
+				ast_mutex_unlock(&pvt->lock);
+				ast_channel_lock(owner);
+				ast_mutex_lock(&pvt->lock);
+				if (pvt->owner == owner) {
+					break;
+				}
+				ast_channel_unlock(owner);
+				ast_channel_unref(owner);
+				owner = NULL;
+			}
 			pvt->reinvite_pending = 0;
 			if (rejected) {
 				/* Peer refused (488 Not Acceptable etc); revert to PBX relay. */
@@ -12917,6 +12984,10 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				sofia_parse_sdp(pvt, sip);
 			}
 			ast_mutex_unlock(&pvt->lock);
+			if (owner) {
+				ast_channel_unlock(owner);
+				ast_channel_unref(owner);
+			}
 			if (rejected) {
 				ast_log(LOG_NOTICE, "Sofia: directmedia re-INVITE rejected on '%s' (%d %s) — staying in relay mode\n",
 					pvt->callid ? pvt->callid : "(no-callid)", status, phrase ? phrase : "");
