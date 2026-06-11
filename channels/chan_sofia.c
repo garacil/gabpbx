@@ -91,14 +91,17 @@
  * sofia_thread.  State the thread of each party when reasoning about a lock.
  *
  * LOCK ORDER (HARD, never invert):
- *     channel-lock  ->  pvt->lock  ->  peer-family  ->  fork->lock
- * peer-family = ao2_lock(peer) and the dedicated peer->lock (an ast_mutex_t
- * struct field, DISTINCT from ao2_lock(peer)).  ast_channel locks and the
- * ast_mutex_t locks (pvt->lock, peer->lock) are RECURSIVE, so a thread
- * re-entering its own held lock is safe.  The reload writer
- * (sofia_parse_peer_config) holds peer->lock as a LEAF — it never takes a
- * channel or pvt lock under it — so widening a reader's hold of peer->lock
- * cannot invert against it.
+ *     channel-lock  ->  pvt->lock  ->  peer-family (ao2_lock(peer) / peer->lock)
+ * peer->lock is a dedicated ast_mutex_t struct field, DISTINCT from
+ * ao2_lock(peer).  ast_channel locks and the ast_mutex_t locks (pvt->lock,
+ * peer->lock) are RECURSIVE, so a thread re-entering its own held lock is
+ * safe.  The reload writer (sofia_parse_peer_config) holds peer->lock as a
+ * LEAF — it never takes a channel or pvt lock under it — so widening a
+ * reader's hold of peer->lock cannot invert against it.
+ *   fork->lock (sofia_fork coordination: winner/children/count/state) is a
+ *   SEPARATE sub-lock taken UNDER pvt->lock — the master->lock -> fork->lock
+ *   order sofia_hangup uses — and is NEVER co-held with peer-family (verified:
+ *   no path holds both), so it is not ordered against peer->lock.
  *
  * GLOBAL config lists are not per-object-lockable, so they have dedicated
  * rwlocks (both leaves): sofia_localha_lock guards sofia_cfg.localha (read by
