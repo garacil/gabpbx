@@ -4373,7 +4373,7 @@ static int sofia_get_rpid(struct sofia_pvt *pvt, sip_t const *sip);
  * name (T55.4 + SS4 precedent). Wired at 3 sites: sofia_process_invite,
  * sofia_process_refer, nua_r_invite status==200 — covers chan_sip's 5 sites
  * (chan_sofia collapses sites because no separate cancel-path parser). */
-static int sofia_change_redirecting_info(struct sofia_pvt *pvt, sip_t const *sip);
+static int sofia_change_redirecting_info(struct sofia_pvt *pvt, struct ast_channel *owner, sip_t const *sip);
 
 /* T55.5 (2026-04-27): MWI re-NOTIFY cross-thread dispatch carrier.
  * mwi_event_cb fires on event-bus thread (NOT sofia_thread); we cannot
@@ -8194,7 +8194,7 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	 * chan_sip.c:20793-20850. Always evaluated; no trust-gating. Must run
 	 * AFTER pvt->owner = chan binding so dialplan vars + redirecting struct
 	 * land on the inbound channel. */
-	sofia_change_redirecting_info(pvt, sip);
+	sofia_change_redirecting_info(pvt, pvt->owner, sip);
 
 	ao2_link(dialogs, pvt);
 
@@ -11265,7 +11265,7 @@ static int sofia_get_rpid(struct sofia_pvt *pvt, sip_t const *sip)
  *
  * On entry: pvt->owner expected non-NULL (caller checks).
  * Returns: 1 on update applied, 0 on no-Diversion-header. */
-static int sofia_change_redirecting_info(struct sofia_pvt *pvt, sip_t const *sip)
+static int sofia_change_redirecting_info(struct sofia_pvt *pvt, struct ast_channel *owner, sip_t const *sip)
 {
 	sip_unknown_t const *u;
 	const char *div_value = NULL;
@@ -11280,7 +11280,7 @@ static int sofia_change_redirecting_info(struct sofia_pvt *pvt, sip_t const *sip
 	char *reason_str = NULL;
 	int reason = AST_REDIRECTING_REASON_UNCONDITIONAL;
 
-	if (!pvt || !pvt->owner || !sip) {
+	if (!pvt || !owner || !sip) {
 		return 0;
 	}
 
@@ -11363,23 +11363,23 @@ static int sofia_change_redirecting_info(struct sofia_pvt *pvt, sip_t const *sip
 	/* Apply to pvt->owner->redirecting (chan_sip L20826-20838 parity).
 	 * ast_free of existing strs BEFORE ast_strdup — prevents leak. */
 	if (!ast_strlen_zero(redir_num)) {
-		ast_free(pvt->owner->redirecting.from.number.str);
-		pvt->owner->redirecting.from.number.str = ast_strdup(redir_num);
-		pvt->owner->redirecting.from.number.valid = 1;
+		ast_free(owner->redirecting.from.number.str);
+		owner->redirecting.from.number.str = ast_strdup(redir_num);
+		owner->redirecting.from.number.valid = 1;
 	}
 	if (!ast_strlen_zero(redir_name)) {
-		ast_free(pvt->owner->redirecting.from.name.str);
-		pvt->owner->redirecting.from.name.str = ast_strdup(redir_name);
-		pvt->owner->redirecting.from.name.valid = 1;
+		ast_free(owner->redirecting.from.name.str);
+		owner->redirecting.from.name.str = ast_strdup(redir_name);
+		owner->redirecting.from.name.valid = 1;
 	}
-	pvt->owner->redirecting.reason = reason;
+	owner->redirecting.reason = reason;
 
 	/* Dialplan variables for chan_sip parity (chan_sip L16296-16306). */
 	if (!ast_strlen_zero(reason_str)) {
-		pbx_builtin_setvar_helper(pvt->owner, "__SIPREDIRECTREASON", reason_str);
+		pbx_builtin_setvar_helper(owner, "__SIPREDIRECTREASON", reason_str);
 	}
 	if (!ast_strlen_zero(domain)) {
-		pbx_builtin_setvar_helper(pvt->owner, "__SIPRDNISDOMAIN", domain);
+		pbx_builtin_setvar_helper(owner, "__SIPRDNISDOMAIN", domain);
 	}
 
 	return 1;
@@ -12309,7 +12309,7 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 	/* post-T56 identity-headers parity SS5 (2026-04-27): REFER may carry
 	 * Diversion header for transfer-source attribution. Update redirecting
 	 * chain before transfer dispatch so child Dial inherits the chain. */
-	sofia_change_redirecting_info(op, sip);
+	sofia_change_redirecting_info(op, op->owner, sip);
 
 	if (is_attended) {
 		int attended_res;
@@ -12815,9 +12815,23 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		 * dialog-state. R13.b SessionTimerRefresh AMI fires only on REFRESH
 		 * (dialog already UP at response-arrival time). */
 		if (pvt && status == 200 && sip && sip->sip_session_expires) {
-			int already_up = (pvt->state == SOFIA_DIALOG_STATE_UP);
+			int already_up;
+			char own_name[80];
+			char own_uniqueid[150];
+			own_name[0] = '\0';
+			own_uniqueid[0] = '\0';
+			/* Snapshot owner name/uniqueid and the scalar state read under a
+			 * short pvt->lock, then emit the AMI event after the unlock so the
+			 * blocking manager_event never runs while the lock is held. */
+			ast_mutex_lock(&pvt->lock);
+			already_up = (pvt->state == SOFIA_DIALOG_STATE_UP);
 			pvt->session_negotiated_expires = sip->sip_session_expires->x_delta;
 			pvt->session_last_refresh_at = time(NULL);
+			if (pvt->owner) {
+				ast_copy_string(own_name, pvt->owner->name, sizeof(own_name));
+				ast_copy_string(own_uniqueid, pvt->owner->uniqueid, sizeof(own_uniqueid));
+			}
+			ast_mutex_unlock(&pvt->lock);
 			if (already_up) {
 				/* R13.b uac-refresh AMI emit; chan_sofia surpass — chan_sip emits no equivalent. */
 				manager_event(EVENT_FLAG_CALL, "SessionTimerRefresh",
@@ -12827,8 +12841,8 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					"SessionExpires: %d\r\n"
 					"Refresher: %s\r\n"
 					"Direction: uac\r\n",
-					pvt->owner ? pvt->owner->name : "",
-					pvt->owner ? pvt->owner->uniqueid : "",
+					own_name,
+					own_uniqueid,
 					pvt->peername,
 					(int)sip->sip_session_expires->x_delta,
 					sip->sip_session_expires->x_refresher ? sip->sip_session_expires->x_refresher : "auto");
@@ -12913,22 +12927,42 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			break;
 		}
 		if (pvt) {
+			/* The channel-locking calls below (sofia_parse_sdp,
+			 * sofia_change_redirecting_info, ast_queue_*, ast_setstate) must not
+			 * run while pvt->lock is held: ast_hangup holds the channel lock
+			 * across tech->hangup=sofia_hangup, which then takes pvt->lock, so
+			 * pvt->lock must never block on the channel lock. Take a short
+			 * pvt->lock only to write pvt->state and snapshot a +1-reffed owner,
+			 * then release it before any channel work and unref on every exit. */
+			struct ast_channel *owner = NULL;
 			if (status == 180) {
+				ast_mutex_lock(&pvt->lock);
 				pvt->state = SOFIA_DIALOG_STATE_RINGING;
+				owner = pvt->owner;
+				if (owner) ast_channel_ref(owner);
+				ast_mutex_unlock(&pvt->lock);
 				if (sip && sip->sip_payload && sip->sip_payload->pl_data) {
 					sofia_parse_sdp(pvt, sip);
 				}
-				if (pvt->owner) {
-					ast_queue_control(pvt->owner, AST_CONTROL_RINGING);
-					ast_setstate(pvt->owner, AST_STATE_RINGING);
+				if (owner) {
+					ast_queue_control(owner, AST_CONTROL_RINGING);
+					ast_setstate(owner, AST_STATE_RINGING);
+					ast_channel_unref(owner);
+					owner = NULL;
 				}
 			} else if (status == 183) {
+				ast_mutex_lock(&pvt->lock);
+				owner = pvt->owner;
+				if (owner) ast_channel_ref(owner);
+				ast_mutex_unlock(&pvt->lock);
 				if (sip && sip->sip_payload && sip->sip_payload->pl_data) {
 					sofia_parse_sdp(pvt, sip);
 				}
-				if (pvt->owner) {
-					ast_queue_control(pvt->owner, AST_CONTROL_PROGRESS);
-					ast_setstate(pvt->owner, AST_STATE_RINGING);
+				if (owner) {
+					ast_queue_control(owner, AST_CONTROL_PROGRESS);
+					ast_setstate(owner, AST_STATE_RINGING);
+					ast_channel_unref(owner);
+					owner = NULL;
 				}
 			} else if (status == 200) {
 				/* RFC 3261 13.2.2.4 / RFC 6026: a 200 OK for an INVITE we have
@@ -12944,7 +12978,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				 * deferred long enough to receive the late 2xx (RFC 6026 Timer M
 				 * = 64*T1).  If not, also defer the pvt teardown on outbound
 				 * final-failure (mirror chan_sip sip_scheddestroy DEFAULT_TRANS_TIMEOUT). */
+				ast_mutex_lock(&pvt->lock);
 				if (pvt->alreadygone || !pvt->owner) {
+					ast_mutex_unlock(&pvt->lock);
 					char orphan_proxy_url[128];
 					ast_log(LOG_NOTICE,
 						"Sofia: orphan 200 OK on terminated INVITE %s: ACK + BYE per RFC 3261 13.2.2.4\n",
@@ -12957,6 +12993,10 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					nua_bye(nh, TAG_END());
 					break;
 				}
+				owner = pvt->owner;
+				ast_channel_ref(owner);
+				ast_mutex_unlock(&pvt->lock);
+
 				int sdp_rc = 0;
 				if (sip && sip->sip_payload && sip->sip_payload->pl_data) {
 					sdp_rc = sofia_parse_sdp(pvt, sip);
@@ -12965,9 +13005,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				 * may carry Diversion if downstream proxy redirected. Update
 				 * redirecting chain on the master/originating channel — chan_sip
 				 * parses redirect chain via parse_moved_contact at the same path. */
-				if (pvt->owner) {
-					sofia_change_redirecting_info(pvt, sip);
-				}
+				sofia_change_redirecting_info(pvt, owner, sip);
 				/* post-T56 call-limit parity SS2 R3 (2026-04-27): outbound
 				 * ringing transition complete on 200 OK. Decrement inRinging
 				 * (call still in inUse pool, decremented at hangup). chan_sip
@@ -12980,9 +13018,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					ast_log(LOG_NOTICE, "Sofia: outbound 200 OK rejected — encryption mismatch in answer (peer=%s)\n",
 						pvt->peer ? pvt->peer->name : "<unknown>");
 					nua_bye(nh, TAG_END());
-					if (pvt->owner) {
-						ast_queue_control(pvt->owner, AST_CONTROL_HANGUP);
-					}
+					ast_queue_control(owner, AST_CONTROL_HANGUP);
+					ast_channel_unref(owner);
+					owner = NULL;
 					break;
 				}
 				/* NAT-aware manual ACK (chan_sip parity): for peers with
@@ -13000,11 +13038,11 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 						nua_ack(nh, NUTAG_PROXY(nat_proxy_url), TAG_END());
 					}
 				}
+				ast_mutex_lock(&pvt->lock);
 				pvt->state = SOFIA_DIALOG_STATE_UP;
-				if (pvt->owner) {
-					ast_queue_control(pvt->owner, AST_CONTROL_ANSWER);
-					ast_setstate(pvt->owner, AST_STATE_UP);
-				}
+				ast_mutex_unlock(&pvt->lock);
+				ast_queue_control(owner, AST_CONTROL_ANSWER);
+				ast_setstate(owner, AST_STATE_UP);
 				/* Set active contact for single-contact outbound path */
 				if (pvt->peer && !pvt->is_fork_child && !pvt->fork && !ast_strlen_zero(pvt->ruri)) {
 					const char *at = strchr(pvt->ruri, '@');
@@ -13027,6 +13065,8 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 						}
 					}
 				}
+				ast_channel_unref(owner);
+				owner = NULL;
 			} else if (status == 484) {
 				/* post-T56 allowoverlap per-peer + [general] parity (2026-04-28,
 				 * Option A FULL WIRE-IN site C — nua_r_invite 484 status special-
@@ -13042,13 +13082,19 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				 * orphan guard at the status==200 branch above. chan_sip parity:
 				 * chan_sip.c:22570 sip_alreadygone(p) after the final-response
 				 * switch. */
+				ast_mutex_lock(&pvt->lock);
 				sofia_alreadygone(pvt);
-				if (pvt->owner) {
+				owner = pvt->owner;
+				if (owner) ast_channel_ref(owner);
+				ast_mutex_unlock(&pvt->lock);
+				if (owner) {
 					int overlap_mode = pvt->peer ? pvt->peer->allowoverlap_mode : sofia_cfg.default_allowoverlap_mode;
-					ast_queue_hangup_with_cause(pvt->owner,
+					ast_queue_hangup_with_cause(owner,
 						(overlap_mode == SOFIA_OVERLAP_YES)
 							? AST_CAUSE_INVALID_NUMBER_FORMAT
 							: AST_CAUSE_UNALLOCATED);
+					ast_channel_unref(owner);
+					owner = NULL;
 				}
 			} else if (status >= 300) {
 				/* Mark dialog as gone for the same reason as the 484 branch
@@ -13057,9 +13103,15 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				 * field). Setting alreadygone here lets the status==200 orphan
 				 * guard recognise the late 2xx and emit ACK+BYE per RFC 3261
 				 * §13.2.2.4 / RFC 6026 instead of dropping it silently. */
+				ast_mutex_lock(&pvt->lock);
 				sofia_alreadygone(pvt);
-				if (pvt->owner) {
-					ast_queue_control(pvt->owner, AST_CONTROL_HANGUP);
+				owner = pvt->owner;
+				if (owner) ast_channel_ref(owner);
+				ast_mutex_unlock(&pvt->lock);
+				if (owner) {
+					ast_queue_control(owner, AST_CONTROL_HANGUP);
+					ast_channel_unref(owner);
+					owner = NULL;
 				}
 			}
 		}
@@ -13592,7 +13644,12 @@ static char *sofia_cli_show_channels(struct ast_cli_entry *e, int cmd, struct as
 #define SOFIA_CLI_PEER_RULE_WIDTH 78
 #define SOFIA_CLI_PEER_LABEL_WIDTH 20
 
-static void sofia_print_ha_lines(int fd, const struct ast_ha *ha)
+/* The peer-dump output is assembled into an ast_str while peer->lock is held,
+ * then written out with a single blocking ast_cli/astman_append after the lock
+ * is dropped (a slow CLI/AMI consumer must not stall the lock holder). These
+ * helpers therefore append into *out instead of writing to an fd; every call
+ * site lives inside sofia_cli_show_peer. */
+static void sofia_print_ha_lines(struct ast_str **out, const struct ast_ha *ha)
 {
 	const struct ast_ha *p;
 
@@ -13602,7 +13659,7 @@ static void sofia_print_ha_lines(int fd, const struct ast_ha *ha)
 
 		ast_copy_string(addr, ast_sockaddr_stringify_addr(&p->addr), sizeof(addr));
 		ast_copy_string(netmask, ast_sockaddr_stringify_addr(&p->netmask), sizeof(netmask));
-		ast_cli(fd, "    %-*.*s : %s %s/%s\n",
+		ast_str_append(out, 0, "    %-*.*s : %s %s/%s\n",
 			SOFIA_CLI_PEER_LABEL_WIDTH, SOFIA_CLI_PEER_LABEL_WIDTH,
 			"ACL rule",
 			p->sense == AST_SENSE_ALLOW ? "permit" : "deny",
@@ -13610,32 +13667,32 @@ static void sofia_print_ha_lines(int fd, const struct ast_ha *ha)
 	}
 }
 
-static void sofia_cli_peer_rule(int fd, char fill)
+static void sofia_cli_peer_rule(struct ast_str **out, char fill)
 {
 	char line[SOFIA_CLI_PEER_RULE_WIDTH + 1];
 
 	memset(line, fill, SOFIA_CLI_PEER_RULE_WIDTH);
 	line[SOFIA_CLI_PEER_RULE_WIDTH] = '\0';
-	ast_cli(fd, "%s\n", line);
+	ast_str_append(out, 0, "%s\n", line);
 }
 
-static void sofia_cli_peer_section(int fd, const char *title)
+static void sofia_cli_peer_section(struct ast_str **out, const char *title)
 {
 	char line[SOFIA_CLI_PEER_RULE_WIDTH + 1];
 	int used;
 
 	used = snprintf(line, sizeof(line), "-- %s ", title);
 	if (used < 0 || used >= (int) sizeof(line)) {
-		ast_cli(fd, "\n-- %s --\n", title);
+		ast_str_append(out, 0, "\n-- %s --\n", title);
 		return;
 	}
 	memset(line + used, '-', SOFIA_CLI_PEER_RULE_WIDTH - used);
 	line[SOFIA_CLI_PEER_RULE_WIDTH] = '\0';
 
-	ast_cli(fd, "\n%s\n", line);
+	ast_str_append(out, 0, "\n%s\n", line);
 }
 
-static void sofia_cli_peer_line(int fd, const char *label, const char *fmt, ...)
+static void sofia_cli_peer_line(struct ast_str **out, const char *label, const char *fmt, ...)
 {
 	char value[1024];
 	va_list ap;
@@ -13644,11 +13701,11 @@ static void sofia_cli_peer_line(int fd, const char *label, const char *fmt, ...)
 	vsnprintf(value, sizeof(value), fmt, ap);
 	va_end(ap);
 
-	ast_cli(fd, "  %-*.*s : %s\n",
+	ast_str_append(out, 0, "  %-*.*s : %s\n",
 		SOFIA_CLI_PEER_LABEL_WIDTH, SOFIA_CLI_PEER_LABEL_WIDTH, label, value);
 }
 
-static void sofia_cli_peer_subline(int fd, const char *label, const char *fmt, ...)
+static void sofia_cli_peer_subline(struct ast_str **out, const char *label, const char *fmt, ...)
 {
 	char value[1024];
 	va_list ap;
@@ -13657,7 +13714,7 @@ static void sofia_cli_peer_subline(int fd, const char *label, const char *fmt, .
 	vsnprintf(value, sizeof(value), fmt, ap);
 	va_end(ap);
 
-	ast_cli(fd, "    %-*.*s : %s\n",
+	ast_str_append(out, 0, "    %-*.*s : %s\n",
 		SOFIA_CLI_PEER_LABEL_WIDTH, SOFIA_CLI_PEER_LABEL_WIDTH, label, value);
 }
 
@@ -13676,6 +13733,7 @@ static char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cl
 	const char *transport_str;
 	const char *type_str;
 	int contacts_used;
+	struct ast_str *buf;
 
 	switch (cmd) {
 	case CLI_INIT:
@@ -13695,6 +13753,16 @@ static char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cl
 	peer = sofia_find_peer(a->argv[3]);
 	if (!peer) {
 		ast_cli(a->fd, "Peer '%s' not found\n", a->argv[3]);
+		return CLI_FAILURE;
+	}
+
+	/* Assemble all output here while holding peer->lock, then emit it with a
+	 * single blocking ast_cli after the unlock. Allocate before locking and
+	 * bail if allocation fails so we never hold the lock with nowhere to
+	 * write. */
+	buf = ast_str_create(8192);
+	if (!buf) {
+		ao2_ref(peer, -1);
 		return CLI_FAILURE;
 	}
 
@@ -13767,179 +13835,179 @@ static char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cl
 		ast_copy_string(status, "disabled", sizeof(status));
 	}
 
-	ast_cli(a->fd, "\n");
-	sofia_cli_peer_rule(a->fd, '=');
-	sofia_cli_peer_line(a->fd, "SIP peer", "%s", peer->name);
-	sofia_cli_peer_line(a->fd, "Registration", "%s", peer->registered ? "registered" : "not registered");
-	sofia_cli_peer_rule(a->fd, '=');
-	sofia_cli_peer_line(a->fd, "Endpoint", "%s@%s:%d via %s",
+	ast_str_append(&buf, 0, "\n");
+	sofia_cli_peer_rule(&buf, '=');
+	sofia_cli_peer_line(&buf, "SIP peer", "%s", peer->name);
+	sofia_cli_peer_line(&buf, "Registration", "%s", peer->registered ? "registered" : "not registered");
+	sofia_cli_peer_rule(&buf, '=');
+	sofia_cli_peer_line(&buf, "Endpoint", "%s@%s:%d via %s",
 		S_OR(peer->defaultuser, peer->name), peer->host, peer->port, transport_str);
-	sofia_cli_peer_line(a->fd, "Context / source", "%s / %s", peer->context, source_str);
-	sofia_cli_peer_line(a->fd, "Contact slots", "%d used of %d allowed", contacts_used, peer->max_contacts);
-	sofia_cli_peer_line(a->fd, "Media", "codecs=%s dtmf=%s nat=%s directmedia=%s",
+	sofia_cli_peer_line(&buf, "Context / source", "%s / %s", peer->context, source_str);
+	sofia_cli_peer_line(&buf, "Contact slots", "%d used of %d allowed", contacts_used, peer->max_contacts);
+	sofia_cli_peer_line(&buf, "Media", "codecs=%s dtmf=%s nat=%s directmedia=%s",
 		ast_strlen_zero(codec_buf) ? "(default)" : codec_buf,
 		dtmf_str, nat, AST_CLI_YESNO(peer->directmedia));
-	sofia_cli_peer_line(a->fd, "Calls", "%d/%s active, %d ringing, %d on-hold",
+	sofia_cli_peer_line(&buf, "Calls", "%d/%s active, %d ringing, %d on-hold",
 		peer->inUse, limit_str, peer->inRinging, peer->onHold);
 	if (peer->qualify) {
-		sofia_cli_peer_line(a->fd, "Qualify", "yes, status=%s", status);
+		sofia_cli_peer_line(&buf, "Qualify", "yes, status=%s", status);
 	} else {
-		sofia_cli_peer_line(a->fd, "Qualify", "no");
+		sofia_cli_peer_line(&buf, "Qualify", "no");
 	}
-	sofia_cli_peer_line(a->fd, "Session timers", "%s, expires=%d, minse=%d, refresher=%s",
+	sofia_cli_peer_line(&buf, "Session timers", "%s, expires=%d, minse=%d, refresher=%s",
 		st_mode_str, peer->session_expires, peer->session_minse, st_refresher_str);
-	sofia_cli_peer_line(a->fd, "Identity headers", "send=%s, trust=%s, presentation=%s",
+	sofia_cli_peer_line(&buf, "Identity headers", "send=%s, trust=%s, presentation=%s",
 		sendrpid_str, AST_CLI_YESNO(peer->trustrpid),
 		ast_named_caller_presentation(peer->callingpres));
 
-	sofia_cli_peer_section(a->fd, "Identity");
-	sofia_cli_peer_line(a->fd, "Name", "%s", peer->name);
-	sofia_cli_peer_line(a->fd, "Username", "%s", S_OR(peer->defaultuser, "(none)"));
-	sofia_cli_peer_line(a->fd, "Type", "%s", type_str);
-	sofia_cli_peer_line(a->fd, "Host", "%s", peer->host);
-	sofia_cli_peer_line(a->fd, "Port", "%d", peer->port);
-	sofia_cli_peer_line(a->fd, "Transport", "%s", transport_str);
-	sofia_cli_peer_line(a->fd, "Context", "%s", peer->context);
-	sofia_cli_peer_line(a->fd, "Registered", "%s", AST_CLI_YESNO(peer->registered));
-	sofia_cli_peer_line(a->fd, "Expires", "%ds", peer->expiresecs);
-	sofia_cli_peer_line(a->fd, "Secret", "%s", ast_strlen_zero(peer->secret) ? "(none)" : "(set)");
+	sofia_cli_peer_section(&buf, "Identity");
+	sofia_cli_peer_line(&buf, "Name", "%s", peer->name);
+	sofia_cli_peer_line(&buf, "Username", "%s", S_OR(peer->defaultuser, "(none)"));
+	sofia_cli_peer_line(&buf, "Type", "%s", type_str);
+	sofia_cli_peer_line(&buf, "Host", "%s", peer->host);
+	sofia_cli_peer_line(&buf, "Port", "%d", peer->port);
+	sofia_cli_peer_line(&buf, "Transport", "%s", transport_str);
+	sofia_cli_peer_line(&buf, "Context", "%s", peer->context);
+	sofia_cli_peer_line(&buf, "Registered", "%s", AST_CLI_YESNO(peer->registered));
+	sofia_cli_peer_line(&buf, "Expires", "%ds", peer->expiresecs);
+	sofia_cli_peer_line(&buf, "Secret", "%s", ast_strlen_zero(peer->secret) ? "(none)" : "(set)");
 	if (peer->qualify) {
-		sofia_cli_peer_line(a->fd, "Qualify", "yes, freq=%ds, timeout=%ds, status=%s",
+		sofia_cli_peer_line(&buf, "Qualify", "yes, freq=%ds, timeout=%ds, status=%s",
 			peer->qualifyfreq, peer->qualifytimeout, status);
 	} else {
-		sofia_cli_peer_line(a->fd, "Qualify", "no");
+		sofia_cli_peer_line(&buf, "Qualify", "no");
 	}
 	if (!ast_strlen_zero(peer->callerid)) {
-		sofia_cli_peer_line(a->fd, "CallerID", "%s", peer->callerid);
+		sofia_cli_peer_line(&buf, "CallerID", "%s", peer->callerid);
 	}
 	if (!ast_strlen_zero(peer->cid_num) || !ast_strlen_zero(peer->cid_name)) {
 		char merged[256];
 		ast_callerid_merge(merged, sizeof(merged),
 			S_OR(peer->cid_name, ""), S_OR(peer->cid_num, ""), "<unknown>");
-		sofia_cli_peer_line(a->fd, "Callerid", "%s", merged);
+		sofia_cli_peer_line(&buf, "Callerid", "%s", merged);
 	}
 	if (!ast_strlen_zero(peer->cid_tag)) {
-		sofia_cli_peer_line(a->fd, "CID tag", "%s", peer->cid_tag);
+		sofia_cli_peer_line(&buf, "CID tag", "%s", peer->cid_tag);
 	}
 
-	sofia_cli_peer_section(a->fd, "Network and media");
-	sofia_cli_peer_line(a->fd, "NAT", "%s", nat);
-	sofia_cli_peer_line(a->fd, "DTMF mode", "%s", dtmf_str);
-	sofia_cli_peer_line(a->fd, "Direct media", "%s", AST_CLI_YESNO(peer->directmedia));
-	sofia_cli_peer_line(a->fd, "Encryption", "%s", AST_CLI_YESNO(peer->encryption));
-	sofia_cli_peer_line(a->fd, "Codecs", "%s", ast_strlen_zero(codec_buf) ? "(default)" : codec_buf);
-	sofia_cli_peer_line(a->fd, "Max call BR", "%d kbps", peer->maxcallbitrate);
+	sofia_cli_peer_section(&buf, "Network and media");
+	sofia_cli_peer_line(&buf, "NAT", "%s", nat);
+	sofia_cli_peer_line(&buf, "DTMF mode", "%s", dtmf_str);
+	sofia_cli_peer_line(&buf, "Direct media", "%s", AST_CLI_YESNO(peer->directmedia));
+	sofia_cli_peer_line(&buf, "Encryption", "%s", AST_CLI_YESNO(peer->encryption));
+	sofia_cli_peer_line(&buf, "Codecs", "%s", ast_strlen_zero(codec_buf) ? "(default)" : codec_buf);
+	sofia_cli_peer_line(&buf, "Max call BR", "%d kbps", peer->maxcallbitrate);
 
-	sofia_cli_peer_section(a->fd, "Limits and features");
-	sofia_cli_peer_line(a->fd, "Busy on active", "%s", AST_CLI_YESNO(peer->busy_on_active));
-	sofia_cli_peer_line(a->fd, "Max contacts", "%d (used: %d)", peer->max_contacts, contacts_used);
+	sofia_cli_peer_section(&buf, "Limits and features");
+	sofia_cli_peer_line(&buf, "Busy on active", "%s", AST_CLI_YESNO(peer->busy_on_active));
+	sofia_cli_peer_line(&buf, "Max contacts", "%d (used: %d)", peer->max_contacts, contacts_used);
 	/* post-T56 allowtransfer per-peer parity (2026-04-27): chan_sip-parity REFER
 	 * policy display; "Transfer mode" wording verbatim per chan_sip.c:18650. */
-	sofia_cli_peer_line(a->fd, "Transfer mode", "%s", sofia_transfer_mode_str(peer->allowtransfer));
+	sofia_cli_peer_line(&buf, "Transfer mode", "%s", sofia_transfer_mode_str(peer->allowtransfer));
 	/* post-T56 lockuseragent per-peer parity (2026-04-27): chan_sip-parity wording
 	 * "Lockuseragent" per chan_sip.c:18733 + chan_sofia surpass display of current
 	 * locked UA string ("Locked-UA") for inspection / UA-spoofing investigation. */
-	sofia_cli_peer_line(a->fd, "Lock user-agent", "%s", AST_CLI_YESNO(peer->lockuseragent));
+	sofia_cli_peer_line(&buf, "Lock user-agent", "%s", AST_CLI_YESNO(peer->lockuseragent));
 	if (peer->lockuseragent && peer->locked_user_agent[0]) {
-		sofia_cli_peer_line(a->fd, "Locked UA", "%s", peer->locked_user_agent);
+		sofia_cli_peer_line(&buf, "Locked UA", "%s", peer->locked_user_agent);
 	}
 	if (peer->lockuseragent && !ast_strlen_zero(peer->lockuseragent_prefixes)) {
-		sofia_cli_peer_line(a->fd, "UA prefixes", "%s", peer->lockuseragent_prefixes);
+		sofia_cli_peer_line(&buf, "UA prefixes", "%s", peer->lockuseragent_prefixes);
 	}
 	/* post-T56 language per-peer parity (2026-04-27): chan_sip-parity per-peer audio
 	 * locale display ("Language" wording). Empty string preserved (operators see
 	 * unset state). */
-	sofia_cli_peer_line(a->fd, "Language", "%s", ast_strlen_zero(peer->language) ? "(none)" : peer->language);
+	sofia_cli_peer_line(&buf, "Language", "%s", ast_strlen_zero(peer->language) ? "(none)" : peer->language);
 	/* post-T56 defaultip per-peer parity (2026-04-28): chan_sip-parity Defaddr->IP
 	 * display per chan_sip.c:18701 verbatim wording. */
-	sofia_cli_peer_line(a->fd, "Default IP", "%s", ast_sockaddr_stringify(&peer->defaddr));
+	sofia_cli_peer_line(&buf, "Default IP", "%s", ast_sockaddr_stringify(&peer->defaddr));
 	/* post-T56 amaflags per-peer parity (2026-04-28): chan_sip-parity
 	 * "AMA flags    : %s" display per chan_sip.c:18649 verbatim wording
 	 * (4-space alignment chan_sip parity) via ast_cdr_flags2str. */
-	sofia_cli_peer_line(a->fd, "AMA flags", "%s", ast_cdr_flags2str(peer->amaflags));
+	sofia_cli_peer_line(&buf, "AMA flags", "%s", ast_cdr_flags2str(peer->amaflags));
 	/* post-T56 subscribemwi per-peer parity (2026-04-28): chan_sip-parity field
 	 * display (yes/no for operator visibility into MWI subscription model). */
-	sofia_cli_peer_line(a->fd, "Subscribe MWI", "%s", AST_CLI_YESNO(peer->subscribemwi));
+	sofia_cli_peer_line(&buf, "Subscribe MWI", "%s", AST_CLI_YESNO(peer->subscribemwi));
 	/* post-T56 preferred_codec_only per-peer parity (2026-04-28): chan_sip-parity
 	 * field display (yes/no for operator visibility into codec-list-narrowing). */
-	sofia_cli_peer_line(a->fd, "Preferred codec", "%s", AST_CLI_YESNO(peer->preferred_codec_only));
+	sofia_cli_peer_line(&buf, "Preferred codec", "%s", AST_CLI_YESNO(peer->preferred_codec_only));
 	/* post-T56 ignoresdpversion per-peer parity (2026-04-28): chan_sip-parity field
 	 * "Ign SDP ver" wording per chan_sip.c:18685 verbatim. PARSE-COMPAT-ONLY display
 	 * (chan_sofia processes every SDP unconditionally; flag has no behavioral effect). */
-	sofia_cli_peer_line(a->fd, "Ignore SDP ver", "%s", AST_CLI_YESNO(peer->ignoresdpversion));
+	sofia_cli_peer_line(&buf, "Ignore SDP ver", "%s", AST_CLI_YESNO(peer->ignoresdpversion));
 	/* post-T56 promiscredir per-peer parity (2026-04-28): chan_sip-parity field
 	 * "PromiscRedir" wording per chan_sip.c:18681 verbatim. PARSE-COMPAT-ONLY
 	 * display (chan_sofia nua_r_redirect handler ABSENT). */
-	sofia_cli_peer_line(a->fd, "Promisc redir", "%s", AST_CLI_YESNO(peer->promiscredir));
+	sofia_cli_peer_line(&buf, "Promisc redir", "%s", AST_CLI_YESNO(peer->promiscredir));
 	/* post-T56 autoframing per-peer parity (2026-04-28): chan_sip-parity field
 	 * "Auto-Framing" wording per chan_sip.c:18728 verbatim. PARSE-COMPAT-ONLY
 	 * display (chan_sofia sofia_parse_sdp ptime gate not wired today). */
-	sofia_cli_peer_line(a->fd, "Auto framing", "%s", AST_CLI_YESNO(peer->autoframing));
+	sofia_cli_peer_line(&buf, "Auto framing", "%s", AST_CLI_YESNO(peer->autoframing));
 	/* faxdetect per-peer display: reports the runtime mode used by DSP CNG
 	 * detection and peer T.38 reINVITE detection. */
-	sofia_cli_peer_line(a->fd, "Fax detect", "%s",
+	sofia_cli_peer_line(&buf, "Fax detect", "%s",
 		peer->faxdetect_mode == SOFIA_FAX_DETECT_NONE ? "no" :
 		peer->faxdetect_mode == SOFIA_FAX_DETECT_BOTH ? "yes (cng,t38)" :
 		peer->faxdetect_mode == SOFIA_FAX_DETECT_CNG ? "cng" : "t38");
-	sofia_cli_peer_section(a->fd, "Fax and T.38");
+	sofia_cli_peer_section(&buf, "Fax and T.38");
 	/* post-T56 Task #8 T.38 fax UDPTL parity SS7 FINAL CLOSE (2026-04-28):
 	 * 5-field T.38 display surface — chan_sip parity at chan_sip.c:18677-18681
 	 * verbatim semantic. T38 support enable status + EC mode + MaxDatagram +
 	 * t38pt_usertpsource + per-peer overrides displayed for operator
 	 * visibility into T.38 negotiation policy. */
-	sofia_cli_peer_line(a->fd, "T38 support", "%s", AST_CLI_YESNO(peer->t38pt_udptl));
-	sofia_cli_peer_line(a->fd, "T38 EC mode", "%s",
+	sofia_cli_peer_line(&buf, "T38 support", "%s", AST_CLI_YESNO(peer->t38pt_udptl));
+	sofia_cli_peer_line(&buf, "T38 EC mode", "%s",
 		peer->t38_ec_mode == SOFIA_T38_EC_REDUNDANCY ? "Redundancy" :
 		peer->t38_ec_mode == SOFIA_T38_EC_FEC ? "FEC" : "None");
-	sofia_cli_peer_line(a->fd, "T38 max datagram", "%d", peer->t38_maxdatagram);
-	sofia_cli_peer_line(a->fd, "T38 RTP source", "%s", AST_CLI_YESNO(peer->t38pt_usertpsource));
-	sofia_cli_peer_section(a->fd, "Timers and RTP");
+	sofia_cli_peer_line(&buf, "T38 max datagram", "%d", peer->t38_maxdatagram);
+	sofia_cli_peer_line(&buf, "T38 RTP source", "%s", AST_CLI_YESNO(peer->t38pt_usertpsource));
+	sofia_cli_peer_section(&buf, "Timers and RTP");
 	/* post-T56 timerb per-peer parity (2026-04-28): chan_sip-parity field
 	 * "Timer B" wording per chan_sip.c:18697 verbatim. Pattern 16 sofia-sip-
 	 * native 11th-instance NTATAG_SIP_T1X64 wire-in active at nua_create. */
-	sofia_cli_peer_line(a->fd, "Timer B", "%d", peer->timer_b);
+	sofia_cli_peer_line(&buf, "Timer B", "%d", peer->timer_b);
 	/* post-T56 timert1 per-peer parity (2026-04-28): chan_sip-parity field
 	 * "Timer T1" wording. Pattern 16 sofia-sip-native 7th-instance REWIRED
 	 * NTATAG_SIP_T1 wire-in active at nua_create per LATENT BUG FIX. */
-	sofia_cli_peer_line(a->fd, "Timer T1", "%d", peer->timer_t1);
+	sofia_cli_peer_line(&buf, "Timer T1", "%d", peer->timer_t1);
 	/* post-T56 allowoverlap per-peer + [general] parity (2026-04-28, Option A
 	 * FULL WIRE-IN): chan_sip parity field "Overlap dial" wording per chan_sip.c
 	 * :18689 verbatim. Tri-state: Yes / No / DTMF (DTMF mode parsed + stored
 	 * but treated as fall-through per chan_sip own design). */
-	sofia_cli_peer_line(a->fd, "Overlap dial", "%s", sofia_allowoverlap_str(peer->allowoverlap_mode));
+	sofia_cli_peer_line(&buf, "Overlap dial", "%s", sofia_allowoverlap_str(peer->allowoverlap_mode));
 	/* post-T56 rtp-timeout bundle per-peer parity (2026-04-28): 3 fields display
 	 * for operator visibility into RTP-timeout enforcement. */
-	sofia_cli_peer_line(a->fd, "RTP timeout", "%d", peer->rtptimeout);
-	sofia_cli_peer_line(a->fd, "RTP hold timeout", "%d", peer->rtpholdtimeout);
-	sofia_cli_peer_line(a->fd, "RTP keepalive", "%d", peer->rtpkeepalive);
-	sofia_cli_peer_section(a->fd, "Routing and dialplan");
+	sofia_cli_peer_line(&buf, "RTP timeout", "%d", peer->rtptimeout);
+	sofia_cli_peer_line(&buf, "RTP hold timeout", "%d", peer->rtpholdtimeout);
+	sofia_cli_peer_line(&buf, "RTP keepalive", "%d", peer->rtpkeepalive);
+	sofia_cli_peer_section(&buf, "Routing and dialplan");
 	/* post-T56 parkinglot per-peer parity (2026-04-28): chan_sip-parity
 	 * "Parkinglot   : %s" display per chan_sip.c:18753 verbatim wording
 	 * (4-space alignment chan_sip parity). */
-	sofia_cli_peer_line(a->fd, "Parking lot", "%s", ast_strlen_zero(peer->parkinglot) ? "(none)" : peer->parkinglot);
+	sofia_cli_peer_line(&buf, "Parking lot", "%s", ast_strlen_zero(peer->parkinglot) ? "(none)" : peer->parkinglot);
 	/* post-T56 usereqphone parity (2026-04-27): chan_sip-parity "User=Phone" wording
 	 * per chan_sip.c:18682 + R11(a) chan_sofia surpass — 3-state inheritance display
 	 * (peer-set explicit / inherited from [general] / default off) per outboundproxy +
 	 * srtpcipher + subscribecontext precedents. */
 	if (peer->usereqphone) {
 		int from_general = sofia_cfg.default_usereqphone && peer->usereqphone == sofia_cfg.default_usereqphone;
-		sofia_cli_peer_line(a->fd, "User=Phone", "yes%s", from_general ? " (from [general])" : "");
+		sofia_cli_peer_line(&buf, "User=Phone", "yes%s", from_general ? " (from [general])" : "");
 	} else {
-		sofia_cli_peer_line(a->fd, "User=Phone", "no");
+		sofia_cli_peer_line(&buf, "User=Phone", "no");
 	}
 	/* post-T56 accountcode per-peer parity (2026-04-27): chan_sip-parity CDR
 	 * billing-tag display gated on !ast_strlen_zero per chan_sip.c:18647-18648. */
 	if (!ast_strlen_zero(peer->accountcode)) {
-		sofia_cli_peer_line(a->fd, "Account code", "%s", peer->accountcode);
+		sofia_cli_peer_line(&buf, "Account code", "%s", peer->accountcode);
 	}
 	/* post-T56 maxforwards parity (2026-04-27): chan_sip-parity "Max forwards"
 	 * wording per chan_sip.c:18666 + R11(a) chan_sofia surpass — 3-state
 	 * inheritance display per outboundproxy + srtpcipher + subscribecontext +
 	 * usereqphone precedents. */
 	if (peer->maxforwards == sofia_cfg.default_max_forwards) {
-		sofia_cli_peer_line(a->fd, "Max forwards", "%d (from [general])", peer->maxforwards);
+		sofia_cli_peer_line(&buf, "Max forwards", "%d (from [general])", peer->maxforwards);
 	} else {
-		sofia_cli_peer_line(a->fd, "Max forwards", "%d", peer->maxforwards);
+		sofia_cli_peer_line(&buf, "Max forwards", "%d", peer->maxforwards);
 	}
 	{
 		/* T55.1 (2026-04-27): MWI mailbox list (NOLOCK; we hold peer->lock from outer caller). */
@@ -13955,18 +14023,18 @@ static char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cl
 			strncat(mailbox_buf, mailbox_entry, sizeof(mailbox_buf) - strlen(mailbox_buf) - 1);
 			first = 0;
 		}
-		sofia_cli_peer_line(a->fd, "Mailbox", "%s", first ? "(none)" : mailbox_buf);
+		sofia_cli_peer_line(&buf, "Mailbox", "%s", first ? "(none)" : mailbox_buf);
 	}
 	{
 		/* T56.1 (2026-04-27): outboundproxy display — show peer-set value if any,
 		 * else inherit-marker if sofia_cfg.outboundproxy non-empty, else (none). */
 		const char *peer_p = peer->outboundproxy;
 		if (!ast_strlen_zero(peer_p)) {
-			sofia_cli_peer_line(a->fd, "Outbound proxy", "%s", peer_p);
+			sofia_cli_peer_line(&buf, "Outbound proxy", "%s", peer_p);
 		} else if (!ast_strlen_zero(sofia_cfg.outboundproxy)) {
-			sofia_cli_peer_line(a->fd, "Outbound proxy", "%s (from [general])", sofia_cfg.outboundproxy);
+			sofia_cli_peer_line(&buf, "Outbound proxy", "%s (from [general])", sofia_cfg.outboundproxy);
 		} else {
-			sofia_cli_peer_line(a->fd, "Outbound proxy", "(none)");
+			sofia_cli_peer_line(&buf, "Outbound proxy", "(none)");
 		}
 	}
 	{
@@ -13977,41 +14045,41 @@ static char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cl
 		 * bridged channel); OUTBOUND-direction Alert-Info on chan_sofia-issued
 		 * HOLD re-INVITE is deferred (chan_sofia does not issue outbound HOLD
 		 * re-INVITE today; tracked as separate task). */
-		sofia_cli_peer_line(a->fd, "MOH interpret", "%s",
+		sofia_cli_peer_line(&buf, "MOH interpret", "%s",
 			ast_strlen_zero(peer->mohinterpret) ? "(none)" : peer->mohinterpret);
-		sofia_cli_peer_line(a->fd, "MOH suggest", "%s",
+		sofia_cli_peer_line(&buf, "MOH suggest", "%s",
 			ast_strlen_zero(peer->mohsuggest) ? "(none)" : peer->mohsuggest);
 	}
 	{
 		/* post-T56 srtpcipher operator option (2026-04-27): SRTP cipher preference display.
 		 * 3-state inheritance follows outboundproxy convention: peer-set / from [general] / (default). */
 		if (!ast_strlen_zero(peer->srtpcipher)) {
-			sofia_cli_peer_line(a->fd, "SRTP cipher", "%s", peer->srtpcipher);
+			sofia_cli_peer_line(&buf, "SRTP cipher", "%s", peer->srtpcipher);
 		} else if (!ast_strlen_zero(sofia_cfg.default_srtpcipher)) {
-			sofia_cli_peer_line(a->fd, "SRTP cipher", "%s (from [general])", sofia_cfg.default_srtpcipher);
+			sofia_cli_peer_line(&buf, "SRTP cipher", "%s (from [general])", sofia_cfg.default_srtpcipher);
 		} else {
-			sofia_cli_peer_line(a->fd, "SRTP cipher", "(default AES_CM_128_HMAC_SHA1_80)");
+			sofia_cli_peer_line(&buf, "SRTP cipher", "(default AES_CM_128_HMAC_SHA1_80)");
 		}
 	}
-	sofia_cli_peer_section(a->fd, "Session and identity headers");
+	sofia_cli_peer_section(&buf, "Session and identity headers");
 	/* post-T56 session timers (RFC 4028) (2026-04-27): chan_sip-parity 4-line display. */
-	sofia_cli_peer_line(a->fd, "Session timers", "%s", st_mode_str);
-	sofia_cli_peer_line(a->fd, "Session expires", "%d", peer->session_expires);
-	sofia_cli_peer_line(a->fd, "Session Min-SE", "%d", peer->session_minse);
-	sofia_cli_peer_line(a->fd, "Session refresher", "%s", st_refresher_str);
+	sofia_cli_peer_line(&buf, "Session timers", "%s", st_mode_str);
+	sofia_cli_peer_line(&buf, "Session expires", "%d", peer->session_expires);
+	sofia_cli_peer_line(&buf, "Session Min-SE", "%d", peer->session_minse);
+	sofia_cli_peer_line(&buf, "Session refresher", "%s", st_refresher_str);
 	/* post-T56 identity-headers parity (2026-04-27): RPID/PAI/Privacy display.
 	 * ast_named_caller_presentation (callerid.h:358) maps int to canonical string. */
-	sofia_cli_peer_line(a->fd, "Calling pres", "%s", ast_named_caller_presentation(peer->callingpres));
-	sofia_cli_peer_line(a->fd, "Send RPID", "%s", sendrpid_str);
-	sofia_cli_peer_line(a->fd, "Trust RPID", "%s", AST_CLI_YESNO(peer->trustrpid));
-	sofia_cli_peer_line(a->fd, "Concurrent calls", "%d/%s (%d ringing, %d on-hold)",
+	sofia_cli_peer_line(&buf, "Calling pres", "%s", ast_named_caller_presentation(peer->callingpres));
+	sofia_cli_peer_line(&buf, "Send RPID", "%s", sendrpid_str);
+	sofia_cli_peer_line(&buf, "Trust RPID", "%s", AST_CLI_YESNO(peer->trustrpid));
+	sofia_cli_peer_line(&buf, "Concurrent calls", "%d/%s (%d ringing, %d on-hold)",
 		peer->inUse, limit_str, peer->inRinging, peer->onHold);
 
-	sofia_cli_peer_section(a->fd, "Groups and source");
+	sofia_cli_peer_section(&buf, "Groups and source");
 	{
 		char grp_buf[256];
-		sofia_cli_peer_line(a->fd, "Call group", "%s", ast_print_group(grp_buf, sizeof(grp_buf), peer->callgroup));
-		sofia_cli_peer_line(a->fd, "Pickup group", "%s", ast_print_group(grp_buf, sizeof(grp_buf), peer->pickupgroup));
+		sofia_cli_peer_line(&buf, "Call group", "%s", ast_print_group(grp_buf, sizeof(grp_buf), peer->callgroup));
+		sofia_cli_peer_line(&buf, "Pickup group", "%s", ast_print_group(grp_buf, sizeof(grp_buf), peer->pickupgroup));
 	}
 	/* post-T56 regexten display-gate parity (2026-04-27): chan_sip.c:18704 gates
 	 * on !ast_strlen_zero(sip_cfg.regcontext) — RegExten line shown only when the
@@ -14019,7 +14087,7 @@ static char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cl
 	 * only on peer->regexten which misled operators into thinking the auto-add
 	 * mechanism worked even when regcontext was unset. */
 	if (!ast_strlen_zero(sofia_cfg.regcontext) && !ast_strlen_zero(peer->regexten)) {
-		sofia_cli_peer_line(a->fd, "Reg ext", "%s", peer->regexten);
+		sofia_cli_peer_line(&buf, "Reg ext", "%s", peer->regexten);
 	}
 	/* post-T56 callbackextension per-peer parity (2026-04-28, Option A FULL WIRE-IN
 	 * via Pattern 16 sofia-sip-native 12th-instance NUTAG_M_USERNAME + chan_sofia
@@ -14027,7 +14095,7 @@ static char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cl
 	 * local-var; never displayed): conditional display only when set, mirrors sip
 	 * show peer regexten gating idiom. */
 	if (!ast_strlen_zero(peer->callbackextension)) {
-		sofia_cli_peer_line(a->fd, "Callback ext", "%s", peer->callbackextension);
+		sofia_cli_peer_line(&buf, "Callback ext", "%s", peer->callbackextension);
 	}
 	/* post-T56 setvar+header per-peer parity (2026-04-28, COMBINED ship): sip show
 	 * peer "Variables:" subsection iterating peer->chanvars per chan_sip.c:18742-
@@ -14037,7 +14105,7 @@ static char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cl
 	if (peer->chanvars) {
 		struct ast_variable *var;
 		for (var = peer->chanvars; var; var = var->next) {
-			sofia_cli_peer_line(a->fd, "Variable", "%s = %s", var->name, var->value);
+			sofia_cli_peer_line(&buf, "Variable", "%s = %s", var->name, var->value);
 		}
 	}
 	/* post-T56 subscribecontext per-peer parity (2026-04-27): chan_sip.c:18645
@@ -14048,21 +14116,21 @@ static char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cl
 	if (!ast_strlen_zero(peer->subscribecontext)) {
 		int from_general = !ast_strlen_zero(sofia_cfg.default_subscribecontext)
 			&& !strcmp(peer->subscribecontext, sofia_cfg.default_subscribecontext);
-		sofia_cli_peer_line(a->fd, "Subscribe context", "%s%s", peer->subscribecontext,
+		sofia_cli_peer_line(&buf, "Subscribe context", "%s%s", peer->subscribecontext,
 			from_general ? " (from [general])" : "");
 	} else if (!ast_strlen_zero(sofia_cfg.default_subscribecontext)) {
-		sofia_cli_peer_line(a->fd, "Subscribe context", "%s (from [general])", sofia_cfg.default_subscribecontext);
+		sofia_cli_peer_line(&buf, "Subscribe context", "%s (from [general])", sofia_cfg.default_subscribecontext);
 	} else {
-		sofia_cli_peer_line(a->fd, "Subscribe context", "<Not set>");
+		sofia_cli_peer_line(&buf, "Subscribe context", "<Not set>");
 	}
 	if (!ast_strlen_zero(peer->fromuser)) {
-		sofia_cli_peer_line(a->fd, "From user", "%s", peer->fromuser);
+		sofia_cli_peer_line(&buf, "From user", "%s", peer->fromuser);
 	}
 	if (!ast_strlen_zero(peer->fromdomain)) {
-		sofia_cli_peer_line(a->fd, "From domain", "%s", peer->fromdomain);
+		sofia_cli_peer_line(&buf, "From domain", "%s", peer->fromdomain);
 	}
 
-	sofia_cli_peer_section(a->fd, "Security and ACL");
+	sofia_cli_peer_section(&buf, "Security and ACL");
 	/* Insecure flags */
 	{
 		char ins[64] = "";
@@ -14075,52 +14143,52 @@ static char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cl
 			}
 			strncat(ins, "invite", sizeof(ins) - strlen(ins) - 1);
 		}
-		sofia_cli_peer_line(a->fd, "Insecure", "%s", ins[0] ? ins : "no");
+		sofia_cli_peer_line(&buf, "Insecure", "%s", ins[0] ? ins : "no");
 	}
 
 	/* ACL detail (was: just yes/no) */
 	if (peer->ha) {
-		sofia_cli_peer_line(a->fd, "ACL", "yes");
-		sofia_print_ha_lines(a->fd, peer->ha);
+		sofia_cli_peer_line(&buf, "ACL", "yes");
+		sofia_print_ha_lines(&buf, peer->ha);
 	} else {
-		sofia_cli_peer_line(a->fd, "ACL", "no");
+		sofia_cli_peer_line(&buf, "ACL", "no");
 	}
 	/* post-T56 contactpermit/contactdeny per-peer parity (2026-04-27): chan_sip
 	 * parity at chan_sip.c:18676 "ContactACL" wording (chan_sofia uses
 	 * "Contact-ACL" for visual separation from "ACL:" line above). */
-	sofia_cli_peer_line(a->fd, "Contact ACL", "%s", peer->contactha ? "yes" : "no");
+	sofia_cli_peer_line(&buf, "Contact ACL", "%s", peer->contactha ? "yes" : "no");
 	/* post-T56 directmediapermit/directmediadeny per-peer parity (2026-04-27): chan_sip
 	 * parity at chan_sip.c:18676 "DirectMedACL" wording verbatim. */
-	sofia_cli_peer_line(a->fd, "Direct media ACL", "%s", peer->directmediaha ? "yes" : "no");
+	sofia_cli_peer_line(&buf, "Direct media ACL", "%s", peer->directmediaha ? "yes" : "no");
 	/* post-T56 dnsmgr per-peer parity (2026-04-27): chan_sip parity at chan_sip.c:19066
 	 * "dnsmgr" Y/N column display. */
-	sofia_cli_peer_line(a->fd, "DNS managed", "%s", peer->dnsmgr ? "yes" : "no");
+	sofia_cli_peer_line(&buf, "DNS managed", "%s", peer->dnsmgr ? "yes" : "no");
 
-	sofia_cli_peer_section(a->fd, "Registration");
+	sofia_cli_peer_section(&buf, "Registration");
 	/* Source: where the peer definition came from. */
-	sofia_cli_peer_line(a->fd, "Source", "%s", source_str);
+	sofia_cli_peer_line(&buf, "Source", "%s", source_str);
 	/* Outbound register state — only meaningful when this peer is a register target */
 	if (!ast_strlen_zero(peer->secret)
 		&& !ast_strlen_zero(peer->host)
 		&& strcasecmp(peer->host, "dynamic") != 0) {
-		sofia_cli_peer_line(a->fd, "Outbound reg", "target=%s:%d expiry=%lds attempts=%d",
+		sofia_cli_peer_line(&buf, "Outbound reg", "target=%s:%d expiry=%lds attempts=%d",
 			peer->host, peer->port,
 			peer->reg_expiry > 0 ? (long)(peer->reg_expiry - time(NULL)) : 0,
 			peer->reg_attempts);
 	}
 
 	if (!ast_sockaddr_isnull(&peer->src_addr)) {
-		sofia_cli_peer_line(a->fd, "Source addr", "%s", ast_sockaddr_stringify(&peer->src_addr));
+		sofia_cli_peer_line(&buf, "Source addr", "%s", ast_sockaddr_stringify(&peer->src_addr));
 	}
 
-	sofia_cli_peer_section(a->fd, "Contacts");
+	sofia_cli_peer_section(&buf, "Contacts");
 	if (peer->contacts && contacts_used > 0) {
 		struct ao2_iterator ci;
 		struct sofia_contact *c;
 		time_t now = time(NULL);
 		int idx = 1;
 
-		sofia_cli_peer_line(a->fd, "Contact count", "%d", contacts_used);
+		sofia_cli_peer_line(&buf, "Contact count", "%d", contacts_used);
 		ci = ao2_iterator_init(peer->contacts, 0);
 		while ((c = ao2_iterator_next(&ci))) {
 			long ttl = (long)(c->expires - now);
@@ -14138,19 +14206,25 @@ static char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cl
 				ast_copy_string(contact_status, "IDLE", sizeof(contact_status));
 			}
 			snprintf(contact_label, sizeof(contact_label), "Contact %d URI", idx++);
-			sofia_cli_peer_line(a->fd, contact_label, "%s", c->contact_uri);
-			sofia_cli_peer_subline(a->fd, "State", "%s", contact_status);
-			sofia_cli_peer_subline(a->fd, "TTL", "%s", ttl_buf);
-			sofia_cli_peer_subline(a->fd, "Source", "%s", src);
-			sofia_cli_peer_subline(a->fd, "User-Agent", "%s",
+			sofia_cli_peer_line(&buf, contact_label, "%s", c->contact_uri);
+			sofia_cli_peer_subline(&buf, "State", "%s", contact_status);
+			sofia_cli_peer_subline(&buf, "TTL", "%s", ttl_buf);
+			sofia_cli_peer_subline(&buf, "Source", "%s", src);
+			sofia_cli_peer_subline(&buf, "User-Agent", "%s",
 				c->user_agent[0] ? c->user_agent : "(none)");
 			ao2_ref(c, -1);
 		}
 		ao2_iterator_destroy(&ci);
 	} else {
-		sofia_cli_peer_line(a->fd, "Contacts", "(none)");
+		sofia_cli_peer_line(&buf, "Contacts", "(none)");
 	}
 	ast_mutex_unlock(&peer->lock);
+
+	/* Single blocking write now that the lock is dropped. Literal "%s" — peer
+	 * data may contain '%'. */
+	ast_cli(a->fd, "%s", ast_str_buffer(buf));
+	ast_free(buf);
+
 	ao2_ref(peer, -1);
 
 	return CLI_SUCCESS;
@@ -17554,6 +17628,13 @@ static int manager_sofia_show_peers(struct mansession *s, const struct message *
 	while ((peer = ao2_iterator_next(&i))) {
 		struct ast_sockaddr addr;
 		char tmp_host[64], tmp_port[16], status[64];
+		/* Snapshot every peer-> field the astman_append reads into locals under
+		 * peer->lock, then emit after the unlock so the blocking AMI socket
+		 * write never stalls the lock holder. l_name is sized [256] because
+		 * peer->name is an unbounded stringfield, keeping the AMI ObjectName
+		 * loss-free. */
+		char l_name[256];
+		int l_dynamic, l_forcerport, l_video, l_acl, l_realtime;
 
 		ast_mutex_lock(&peer->lock);
 
@@ -17594,6 +17675,18 @@ static int manager_sofia_show_peers(struct mansession *s, const struct message *
 			break;
 		}
 
+		/* Snapshot the remaining peer-> reads into locals, then drop the lock
+		 * before the blocking astman_append. */
+		ast_copy_string(l_name, peer->name, sizeof(l_name));
+		l_dynamic = !strcasecmp(peer->host, "dynamic");
+		l_forcerport = (peer->nat & SOFIA_NAT_FORCE_RPORT) ? 1 : 0;
+		l_video = (peer->capability & AST_FORMAT_VIDEO_MASK) ? 1 : 0;
+		l_acl = peer->ha ? 1 : 0;
+		l_realtime = peer->is_realtime ? 1 : 0;
+
+		ast_mutex_unlock(&peer->lock);
+		ao2_ref(peer, -1);
+
 		astman_append(s,
 			"Event: PeerEntry\r\n"
 			"%s"
@@ -17611,18 +17704,16 @@ static int manager_sofia_show_peers(struct mansession *s, const struct message *
 			"RealtimeDevice: %s\r\n"
 			"\r\n",
 			idtext,
-			peer->name,
+			l_name,
 			tmp_host,
 			tmp_port,
-			!strcasecmp(peer->host, "dynamic") ? "yes" : "no",
-			(peer->nat & SOFIA_NAT_FORCE_RPORT) ? "yes" : "no",
-			(peer->capability & AST_FORMAT_VIDEO_MASK) ? "yes" : "no",
-			peer->ha ? "yes" : "no",
+			l_dynamic ? "yes" : "no",
+			l_forcerport ? "yes" : "no",
+			l_video ? "yes" : "no",
+			l_acl ? "yes" : "no",
 			status,
-			peer->is_realtime ? "yes" : "no");
+			l_realtime ? "yes" : "no");
 
-		ast_mutex_unlock(&peer->lock);
-		ao2_ref(peer, -1);
 		total++;
 	}
 	ao2_iterator_destroy(&i);
@@ -17659,6 +17750,7 @@ static int manager_sofia_show_peer(struct mansession *s, const struct message *m
 	char codec_buf[256];
 	char group_buf[256];
 	long reg_secs;
+	struct ast_str *buf;
 
 	if (ast_strlen_zero(peername)) {
 		astman_send_error(s, m, "Peer: <name> missing.");
@@ -17671,6 +17763,17 @@ static int manager_sofia_show_peer(struct mansession *s, const struct message *m
 	}
 	if (!ast_strlen_zero(id)) {
 		snprintf(idText, sizeof(idText), "ActionID: %s\r\n", id);
+	}
+
+	/* Assemble the whole detail response into buf while holding peer->lock,
+	 * then emit it with one blocking astman_append after the unlock so a slow
+	 * AMI consumer can't stall the lock holder. Allocate before locking and
+	 * bail if it fails. */
+	buf = ast_str_create(8192);
+	if (!buf) {
+		astman_send_error(s, m, "Out of memory");
+		ao2_ref(peer, -1);
+		return 0;
 	}
 
 	ast_mutex_lock(&peer->lock);
@@ -17733,22 +17836,22 @@ static int manager_sofia_show_peer(struct mansession *s, const struct message *m
 	/* First contact for UserAgent + Reg-Contact (NULL-safe) */
 	contact = sofia_peer_first_contact(peer);
 
-	astman_append(s, "Response: Success\r\n%s", idText);
-	astman_append(s, "Channeltype: SIP\r\n");
-	astman_append(s, "ObjectName: %s\r\n", peer->name);
-	astman_append(s, "ChanObjectType: peer\r\n");
-	astman_append(s, "SecretExist: %s\r\n", ast_strlen_zero(peer->secret) ? "N" : "Y");
-	astman_append(s, "RemoteSecretExist: N\r\n");
-	astman_append(s, "MD5SecretExist: N\r\n");
-	astman_append(s, "Context: %s\r\n", peer->context);
-	astman_append(s, "Language: \r\n");
-	astman_append(s, "AMAflags: Unknown\r\n");
-	astman_append(s, "CID-CallingPres: Allowed, Not Screened\r\n");
+	ast_str_append(&buf, 0, "Response: Success\r\n%s", idText);
+	ast_str_append(&buf, 0, "Channeltype: SIP\r\n");
+	ast_str_append(&buf, 0, "ObjectName: %s\r\n", peer->name);
+	ast_str_append(&buf, 0, "ChanObjectType: peer\r\n");
+	ast_str_append(&buf, 0, "SecretExist: %s\r\n", ast_strlen_zero(peer->secret) ? "N" : "Y");
+	ast_str_append(&buf, 0, "RemoteSecretExist: N\r\n");
+	ast_str_append(&buf, 0, "MD5SecretExist: N\r\n");
+	ast_str_append(&buf, 0, "Context: %s\r\n", peer->context);
+	ast_str_append(&buf, 0, "Language: \r\n");
+	ast_str_append(&buf, 0, "AMAflags: Unknown\r\n");
+	ast_str_append(&buf, 0, "CID-CallingPres: Allowed, Not Screened\r\n");
 	if (!ast_strlen_zero(peer->fromuser)) {
-		astman_append(s, "SIP-FromUser: %s\r\n", peer->fromuser);
+		ast_str_append(&buf, 0, "SIP-FromUser: %s\r\n", peer->fromuser);
 	}
 	if (!ast_strlen_zero(peer->fromdomain)) {
-		astman_append(s, "SIP-FromDomain: %s\r\n", peer->fromdomain);
+		ast_str_append(&buf, 0, "SIP-FromDomain: %s\r\n", peer->fromdomain);
 	}
 	/* post-T56 Task #2 D-3 SS1 (2026-04-28, GAP-4 fix + chan_sofia surpass —
 	 * chan_sip baseline emits Transport but lacks WS/WSS; chan_sofia includes
@@ -17757,14 +17860,14 @@ static int manager_sofia_show_peer(struct mansession *s, const struct message *m
 	 * :11062-11066. Operator NMS / monitoring systems can correlate per-peer
 	 * transport for alerting (e.g., expected WSS browser-UA peer arrives via
 	 * different transport → anomaly). */
-	astman_append(s, "Transport: %s\r\n",
+	ast_str_append(&buf, 0, "Transport: %s\r\n",
 		peer->transport == SOFIA_TRANSPORT_TCP ? "tcp" :
 		peer->transport == SOFIA_TRANSPORT_TLS ? "tls" :
 		peer->transport == SOFIA_TRANSPORT_WS  ? "ws"  :
 		peer->transport == SOFIA_TRANSPORT_WSS ? "wss" : "udp");
-	astman_append(s, "Callgroup: %s\r\n",
+	ast_str_append(&buf, 0, "Callgroup: %s\r\n",
 		ast_print_group(group_buf, sizeof(group_buf), peer->callgroup));
-	astman_append(s, "Pickupgroup: %s\r\n",
+	ast_str_append(&buf, 0, "Pickupgroup: %s\r\n",
 		ast_print_group(group_buf, sizeof(group_buf), peer->pickupgroup));
 	/* post-T56 MOH per-peer parity (2026-04-27): MOHInterpret + MOHSuggest
 	 * AMI fields. chan_sip parity at chan_sip.c:18784 string format verbatim.
@@ -17772,114 +17875,114 @@ static int manager_sofia_show_peer(struct mansession *s, const struct message *m
 	 * emitted hardcoded empty string regardless of peer config (parsed-but-
 	 * never-read-from-correct-source variant). Both fields now emit peer's
 	 * actual value. */
-	astman_append(s, "MOHInterpret: %s\r\n",
+	ast_str_append(&buf, 0, "MOHInterpret: %s\r\n",
 		ast_strlen_zero(peer->mohinterpret) ? "" : peer->mohinterpret);
-	astman_append(s, "MOHSuggest: %s\r\n",
+	ast_str_append(&buf, 0, "MOHSuggest: %s\r\n",
 		ast_strlen_zero(peer->mohsuggest) ? "" : peer->mohsuggest);
-	astman_append(s, "VoiceMailbox: \r\n");
+	ast_str_append(&buf, 0, "VoiceMailbox: \r\n");
 	/* post-T56 accountcode per-peer parity (2026-04-27): chan_sip-parity AMI field
 	 * gated on !ast_strlen_zero per chan_sip.c:18772-18773. */
 	if (!ast_strlen_zero(peer->accountcode)) {
-		astman_append(s, "Accountcode: %s\r\n", peer->accountcode);
+		ast_str_append(&buf, 0, "Accountcode: %s\r\n", peer->accountcode);
 	}
 	/* post-T56 allowtransfer per-peer parity (2026-04-27): in-flight stub fix —
 	 * pre-existing hardcoded "open" emitted regardless of peer config (Pattern 1
 	 * stored-but-never-read variant; ADDENDUM #4 SS6 8-in-flight-catches-pattern).
 	 * Now reflects peer->allowtransfer; chan_sip parity at chan_sip.c:18787 verbatim. */
-	astman_append(s, "TransferMode: %s\r\n", sofia_transfer_mode_str(peer->allowtransfer));
+	ast_str_append(&buf, 0, "TransferMode: %s\r\n", sofia_transfer_mode_str(peer->allowtransfer));
 	/* post-T56 allowsubscribe per-peer parity (2026-04-27): chan_sip parity field
 	 * (chan_sip flag SIP_PAGE2_ALLOWSUBSCRIBE → operator-visible yes/no). REQUEST-EVENT
 	 * GATING dimension #6 sibling to TransferMode. */
-	astman_append(s, "AllowSubscribe: %s\r\n", peer->allowsubscribe ? "yes" : "no");
+	ast_str_append(&buf, 0, "AllowSubscribe: %s\r\n", peer->allowsubscribe ? "yes" : "no");
 	/* post-T56 buggymwi per-peer parity (2026-04-27): chan_sip parity field
 	 * (chan_sip flag SIP_PAGE2_BUGGY_MWI → operator-visible yes/no for verifying
 	 * Cisco-buggy-stack workaround applied per-peer). */
-	astman_append(s, "BuggyMWI: %s\r\n", peer->buggymwi ? "yes" : "no");
+	ast_str_append(&buf, 0, "BuggyMWI: %s\r\n", peer->buggymwi ? "yes" : "no");
 	/* post-T56 lockuseragent per-peer parity (2026-04-27): chan_sip parity Lockuseragent
 	 * field (yes/no) + chan_sofia surpass LockedUserAgent display field (current
 	 * locked UA string for compliance audit / UA-spoofing investigation). */
-	astman_append(s, "Lockuseragent: %s\r\n", peer->lockuseragent ? "yes" : "no");
-	astman_append(s, "LockedUserAgent: %s\r\n", peer->locked_user_agent);
-	astman_append(s, "LockUserAgentPrefixes: %s\r\n", S_OR(peer->lockuseragent_prefixes, ""));
+	ast_str_append(&buf, 0, "Lockuseragent: %s\r\n", peer->lockuseragent ? "yes" : "no");
+	ast_str_append(&buf, 0, "LockedUserAgent: %s\r\n", peer->locked_user_agent);
+	ast_str_append(&buf, 0, "LockUserAgentPrefixes: %s\r\n", S_OR(peer->lockuseragent_prefixes, ""));
 	/* post-T56 language per-peer parity (2026-04-27): per-peer audio-locale field. */
-	astman_append(s, "Language: %s\r\n", peer->language);
+	ast_str_append(&buf, 0, "Language: %s\r\n", peer->language);
 	/* post-T56 defaultip per-peer parity (2026-04-28): chan_sip parity at
 	 * chan_sip.c:18820 verbatim Default-addr-IP + Default-addr-port fields. */
-	astman_append(s, "Default-addr-IP: %s\r\nDefault-addr-port: %d\r\n",
+	ast_str_append(&buf, 0, "Default-addr-IP: %s\r\nDefault-addr-port: %d\r\n",
 		ast_sockaddr_stringify_addr(&peer->defaddr),
 		ast_sockaddr_port(&peer->defaddr));
 	/* post-T56 maxcallbitrate per-peer parity (2026-04-28): chan_sip parity at
 	 * chan_sip.c:18792 verbatim "MaxCallBR: %d kbps" field. */
-	astman_append(s, "MaxCallBR: %d kbps\r\n", peer->maxcallbitrate);
+	ast_str_append(&buf, 0, "MaxCallBR: %d kbps\r\n", peer->maxcallbitrate);
 	/* post-T56 amaflags per-peer parity (2026-04-28): chan_sip parity at
 	 * chan_sip.c:18774 verbatim "AMAflags: %s" via ast_cdr_flags2str. */
-	astman_append(s, "AMAflags: %s\r\n", ast_cdr_flags2str(peer->amaflags));
+	ast_str_append(&buf, 0, "AMAflags: %s\r\n", ast_cdr_flags2str(peer->amaflags));
 	/* post-T56 subscribemwi per-peer parity (2026-04-28): chan_sip parity field
 	 * (sip.h:324 SIP_PAGE2_SUBSCRIBEMWIONLY → operator-visible yes/no). */
-	astman_append(s, "SubscribeMWI: %s\r\n", peer->subscribemwi ? "yes" : "no");
+	ast_str_append(&buf, 0, "SubscribeMWI: %s\r\n", peer->subscribemwi ? "yes" : "no");
 	/* post-T56 preferred_codec_only per-peer parity (2026-04-28): chan_sip parity field
 	 * (sip.h:313 SIP_PAGE2_PREFERRED_CODEC → operator-visible yes/no). */
-	astman_append(s, "PreferredCodec: %s\r\n", peer->preferred_codec_only ? "yes" : "no");
+	ast_str_append(&buf, 0, "PreferredCodec: %s\r\n", peer->preferred_codec_only ? "yes" : "no");
 	/* post-T56 ignoresdpversion per-peer parity (2026-04-28): chan_sip parity field
 	 * (sip.h:325 SIP_PAGE2_IGNORESDPVERSION → operator-visible yes/no). PARSE-COMPAT-
 	 * ONLY (chan_sofia processes every SDP unconditionally). */
-	astman_append(s, "IgnoreSDPVersion: %s\r\n", peer->ignoresdpversion ? "yes" : "no");
+	ast_str_append(&buf, 0, "IgnoreSDPVersion: %s\r\n", peer->ignoresdpversion ? "yes" : "no");
 	/* post-T56 promiscredir per-peer parity (2026-04-28): chan_sip-parity AMI field
 	 * "SIP-PromiscRedir" per chan_sip.c:18801 verbatim Y/N format. PARSE-COMPAT-ONLY. */
-	astman_append(s, "SIP-PromiscRedir: %s\r\n", peer->promiscredir ? "Y" : "N");
+	ast_str_append(&buf, 0, "SIP-PromiscRedir: %s\r\n", peer->promiscredir ? "Y" : "N");
 	/* post-T56 autoframing per-peer parity (2026-04-28): chan_sip-parity AMI field
 	 * "Autoframing" yes/no format. PARSE-COMPAT-ONLY (sofia_parse_sdp ptime gate
 	 * not wired today). */
-	astman_append(s, "Autoframing: %s\r\n", peer->autoframing ? "yes" : "no");
+	ast_str_append(&buf, 0, "Autoframing: %s\r\n", peer->autoframing ? "yes" : "no");
 	/* faxdetect per-peer AMI field: reports the runtime mode used by DSP CNG
 	 * detection and peer T.38 reINVITE detection. */
-	astman_append(s, "FaxDetect: %s\r\n",
+	ast_str_append(&buf, 0, "FaxDetect: %s\r\n",
 		peer->faxdetect_mode == SOFIA_FAX_DETECT_NONE ? "no" :
 		peer->faxdetect_mode == SOFIA_FAX_DETECT_BOTH ? "cng,t38" :
 		peer->faxdetect_mode == SOFIA_FAX_DETECT_CNG ? "cng" : "t38");
 	/* post-T56 timerb per-peer parity (2026-04-28): chan_sip-parity AMI field
 	 * "Timer-B: %d ms" — operator-visible RFC 3261 Timer B value. */
-	astman_append(s, "Timer-B: %d\r\n", peer->timer_b);
+	ast_str_append(&buf, 0, "Timer-B: %d\r\n", peer->timer_b);
 	/* post-T56 timert1 per-peer parity (2026-04-28): chan_sip-parity AMI field
 	 * "Timer-T1: %d ms" — operator-visible RFC 3261 §17.1.1.1 T1 retransmission
 	 * interval value. Pattern 16 sofia-sip-native 7th-instance REWIRED. */
-	astman_append(s, "Timer-T1: %d\r\n", peer->timer_t1);
+	ast_str_append(&buf, 0, "Timer-T1: %d\r\n", peer->timer_t1);
 	/* post-T56 allowoverlap per-peer + [general] parity (2026-04-28, Option A
 	 * FULL WIRE-IN + chan_sofia surpass — chan_sip AMI silent verified ABSENT
 	 * via grep): operator-visible RFC 3261 §3 overlap-dial mode tri-state. */
-	astman_append(s, "OverlapDial: %s\r\n", sofia_allowoverlap_str(peer->allowoverlap_mode));
+	ast_str_append(&buf, 0, "OverlapDial: %s\r\n", sofia_allowoverlap_str(peer->allowoverlap_mode));
 	/* post-T56 progressinband per-peer parity (2026-04-28): chan_sip parity tri-state
 	 * field (sip.h:282-285 SIP_PROG_INBAND_NEVER/NO/YES → operator-visible never/no/yes).
 	 * Option B partial wire-in (NEVER + YES exact; NO degrades to NEVER). */
-	astman_append(s, "ProgressInband: %s\r\n",
+	ast_str_append(&buf, 0, "ProgressInband: %s\r\n",
 		peer->progressinband == SOFIA_PROG_INBAND_NEVER ? "never" :
 		peer->progressinband == SOFIA_PROG_INBAND_YES ? "yes" : "no");
 	/* post-T56 rtp-timeout bundle per-peer parity (2026-04-28): 3 fields chan_sip parity. */
-	astman_append(s, "RTPTimeout: %d\r\n", peer->rtptimeout);
-	astman_append(s, "RTPHoldTimeout: %d\r\n", peer->rtpholdtimeout);
-	astman_append(s, "RTPKeepalive: %d\r\n", peer->rtpkeepalive);
+	ast_str_append(&buf, 0, "RTPTimeout: %d\r\n", peer->rtptimeout);
+	ast_str_append(&buf, 0, "RTPHoldTimeout: %d\r\n", peer->rtpholdtimeout);
+	ast_str_append(&buf, 0, "RTPKeepalive: %d\r\n", peer->rtpkeepalive);
 	/* post-T56 parkinglot per-peer parity (2026-04-28): chan_sip parity at
 	 * chan_sip.c:18849 verbatim "Parkinglot: %s" field. */
-	astman_append(s, "Parkinglot: %s\r\n", peer->parkinglot);
-	astman_append(s, "LastMsgsSent: 0\r\n");
+	ast_str_append(&buf, 0, "Parkinglot: %s\r\n", peer->parkinglot);
+	ast_str_append(&buf, 0, "LastMsgsSent: 0\r\n");
 	/* post-T56 maxforwards parity (2026-04-27): in-flight Pattern 1 stub-fix #13 —
 	 * pre-existing hardcoded "Maxforwards: 0" emitted regardless of peer config
 	 * (stored-but-never-read variant; ADDENDUM #4 SS6 8-in-flight-catches-pattern
 	 * advances to 13/13 1-day peak). Now reflects peer->maxforwards; chan_sip
 	 * parity at chan_sip.c:18789 verbatim. */
-	astman_append(s, "Maxforwards: %d\r\n", peer->maxforwards);
+	ast_str_append(&buf, 0, "Maxforwards: %d\r\n", peer->maxforwards);
 	/* post-T56 call-limit parity SS6 R8 (2026-04-27): chan_sip-parity field
 	 * values for Call-limit + Busy-level + InUse/InRinging/OnHold. Fixed
 	 * pre-existing stubs that emitted busy_on_active as Call-limit and
 	 * hardcoded 0 as Busy-level. Always-emit (no zero-gate) per chan_sip
 	 * L18790-18791 — operator AMI scripts get consistent field set. */
-	astman_append(s, "Call-limit: %d\r\n", peer->call_limit);
-	astman_append(s, "Busy-level: %d\r\n", peer->busy_level);
-	astman_append(s, "InUse: %d\r\n", peer->inUse);
-	astman_append(s, "InRinging: %d\r\n", peer->inRinging);
-	astman_append(s, "OnHold: %d\r\n", peer->onHold);
-	astman_append(s, "MaxCallBR: 384 kbps\r\n");
-	astman_append(s, "Dynamic: %s\r\n", !strcasecmp(peer->host, "dynamic") ? "Y" : "N");
+	ast_str_append(&buf, 0, "Call-limit: %d\r\n", peer->call_limit);
+	ast_str_append(&buf, 0, "Busy-level: %d\r\n", peer->busy_level);
+	ast_str_append(&buf, 0, "InUse: %d\r\n", peer->inUse);
+	ast_str_append(&buf, 0, "InRinging: %d\r\n", peer->inRinging);
+	ast_str_append(&buf, 0, "OnHold: %d\r\n", peer->onHold);
+	ast_str_append(&buf, 0, "MaxCallBR: 384 kbps\r\n");
+	ast_str_append(&buf, 0, "Dynamic: %s\r\n", !strcasecmp(peer->host, "dynamic") ? "Y" : "N");
 	/* post-T56 cid bundle parity (2026-04-28): chan_sip-parity Callerid AMI field
 	 * via ast_callerid_merge per chan_sip.c:18794 verbatim format; reflects
 	 * cid_name + cid_num set via callerid/fullname/cid_number/cid_name keys.
@@ -17888,48 +17991,48 @@ static int manager_sofia_show_peer(struct mansession *s, const struct message *m
 		char merged[256];
 		ast_callerid_merge(merged, sizeof(merged),
 			S_OR(peer->cid_name, ""), S_OR(peer->cid_num, ""), "<unknown>");
-		astman_append(s, "Callerid: %s\r\n", merged);
+		ast_str_append(&buf, 0, "Callerid: %s\r\n", merged);
 	} else {
-		astman_append(s, "Callerid: %s\r\n", peer->callerid);
+		ast_str_append(&buf, 0, "Callerid: %s\r\n", peer->callerid);
 	}
 	if (!ast_strlen_zero(peer->cid_tag)) {
-		astman_append(s, "CIDtag: %s\r\n", peer->cid_tag);
+		ast_str_append(&buf, 0, "CIDtag: %s\r\n", peer->cid_tag);
 	}
-	astman_append(s, "RegExpire: %ld seconds\r\n", reg_secs);
-	astman_append(s, "SIP-AuthInsecure: %s\r\n", insecure);
-	astman_append(s, "SIP-Forcerport: %s\r\n", (peer->nat & SOFIA_NAT_FORCE_RPORT) ? "Y" : "N");
-	astman_append(s, "SIP-Comedia: %s\r\n", (peer->nat & SOFIA_NAT_COMEDIA) ? "Y" : "N");
-	astman_append(s, "ACL: %s\r\n", peer->ha ? "Y" : "N");
+	ast_str_append(&buf, 0, "RegExpire: %ld seconds\r\n", reg_secs);
+	ast_str_append(&buf, 0, "SIP-AuthInsecure: %s\r\n", insecure);
+	ast_str_append(&buf, 0, "SIP-Forcerport: %s\r\n", (peer->nat & SOFIA_NAT_FORCE_RPORT) ? "Y" : "N");
+	ast_str_append(&buf, 0, "SIP-Comedia: %s\r\n", (peer->nat & SOFIA_NAT_COMEDIA) ? "Y" : "N");
+	ast_str_append(&buf, 0, "ACL: %s\r\n", peer->ha ? "Y" : "N");
 	/* post-T56 contactpermit/contactdeny per-peer parity (2026-04-27): chan_sip
 	 * parity AMI field. */
-	astman_append(s, "ContactACL: %s\r\n", peer->contactha ? "Y" : "N");
+	ast_str_append(&buf, 0, "ContactACL: %s\r\n", peer->contactha ? "Y" : "N");
 	/* post-T56 directmediapermit/directmediadeny per-peer parity (2026-04-27): chan_sip
 	 * parity AMI field at chan_sip.c:18676 "DirectMedACL" wording. */
-	astman_append(s, "DirectMedACL: %s\r\n", peer->directmediaha ? "Y" : "N");
+	ast_str_append(&buf, 0, "DirectMedACL: %s\r\n", peer->directmediaha ? "Y" : "N");
 	/* post-T56 dnsmgr per-peer parity (2026-04-27): chan_sip parity AMI field. */
-	astman_append(s, "DnsMgr: %s\r\n", peer->dnsmgr ? "Y" : "N");
-	astman_append(s, "SIP-CanReinvite: %s\r\n", peer->directmedia ? "Y" : "N");
-	astman_append(s, "SIP-DirectMedia: %s\r\n", peer->directmedia ? "Y" : "N");
-	astman_append(s, "SIP-PromiscRedir: N\r\n");
+	ast_str_append(&buf, 0, "DnsMgr: %s\r\n", peer->dnsmgr ? "Y" : "N");
+	ast_str_append(&buf, 0, "SIP-CanReinvite: %s\r\n", peer->directmedia ? "Y" : "N");
+	ast_str_append(&buf, 0, "SIP-DirectMedia: %s\r\n", peer->directmedia ? "Y" : "N");
+	ast_str_append(&buf, 0, "SIP-PromiscRedir: N\r\n");
 	/* post-T56 usereqphone parity (2026-04-27): in-flight Pattern 1 stub-fix —
 	 * pre-existing hardcoded "N" emitted regardless of peer config (stored-but-
 	 * never-read variant; ADDENDUM #4 SS6 8-in-flight-catches-pattern continues
 	 * to 11th instance in 1 day's work). Now reflects peer->usereqphone; chan_sip
 	 * parity at chan_sip.c:18802 verbatim. */
-	astman_append(s, "SIP-UserPhone: %s\r\n", peer->usereqphone ? "Y" : "N");
-	astman_append(s, "SIP-VideoSupport: %s\r\n", (peer->capability & AST_FORMAT_VIDEO_MASK) ? "Y" : "N");
-	astman_append(s, "SIP-TextSupport: N\r\n");
-	astman_append(s, "SIP-T.38Support: N\r\n");
-	astman_append(s, "SIP-T.38EC: None\r\n");
-	astman_append(s, "SIP-T.38MaxDtgrm: 0\r\n");
-	astman_append(s, "SIP-Sess-Timers: Refuse\r\n");
-	astman_append(s, "SIP-Sess-Refresh: uas\r\n");
-	astman_append(s, "SIP-Sess-Expires: 1800\r\n");
-	astman_append(s, "SIP-Sess-Min: 90\r\n");
-	astman_append(s, "SIP-RTP-Engine: gabpbx\r\n");
-	astman_append(s, "SIP-Encryption: %s\r\n", peer->encryption ? "Y" : "N");
+	ast_str_append(&buf, 0, "SIP-UserPhone: %s\r\n", peer->usereqphone ? "Y" : "N");
+	ast_str_append(&buf, 0, "SIP-VideoSupport: %s\r\n", (peer->capability & AST_FORMAT_VIDEO_MASK) ? "Y" : "N");
+	ast_str_append(&buf, 0, "SIP-TextSupport: N\r\n");
+	ast_str_append(&buf, 0, "SIP-T.38Support: N\r\n");
+	ast_str_append(&buf, 0, "SIP-T.38EC: None\r\n");
+	ast_str_append(&buf, 0, "SIP-T.38MaxDtgrm: 0\r\n");
+	ast_str_append(&buf, 0, "SIP-Sess-Timers: Refuse\r\n");
+	ast_str_append(&buf, 0, "SIP-Sess-Refresh: uas\r\n");
+	ast_str_append(&buf, 0, "SIP-Sess-Expires: 1800\r\n");
+	ast_str_append(&buf, 0, "SIP-Sess-Min: 90\r\n");
+	ast_str_append(&buf, 0, "SIP-RTP-Engine: gabpbx\r\n");
+	ast_str_append(&buf, 0, "SIP-Encryption: %s\r\n", peer->encryption ? "Y" : "N");
 	/* post-T56 srtpcipher operator option (2026-04-27): SRTPCipher field for AMI SIPshowpeer. */
-	astman_append(s, "SRTPCipher: %s\r\n", S_OR(peer->srtpcipher, ""));
+	ast_str_append(&buf, 0, "SRTPCipher: %s\r\n", S_OR(peer->srtpcipher, ""));
 	/* post-T56 session timers (RFC 4028) (2026-04-27): 4 chan_sip-parity AMI fields. */
 	{
 		const char *st_mode_str =
@@ -17939,26 +18042,26 @@ static int manager_sofia_show_peer(struct mansession *s, const struct message *m
 		const char *st_refresher_str =
 			(peer->session_refresher == SESSION_REFRESHER_UAC) ? "uac" :
 			(peer->session_refresher == SESSION_REFRESHER_UAS) ? "uas" : "auto";
-		astman_append(s, "SessionTimers: %s\r\n", st_mode_str);
-		astman_append(s, "SessionExpires: %d\r\n", peer->session_expires);
-		astman_append(s, "SessionMinSE: %d\r\n", peer->session_minse);
-		astman_append(s, "SessionRefresher: %s\r\n", st_refresher_str);
+		ast_str_append(&buf, 0, "SessionTimers: %s\r\n", st_mode_str);
+		ast_str_append(&buf, 0, "SessionExpires: %d\r\n", peer->session_expires);
+		ast_str_append(&buf, 0, "SessionMinSE: %d\r\n", peer->session_minse);
+		ast_str_append(&buf, 0, "SessionRefresher: %s\r\n", st_refresher_str);
 	}
-	astman_append(s, "SIP-DTMFmode: %s\r\n", dtmfmode);
-	astman_append(s, "ToHost: %s\r\n", peer->host);
-	astman_append(s, "Address-IP: %s\r\nAddress-Port: %s\r\n", tmp_host, tmp_port);
-	astman_append(s, "Default-Username: %s\r\n", peer->defaultuser);
+	ast_str_append(&buf, 0, "SIP-DTMFmode: %s\r\n", dtmfmode);
+	ast_str_append(&buf, 0, "ToHost: %s\r\n", peer->host);
+	ast_str_append(&buf, 0, "Address-IP: %s\r\nAddress-Port: %s\r\n", tmp_host, tmp_port);
+	ast_str_append(&buf, 0, "Default-Username: %s\r\n", peer->defaultuser);
 	/* post-T56 regexten display-gate parity (2026-04-27): chan_sip.c:18822 gates
 	 * AMI RegExtension field on !ast_strlen_zero(sip_cfg.regcontext) — only
 	 * emitted when the auto-extension mechanism is active. */
 	if (!ast_strlen_zero(sofia_cfg.regcontext) && !ast_strlen_zero(peer->regexten)) {
-		astman_append(s, "RegExtension: %s\r\n", peer->regexten);
+		ast_str_append(&buf, 0, "RegExtension: %s\r\n", peer->regexten);
 	}
 	/* post-T56 callbackextension per-peer parity (2026-04-28, Option A FULL WIRE-IN
 	 * + chan_sofia surpass over chan_sip AMI silent — chan_sip never exposes
 	 * callbackextension in any AMI action): conditional emit only when set. */
 	if (!ast_strlen_zero(peer->callbackextension)) {
-		astman_append(s, "CallbackExtension: %s\r\n", peer->callbackextension);
+		ast_str_append(&buf, 0, "CallbackExtension: %s\r\n", peer->callbackextension);
 	}
 	/* post-T56 setvar+header per-peer parity (2026-04-28, COMBINED ship): AMI
 	 * ChanVariable iteration per chan_sip.c:18850-18854 verbatim format. Includes
@@ -17966,42 +18069,48 @@ static int manager_sofia_show_peer(struct mansession *s, const struct message *m
 	if (peer->chanvars) {
 		struct ast_variable *var;
 		for (var = peer->chanvars; var; var = var->next) {
-			astman_append(s, "ChanVariable: %s=%s\r\n", var->name, var->value);
+			ast_str_append(&buf, 0, "ChanVariable: %s=%s\r\n", var->name, var->value);
 		}
 	}
 	ast_getformatname_multiple(codec_buf, sizeof(codec_buf) - 1, peer->capability);
-	astman_append(s, "Codecs: %s\r\n", codec_buf);
+	ast_str_append(&buf, 0, "Codecs: %s\r\n", codec_buf);
 	/* CodecOrder — walk peer->prefs in priority order */
 	{
 		int x;
 		format_t codec;
-		astman_append(s, "CodecOrder: ");
+		ast_str_append(&buf, 0, "CodecOrder: ");
 		for (x = 0; x < 64; x++) {
 			codec = ast_codec_pref_index(&peer->prefs, x);
 			if (!codec) {
 				break;
 			}
-			astman_append(s, "%s%s", x ? "," : "", ast_getformatname(codec));
+			ast_str_append(&buf, 0, "%s%s", x ? "," : "", ast_getformatname(codec));
 		}
-		astman_append(s, "\r\n");
+		ast_str_append(&buf, 0, "\r\n");
 	}
-	astman_append(s, "Status: %s\r\n", status);
-	astman_append(s, "SIP-Useragent: %s\r\n", contact ? S_OR(contact->user_agent, "") : "");
-	astman_append(s, "Reg-Contact: %s\r\n", contact ? S_OR(contact->contact_uri, "") : "");
-	astman_append(s, "QualifyFreq: %d ms\r\n", peer->qualifyfreq);
-	astman_append(s, "Parkinglot: \r\n");
+	ast_str_append(&buf, 0, "Status: %s\r\n", status);
+	ast_str_append(&buf, 0, "SIP-Useragent: %s\r\n", contact ? S_OR(contact->user_agent, "") : "");
+	ast_str_append(&buf, 0, "Reg-Contact: %s\r\n", contact ? S_OR(contact->contact_uri, "") : "");
+	ast_str_append(&buf, 0, "QualifyFreq: %d ms\r\n", peer->qualifyfreq);
+	ast_str_append(&buf, 0, "Parkinglot: \r\n");
 	/* chan_sofia-only fields (T21/T22/T37) */
-	astman_append(s, "BusyOnActive: %s\r\n", peer->busy_on_active ? "Y" : "N");
-	astman_append(s, "MaxContacts: %d\r\n", peer->max_contacts);
-	astman_append(s, "QualifyTimeout: %d\r\n", peer->qualifytimeout);
-	astman_append(s, "LastMs: %d\r\n", peer->lastms);
-	astman_append(s, "RealtimeDevice: %s\r\n", peer->is_realtime ? "yes" : "no");
-	astman_append(s, "\r\n");
+	ast_str_append(&buf, 0, "BusyOnActive: %s\r\n", peer->busy_on_active ? "Y" : "N");
+	ast_str_append(&buf, 0, "MaxContacts: %d\r\n", peer->max_contacts);
+	ast_str_append(&buf, 0, "QualifyTimeout: %d\r\n", peer->qualifytimeout);
+	ast_str_append(&buf, 0, "LastMs: %d\r\n", peer->lastms);
+	ast_str_append(&buf, 0, "RealtimeDevice: %s\r\n", peer->is_realtime ? "yes" : "no");
+	ast_str_append(&buf, 0, "\r\n");
 
 	if (contact) {
 		ao2_ref(contact, -1);
 	}
 	ast_mutex_unlock(&peer->lock);
+
+	/* Single blocking AMI write now that the lock is dropped. Literal "%s" —
+	 * peer data may contain '%'. */
+	astman_append(s, "%s", ast_str_buffer(buf));
+	ast_free(buf);
+
 	ao2_ref(peer, -1);
 	return 0;
 }
