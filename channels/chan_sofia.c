@@ -6889,7 +6889,7 @@ static int sofia_answer(struct ast_channel *ast)
 		sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
 		if (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf))) {
 			nua_respond(pvt->nh, SIP_200_OK,
-				SIPTAG_CONTACT_STR(contact_buf),
+				TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
 				TAG_IF(st_seconds >= 0, NUTAG_SESSION_TIMER(st_seconds)),
 				TAG_IF(st_min_se > 0, NUTAG_MIN_SE(st_min_se)),
 				TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
@@ -6898,7 +6898,7 @@ static int sofia_answer(struct ast_channel *ast)
 				TAG_END());
 		} else {
 			nua_respond(pvt->nh, SIP_200_OK,
-				SIPTAG_CONTACT_STR(contact_buf),
+				TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
 				TAG_IF(st_seconds >= 0, NUTAG_SESSION_TIMER(st_seconds)),
 				TAG_IF(st_min_se > 0, NUTAG_MIN_SE(st_min_se)),
 				TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
@@ -7069,7 +7069,8 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 		char contact_buf[256];
 		sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
 		nua_respond(pvt->nh, SIP_180_RINGING,
-			SIPTAG_CONTACT_STR(contact_buf), TAG_END());
+			TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
+			TAG_END());
 	}
 		/* post-T56 progressinband per-peer + [general] tri-state parity (2026-04-28,
 		 * Option B partial wire-in): YES → return -1 to force core in-band audio
@@ -7146,7 +7147,7 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 			sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
 			if (pvt->rtp && sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf))) {
 				nua_respond(pvt->nh, SIP_183_SESSION_PROGRESS,
-					SIPTAG_CONTACT_STR(contact_buf),
+					TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
 					SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 					SIPTAG_PAYLOAD_STR(sdp_buf),
 					TAG_END());
@@ -7156,7 +7157,8 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 				 * (inbound) and sofia_request_call (outbound) before
 				 * AST_CONTROL_PROGRESS can reach the channel. */
 				nua_respond(pvt->nh, SIP_183_SESSION_PROGRESS,
-					SIPTAG_CONTACT_STR(contact_buf), TAG_END());
+					TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
+					TAG_END());
 			}
 		}
 		break;
@@ -7673,8 +7675,19 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	ast_mutex_unlock(&pvt->lock);
 
 	if (sdp_ok) {
+		/* A re-INVITE 200 OK is a target-refresh response (RFC 3261 §12.2.1.2):
+		 * its Contact replaces the peer's stored remote target for this dialog.
+		 * Stamp it from the per-leg kernel-routed source address (pvt->ourip),
+		 * consistent with the initial 200 OK in sofia_answer, so a hold/resume,
+		 * session refresh (RFC 4028) or transfer-driven re-INVITE on a multihomed
+		 * wildcard bind does not move the target onto the wrong interface and
+		 * silently break subsequent in-dialog requests. See the note in
+		 * sofia_answer. */
+		char contact_buf[256];
+		sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
 		nua_respond(nh, SIP_200_OK,
 			NUTAG_WITH_THIS(nua),
+			TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
 			SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 			SIPTAG_PAYLOAD_STR(sdp_buf),
 			TAG_END());
