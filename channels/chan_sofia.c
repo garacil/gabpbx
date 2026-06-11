@@ -6577,7 +6577,9 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 			}
 			ao2_iterator_destroy(&ci);
 
+			ast_mutex_lock(&pvt->lock);
 			pvt->state = SOFIA_DIALOG_STATE_TRYING;
+			ast_mutex_unlock(&pvt->lock);
 			if (sofia_debug)
 				ast_verbose("Sofia: Forking %d INVITEs to peer '%s' (%s)\n",
 					branch_idx, pvt->peername, fork->fork_id);
@@ -6641,7 +6643,9 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		}
 	}
 
+	ast_mutex_lock(&pvt->lock);
 	pvt->state = SOFIA_DIALOG_STATE_TRYING;
+	ast_mutex_unlock(&pvt->lock);
 
 	has_addheaders = sofia_build_addheader_str(ast, addheader_buf, sizeof(addheader_buf));
 
@@ -6906,7 +6910,9 @@ static int sofia_answer(struct ast_channel *ast)
 		}
 	}
 
+	ast_mutex_lock(&pvt->lock);
 	pvt->state = SOFIA_DIALOG_STATE_UP;
+	ast_mutex_unlock(&pvt->lock);
 	ast_setstate(ast, AST_STATE_UP);
 
 	return 0;
@@ -12548,7 +12554,9 @@ static void sofia_process_ack(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op
 		sip_t const *sip, tagi_t tags[])
 {
 	if (op) {
+		ast_mutex_lock(&op->lock);
 		op->state = SOFIA_DIALOG_STATE_UP;
+		ast_mutex_unlock(&op->lock);
 		/* For late-offer INVITEs (no SDP in INVITE), the ACK may carry SDP */
 		if (sip && sip->sip_payload && sip->sip_payload->pl_data && op->rtp) {
 			sofia_parse_sdp(op, sip);
@@ -13329,7 +13337,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		break;
 	case nua_i_terminated:
 		if (pvt) {
+			ast_mutex_lock(&pvt->lock);
 			pvt->state = SOFIA_DIALOG_STATE_DOWN;
+			ast_mutex_unlock(&pvt->lock);
 		}
 		break;
 	case nua_r_set_params:
