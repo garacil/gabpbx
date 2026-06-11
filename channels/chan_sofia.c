@@ -5993,8 +5993,8 @@ static struct sofia_peer *sofia_find_peer(const char *name)
 /* chan_sip parity: IP-based fallback peer match.
  * Used by sofia_process_invite after the From-username lookup fails — typical
  * for trunk gateways whose From-user is the caller-ID number, not the peer
- * name (e.g. Huawei SoftX3000 sending From: <sip:621120700@…> while the peer
- * is configured as [trunk_eli4] host=213.162.195.21). Matches peer->src_addr
+ * name (e.g. Huawei SoftX3000 sending From: <sip:CALLERID@…> while the peer
+ * is configured as [trunkX] host=<carrier-ip>). Matches peer->src_addr
  * (set both by dnsmgr for static host=<ip> peers and by REGISTER for dynamic
  * peers) or, if that is unset, peer->defaddr. Port is ignored on purpose so
  * the existing SOFIA_INSECURE_PORT semantic stays the only port-mismatch
@@ -7636,8 +7636,8 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 		 * chan_sip sip_request_call parsing, dial string before '@' is the Request-URI user
 		 * (extension/number to dial), part after '@' is the configured peer name used for
 		 * routing. Required for drop-in compatibility (chan-sip-compat-naming-rules.md):
-		 * production dialplans like Dial(SIP/9999#622501314@trunk_eli3) MUST resolve to
-		 * peer=trunk_eli3, exten=9999#622501314 — without this fix peer lookup fails on
+		 * production dialplans like Dial(SIP/EXTEN#NUMBER@trunkX) MUST resolve to
+		 * peer=trunkX, exten=EXTEN#NUMBER — without this fix peer lookup fails on
 		 * the full string and the call ends in CHANUNAVAIL. If neither '/' nor '@' is
 		 * present, treat the whole input as a plain peer name (no extension) — matches
 		 * the original Dial(SIP/peer) behavior. */
@@ -7736,8 +7736,8 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 			/* NAT in-dialog routing override (chan_sip parity): when peer is
 			 * behind NAT (force_rport / comedia), sofia-sip's auto-generated
 			 * ACK and BYE would honor the 200 OK Contact URI which usually
-			 * carries the peer's LAN IP (e.g. Yealink advertising 192.168.0.33
-			 * even when registered from 95.23.145.25). NUTAG_PROXY pins all
+			 * carries the peer's LAN IP (e.g. Yealink advertising 192.168.x.x
+			 * even when registered from a public address). NUTAG_PROXY pins all
 			 * outgoing dialog messages to peer->src_addr — the registered/
 			 * resolved public address — so ACK reaches the phone, suppressing
 			 * the 200 OK retransmit loop and unblocking the call. */
@@ -10875,7 +10875,7 @@ static void sofia_resolve_ourip(struct sofia_pvt *pvt, const struct ast_sockaddr
  *   if AST_PRES_RESTRICTION → l="anonymous", n="" (chan_sip L11780 pattern).
  * - Fallback chain: connected.id missing → peer->fromuser → peer->name → "asterisk".
  * - URI-encoding: ast_uri_encode the user-part — required for # / ? / @ / etc.
- *   (post-T56 dial-atpeer fix exposed exten#did@peer form like 9999#622501314).
+ *   (post-T56 dial-atpeer fix exposed exten#did@peer form like EXTEN#NUMBER).
  * - Tag: NEVER add ;tag= manually — sofia-sip nua layer auto-emits the From-tag
  *   as part of dialog state. Format: "\"%s\" <sip:%s@%s>" (no tag). */
 static void sofia_build_from(struct sofia_pvt *pvt, char *buf, size_t len)
