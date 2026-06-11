@@ -15946,6 +15946,7 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 	 * var name. Local scope resets per peer-build per chan_sip.c:28582 verbatim
 	 * idiom. */
 	int headercount = 0;
+	int locked = 0;
 
 	peer = sofia_find_peer(cat);
 	if (!peer) {
@@ -15962,6 +15963,17 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		 * the transient empty-string window for secret/context/host/...
 		 * and the freed-mid-iteration chanvars list. */
 		ast_mutex_lock(&peer->lock);
+		locked = 1;
+		/* The lock is now held across the whole reset + repopulate + defaults
+		 * window (released after the defaulting block below, before
+		 * sofia_create_peer_hint / sofia_dnsmgr_setup_peer / ao2_link).  The
+		 * repopulate loop's ast_string_field_set calls free the old stringfield
+		 * pool when a value grows, so a reader holding peer->lock must be
+		 * serialized behind the whole mutation or it can dereference a
+		 * freed/torn field, not merely see the empty-string reset window.
+		 * Readers take peer->lock as a leaf, so widening cannot invert; a
+		 * freshly-alloced peer is not findable until ao2_link, so it needs no
+		 * lock (tracked by `locked`). */
 		/* Drop the existing dialplan hint extension BEFORE wiping
 		 * subscribecontext / regexten — we need the OLD values to locate
 		 * the right extension to remove.  The subsequent
@@ -16027,7 +16039,8 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			ast_variables_destroy(peer->chanvars);
 			peer->chanvars = NULL;
 		}
-		ast_mutex_unlock(&peer->lock);
+		/* peer->lock stays held through the repopulate loop + defaults below;
+		 * it is released after the defaulting block. */
 	}
 
 	/* Clear the reload-sweep mark: this peer survived the new config and
@@ -16594,6 +16607,16 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 	}
 	if (peer->capability == 0) {
 		peer->capability = AST_FORMAT_ULAW | AST_FORMAT_ALAW;
+	}
+
+	/* All freeable fields are now repopulated and defaulted; release the reload
+	 * mutation lock.  Everything below (hint creation, dnsmgr setup, ao2_link)
+	 * runs unlocked: they hold heavy global locks, or for dnsmgr would deadlock
+	 * the refresh thread if taken under peer->lock.  A defaultip=<hostname>
+	 * resolves via a blocking ast_get_ip inside the window above (rare; the
+	 * conventional IP literal is non-blocking). */
+	if (locked) {
+		ast_mutex_unlock(&peer->lock);
 	}
 
 	/* post-T56 germanico dynamic hints parity (2026-04-27): chan_sofia surpass —
