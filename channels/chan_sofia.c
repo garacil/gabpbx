@@ -526,12 +526,12 @@ static struct {
 	/* post-T56 ignoreregexpire [general] parity (2026-04-28): when set, expired
 	 * SIP registrations are NOT removed from peer->contacts — preserves last-known
 	 * contact across short upstream-trunk outages (e.g., stable PSTN gateway with
-	 * intermittent network drops; carrier-softswitch scenarios). chan_sip parity at
+	 * intermittent network drops; SoftX3000-style scenarios). chan_sip parity at
 	 * chan_sip.c:29594-29595 verbatim [general] parser ast_true + L14625-14637
 	 * destroy_association cleanup-skip-when-set + L29197-29204 realtime peer-load
 	 * expired-contact-preserve-when-set. chan_sip default = implicit sip_cfg
 	 * static-zero (no explicit init line); chan_sofia explicit-init = 0 for
-	 * clarity (more disciplined than chan_sip). Production .193 sofia.conf line
+	 * clarity (more disciplined than chan_sip). Production sofia.conf line
 	 * 71 ignoreregexpire=yes precedent — silently ignored prior to this task;
 	 * finally honored on next reload. chan_sofia 1-site wire-in at
 	 * sofia_expire_contacts_cb (chan_sip 2nd site sofia_find_peer_realtime
@@ -598,7 +598,7 @@ static struct {
 	 * honest disclosure: chan_sofia operators using sip show inuse / SIPshowpeer
 	 * onHold see counter freeze when notifyhold=no — minor counter-tracking
 	 * divergence from prior chan_sofia always-tracked baseline; chan_sip-drop-in
-	 * correction toward chan_sip-faithful semantics. .193 production
+	 * correction toward chan_sip-faithful semantics. production
 	 * sofia.conf has notifyhold=yes — counter tracking unchanged for that
 	 * deployment. */
 	int notifyhold;
@@ -754,7 +754,7 @@ static struct {
 	 * exposure). Default 1 (TRUE) per chan_sip drop-in. */
 	int subscribe_network_change_event;
 	/* post-T56 rtsavesysname [general] parity (2026-04-28, REAL OPERATOR DRIVER on
-	 * .193 sofia.conf rtsavesysname=yes silently-ignored prior to this commit; finally
+	 * production sofia.conf rtsavesysname=yes silently-ignored prior to this commit; finally
 	 * honored on next reload + Pattern 12 26th-instance behavior-change-from-chan_sofia-
 	 * baseline-disclosure sub-pattern 5th-sub-instance): chan_sip-parity flag for
 	 * multi-server gabpbx realtime deployments. When set + ast_config_AST_SYSTEM_NAME
@@ -779,7 +779,7 @@ static struct {
 	 * (sysname + syslabel) + appended `syslabel, sysname` pair to ast_update_realtime
 	 * varargs (NULL-key pair = no-op when not active). */
 	int rtsave_sysname;
-	/* post-T56 rtupdate [general] parity (2026-04-28, REAL OPERATOR DRIVER on .193
+	/* post-T56 rtupdate [general] parity (2026-04-28, REAL OPERATOR DRIVER on production
 	 * sofia.conf rtupdate=yes commented operator-aware): chan_sip-parity flag gating
 	 * whether peer registration changes propagate to realtime DB via ast_update_realtime
 	 * calls. Default 1 (TRUE) per chan_sip drop-in (chan_sip.c:29480 verbatim explicit
@@ -797,7 +797,7 @@ static struct {
 	 * sites. rtupdate=no skips ALL realtime DB writes regardless of rtsavesysname. */
 	int peer_rtupdate;
 	/* post-T56 rtcachefriends [general] parity (2026-04-28, REAL OPERATOR DRIVER on
-	 * .193 sofia.conf rtcachefriends=yes silently-ignored prior to this commit;
+	 * production sofia.conf rtcachefriends=yes silently-ignored prior to this commit;
 	 * finally honored on next reload as parse-clean migration matching chan_sofia
 	 * intrinsic baseline + Pattern 12 27th-instance chan_sofia-architectural-
 	 * divergence sub-pattern 7th-sub-instance post-PROVEN): chan_sip-parity flag for
@@ -981,7 +981,7 @@ static struct {
 	 * tos/cos audio/video full wire-in via ast_rtp_instance_set_qos at
 	 * sofia_rtp_init. tos/cos text PARSE-COMPAT-ONLY (chan_sofia text-RTP
 	 * infrastructure ABSENT — no pvt->trtp). Default 0 (no QoS markings)
-	 * per chan_sip drop-in. .193 production sofia.conf line tos_sip=cs3 +
+	 * per chan_sip drop-in. production sofia.conf line tos_sip=cs3 +
 	 * tos_audio=ef + tos_video=af41 silently-ignored prior to this commit;
 	 * finally honored on next reload (REAL OPERATOR DRIVER). */
 	unsigned int tos_sip;
@@ -1004,7 +1004,7 @@ static struct {
 	 * automatically once tag set on nua handle; chan_sofia helper-architecture-
 	 * advantage 13th-instance: single emit-site vs chan_sip 5-site add_header
 	 * duplication 11132/11307/12986/14331/+others). REAL OPERATOR DRIVER:
-	 * sofia.conf useragent=<carrier softswitch> silently-ignored
+	 * production sofia.conf useragent=Huawei SoftX3000 V300R011 silently-ignored
 	 * prior to this commit; finally honored on next reload. */
 	char useragent[AST_MAX_EXTENSION];
 		int default_qualify;
@@ -1448,7 +1448,7 @@ struct sofia_peer {
 	 * expecting chan_sip skip-on-no-change semantic: KNOWN LIMITATION (chan_sofia
 	 * infrastructure ABSENT; documented in sample.conf). Future-fix path: implement SDP
 	 * version-tracking gate at sofia_process_invite SDP handler if operator demand
-	 * surfaces (~50-100 LoC follow-up). .193 sofia.conf has commented `;ignoresdpversion
+	 * surfaces (~50-100 LoC follow-up). production sofia.conf has commented `;ignoresdpversion
 	 * =yes` (operator-aware-but-not-active) — finally parse-clean on next reload. */
 	int ignoresdpversion;
 	/* post-T56 promiscredir per-peer parity (2026-04-28, Pattern 12 honest-disclosure
@@ -1665,7 +1665,7 @@ struct sofia_peer {
 	 * absence finding). chan_sofia helper-architecture-advantage advances 22→23. */
 	int allowoverlap_mode;
 	/* post-T56 progressinband per-peer + [general] tri-state parity (2026-04-28,
-	 * REAL OPERATOR DRIVER on .193 sofia.conf progressinband=no silently-ignored
+	 * REAL OPERATOR DRIVER on production sofia.conf progressinband=no silently-ignored
 	 * prior to this commit; finally honored on next reload as NEVER-equivalent
 	 * NO-state semantic per Option B partial wire-in): per-peer tri-state SDP
 	 * early-media in-band audio control. Values per SOFIA_PROG_INBAND_* macros:
@@ -1716,7 +1716,7 @@ struct sofia_peer {
 	 * SDP-process. gabpbx-core APIs at rtp_engine.h:1671 ast_rtp_instance_set_timeout
 	 * + L1689 set_hold_timeout + L1707 set_keepalive. Default 0 (disabled) per
 	 * chan_sip drop-in. Inherited from sofia_cfg.default_X at sofia_peer_alloc.
-	 * .193 production sofia.conf line rtptimeout=30 + rtpholdtimeout=300 currently
+	 * production sofia.conf line rtptimeout=30 + rtpholdtimeout=300 currently
 	 * silently-ignored on chan_sofia until this commit; finally honored on next reload
 	 * (REAL OPERATOR DRIVER). */
 	int rtptimeout;
@@ -2674,6 +2674,30 @@ static void sofia_change_t38_state(struct sofia_pvt *pvt, int new_state)
 		const char *rr_str = "None";
 		const char *rm_str = "transferredTCF";
 		const char *ec_str = "None";
+		/* reload-UAF fix: pvt->peer->name is an unbounded peer stringfield;
+		 * the reload writer (sofia_parse_peer_config on sofia_thread) frees its
+		 * pool under peer->lock when the value grows, so the prior inline
+		 * lock-free read of pvt->peer->name was a crash-UAF racing reload.
+		 * Snapshot it under peer->lock into a generously sized local, then emit
+		 * the AMI event using the local. Mirrors the show_peers l_name[256] fix.
+		 * LOCK ORDER: peer->lock is taken AFTER any already-held lock here.
+		 * Three callers reach sofia_change_t38_state:
+		 *   (1) sofia_indicate (channel-locked by core, no pvt->lock) -> order
+		 *       channel -> peer;
+		 *   (2) sofia_parse_sdp on sofia_thread (no pvt/peer lock held);
+		 *   (3) sofia_t38_abort which HOLDS pvt->lock across this call
+		 *       -> order pvt -> peer.
+		 * All three respect the canonical channel -> pvt -> peer-family order;
+		 * the reload writer never takes pvt->lock under peer->lock, so no cycle. */
+		char l_peername[256];	/* peer->name is unbounded; size loss-free vs the AMI Peer baseline */
+		ast_copy_string(l_peername, "<unknown>", sizeof(l_peername));
+		if (pvt->peer) {
+			ast_mutex_lock(&pvt->peer->lock);
+			if (pvt->peer->name) {
+				ast_copy_string(l_peername, pvt->peer->name, sizeof(l_peername));
+			}
+			ast_mutex_unlock(&pvt->peer->lock);
+		}
 		switch (new_state) {
 		case SOFIA_T38_DISABLED:       state_str = "Disabled";       break;
 		case SOFIA_T38_LOCAL_REINVITE: state_str = "LocalReinvite";  break;
@@ -2716,7 +2740,7 @@ static void sofia_change_t38_state(struct sofia_pvt *pvt, int new_state)
 			"EC: %s\r\n",
 			chan->name,
 			chan->uniqueid,
-			(pvt->peer && pvt->peer->name) ? pvt->peer->name : "<unknown>",
+			l_peername,
 			state_str,
 			rr_str,
 			parameters.max_ifp,
@@ -3077,7 +3101,7 @@ static int sofia_rtp_init(struct sofia_pvt *pvt)
 	 * 802.1p CoS at L2) to RTP audio instance via gabpbx-core API
 	 * ast_rtp_instance_set_qos (rtp_engine.h:1311). Same for video on pvt->vrtp.
 	 * tos/cos values are unsigned int; ast_rtp_instance_set_qos signature accepts
-	 * int — cast for API conformance. .193 production sofia.conf line tos_audio=ef
+	 * int — cast for API conformance. production sofia.conf line tos_audio=ef
 	 * + tos_video=af41 finally honored on next reload (REAL OPERATOR DRIVER). */
 	if (sofia_cfg.tos_audio || sofia_cfg.cos_audio) {
 		ast_rtp_instance_set_qos(pvt->rtp, (int)sofia_cfg.tos_audio,
@@ -3093,7 +3117,7 @@ static int sofia_rtp_init(struct sofia_pvt *pvt)
 	 * keepalive via gabpbx-core APIs (rtp_engine.h:1671/1689/1707). Each non-zero
 	 * value enables the respective behavior on the RTP instance: rtptimeout drops
 	 * stream after N seconds with no inbound RTP; rtpholdtimeout same but for
-	 * on-hold state; rtpkeepalive sends periodic keepalive packets. .193 production
+	 * on-hold state; rtpkeepalive sends periodic keepalive packets. production
 	 * sofia.conf rtptimeout=30 + rtpholdtimeout=300 finally honored on next reload. */
 	if (pvt->peer) {
 		if (pvt->peer->rtptimeout > 0) {
@@ -4101,6 +4125,17 @@ static struct ast_channel *sofia_new(struct sofia_pvt *pvt, int state, const cha
 	chan->tech_pvt = pvt;
 
 	if (pvt->peer) {
+		/* reload-UAF fix: on the OUTBOUND path (sofia_request_call, PBX
+		 * thread) these pvt->peer reads race the reload writer
+		 * (sofia_parse_peer_config on sofia_thread) which frees the peer
+		 * stringfield pool under peer->lock. (The inbound caller runs on
+		 * sofia_thread and cannot race the writer, but taking the lock there is
+		 * harmless/uncontended.) Hold peer->lock across the freeable-stringfield
+		 * reads (language/cid_tag/parkinglot) and release before the chanvars
+		 * loop, whose pbx_builtin_setvar_helper takes the CHANNEL lock and must
+		 * not run under peer->lock. peer->lock is recursive, so this is safe
+		 * regardless of caller hold-state. */
+		ast_mutex_lock(&pvt->peer->lock);
 		chan->callgroup = pvt->peer->callgroup;
 		chan->pickupgroup = pvt->peer->pickupgroup;
 		/* post-T56 language per-peer parity (2026-04-27): propagate per-peer audio
@@ -4134,6 +4169,10 @@ static struct ast_channel *sofia_new(struct sofia_pvt *pvt, int state, const cha
 		if (!ast_strlen_zero(pvt->peer->parkinglot)) {
 			ast_string_field_set(chan, parkinglot, pvt->peer->parkinglot);
 		}
+		/* All freeable peer stringfields read above; release peer->lock before the
+		 * chanvars loop below, whose pbx_builtin_setvar_helper takes the channel
+		 * lock (must not nest under peer->lock to preserve channel->peer order). */
+		ast_mutex_unlock(&pvt->peer->lock);
 		/* post-T56 setvar+header per-peer parity (2026-04-28, COMBINED ship): apply
 		 * peer->chanvars to channel via pbx_builtin_setvar_helper. Mirrors chan_sip.c
 		 * :8007-8010 verbatim sip_new iteration semantic. setvar entries become regular
@@ -5954,8 +5993,8 @@ static struct sofia_peer *sofia_find_peer(const char *name)
 /* chan_sip parity: IP-based fallback peer match.
  * Used by sofia_process_invite after the From-username lookup fails — typical
  * for trunk gateways whose From-user is the caller-ID number, not the peer
- * name (e.g. a carrier softswitch sending From: <sip:CALLERID@…> while the peer
- * is configured as [trunkX] host=<carrier-ip>). Matches peer->src_addr
+ * name (e.g. Huawei SoftX3000 sending From: <sip:621120700@…> while the peer
+ * is configured as [trunk_eli4] host=213.162.195.21). Matches peer->src_addr
  * (set both by dnsmgr for static host=<ip> peers and by REGISTER for dynamic
  * peers) or, if that is unset, peer->defaddr. Port is ignored on purpose so
  * the existing SOFIA_INSECURE_PORT semantic stays the only port-mismatch
@@ -6043,12 +6082,31 @@ static enum ast_rtp_glue_result sofia_get_rtp_peer(struct ast_channel *chan,
 		struct ast_channel *bridged_chan = sofia_find_bridged_channel(pvt);
 		if (bridged_chan && bridged_chan->tech == &sofia_tech) {
 			struct sofia_pvt *bridged_pvt = bridged_chan->tech_pvt;
-			if (bridged_pvt && bridged_pvt->peer && bridged_pvt->peer->directmediaha) {
+			struct sofia_peer *bpeer = bridged_pvt ? bridged_pvt->peer : NULL;
+			if (bpeer) {
+				/* reload-UAF: the bridge partner's peer->directmediaha is an
+				 * ast_ha LIST that sofia_parse_peer_config frees (ast_free_ha
+				 * + NULL) under peer->lock during a reload. A pointer can't be
+				 * snapshotted, so HOLD bpeer->lock across the ast_apply_ha
+				 * consume. peer->lock is a leaf here (we hold only THIS leg's
+				 * channel lock; the partner pvt/channel/peer are all unheld) so
+				 * taking it cannot invert the channel->pvt->peer order.
+				 * peer->name is a freeable unbounded stringfield — snapshot it
+				 * under the same lock for the debug line. */
+				int denied = 0;
+				char l_name[256];
 				struct ast_sockaddr them = { { 0, }, };
 				ast_rtp_instance_get_remote_address(pvt->rtp, &them);
-				if (ast_apply_ha(bridged_pvt->peer->directmediaha, &them) == AST_SENSE_DENY) {
+				ast_mutex_lock(&bpeer->lock);
+				if (bpeer->directmediaha &&
+					ast_apply_ha(bpeer->directmediaha, &them) == AST_SENSE_DENY) {
+					denied = 1;
+					ast_copy_string(l_name, bpeer->name, sizeof(l_name));
+				}
+				ast_mutex_unlock(&bpeer->lock);
+				if (denied) {
 					ast_debug(2, "Sofia: get_rtp_peer LOCAL — direct media to %s denied by bridge-partner '%s' directmedia ACL\n",
-						ast_sockaddr_stringify(&them), bridged_pvt->peer->name);
+						ast_sockaddr_stringify(&them), l_name);
 					return AST_RTP_GLUE_RESULT_LOCAL;
 				}
 			}
@@ -6553,7 +6611,20 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 						/* post-T56 srtpcipher operator option (2026-04-27): per-peer cipher list
 						 * (or [general] fallback) drives multi-cipher a=crypto:N offer. NULL list
 						 * = legacy single-line AES_CM_128_HMAC_SHA1_80. */
-						const char *cipher_list = !ast_strlen_zero(pvt->peer->srtpcipher) ? pvt->peer->srtpcipher
+						/* reload-UAF fix: pvt->peer->srtpcipher is an unbounded peer stringfield
+						 * the reload writer (sofia_parse_peer_config on sofia_thread) frees under
+						 * peer->lock when it grows. Snapshot it under peer->lock into a local, then
+						 * keep the sdp_crypto_* library calls OUTSIDE the lock. LOCK ORDER channel
+						 * -> peer (no pvt->lock held here). */
+						char l_srtpcipher[256];
+						const char *cipher_list;
+						l_srtpcipher[0] = '\0';
+						ast_mutex_lock(&pvt->peer->lock);
+						if (!ast_strlen_zero(pvt->peer->srtpcipher)) {
+							ast_copy_string(l_srtpcipher, pvt->peer->srtpcipher, sizeof(l_srtpcipher));
+						}
+						ast_mutex_unlock(&pvt->peer->lock);
+						cipher_list = !ast_strlen_zero(l_srtpcipher) ? l_srtpcipher
 							: (!ast_strlen_zero(sofia_cfg.default_srtpcipher) ? sofia_cfg.default_srtpcipher : NULL);
 						child->srtp = sofia_srtp_alloc();
 						if (!child->srtp || !(child->srtp->crypto = sdp_crypto_setup())
@@ -6588,12 +6659,28 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 						char contact_buf[256];
 						char rpid_buf[512];
 						char diversion_buf[512];
+						/* reload-UAF fix: the From/identity builders read freeable peer
+						 * stringfields (cid_num/fromuser/name/cid_name/fromdomain) via
+						 * sofia_resolve_identity + sofia_build_contact; the reload writer
+						 * (sofia_parse_peer_config on sofia_thread) frees that pool under
+						 * peer->lock when a value grows. Every call in this span is pure
+						 * string-formatting (no blocking, no channel/pvt lock, no nua_/su_),
+						 * so hold child->peer->lock across the whole builder block (S1
+						 * lock-span widen — no helper signature change). LOCK ORDER channel
+						 * -> peer (pvt->lock not held here); reload writer never takes
+						 * pvt/channel under peer->lock, so no inversion. */
+						if (child->peer) {
+							ast_mutex_lock(&child->peer->lock);
+						}
 						sofia_build_from(child, from_buf, sizeof(from_buf));
 						sofia_build_contact(child, contact_buf, sizeof(contact_buf));
 						sofia_add_rpid(child, rpid_buf, sizeof(rpid_buf));
 						/* post-T56 identity-headers parity SS3 (2026-04-27): outbound
 						 * Diversion header per RFC 5806 when redirecting chain present. */
 						sofia_add_diversion(child, diversion_buf, sizeof(diversion_buf));
+						if (child->peer) {
+							ast_mutex_unlock(&child->peer->lock);
+						}
 						/* post-T56 session timers (RFC 4028) (2026-04-27): per-child
 						 * NUTAG_* wire-in; helper computes per-peer + outbound values.
 						 * Pattern 16 sofia-sip auto-handles refresh re-INVITE scheduling. */
@@ -6687,7 +6774,20 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		/* post-T56 srtpcipher operator option (2026-04-27): per-peer cipher list (or
 		 * [general] fallback) drives multi-cipher a=crypto:N offer. NULL list = legacy
 		 * single-line AES_CM_128_HMAC_SHA1_80 for backwards-compat. */
-		const char *cipher_list = !ast_strlen_zero(pvt->peer->srtpcipher) ? pvt->peer->srtpcipher
+		/* reload-UAF fix: pvt->peer->srtpcipher is an unbounded peer stringfield the
+		 * reload writer (sofia_parse_peer_config on sofia_thread) frees under peer->lock
+		 * when it grows. Snapshot it under peer->lock into a local, then keep the
+		 * sdp_crypto_* library calls OUTSIDE the lock. LOCK ORDER channel -> peer
+		 * (pvt->lock not held here). */
+		char l_srtpcipher[256];
+		const char *cipher_list;
+		l_srtpcipher[0] = '\0';
+		ast_mutex_lock(&pvt->peer->lock);
+		if (!ast_strlen_zero(pvt->peer->srtpcipher)) {
+			ast_copy_string(l_srtpcipher, pvt->peer->srtpcipher, sizeof(l_srtpcipher));
+		}
+		ast_mutex_unlock(&pvt->peer->lock);
+		cipher_list = !ast_strlen_zero(l_srtpcipher) ? l_srtpcipher
 			: (!ast_strlen_zero(sofia_cfg.default_srtpcipher) ? sofia_cfg.default_srtpcipher : NULL);
 		pvt->srtp = sofia_srtp_alloc();
 		if (!pvt->srtp || !(pvt->srtp->crypto = sdp_crypto_setup())) {
@@ -6729,6 +6829,18 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		char contact_buf[256];
 		char rpid_buf[512];
 		char diversion_buf[512];
+		/* reload-UAF fix: the From/identity builders read freeable peer stringfields
+		 * (cid_num/fromuser/name/cid_name/fromdomain) via sofia_resolve_identity +
+		 * sofia_build_contact; the reload writer (sofia_parse_peer_config on
+		 * sofia_thread) frees that pool under peer->lock when a value grows. Every
+		 * call in this span is pure string-formatting (no blocking, no channel/pvt
+		 * lock, no nua_/su_), so hold pvt->peer->lock across the whole builder block
+		 * (S1 lock-span widen — no helper signature change). LOCK ORDER channel ->
+		 * peer (pvt->lock was released at the state transition above); reload writer
+		 * never takes pvt/channel under peer->lock, so no inversion. */
+		if (pvt->peer) {
+			ast_mutex_lock(&pvt->peer->lock);
+		}
 		sofia_build_from(pvt, from_buf, sizeof(from_buf));
 		sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
 		/* post-T56 identity-headers parity SS2 (2026-04-27): outbound RPID/PAI/
@@ -6737,6 +6849,9 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		/* post-T56 identity-headers parity SS3 (2026-04-27): outbound Diversion
 		 * header per RFC 5806 when channel redirecting chain present. */
 		sofia_add_diversion(pvt, diversion_buf, sizeof(diversion_buf));
+		if (pvt->peer) {
+			ast_mutex_unlock(&pvt->peer->lock);
+		}
 
 		/* Diagnostic: dump the header strings handed to nua_invite. A malformed
 		 * value in any of these makes sofia-sip reject the request at construction
@@ -7257,10 +7372,25 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 		/* post-T56 MOH per-peer parity R4 (2026-04-27): peer->mohinterpret as
 		 * interpclass fallback when data (mohsuggest from upstream bridge) is
 		 * empty. Mirrors chan_sip ast_moh_start(ast, data, p->mohinterpret) at
-		 * chan_sip.c:7704. */
-		ast_moh_start(ast, data,
-			(pvt && pvt->peer && !ast_strlen_zero(pvt->peer->mohinterpret))
-				? pvt->peer->mohinterpret : NULL);
+		 * chan_sip.c:7704.
+		 *
+		 * reload-UAF fix: peer->mohinterpret is an unbounded AST_STRING_FIELD
+		 * that sofia_parse_peer_config (sofia_thread) frees on reload via
+		 * ast_string_field_set. This indicate path runs on the bridge/dialplan
+		 * thread, so the bare read raced the reload. Snapshot the field under
+		 * peer->lock into a local, drop the lock, then call ast_moh_start with
+		 * the local. peer->lock is NOT held across ast_moh_start because that
+		 * may lock the channel (lock-order: never take channel under peer->lock). */
+		{
+			char l_mohinterpret[256] = "";
+			if (pvt->peer) {
+				ast_mutex_lock(&pvt->peer->lock);
+				ast_copy_string(l_mohinterpret, pvt->peer->mohinterpret, sizeof(l_mohinterpret));
+				ast_mutex_unlock(&pvt->peer->lock);
+			}
+			ast_moh_start(ast, data,
+				!ast_strlen_zero(l_mohinterpret) ? l_mohinterpret : NULL);
+		}
 		break;
 	case AST_CONTROL_UNHOLD:
 		ast_moh_stop(ast);
@@ -7506,8 +7636,8 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 		 * chan_sip sip_request_call parsing, dial string before '@' is the Request-URI user
 		 * (extension/number to dial), part after '@' is the configured peer name used for
 		 * routing. Required for drop-in compatibility (chan-sip-compat-naming-rules.md):
-		 * production dialplans like Dial(SIP/EXTEN#NUMBER@trunkX) MUST resolve to
-		 * peer=trunkX, exten=EXTEN#NUMBER — without this fix peer lookup fails on
+		 * production dialplans like Dial(SIP/9999#622501314@trunk_eli3) MUST resolve to
+		 * peer=trunk_eli3, exten=9999#622501314 — without this fix peer lookup fails on
 		 * the full string and the call ends in CHANUNAVAIL. If neither '/' nor '@' is
 		 * present, treat the whole input as a plain peer name (no extension) — matches
 		 * the original Dial(SIP/peer) behavior. */
@@ -7536,6 +7666,19 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 	ast_string_field_set(pvt, peername, peername ? peername : "unknown");
 
 	if (peer) {
+		/* reload-UAF fix: the reload writer (sofia_parse_peer_config on
+		 * sofia_thread) frees the peer stringfield pool under peer->lock when a
+		 * value grows. This block runs on the PBX dialing thread and reads many
+		 * freeable peer stringfields lock-free (context/defaultuser/secret/
+		 * fromuser/fromdomain/subscribecontext/accountcode here, peer->host inside
+		 * sofia_resolve_peer_target, peer->outboundproxy inside
+		 * sofia_format_outboundproxy, peer->host in the target snprintf). Hold
+		 * peer->lock across the whole field-reading span; it is released right
+		 * before sofia_resolve_ourip (the only blocking call here — DNS +
+		 * kernel-route query — which reads no freeable peer stringfield). The
+		 * span takes no channel/pvt lock, so it cannot invert the canonical
+		 * channel->pvt->peer order; the reload writer holds peer->lock as a leaf. */
+		ast_mutex_lock(&peer->lock);
 		ast_string_field_set(pvt, context, peer->context);
 		ast_string_field_set(pvt, username, peer->defaultuser);
 		ast_string_field_set(pvt, peersecret, peer->secret);
@@ -7572,6 +7715,14 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 						peer->port ? peer->port : 5060);
 					ast_sockaddr_parse(&target, target_url, 0);
 				}
+				/* Release peer->lock before sofia_resolve_ourip: it blocks on DNS
+				 * (ast_sockaddr_resolve) + a kernel route query (ast_ouraddrfor) and
+				 * must not run under the peer mutex. All freeable peer stringfields
+				 * were already read above; `target` is a local copy and everything
+				 * after this point (ruri set from local url, the NAT proxy_url block
+				 * reading only peer->nat/src_addr/port, nua_handle) reads no freeable
+				 * peer stringfield. */
+				ast_mutex_unlock(&peer->lock);
 				sofia_resolve_ourip(pvt, &target);
 			}
 			ast_string_field_set(pvt, ruri, url);
@@ -7585,8 +7736,8 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 			/* NAT in-dialog routing override (chan_sip parity): when peer is
 			 * behind NAT (force_rport / comedia), sofia-sip's auto-generated
 			 * ACK and BYE would honor the 200 OK Contact URI which usually
-			 * carries the peer's LAN IP (e.g. a phone advertising 192.168.x.x
-			 * even when registered from a public address). NUTAG_PROXY pins all
+			 * carries the peer's LAN IP (e.g. Yealink advertising 192.168.0.33
+			 * even when registered from 95.23.145.25). NUTAG_PROXY pins all
 			 * outgoing dialog messages to peer->src_addr — the registered/
 			 * resolved public address — so ACK reaches the phone, suppressing
 			 * the 200 OK retransmit loop and unblocking the call. */
@@ -8013,7 +8164,7 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			 * whose From-user is the caller-ID number not the peer-name) get
 			 * identified. Without this fallback unknown-peer + alwaysauthreject
 			 * below emits a 401 the trunk cannot answer, breaking inbound
-			 * calls from carrier gateways. */
+			 * calls from gateways like Huawei SoftX3000. */
 			struct ast_sockaddr src;
 			sofia_get_source_addr(sip, &src);
 			caller_peer = sofia_find_peer_by_ip(&src);
@@ -8645,6 +8796,16 @@ static int func_sofia_sippeer(struct ast_channel *chan, const char *cmd,
 
 	buf[0] = '\0';
 
+	/* UAF-vs-reload fix: sofia_parse_peer_config (sofia_thread) frees the peer
+	 * stringfield pool under peer->lock when a field grows. host/context/
+	 * srtpcipher/callerid/fromuser/fromdomain/accountcode are read lock-free
+	 * below on the dialplan thread. Hold peer->lock across the whole field-
+	 * reading region (it is a leaf here — no channel/pvt lock held; the contact
+	 * ao2 ops below take only ao2_lock(c), never peer->lock) and unlock before
+	 * the ao2_ref(peer,-1) release. No early returns exist in this chain, so a
+	 * single lock/unlock pair cannot leak peer->lock. */
+	ast_mutex_lock(&peer->lock);
+
 	if (!strcasecmp(colname, "ip")) {
 		struct ast_sockaddr addr;
 		if (!strcasecmp(peer->host, "dynamic") && peer->registered) {
@@ -8748,6 +8909,8 @@ static int func_sofia_sippeer(struct ast_channel *chan, const char *cmd,
 	}
 	/* unknown colname -> empty buf + return 0 (chan_sip parity) */
 
+	ast_mutex_unlock(&peer->lock);
+
 	ao2_ref(peer, -1);
 	return 0;
 }
@@ -8795,7 +8958,19 @@ static int func_sofia_sipchaninfo(struct ast_channel *chan, const char *cmd,
 	} else if (!strcasecmp(data, "uri")) {
 		ast_copy_string(buf, S_OR(pvt->ruri, ""), len);
 	} else if (!strcasecmp(data, "peername")) {
-		ast_copy_string(buf, pvt->peer ? pvt->peer->name : "", len);
+		/* reload-UAF fix: pvt->peer->name is an unbounded peer stringfield
+		 * that the reload writer (sofia_parse_peer_config on sofia_thread)
+		 * frees while holding peer->lock. pvt->lock does NOT serialize
+		 * against that, so snapshot the name under peer->lock. peer is a
+		 * lock-order leaf here (channel->pvt->peer), recursive mutex.
+		 * pvt->peer may be NULL — guard. */
+		if (pvt->peer) {
+			char l_peername[256];
+			ast_mutex_lock(&pvt->peer->lock);
+			ast_copy_string(l_peername, pvt->peer->name, sizeof(l_peername));
+			ast_mutex_unlock(&pvt->peer->lock);
+			ast_copy_string(buf, l_peername, len);
+		}
 	} else if (!strcasecmp(data, "t38passthrough")) {
 		/* Current compatibility behavior: this dialplan function reports
 		 * 0 here. T.38 call state is handled by the channel T.38 control
@@ -10700,7 +10875,7 @@ static void sofia_resolve_ourip(struct sofia_pvt *pvt, const struct ast_sockaddr
  *   if AST_PRES_RESTRICTION → l="anonymous", n="" (chan_sip L11780 pattern).
  * - Fallback chain: connected.id missing → peer->fromuser → peer->name → "asterisk".
  * - URI-encoding: ast_uri_encode the user-part — required for # / ? / @ / etc.
- *   (post-T56 dial-atpeer fix exposed exten#did@peer form like EXTEN#NUMBER).
+ *   (post-T56 dial-atpeer fix exposed exten#did@peer form like 9999#622501314).
  * - Tag: NEVER add ;tag= manually — sofia-sip nua layer auto-emits the From-tag
  *   as part of dialog state. Format: "\"%s\" <sip:%s@%s>" (no tag). */
 static void sofia_build_from(struct sofia_pvt *pvt, char *buf, size_t len)
@@ -11664,9 +11839,15 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
  *
  * Caller pattern: TAG_IF(buf[0], NUTAG_INITIAL_ROUTE_STR(buf))
  *
- * Lock: caller must own a peer ref preventing concurrent mutation of
- * peer->outboundproxy. Both T56.2 wire-in callers hold a peer ref
- * (sofia_call ao2_ref +1; sofia_do_register ao2_iterator ref). */
+ * Lock: caller MUST hold peer->lock across this call. A peer ao2 ref does
+ * NOT prevent concurrent mutation: the reload writer (sofia_parse_peer_config
+ * on sofia_thread) re-sets peer->outboundproxy via ast_string_field_set, which
+ * FREES the old peer stringfield pool when a value grows — racing a lock-free
+ * read here even while a ref is held. Of the two callers, only
+ * sofia_request_call races the reload (PBX dialing thread); it now holds
+ * peer->lock across this call. sofia_do_register is invoked once at module
+ * load (load_module, before any reload can be dispatched to sofia_thread), so
+ * it is safe without the lock. */
 static void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len)
 {
 	const char *spec;
@@ -11749,8 +11930,16 @@ static void transmit_mwi_notify_for_peer(struct sofia_peer *peer)
 			total_urgent += urgent_msgs;
 		}
 	}
-	/* Snapshot the cfg-derived strings + peer->fromdomain under peer->lock so
-	 * the body assembly happens after release without dangling pointers. */
+	/* NOTE: this only copies the POINTER (fromdomain = peer->fromdomain),
+	 * NOT the string content - fromdomain aliases peer->fromdomain's pool
+	 * and is dereferenced below (Message-Account line) AFTER peer->lock is
+	 * released. That lock-free deref is safe NOT because of any snapshot,
+	 * but because every caller of transmit_mwi_notify_for_peer runs on
+	 * sofia_thread (mwi_notify_callback dispatched there; the nua_i_subscribe
+	 * handler is already there), so it is serialized against the reload
+	 * writer sofia_parse_peer_config (also sofia_thread), which is the thread
+	 * that would free the old stringfield pool. peer->lock here only guards
+	 * the mwi_subscription_handle read + the mailbox traversal above. */
 	fromdomain = !ast_strlen_zero(peer->fromdomain) ? peer->fromdomain : sofia_cfg.realm;
 	ast_mutex_unlock(&peer->lock);
 
@@ -13666,7 +13855,7 @@ static void *sofia_thread_func(void *data)
 				NTATAG_SIP_T1X64(sofia_cfg.default_timer_b)),
 			/* post-T56 tos/cos bundle (2026-04-28): Pattern 16 sofia-sip-native 9th-instance
 			 * — TPTAG_TOS at nua_create applies SIP-listener-side TOS via setsockopt at
-			 * UDP/TCP transport level. tport_tag.h:319 verbatim. .193 production
+			 * UDP/TCP transport level. tport_tag.h:319 verbatim. production
 			 * tos_sip=cs3 finally honored on next reload (REAL OPERATOR DRIVER). */
 			TAG_IF(sofia_cfg.tos_sip, TPTAG_TOS((int)sofia_cfg.tos_sip)),
 			/* post-T56 useragent [general] parity (2026-04-28): Pattern 16
@@ -13677,7 +13866,7 @@ static void *sofia_thread_func(void *data)
 			 * advantage 13th-instance: single emit-site vs chan_sip 5-site
 			 * add_header duplication (chan_sip.c:11132 response Server +
 			 * L11307+12986+14331 outbound User-Agent + others). REAL OPERATOR
-			 * DRIVER: a carrier-softswitch user-agent finally honored
+			 * DRIVER: production useragent=Huawei SoftX3000 V300R011 finally honored
 			 * on next reload. Empty-string default-init guard via TAG_IF skips
 			 * tag (sofia-sip falls back to library default). */
 			TAG_IF(!ast_strlen_zero(sofia_cfg.useragent),
@@ -13763,6 +13952,8 @@ static char *sofia_cli_show_peers(struct ast_cli_entry *e, int cmd, struct ast_c
 	while ((peer = ao2_iterator_next(&i))) {
 		char status[32];
 		char nat_str[16] = "";
+		char l_name[256];
+		char l_host[256];
 
 		if (peer->qualify) {
 			switch (peer->peer_status) {
@@ -13788,9 +13979,20 @@ static char *sofia_cli_show_peers(struct ast_cli_entry *e, int cmd, struct ast_c
 		if (peer->nat & SOFIA_NAT_COMEDIA)
 			strcat(nat_str, "C");
 
+		/* reload-UAF fix: peer->name and peer->host are unbounded
+		 * stringfields the reload writer (sofia_parse_peer_config on sofia_thread)
+		 * frees/reallocates under peer->lock via ast_string_field_set. Snapshot
+		 * them into locals while holding peer->lock, then drop the lock before the
+		 * blocking ast_cli. Sizes are generous: peer->name/host are unbounded, so
+		 * 256 avoids the truncation class that drove the show_peer l_name[256] fix. */
+		ast_mutex_lock(&peer->lock);
+		ast_copy_string(l_name, peer->name, sizeof(l_name));
+		ast_copy_string(l_host, peer->host, sizeof(l_host));
+		ast_mutex_unlock(&peer->lock);
+
 		ast_cli(a->fd, "%-20s %-30s %-4s %-5d %-15s %s\n",
-			peer->name,
-			peer->host,
+			l_name,
+			l_host,
 			peer->registered ? "Dyn" : "",
 			peer->port,
 			status,
@@ -14522,6 +14724,7 @@ static char *sofia_cli_show_inuse(struct ast_cli_entry *e, int cmd, struct ast_c
 #define FORMAT2 "%-25.25s %-15.15s %-15.15s \n"
 	char ilimits[40];
 	char iused[40];
+	char l_name[256];
 	int showall = 0;
 	struct ao2_iterator iter;
 	struct sofia_peer *peer;
@@ -14549,6 +14752,13 @@ static char *sofia_cli_show_inuse(struct ast_cli_entry *e, int cmd, struct ast_c
 	iter = ao2_iterator_init(peers, 0);
 	while ((peer = ao2_iterator_next(&iter))) {
 		ao2_lock(peer);
+		/* peer->name is an UNBOUNDED freeable stringfield: the reload writer
+		 * (sofia_parse_peer_config on sofia_thread) frees the old stringfield
+		 * pool under peer->lock, NOT under ao2_lock(peer). Snapshot the name
+		 * under peer->lock to serialize against that free and avoid a UAF. */
+		ast_mutex_lock(&peer->lock);
+		ast_copy_string(l_name, peer->name, sizeof(l_name));
+		ast_mutex_unlock(&peer->lock);
 		if (peer->call_limit) {
 			snprintf(ilimits, sizeof(ilimits), "%d", peer->call_limit);
 		} else {
@@ -14558,7 +14768,7 @@ static char *sofia_cli_show_inuse(struct ast_cli_entry *e, int cmd, struct ast_c
 			peer->inUse, peer->inRinging, peer->onHold);
 		if (showall || peer->call_limit > 0 || peer->busy_level > 0
 				|| peer->inUse > 0 || peer->inRinging > 0 || peer->onHold > 0) {
-			ast_cli(a->fd, FORMAT2, peer->name, iused, ilimits);
+			ast_cli(a->fd, FORMAT2, l_name, iused, ilimits);
 		}
 		ao2_unlock(peer);
 		ao2_ref(peer, -1);
@@ -14906,10 +15116,22 @@ static char *complete_sofia_peer(const char *word, int state, int only_realtime)
 	struct sofia_peer *peer;
 
 	while ((peer = ao2_iterator_next(&i))) {
-		if (!strncasecmp(word, peer->name, wordlen)
-				&& (!only_realtime || peer->is_realtime)
+		char l_name[256];
+		int l_realtime;
+
+		/* reload-UAF: peer->name is an unbounded stringfield the reload writer
+		 * frees under peer->lock; snapshot it (and is_realtime, for a
+		 * consistent read) under peer->lock before matching. peer->lock is a
+		 * leaf in this CLI tab-complete path (no channel/pvt lock held). */
+		ast_mutex_lock(&peer->lock);
+		ast_copy_string(l_name, peer->name, sizeof(l_name));
+		l_realtime = peer->is_realtime;
+		ast_mutex_unlock(&peer->lock);
+
+		if (!strncasecmp(word, l_name, wordlen)
+				&& (!only_realtime || l_realtime)
 				&& ++which > state) {
-			result = ast_strdup(peer->name);
+			result = ast_strdup(l_name);
 		}
 		ao2_ref(peer, -1);
 		if (result) {
@@ -15732,7 +15954,7 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			/* post-T56 ignoreregexpire [general] parity (2026-04-28): chan_sip parity at
 			 * chan_sip.c:29594-29595 verbatim ast_true(v->value) semantic. When yes,
 			 * expired contacts preserved across short upstream-trunk outages (stable-trunk
-			 * use case). Production .193 sofia.conf line 71 ignoreregexpire=yes precedent. */
+			 * use case). Production sofia.conf line 71 ignoreregexpire=yes precedent. */
 			sofia_cfg.ignore_regexpire = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "maxcallbitrate")) {
 			/* post-T56 maxcallbitrate [general] parity (2026-04-28): chan_sip parity at
@@ -18800,12 +19022,27 @@ static int manager_sofia_notify(struct mansession *s, const struct message *m)
 		/* Step A IPv6 parity SS3 (2026-04-28): bracket-wrap IPv6 host. The
 		 * peer->host fallback may be unbracketed IPv6 from operator config. */
 		char hbuf[80];
+		/* reload-UAF fix: peer->defaultuser/name/host are unbounded
+		 * stringfields the reload writer frees under peer->lock on grow.
+		 * Snapshot them (and the port) into locals under peer->lock, then
+		 * build the URI from the locals so the lock-free read can't race
+		 * sofia_parse_peer_config. */
+		char l_defaultuser[256], l_name[256], l_host[256];
+		int l_port;
+
+		ast_mutex_lock(&peer->lock);
+		ast_copy_string(l_defaultuser, peer->defaultuser, sizeof(l_defaultuser));
+		ast_copy_string(l_name, peer->name, sizeof(l_name));
+		ast_copy_string(l_host, peer->host, sizeof(l_host));
+		l_port = peer->port;
+		ast_mutex_unlock(&peer->lock);
+
 		snprintf(target_uri, sizeof(target_uri), "sip:%s@%s:%d",
-			!ast_strlen_zero(peer->defaultuser) ? peer->defaultuser : peer->name,
+			!ast_strlen_zero(l_defaultuser) ? l_defaultuser : l_name,
 			sofia_uri_format_host(
-				!ast_strlen_zero(peer->host) ? peer->host : "unknown",
+				!ast_strlen_zero(l_host) ? l_host : "unknown",
 				hbuf, sizeof(hbuf)),
-			peer->port ? peer->port : 5060);
+			l_port ? l_port : 5060);
 	}
 
 	dispatch = ast_calloc(1, sizeof(*dispatch));
