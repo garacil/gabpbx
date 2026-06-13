@@ -98,7 +98,7 @@ struct ast_taskprocessor {
 	/*! \brief Taskprocessor singleton list entry */
 	AST_LIST_ENTRY(ast_taskprocessor) list;
 };
-#define TPS_MAX_BUCKETS 7
+#define TPS_MAX_BUCKETS 127
 /*! \brief tps_singletons is the astobj2 container for taskprocessor singletons */
 static struct ao2_container *tps_singletons;
 

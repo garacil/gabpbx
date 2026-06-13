@@ -159,7 +159,7 @@ static AST_RWLIST_HEAD_STATIC(backends, chanlist);
 #ifdef LOW_MEMORY
 #define NUM_CHANNEL_BUCKETS 61
 #else
-#define NUM_CHANNEL_BUCKETS 1567
+#define NUM_CHANNEL_BUCKETS 8191
 #endif
 
 #if 0	/* XXX AstData: ast_callerid no longer exists. (Equivalent code not readily apparent.) */

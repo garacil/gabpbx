@@ -313,8 +313,8 @@
 #define SOFIA_OVERLAP_NO        0
 #define SOFIA_OVERLAP_YES       1
 #define SOFIA_OVERLAP_DTMF      2
-#define MAX_PEER_BUCKETS 53
-#define MAX_DIALOG_BUCKETS 53
+#define MAX_PEER_BUCKETS 16381
+#define MAX_DIALOG_BUCKETS 8191
 
 #define SOFIA_TYPE_PEER    (1 << 0)
 #define SOFIA_TYPE_USER    (1 << 1)
@@ -5199,7 +5199,7 @@ static struct sofia_peer *sofia_peer_alloc(const char *name)
 	peer->is_realtime = 0;
 		peer->is_register_line = 0;
 	peer->_reload_marked = 0;
-	peer->contacts = ao2_container_alloc(8, contact_hash_fn, contact_cmp_fn);
+	peer->contacts = ao2_container_alloc(13, contact_hash_fn, contact_cmp_fn);
 	if (!peer->contacts) {
 		ao2_ref(peer, -1);
 		return NULL;
@@ -6078,18 +6078,43 @@ static struct sofia_peer *sofia_find_peer_realtime(const char *name)
 	return peer;
 }
 
+/* Lookup-key shim for ao2_find(peers, &key, OBJ_POINTER): mirrors struct
+ * sofia_peer's leading layout (AST_DECLARE_STRING_FIELDS emits the pool pointer
+ * FIRST, then 'name' — the first string field, at offset 8) so peer_hash_fn /
+ * peer_cmp_fn, which only read ->name, see the lookup name at the right offset
+ * without allocating a full peer.  Keep in sync with struct sofia_peer's
+ * string-field block. */
+struct sofia_peer_key {
+	struct ast_string_field_pool *__field_mgr_pool;
+	const char *name;
+};
+
+static int peer_hash_fn(const void *obj, int flags)
+{
+	const struct sofia_peer *peer = obj;
+
+	return ast_str_case_hash(peer->name);
+}
+
+static int peer_cmp_fn(void *obj, void *arg, int flags)
+{
+	struct sofia_peer *peer = obj;
+	struct sofia_peer *match = arg;	/* &sofia_peer_key — layout-compatible for ->name */
+
+	return strcasecmp(peer->name, match->name) ? 0 : (CMP_MATCH | CMP_STOP);
+}
+
 static struct sofia_peer *sofia_find_peer(const char *name)
 {
-	struct ao2_iterator i;
-	struct sofia_peer *peer, *found = NULL;
+	struct sofia_peer *found = NULL;
 
 	/* Atomically: check the in-memory cache, and on miss build via
 	 * realtime — BOTH under ao2_lock(peers) so two concurrent misses for
 	 * the same name cannot both run sofia_find_peer_realtime and link
 	 * duplicate peer structs into the container.  The peers container
-	 * was allocated with hash_fn=NULL (chan_sofia.c:17445) so it does
-	 * not natively refuse duplicates by name — name uniqueness must be
-	 * enforced by the callers, here.
+	 * now has a real peer_hash_fn keyed on peer->name (so this lookup is
+	 * O(1)), but legacy ao2_link still does not refuse duplicates by name,
+	 * so name uniqueness must be enforced by the callers, here.
 	 *
 	 * Holding the lock through the realtime DB query (sippeers +
 	 * optional sipregs overlay + hint create + dnsmgr setup) briefly
@@ -6106,15 +6131,11 @@ static struct sofia_peer *sofia_find_peer(const char *name)
 	 * do not deadlock. */
 	ao2_lock(peers);
 
-	i = ao2_iterator_init(peers, 0);
-	while ((peer = ao2_iterator_next(&i))) {
-		if (!strcasecmp(peer->name, name)) {
-			found = peer;
-			break;
-		}
-		ao2_ref(peer, -1);
+	{
+		struct sofia_peer_key key = { .name = name };
+
+		found = ao2_find(peers, &key, OBJ_POINTER);
 	}
-	ao2_iterator_destroy(&i);
 
 	if (found) {
 		ao2_unlock(peers);
@@ -13145,17 +13166,27 @@ static void *sofia_qualify_thread(void *data)
  * one already executing here that has already latched hmagic. Looking the
  * address up under the dialogs container lock closes that window: if sofia_hangup
  * already unlinked the pvt we get NULL (skip the event), otherwise we take a +1
- * ref that pins the struct for the whole dispatch. ao2_match_by_addr only
- * compares pointer values (never derefs), so passing a possibly-dangling hmagic
- * is safe. The dialogs container has NULL hash/cmp, so this scans all buckets via
- * OBJ_MULTIPLE-less ao2_callback with an explicit address matcher (ao2_find's
- * OBJ_POINTER fast-path would call the NULL hash_fn). */
+ * ref that pins the struct for the whole dispatch. dialog_hash_fn / dialog_cmp_fn
+ * use only the POINTER VALUE (never deref), so passing a possibly-dangling hmagic
+ * is safe AND ao2_find's OBJ_POINTER fast-path hashes that value to a single
+ * bucket — O(1) instead of scanning every bucket. */
+static int dialog_hash_fn(const void *obj, int flags)
+{
+	/* Hash the pointer VALUE only — never dereference (hmagic may dangle). */
+	return (int) ((uintptr_t) obj >> 5);
+}
+
+static int dialog_cmp_fn(void *obj, void *arg, int flags)
+{
+	return (obj == arg) ? (CMP_MATCH | CMP_STOP) : 0;
+}
+
 static struct sofia_pvt *sofia_pvt_ref_if_linked(nua_hmagic_t *hmagic)
 {
 	if (!hmagic) {
 		return NULL;
 	}
-	return ao2_callback(dialogs, 0, ao2_match_by_addr, hmagic);
+	return ao2_find(dialogs, hmagic, OBJ_POINTER);
 }
 
 static void sofia_event_callback(nua_event_t event, int status, char const *phrase,
@@ -19376,13 +19407,13 @@ static int load_module(void)
 	 * an OOM on the second or third doesn't leak the first two.  The
 	 * `goto err_cleanup` ladder at the bottom of the function unwinds in
 	 * reverse-construction order. */
-	peers = ao2_container_alloc(MAX_PEER_BUCKETS, NULL, NULL);
+	peers = ao2_container_alloc(MAX_PEER_BUCKETS, peer_hash_fn, peer_cmp_fn);
 	if (!peers) {
 		ast_log(LOG_ERROR, "Unable to create Sofia peers container\n");
 		rc = AST_MODULE_LOAD_FAILURE;
 		goto err_cleanup;
 	}
-	dialogs = ao2_container_alloc(MAX_DIALOG_BUCKETS, NULL, NULL);
+	dialogs = ao2_container_alloc(MAX_DIALOG_BUCKETS, dialog_hash_fn, dialog_cmp_fn);
 	if (!dialogs) {
 		ast_log(LOG_ERROR, "Unable to create Sofia dialogs container\n");
 		rc = AST_MODULE_LOAD_FAILURE;

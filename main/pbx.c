@@ -986,7 +986,7 @@ struct ast_hint {
 #ifdef LOW_MEMORY
 #define HASH_EXTENHINT_SIZE 17
 #else
-#define HASH_EXTENHINT_SIZE 563
+#define HASH_EXTENHINT_SIZE 16381
 #endif
 
 static const struct cfextension_states {
@@ -7236,7 +7236,7 @@ struct ast_context *ast_context_find_or_create(struct ast_context **extcontexts,
 		/* Protect creation of contexts_table from reentrancy. */
 		ast_wrlock_contexts();
 		if (!contexts_table) {
-			contexts_table = ast_hashtab_create(17,
+			contexts_table = ast_hashtab_create(2053,
 				ast_hashtab_compare_contexts,
 				ast_hashtab_resize_java,
 				ast_hashtab_newsize_java,
@@ -8690,7 +8690,7 @@ static int ast_add_extension2_lockopt(struct ast_context *con,
 			ast_hashtab_insert_safe(tmp->peer_table, tmp);
 		} else {  /* this is the first exten in this context */
 			if (!con->root_table)
-				con->root_table = ast_hashtab_create(27,
+				con->root_table = ast_hashtab_create(67,
 													hashtab_compare_extens,
 													ast_hashtab_resize_java,
 													ast_hashtab_newsize_java,

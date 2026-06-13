@@ -159,7 +159,7 @@ static int ast_event_hash_devstate_change(const void *obj, const int flags);
 #ifdef LOW_MEMORY
 #define NUM_CACHE_BUCKETS 17
 #else
-#define NUM_CACHE_BUCKETS 563
+#define NUM_CACHE_BUCKETS 16381
 #endif
 
 #define MAX_CACHE_ARGS 8
