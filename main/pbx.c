@@ -1247,6 +1247,10 @@ static int stateid = 1;
  * order.
  */
 static struct ao2_container *hints;
+/* Reverse index: device name -> the (device,hint) pairs that watch it.  Lets
+ * handle_statechange() visit only the hints for the changed device instead of
+ * scanning the entire hints container (O(watchers) vs O(all hints)). */
+static struct ao2_container *device_hints;
 
 static struct ao2_container *statecbs;
 
@@ -4438,12 +4442,102 @@ int ast_extension_state(struct ast_channel *c, const char *context, const char *
 	return ast_extension_state2(e);  /* Check all devices in the hint */
 }
 
+/*!
+ * \brief Reverse-index entry: one (device, hint) pair.
+ *
+ * device_hints is keyed by device name so handle_statechange() can visit only
+ * the hints that watch the changed device.  'device' is the FIRST member so a
+ * plain on-stack key can be hashed/compared at offset 0.  Each entry holds a +1
+ * ref on its hint, keeping the hint alive for as long as it is indexed.
+ */
+struct ast_devhint {
+	char device[256];
+	struct ast_hint *hint;
+};
+
+static void destroy_devhint(void *obj)
+{
+	struct ast_devhint *dh = obj;
+
+	if (dh->hint) {
+		ao2_ref(dh->hint, -1);
+	}
+}
+
+static int devhint_hash(const void *obj, const int flags)
+{
+	const struct ast_devhint *dh = obj;
+
+	return ast_str_case_hash(dh->device);
+}
+
+static int devhint_cmp(void *obj, void *arg, int flags)
+{
+	const struct ast_devhint *dh = obj;
+	const struct ast_devhint *key = arg;
+
+	if (strcasecmp(dh->device, key->device)) {
+		return 0;
+	}
+	/* key->hint == NULL means "match every hint watching this device". */
+	if (key->hint && dh->hint != key->hint) {
+		return 0;
+	}
+	return CMP_MATCH;
+}
+
+/*! \brief Index a hint under each device in its '&'-separated device list. */
+static void hint_devindex_link(struct ast_hint *hint, const char *devices)
+{
+	char *parse, *cur;
+
+	if (!device_hints || !hint || ast_strlen_zero(devices)) {
+		return;
+	}
+	parse = ast_strdupa(devices);
+	while ((cur = strsep(&parse, "&"))) {
+		struct ast_devhint *dh;
+
+		if (ast_strlen_zero(cur)) {
+			continue;
+		}
+		if (!(dh = ao2_alloc(sizeof(*dh), destroy_devhint))) {
+			continue;
+		}
+		ast_copy_string(dh->device, cur, sizeof(dh->device));
+		ao2_ref(hint, +1);
+		dh->hint = hint;
+		ao2_link(device_hints, dh);
+		ao2_ref(dh, -1);
+	}
+}
+
+/*! \brief Remove a hint's index entries for each device in the given list. */
+static void hint_devindex_unlink(struct ast_hint *hint, const char *devices)
+{
+	char *parse, *cur;
+
+	if (!device_hints || !hint || ast_strlen_zero(devices)) {
+		return;
+	}
+	parse = ast_strdupa(devices);
+	while ((cur = strsep(&parse, "&"))) {
+		struct ast_devhint key;
+
+		if (ast_strlen_zero(cur)) {
+			continue;
+		}
+		ast_copy_string(key.device, cur, sizeof(key.device));
+		key.hint = hint;
+		ao2_callback(device_hints,
+			OBJ_MULTIPLE | OBJ_UNLINK | OBJ_NODATA | OBJ_POINTER, devhint_cmp, &key);
+	}
+}
+
 static int handle_statechange(void *datap)
 {
-	struct ast_hint *hint;
 	struct ast_str *hint_app;
 	struct statechange *sc = datap;
-	struct ao2_iterator i;
 	struct ao2_iterator cb_iter;
 	char context_name[AST_MAX_CONTEXT];
 	char exten_name[AST_MAX_EXTENSION];
@@ -4455,78 +4549,88 @@ static int handle_statechange(void *datap)
 	}
 
 	ast_mutex_lock(&context_merge_lock);/* Hold off ast_merge_contexts_and_delete */
-	i = ao2_iterator_init(hints, 0);
-	for (; (hint = ao2_iterator_next(&i)); ao2_ref(hint, -1)) {
-		struct ast_state_cb *state_cb;
-		char *cur, *parse;
-		int state;
 
-		ao2_lock(hint);
-		if (!hint->exten) {
-			/* The extension has already been destroyed */
-			ao2_unlock(hint);
-			continue;
-		}
+	/*
+	 * Reverse index: visit only the hints that actually watch sc->dev rather
+	 * than scanning every hint per device-state event.  Each matched entry
+	 * holds a +1 ref on its hint, so the hint stays alive while we process it.
+	 * If no hint watches this device, the lookup returns nothing and we do no
+	 * work — which is exactly what the old full scan concluded the slow way.
+	 */
+	if (device_hints) {
+		struct ast_devhint key;
+		struct ao2_iterator *match_iter;
 
-		/* Does this hint monitor the device that changed state? */
-		ast_str_set(&hint_app, 0, "%s", ast_get_extension_app(hint->exten));
-		parse = ast_str_buffer(hint_app);
-		while ((cur = strsep(&parse, "&"))) {
-			if (!strcasecmp(cur, sc->dev)) {
-				/* The hint monitors the device. */
-				break;
+		ast_copy_string(key.device, sc->dev, sizeof(key.device));
+		key.hint = NULL;	/* match every hint watching this device */
+
+		/*
+		 * ao2_callback() with OBJ_MULTIPLE returns a malloc'd ao2_iterator
+		 * (AO2_ITERATOR_UNLINK) that owns the only ref to the result set, not a
+		 * container.  Walk it directly; each ao2_iterator_next() hands us one
+		 * ref on the devhint to drop, and ao2_iterator_destroy() frees the
+		 * iterator and the underlying result container.
+		 */
+		match_iter = ao2_callback(device_hints, OBJ_MULTIPLE | OBJ_POINTER, devhint_cmp, &key);
+		if (match_iter) {
+			struct ast_devhint *dh;
+
+			for (; (dh = ao2_iterator_next(match_iter)); ao2_ref(dh, -1)) {
+				struct ast_hint *hint = dh->hint;
+				struct ast_state_cb *state_cb;
+				int state;
+
+				ao2_lock(hint);
+				if (!hint->exten) {
+					/* The extension has already been destroyed */
+					ao2_unlock(hint);
+					continue;
+				}
+
+				/*
+				 * Save off strings in case the hint extension gets destroyed
+				 * while we are notifying the watchers.
+				 */
+				ast_copy_string(context_name,
+					ast_get_context_name(ast_get_extension_context(hint->exten)),
+					sizeof(context_name));
+				ast_copy_string(exten_name, ast_get_extension_name(hint->exten),
+					sizeof(exten_name));
+				ast_str_set(&hint_app, 0, "%s", ast_get_extension_app(hint->exten));
+				ao2_unlock(hint);
+
+				/*
+				 * Get device state for this hint.  We cannot hold any locks
+				 * while determining the hint device state or notifying the
+				 * watchers without causing a deadlock (conlock, hints, hint).
+				 */
+				state = ast_extension_state3(hint_app);
+				if (state == hint->laststate) {
+					continue;
+				}
+
+				// germanico bbdd state changed
+
+				/* Device state changed since last check - notify the watchers. */
+				hint->laststate = state;	/* record we saw the change */
+
+				/* For general callbacks */
+				cb_iter = ao2_iterator_init(statecbs, 0);
+				for (; (state_cb = ao2_iterator_next(&cb_iter)); ao2_ref(state_cb, -1)) {
+					state_cb->change_cb(context_name, exten_name, state, state_cb->data);
+				}
+				ao2_iterator_destroy(&cb_iter);
+
+				/* For extension callbacks */
+				cb_iter = ao2_iterator_init(hint->callbacks, 0);
+				for (; (state_cb = ao2_iterator_next(&cb_iter)); ao2_ref(state_cb, -1)) {
+					state_cb->change_cb(context_name, exten_name, state, state_cb->data);
+				}
+				ao2_iterator_destroy(&cb_iter);
 			}
+			ao2_iterator_destroy(match_iter);
 		}
-		if (!cur) {
-			/* The hint does not monitor the device. */
-			ao2_unlock(hint);
-			continue;
-		}
-
-		/*
-		 * Save off strings in case the hint extension gets destroyed
-		 * while we are notifying the watchers.
-		 */
-		ast_copy_string(context_name,
-			ast_get_context_name(ast_get_extension_context(hint->exten)),
-			sizeof(context_name));
-		ast_copy_string(exten_name, ast_get_extension_name(hint->exten),
-			sizeof(exten_name));
-		ast_str_set(&hint_app, 0, "%s", ast_get_extension_app(hint->exten));
-		ao2_unlock(hint);
-
-		/*
-		 * Get device state for this hint.
-		 *
-		 * NOTE: We cannot hold any locks while determining the hint
-		 * device state or notifying the watchers without causing a
-		 * deadlock.  (conlock, hints, and hint)
-		 */
-		state = ast_extension_state3(hint_app);
-		if (state == hint->laststate) {
-			continue;
-		}
-
-		// germanico bbdd state changed
-
-		/* Device state changed since last check - notify the watchers. */
-		hint->laststate = state;	/* record we saw the change */
-
-		/* For general callbacks */
-		cb_iter = ao2_iterator_init(statecbs, 0);
-		for (; (state_cb = ao2_iterator_next(&cb_iter)); ao2_ref(state_cb, -1)) {
-			state_cb->change_cb(context_name, exten_name, state, state_cb->data);
-		}
-		ao2_iterator_destroy(&cb_iter);
-
-		/* For extension callbacks */
-		cb_iter = ao2_iterator_init(hint->callbacks, 0);
-		for (; (state_cb = ao2_iterator_next(&cb_iter)); ao2_ref(state_cb, -1)) {
-			state_cb->change_cb(context_name, exten_name, state, state_cb->data);
-		}
-		ao2_iterator_destroy(&cb_iter);
 	}
-	ao2_iterator_destroy(&i);
 	ast_mutex_unlock(&context_merge_lock);
 
 	ast_free(hint_app);
@@ -4755,6 +4859,9 @@ static int ast_remove_hint(struct ast_exten *e)
 		return -1;
 	}
 
+	/* Drop the reverse-index entries for this hint before the exten goes away. */
+	hint_devindex_unlink(hint, ast_get_extension_app(e));
+
 	/*
 	 * The extension is being destroyed so we must save some
 	 * information to notify that the extension is deactivated.
@@ -4821,6 +4928,9 @@ static int ast_add_hint(struct ast_exten *e)
 		ast_get_extension_name(e), ast_get_extension_app(e));
 	ao2_link(hints, hint_new);
 
+	/* Index the hint under each device it monitors (reverse device index). */
+	hint_devindex_link(hint_new, ast_get_extension_app(e));
+
 	ao2_unlock(hints);
 	ao2_ref(hint_new, -1);
 
@@ -4853,6 +4963,10 @@ static int ast_change_hint(struct ast_exten *oe, struct ast_exten *ne)
 	hint->exten = ne;
 	ao2_unlock(hint);
 	ao2_link(hints, hint);
+
+	/* Re-index: the device list may differ between the old and new exten. */
+	hint_devindex_unlink(hint, ast_get_extension_app(oe));
+	hint_devindex_link(hint, ast_get_extension_app(ne));
 
 	ao2_unlock(hints);
 	ao2_ref(hint, -1);
@@ -10744,7 +10858,8 @@ static int statecbs_cmp(void *obj, void *arg, int flags)
 int ast_pbx_init(void)
 {
 	hints = ao2_container_alloc(HASH_EXTENHINT_SIZE, hint_hash, hint_cmp);
+	device_hints = ao2_container_alloc(HASH_EXTENHINT_SIZE, devhint_hash, devhint_cmp);
 	statecbs = ao2_container_alloc(1, NULL, statecbs_cmp);
 
-	return (hints && statecbs) ? 0 : -1;
+	return (hints && device_hints && statecbs) ? 0 : -1;
 }
