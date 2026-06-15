@@ -13172,8 +13172,13 @@ static void *sofia_qualify_thread(void *data)
  * bucket — O(1) instead of scanning every bucket. */
 static int dialog_hash_fn(const void *obj, int flags)
 {
-	/* Hash the pointer VALUE only — never dereference (hmagic may dangle). */
-	return (int) ((uintptr_t) obj >> 5);
+	/* Hash the pointer VALUE only — never dereference (hmagic may dangle).  Mask off the
+	 * sign bit so the result is ALWAYS non-negative: this fork's legacy astobj2 abs()es the
+	 * hash on the LINK path (main/astobj2.c) but NOT on the FIND/UNLINK (OBJ_POINTER) path,
+	 * so a negative value (common for PIE/heap pointers, where bit 36 is set) would miss the
+	 * single-bucket fast path and fall back to a full n_buckets scan — exactly the O(n) the
+	 * container was sized to avoid. */
+	return (int) (((uintptr_t) obj >> 5) & 0x7fffffff);
 }
 
 static int dialog_cmp_fn(void *obj, void *arg, int flags)
@@ -15860,8 +15865,9 @@ static void sofia_parse_register_line(const char *value)
 	/* Find-or-alloc, like sofia_parse_peer_config does for [section] peers.
 	 * Without this, every reload that re-parses a `register =>` line would
 	 * sofia_peer_alloc + ao2_link a SECOND struct with the same name into
-	 * the peers container — the peers container has no name-based hash
-	 * (allocated with hash_fn=NULL at chan_sofia.c:17445), so duplicates
+	 * the peers container — legacy ao2_link (main/astobj2.c) inserts
+	 * unconditionally and never calls cmp_fn, so even though the container
+	 * now carries peer_hash_fn/peer_cmp_fn it does NOT dedup, and duplicates
 	 * by name are silently allowed.  The mark-and-sweep sweep would then
 	 * race to remove the OLD struct (marked at reload-start) while the
 	 * NEW one (allocated with _reload_marked = 0) survives, but during
@@ -16696,9 +16702,10 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 	struct sofia_peer *peer;
 	/* Find-or-alloc, mirroring the register=> parser: only a NEWLY allocated
 	 * peer must be ao2_link()ed into the peers container at the end of this
-	 * function.  An existing (cache-hit) peer is already linked, and the
-	 * peers container was allocated with hash_fn=NULL AND cmp_fn=NULL
-	 * (chan_sofia.c load_module), so ao2_link does NOT dedup — re-linking a
+	 * function.  An existing (cache-hit) peer is already linked, and legacy
+	 * ao2_link (main/astobj2.c) inserts unconditionally and never calls cmp_fn
+	 * — so even with the container's peer_hash_fn/peer_cmp_fn it does
+	 * NOT dedup — re-linking a
 	 * surviving config peer on every `sip reload` would add a duplicate node
 	 * plus a leaked container ref per reload (the container grows linearly;
 	 * the mark/sweep cannot reclaim the duplicates because the struct is
