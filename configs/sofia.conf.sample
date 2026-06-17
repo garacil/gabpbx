@@ -406,20 +406,16 @@ srvlookup=yes
 ; Per-peer subscribecontext= overrides default_subscribecontext from [general].
 ; chan_sip operator scripts copying these config keys copy verbatim to chan_sofia.
 ;
-; KNOWN LIMITATION (chan_sofia today, parsed-but-effect-pending): chan_sofia's
-; SUBSCRIBE-handling path (sofia_process_subscribe) currently only routes the
-; message-summary event-package to the MWI handler (T55) + auto-202s all other
-; events. There is no general SUBSCRIBE-to-dialplan dispatch infrastructure yet,
-; so a configured subscribecontext value is parsed + persisted + displayed (sip
-; show peer Subscr.Cont. line + realtime sippeers column) but does not yet route
-; SUBSCRIBE dispatch. The pivot-site override (chan_sip.c:16427-16429
-; equivalent) lands paired with a future presence/dialog event-package handler
-; task. Operators get drop-in config-parse compat today; runtime effect arrives
-; with the presence handler.
-;
-; This honest-disclosure pattern mirrors the regexten task's cleanup_stale_contexts
-; KNOWN LIMITATION (chan_sofia non-unloadable per T40 architectural).
-;
+; EFFECT (presence/BLF, active): chan_sofia now serves inbound presence/BLF
+; subscriptions (Event: dialog / dialog-info / presence) — it registers a hint
+; watcher with the dialplan and pushes dialog-info+xml / pidf+xml / xpidf+xml
+; NOTIFYs as the watched extension's state changes (so `core show hints` counts
+; the watcher and BLF lamps track). subscribecontext selects the dialplan context
+; whose hints a watcher may subscribe to: a presence SUBSCRIBE for extension N
+; resolves the hint as N@<subscribecontext> (falling back to the peer's voice
+; context, then "default"). Use it to isolate which hints a peer can watch.
+; Subscriptions are gated by allowsubscribe (above). Event: message-summary still
+; routes to the MWI handler; unknown event packages are auto-202'd.
 ;default_subscribecontext = presence    ; [general] default; peers inherit when their subscribecontext= is unset
 ;subscribecontext         = presence    ; per-peer override (in [peer] section)
 

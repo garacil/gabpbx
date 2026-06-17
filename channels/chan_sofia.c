@@ -2584,6 +2584,7 @@ static int sofia_fixup(struct ast_channel *oldchan, struct ast_channel *newchan)
 static int sofia_send_digit_begin(struct ast_channel *ast, char digit);
 static int sofia_send_digit_end(struct ast_channel *ast, char digit, unsigned int duration);
 static const char *sofia_get_callid(struct ast_channel *ast);
+static int sofia_devicestate(void *data);	/* BLF/presence: report SIP/<peer> device state to the core */
 
 static struct ast_channel_tech sofia_tech = {
 	.type = SOFIA_CHANNEL_TYPE,
@@ -2597,7 +2598,7 @@ static struct ast_channel_tech sofia_tech = {
 			| AST_FORMAT_MP4_VIDEO | AST_FORMAT_VP8,
 	.properties = AST_CHAN_TP_WANTSJITTER | AST_CHAN_TP_CREATESJITTER,
 	.requester = sofia_request_call,
-	.devicestate = NULL,
+	.devicestate = sofia_devicestate,
 	.send_digit_begin = sofia_send_digit_begin,
 	.send_digit_end = sofia_send_digit_end,
 	.call = sofia_call,
@@ -9510,6 +9511,8 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 					"PeerStatus: Unregistered\r\n"
 					"Cause: Wildcard\r\n",
 					peer->name);
+				/* BLF/presence: re-evaluate SIP/<peer> hint state (now offline). */
+				ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
 				return 0;
 				}
 			}
@@ -9682,6 +9685,8 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 			"PeerStatus: Unregistered\r\n"
 			"Cause: Expired\r\n",
 			peer->name);
+		/* BLF/presence: re-evaluate SIP/<peer> hint state (now offline). */
+		ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
 	}
 	if (update) {
 		update->now_registered = peer->registered;
@@ -11073,6 +11078,13 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		/* post-T56 regexten parity (2026-04-27): auto-add dialplan extension on
 		 * REGISTER success (chan_sip parity). No-op if sofia_cfg.regcontext empty. */
 		register_peer_exten(peer, 1);
+		/* BLF/presence: re-evaluate SIP/<peer> hint state ONLY on a real
+		 * registration transition (offline->online / contact change). A plain
+		 * ~60s refresh REGISTER changes nothing, so gating on sofia_register_changed
+		 * avoids a needless devstate recompute + BLF fan-out per refresh per peer. */
+		if (sofia_register_changed(&reg_update)) {
+			ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
+		}
 		manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
 			"ChannelType: SIP\r\n"
 			"Peer: SIP/%s\r\n"
@@ -12581,6 +12593,801 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 	 * off sofia_thread). */
 }
 
+/* =========================================================================
+ *  Presence / BLF (dialog-info + presence) inbound SUBSCRIBE -> NOTIFY
+ *
+ *  Fills the hole left by the legacy auto-202 stub: a watcher (e.g. ext 210
+ *  with a BLF key for 211) SUBSCRIBEs to Event: dialog / presence; we register
+ *  a hint watcher with the gabpbx core (ast_extension_state_add_destroy — this
+ *  is what makes `core show hints` count the Watcher) and push a NOTIFY with
+ *  the watched extension's state every time it changes.
+ *
+ *  Lifecycle is owned by sofia-sip's notifier state machine (nua_notifier /
+ *  NUTAG_SUBSTATE), exactly like the MWI path: the library manages the server
+ *  dialog, Subscription-State, expiry, refresh re-SUBSCRIBE and the terminating
+ *  NOTIFY — we never hand-roll timers the way chan_sip does.
+ *
+ *  Threading (concurrency doctrine): every nua_* call and every mutation of
+ *  presence_subs / sub->* happens on sofia_thread. The core fires
+ *  sofia_presence_state_cb on its device_state taskprocessor (no PBX locks
+ *  held); that callback ONLY snapshots {state} + bumps a ref + marshals to
+ *  sofia_thread via sofia_dispatch_to_root_thread. No new thread is created.
+ *  This mirrors mwi_event_cb -> mwi_notify_callback verbatim.
+ *
+ *  Improvement over chan_sip: a detailed, subscription-scoped AMI event
+ *  (SofiaPresenceState) is emitted on every NOTIFY push — chan_sip is silent on
+ *  that plane and the core's generic ExtensionStatus carries no watcher
+ *  dimension. ========================================================== */
+
+#define MAX_PRESENCE_SUB_BUCKETS 1009		/* prime; one entry per active watcher dialog */
+#define SOFIA_PRESENCE_DEFAULT_EXPIRY 3600	/* used when the SUBSCRIBE omits Expires */
+#define SOFIA_PRESENCE_SWEEP_MS 5000		/* expiry-sweep timer interval (ms) */
+#define SOFIA_PRESENCE_EXPIRY_GRACE 5		/* seconds past expires_at before a stale sub is swept */
+
+enum sofia_sub_format {
+	SOFIA_SUB_DIALOG_INFO = 0,	/* application/dialog-info+xml (BLF) */
+	SOFIA_SUB_PIDF,			/* application/pidf+xml */
+	SOFIA_SUB_XPIDF,		/* application/xpidf+xml (Polycom/MSN) */
+	SOFIA_SUB_CPIM_PIDF,		/* application/cpim-pidf+xml */
+};
+
+/* One active watcher subscription. ao2-managed. Keyed by the LOGICAL pair
+ * (watcher peer, watched exten, context) — NOT by nh — so a re-SUBSCRIBE on a
+ * fresh dialog (phone reboot) REPLACES the prior subscription instead of leaking
+ * a watcher, and an Expires:0 terminates it (MWI-style replace; sofia-sip does
+ * not reliably reuse the handle for in-dialog refresh/unsub). Mutated only on
+ * sofia_thread. */
+struct sofia_presence_sub {
+	char subkey[200];			/* "peername|exten|context" — container key */
+	nua_handle_t *nh;			/* subscription dialog handle (NOT bound as hmagic;
+						 * correlated via sofia_presence_find_by_nh) */
+	char exten[AST_MAX_EXTENSION];		/* watched extension (To user) */
+	char context[AST_MAX_CONTEXT];		/* hint lookup context */
+	char entity[256];			/* watched resource URI: sip:exten@domain */
+	char peername[80];			/* subscriber peer name (From user) for AMI */
+	char watcher_addr[64];			/* subscriber source addr for AMI */
+	char event[16];				/* "dialog" or "presence" (NOTIFY Event hdr) */
+	enum sofia_sub_format format;		/* negotiated body type */
+	int stateid;				/* ast_extension_state_add_destroy id (-1 = none) */
+	int laststate;				/* last AST_EXTENSION_* pushed */
+	uint32_t version;			/* monotonic dialog-info version= counter */
+	int expires;				/* granted subscription lifetime (seconds) */
+	time_t expires_at;			/* absolute expiry, for Subscription-State expires= */
+	int terminated;				/* set on sofia_thread at teardown (idempotency) */
+};
+
+static struct ao2_container *presence_subs;	/* keyed by subkey; created in load_module */
+static su_timer_t *presence_expiry_timer;	/* recurring sweep on sofia_thread (see load) */
+
+/* dispatch carrier: state-change cb (device_state thread) -> sofia_thread */
+struct sofia_presence_dispatch {
+	struct sofia_presence_sub *sub;		/* +1 ref TRANSFERRED — callback drops */
+	int state;				/* snapshot of AST_EXTENSION_* at fire time */
+};
+
+static int presence_sub_hash_fn(const void *obj, int flags)
+{
+	const struct sofia_presence_sub *sub = obj;	/* full sub or {.subkey} shim */
+	return ast_str_hash(sub->subkey);
+}
+
+static int presence_sub_cmp_fn(void *obj, void *arg, int flags)
+{
+	struct sofia_presence_sub *sub = obj;
+	struct sofia_presence_sub *match = arg;		/* {.subkey} shim */
+	return strcmp(sub->subkey, match->subkey) ? 0 : (CMP_MATCH | CMP_STOP);
+}
+
+static void presence_sub_destructor(void *obj)
+{
+	/* Nothing to free: all fields are inline and the nua handle is destroyed
+	 * explicitly on sofia_thread in sofia_presence_teardown (this destructor may
+	 * run on any thread, so it must NOT touch nua_*). */
+	(void) obj;
+}
+
+/* forward decls (mutual recursion: state_cb -> dispatch -> teardown -> state_cb fn-ptr) */
+static int sofia_presence_state_cb(char *context, char *exten,
+		enum ast_extension_states state, void *data);
+static void sofia_presence_teardown(struct sofia_presence_sub *sub, int send_terminated);
+
+/* chan_sip parity state map (chan_sip.c:13464-13527). local_state: 0=open 1=inuse 2=closed. */
+static void sofia_presence_state_map(int state, const char **statestring,
+		const char **pidfstate, const char **pidfnote, int *local_state)
+{
+	*statestring = "terminated";
+	*pidfstate = "--";
+	*pidfnote = "Ready";
+	*local_state = 0;	/* NOTIFY_OPEN */
+
+	switch (state) {
+	case (AST_EXTENSION_RINGING | AST_EXTENSION_INUSE):
+		*statestring = "early";  *local_state = 1; *pidfstate = "busy"; *pidfnote = "Ringing"; break;
+	case AST_EXTENSION_RINGING:
+		*statestring = "early";  *local_state = 1; *pidfstate = "busy"; *pidfnote = "Ringing"; break;
+	case AST_EXTENSION_INUSE:
+		*statestring = "confirmed"; *local_state = 1; *pidfstate = "busy"; *pidfnote = "On the phone"; break;
+	case AST_EXTENSION_BUSY:
+		*statestring = "confirmed"; *local_state = 2; *pidfstate = "busy"; *pidfnote = "On the phone"; break;
+	case AST_EXTENSION_UNAVAILABLE:
+		*statestring = "terminated"; *local_state = 2; *pidfstate = "away"; *pidfnote = "Unavailable"; break;
+	case AST_EXTENSION_ONHOLD:
+		*statestring = "confirmed"; *local_state = 2; *pidfstate = "busy"; *pidfnote = "On hold"; break;
+	case AST_EXTENSION_NOT_INUSE:
+	default:
+		break;
+	}
+}
+
+static const char *sofia_presence_mime(enum sofia_sub_format f)
+{
+	switch (f) {
+	case SOFIA_SUB_DIALOG_INFO: return "application/dialog-info+xml";
+	case SOFIA_SUB_PIDF:        return "application/pidf+xml";
+	case SOFIA_SUB_XPIDF:       return "application/xpidf+xml";
+	case SOFIA_SUB_CPIM_PIDF:   return "application/cpim-pidf+xml";
+	}
+	return "application/dialog-info+xml";
+}
+
+/* Build the NOTIFY body for sub->format. chan_sip parity (state_notify_build_xml
+ * chan_sip.c:13529-13653) + the "all hinted devices unavailable => offline"
+ * override. exten is XML-escaped. */
+static void sofia_presence_build_body(struct ast_str **buf, const struct sofia_presence_sub *sub, int state)
+{
+	const char *statestring, *pidfstate, *pidfnote;
+	int local_state;
+	char hint[AST_MAX_EXTENSION];
+	char exten_esc[AST_MAX_EXTENSION * 6];		/* *6: ast_xml_escape worst-case (&quot;) expansion */
+	char entity_esc[sizeof(sub->entity) * 6];
+
+	sofia_presence_state_map(state, &statestring, &pidfstate, &pidfnote, &local_state);
+
+	/* If every hinted device is unregistered, override to offline (chan_sip parity).
+	 * The override can ONLY flip an "open" (idle) presentation to "closed", so run
+	 * the ast_get_hint (process-global contexts rdlock) + per-device scan ONLY when
+	 * local_state is currently open — i.e. skip it for the in-use/closed states
+	 * (INUSE/RINGING/BUSY/ONHOLD/UNAVAILABLE) where it can never change the result.
+	 * This keeps the global lock + device scan off the in-call NOTIFY fan-out. */
+	if (local_state == 0 && ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, sub->context, sub->exten)) {
+		char *h = hint, *one;
+		int total = 0, unavail = 0;
+		while ((one = strsep(&h, "&"))) {
+			total++;
+			if (ast_device_state(one) == AST_DEVICE_UNAVAILABLE) {
+				unavail++;
+			}
+		}
+		if (total > 0 && total == unavail) {
+			local_state = 2;	/* closed */
+			pidfstate = "away";
+			pidfnote = "Not online";
+		}
+	}
+
+	ast_xml_escape(sub->exten, exten_esc, sizeof(exten_esc));
+	/* entity is built from the remote To header (sip:to_user@to_host) — escape it
+	 * too before it goes into XML attributes/elements. */
+	ast_xml_escape(sub->entity, entity_esc, sizeof(entity_esc));
+
+	switch (sub->format) {
+	case SOFIA_SUB_XPIDF:
+	case SOFIA_SUB_CPIM_PIDF:
+		ast_str_append(buf, 0,
+			"<?xml version=\"1.0\"?>\n"
+			"<!DOCTYPE presence PUBLIC \"-//IETF//DTD RFCxxxx XPIDF 1.0//EN\" \"xpidf.dtd\">\n"
+			"<presence>\n");
+		ast_str_append(buf, 0, "<presentity uri=\"%s;method=SUBSCRIBE\" />\n", entity_esc);
+		ast_str_append(buf, 0, "<atom id=\"%s\">\n", exten_esc);
+		ast_str_append(buf, 0, "<address uri=\"%s;user=ip\" priority=\"0.800000\">\n", entity_esc);
+		ast_str_append(buf, 0, "<status status=\"%s\" />\n",
+			(local_state == 0) ? "open" : (local_state == 1) ? "inuse" : "closed");
+		ast_str_append(buf, 0, "<msnsubstatus substatus=\"%s\" />\n",
+			(local_state == 0) ? "online" : (local_state == 1) ? "onthephone" : "offline");
+		ast_str_append(buf, 0, "</address>\n</atom>\n</presence>\n");
+		break;
+	case SOFIA_SUB_PIDF:
+		ast_str_append(buf, 0,
+			"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n"
+			"<presence xmlns=\"urn:ietf:params:xml:ns:pidf\" \n"
+			"xmlns:pp=\"urn:ietf:params:xml:ns:pidf:person\"\n"
+			"xmlns:es=\"urn:ietf:params:xml:ns:pidf:rpid:status:rpid-status\"\n"
+			"xmlns:ep=\"urn:ietf:params:xml:ns:pidf:rpid:rpid-person\"\n"
+			"entity=\"%s\">\n", entity_esc);
+		ast_str_append(buf, 0, "<pp:person><status>\n");
+		if (pidfstate[0] != '-') {
+			ast_str_append(buf, 0, "<ep:activities><ep:%s/></ep:activities>\n", pidfstate);
+		}
+		ast_str_append(buf, 0, "</status></pp:person>\n");
+		ast_str_append(buf, 0, "<note>%s</note>\n", pidfnote);
+		ast_str_append(buf, 0, "<tuple id=\"%s\">\n", exten_esc);
+		ast_str_append(buf, 0, "<contact priority=\"1\">%s</contact>\n", entity_esc);
+		if (pidfstate[0] == 'b') {
+			ast_str_append(buf, 0, "<status><basic>open</basic></status>\n");
+		} else {
+			ast_str_append(buf, 0, "<status><basic>%s</basic></status>\n",
+				(local_state != 2) ? "open" : "closed");
+		}
+		ast_str_append(buf, 0, "</tuple>\n</presence>\n");
+		break;
+	case SOFIA_SUB_DIALOG_INFO:
+	default:
+		ast_str_append(buf, 0, "<?xml version=\"1.0\"?>\n");
+		ast_str_append(buf, 0,
+			"<dialog-info xmlns=\"urn:ietf:params:xml:ns:dialog-info\" "
+			"version=\"%u\" state=\"full\" entity=\"%s\">\n",
+			sub->version, entity_esc);
+		if (state & AST_EXTENSION_RINGING) {
+			ast_str_append(buf, 0, "<dialog id=\"%s\" direction=\"recipient\">\n", exten_esc);
+		} else {
+			ast_str_append(buf, 0, "<dialog id=\"%s\">\n", exten_esc);
+		}
+		ast_str_append(buf, 0, "<state>%s</state>\n", statestring);
+		if (state == AST_EXTENSION_ONHOLD) {
+			ast_str_append(buf, 0,
+				"<local>\n<target uri=\"%s\">\n"
+				"<param pname=\"+sip.rendering\" pvalue=\"no\"/>\n"
+				"</target>\n</local>\n", entity_esc);
+		}
+		ast_str_append(buf, 0, "</dialog>\n</dialog-info>\n");
+		break;
+	}
+}
+
+/* Emit one NOTIFY for sub at the given state, plus the detailed AMI event.
+ * Runs on sofia_thread. terminate=1 sets Subscription-State: terminated (final
+ * NOTIFY); otherwise sofia-sip auto-fills active;expires per the notifier. */
+static void sofia_presence_emit_notify(struct sofia_presence_sub *sub, int state, int terminate)
+{
+	struct ast_str *body;
+	const char *statestring, *pidfstate, *pidfnote, *mime;
+	const char *prevstr, *curstr;
+	int local_state;
+
+	if (!sub || !sub->nh) {
+		return;
+	}
+	body = ast_str_create(640);
+	if (!body) {
+		return;
+	}
+
+	prevstr = ast_extension_state2str(sub->laststate);
+	sub->version++;
+	sub->laststate = state;
+
+	mime = sofia_presence_mime(sub->format);
+	sofia_presence_build_body(&body, sub, state);
+
+	/* Subscription-State is MANDATORY per RFC 6665 §8.2.1. We compose it
+	 * explicitly (active;expires=N / terminated) — with the nua_respond+nua_notify
+	 * server idiom sofia-sip does not auto-add it. NUTAG_SUBSTATE keeps sofia-sip's
+	 * own subscription-usage state machine (expiry timer, nua_r_notify on timeout)
+	 * in sync. */
+	{
+		char ss[64];
+		int remaining = (int) (sub->expires_at - time(NULL));
+		if (remaining < 0) {
+			remaining = 0;
+		}
+		if (terminate) {
+			ast_copy_string(ss, "terminated;reason=timeout", sizeof(ss));
+		} else {
+			snprintf(ss, sizeof(ss), "active;expires=%d", remaining);
+		}
+		nua_notify(sub->nh,
+			SIPTAG_EVENT_STR(sub->event),
+			NUTAG_SUBSTATE(terminate ? nua_substate_terminated : nua_substate_active),
+			SIPTAG_SUBSCRIPTION_STATE_STR(ss),
+			SIPTAG_CONTENT_TYPE_STR(mime),
+			SIPTAG_PAYLOAD_STR(ast_str_buffer(body)),
+			TAG_END());
+	}
+
+	ast_free(body);
+
+	/* Part D: subscription-scoped AMI event — richer than chan_sip (silent) and
+	 * than the core's watcher-less ExtensionStatus. */
+	sofia_presence_state_map(state, &statestring, &pidfstate, &pidfnote, &local_state);
+	curstr = ast_extension_state2str(state);
+	manager_event(EVENT_FLAG_CALL, "SofiaPresenceState",
+		"Watcher: SIP/%s\r\n"
+		"WatcherAddr: %s\r\n"
+		"Exten: %s\r\n"
+		"Context: %s\r\n"
+		"PrevState: %s\r\n"
+		"State: %s\r\n"
+		"StateCode: %d\r\n"
+		"DialogState: %s\r\n"
+		"Format: %s\r\n"
+		"SubscriptionState: %s\r\n"
+		"Version: %u\r\n",
+		sub->peername, sub->watcher_addr, sub->exten, sub->context,
+		prevstr, curstr, state, statestring, mime,
+		terminate ? "terminated" : "active", sub->version);
+
+	if (sofia_debug) {
+		ast_verbose("Sofia presence: NOTIFY %s state=%s watcher=SIP/%s exten=%s@%s v=%u\n",
+			mime, curstr, sub->peername, sub->exten, sub->context, sub->version);
+	}
+}
+
+/* sofia_thread: drop a watcher subscription. Idempotent. If send_terminated,
+ * emit a final NOTIFY with Subscription-State: terminated before destroying. */
+static void sofia_presence_teardown(struct sofia_presence_sub *sub, int send_terminated)
+{
+	if (!sub || sub->terminated) {
+		return;
+	}
+	sub->terminated = 1;
+	if (send_terminated && sub->nh) {
+		struct ast_str *body = ast_str_create(640);
+		if (body) {
+			sub->version++;
+			sofia_presence_build_body(&body, sub, AST_EXTENSION_NOT_INUSE);
+			nua_notify(sub->nh,
+				SIPTAG_EVENT_STR(sub->event),
+				NUTAG_SUBSTATE(nua_substate_terminated),
+				SIPTAG_SUBSCRIPTION_STATE_STR("terminated;reason=timeout"),
+				SIPTAG_CONTENT_TYPE_STR(sofia_presence_mime(sub->format)),
+				SIPTAG_PAYLOAD_STR(ast_str_buffer(body)),
+				TAG_END());
+			ast_free(body);
+		}
+	}
+	if (sub->stateid > -1) {
+		ast_extension_state_del(sub->stateid, sofia_presence_state_cb);	/* fires destroy_cb -> drops reg ref */
+		sub->stateid = -1;
+	}
+	if (presence_subs) {
+		ao2_unlink(presence_subs, sub);		/* drops container ref */
+	}
+	if (sub->nh) {
+		nua_handle_bind(sub->nh, NULL);		/* defensive: presence subs are never bound as
+							 * hmagic (correlation is by container iteration),
+							 * but clear any binding before destroy regardless */
+		nua_handle_destroy(sub->nh);
+		sub->nh = NULL;
+	}
+}
+
+/* sofia_thread: marshaled target of the device-state callback. */
+static void sofia_presence_notify_dispatch_cb(void *arg)
+{
+	struct sofia_presence_dispatch *d = arg;
+	struct sofia_presence_sub *sub;
+
+	if (!d) {
+		return;
+	}
+	sub = d->sub;
+	if (sub && !sub->terminated && sub->nh) {
+		if (d->state == AST_EXTENSION_REMOVED || d->state == AST_EXTENSION_DEACTIVATED) {
+			/* hint went away: final NOTIFY + teardown (chan_sip cb_extensionstate parity) */
+			sofia_presence_emit_notify(sub, AST_EXTENSION_UNAVAILABLE, 1);
+			sofia_presence_teardown(sub, 0);	/* terminated NOTIFY already sent above */
+		} else {
+			sofia_presence_emit_notify(sub, d->state, 0);
+		}
+	}
+	if (sub) {
+		ao2_ref(sub, -1);	/* drop dispatch ref */
+	}
+	ast_free(d);
+}
+
+/* device_state taskprocessor thread (NOT sofia_thread): snapshot + marshal only. */
+static int sofia_presence_state_cb(char *context, char *exten,
+		enum ast_extension_states state, void *data)
+{
+	struct sofia_presence_sub *sub = data;
+	struct sofia_presence_dispatch *d;
+
+	if (!sub) {
+		return 0;
+	}
+	d = ast_calloc(1, sizeof(*d));
+	if (!d) {
+		return 0;
+	}
+	ao2_ref(sub, +1);	/* dispatch ref (TRANSFER) */
+	d->sub = sub;
+	d->state = (int) state;
+	if (sofia_dispatch_to_root_thread(sofia_presence_notify_dispatch_cb, d) < 0) {
+		ao2_ref(sub, -1);
+		ast_free(d);
+	}
+	return 0;
+}
+
+/* core destroy callback: drops the registration's +1 ref on the sub. */
+static void sofia_presence_sub_destroy_cb(int id, void *data)
+{
+	struct sofia_presence_sub *sub = data;
+	if (sub) {
+		ao2_ref(sub, -1);
+	}
+}
+
+/* Type-safe correlation of a notifier handle -> its subscription, for the
+ * expiry path (nua_r_notify terminated). Iterates the (small) container rather
+ * than dereferencing hmagic as a presence sub. Returns +1-reffed sub or NULL. */
+static struct sofia_presence_sub *sofia_presence_find_by_nh(nua_handle_t *nh)
+{
+	struct ao2_iterator it;
+	struct sofia_presence_sub *sub, *found = NULL;
+
+	if (!presence_subs || !nh) {
+		return NULL;
+	}
+	it = ao2_iterator_init(presence_subs, 0);
+	while ((sub = ao2_iterator_next(&it))) {
+		if (sub->nh == nh) {
+			found = sub;	/* keep the +1 ref */
+			break;
+		}
+		ao2_ref(sub, -1);
+	}
+	ao2_iterator_destroy(&it);
+	return found;
+}
+
+/* Did sofia-sip mark this NOTIFY transaction as terminating the subscription? */
+static int sofia_substate_terminated(tagi_t tags[])
+{
+	int substate = nua_substate_active;
+	if (tags) {
+		tl_gets(tags, NUTAG_SUBSTATE_REF(substate), TAG_END());
+	}
+	return substate == nua_substate_terminated;
+}
+
+/* Periodic expiry sweep — runs on sofia_thread via a su_timer on sofia_root.
+ *
+ * sofia-sip does NOT arm a server-side expiry timer for subscriptions the app
+ * accepts with nua_respond() (only its own auto-/nua_notifier-responded ones),
+ * so a watcher that stops refreshing (phone reboot / network loss, no explicit
+ * Expires:0) would otherwise leak forever. We own expiry ourselves — chan_sip
+ * parity (sip_scheddestroy). Watchers that refresh keep pushing expires_at into
+ * the future; only genuinely stale ones (now >= expires_at + grace) are torn
+ * down (with a final terminated NOTIFY). Collect-then-teardown so we never
+ * mutate the container mid-iteration. */
+static void sofia_presence_expiry_sweep(su_root_magic_t *magic, su_timer_t *t, su_timer_arg_t *arg)
+{
+	struct ao2_iterator it;
+	struct sofia_presence_sub *sub;
+	struct sofia_presence_sub *expired[64];
+	int n = 0, i;
+	time_t now;
+
+	if (!presence_subs) {
+		return;
+	}
+	now = time(NULL);
+	it = ao2_iterator_init(presence_subs, 0);
+	while ((sub = ao2_iterator_next(&it))) {
+		if (!sub->terminated && sub->expires_at > 0
+				&& now >= sub->expires_at + SOFIA_PRESENCE_EXPIRY_GRACE
+				&& n < (int) ARRAY_LEN(expired)) {
+			expired[n++] = sub;	/* keep the iterator's +1 ref for teardown below */
+		} else {
+			ao2_ref(sub, -1);
+		}
+	}
+	ao2_iterator_destroy(&it);
+
+	for (i = 0; i < n; i++) {
+		if (sofia_debug) {
+			ast_verbose("Sofia presence: expiring stale watcher SIP/%s -> %s@%s (no refresh)\n",
+				expired[i]->peername, expired[i]->exten, expired[i]->context);
+		}
+		sofia_presence_teardown(expired[i], 1);	/* terminated NOTIFY + destroy */
+		ao2_ref(expired[i], -1);
+	}
+}
+
+/* tech.devicestate: tell the gabpbx core the state of SIP/<peer> so hints over
+ * SIP/<peer> reflect registration + call-limit. STRICT-IMPROVEMENT contract: the
+ * core uses our concrete result and SKIPS the generic channel scan (devicestate.c
+ * _ast_device_state: "if (res != AST_DEVICE_UNKNOWN) return res"). So we return a
+ * concrete value ONLY where we add information the generic channel scan cannot
+ * derive — offline (not registered), on-hold, and call-limit BUSY — and return
+ * AST_DEVICE_UNKNOWN otherwise so the proven generic scan still decides
+ * INUSE/RINGING/NOT_INUSE during calls. Cache-only peer lookup (NEVER realtime —
+ * a realtime load here would defeat rtautoclear, chan_sip.c:27787 parity). */
+static int sofia_devicestate(void *data)
+{
+	char *dev, *at;
+	struct sofia_peer_key key = { .__field_mgr_pool = NULL, .name = NULL };
+	struct sofia_peer *peer;
+	int res = AST_DEVICE_UNKNOWN;
+
+	dev = ast_strdupa(data ? (const char *) data : "");
+	if ((at = strchr(dev, '@'))) {
+		dev = at + 1;
+	}
+	if (ast_strlen_zero(dev) || !peers) {
+		return AST_DEVICE_UNKNOWN;
+	}
+
+	key.name = dev;
+	peer = ao2_find(peers, &key, OBJ_POINTER);	/* cache-only */
+	if (!peer) {
+		return AST_DEVICE_UNKNOWN;		/* unknown device -> let core decide */
+	}
+
+	ast_mutex_lock(&peer->lock);
+	/* Reachable = a peer with a known address. chan_sofia stores the canonical
+	 * "where to reach this peer" in peer->src_addr for BOTH the dynamic-registered
+	 * source (set at REGISTER, zeroed at unregister) AND the static host=<ip> /
+	 * dnsmgr-resolved address (sofia_dnsmgr_setup_peer). peer->addr is never
+	 * written in chan_sofia, so it must NOT be consulted here (doing so pinned
+	 * static host=<ip> peers to UNAVAILABLE). defaddr is the dynamic defaultip=
+	 * fallback. Otherwise the peer is offline. */
+	if (!peer->registered
+			&& ast_sockaddr_isnull(&peer->src_addr)
+			&& ast_sockaddr_isnull(&peer->defaddr)) {
+		res = AST_DEVICE_UNAVAILABLE;		/* unreachable -> offline (generic can't know) */
+	} else if (peer->onHold) {
+		res = AST_DEVICE_ONHOLD;
+	} else if (peer->call_limit && peer->inUse >= peer->call_limit) {
+		res = AST_DEVICE_BUSY;
+	} else if (peer->call_limit && peer->busy_level && peer->inUse >= peer->busy_level) {
+		res = AST_DEVICE_BUSY;
+	} else {
+		res = AST_DEVICE_UNKNOWN;		/* registered/idle/in-call -> generic channel scan */
+	}
+	ast_mutex_unlock(&peer->lock);
+
+	ao2_ref(peer, -1);
+	return res;
+}
+
+/* Event: dialog / presence handler. Runs on sofia_thread. */
+static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
+		struct sofia_pvt *op, sip_t const *sip, tagi_t tags[])
+{
+	struct sofia_peer *peer;
+	struct sofia_presence_sub *sub;
+	const char *from_user, *to_user, *event;
+	const char *to_host;
+	char l_context[AST_MAX_CONTEXT];
+	char l_peername[80];
+	char l_exten[AST_MAX_EXTENSION];	/* bounded copy of To-user — keeps subkey consistent with sub->exten */
+	char subkey[200];
+	char hint[AST_MAX_EXTENSION];
+	struct ast_sockaddr src = { {0,} };	/* zero-init: sofia_get_source_addr leaves it untouched if no Via */
+	int firststate;
+	int expires;
+
+	event = (sip && sip->sip_event && sip->sip_event->o_type) ? sip->sip_event->o_type : "dialog";
+
+	/* To URI = watched resource; From URI = subscriber. */
+	if (!sip || !sip->sip_to || !sip->sip_to->a_url || !sip->sip_to->a_url->url_user
+			|| !sip->sip_from || !sip->sip_from->a_url || !sip->sip_from->a_url->url_user) {
+		nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
+		return;
+	}
+	to_user = sip->sip_to->a_url->url_user;
+	to_host = sip->sip_to->a_url->url_host;
+	from_user = sip->sip_from->a_url->url_user;
+
+	/* Identify the subscriber peer (gating + context source). */
+	peer = sofia_find_peer(from_user);
+	if (!peer) {
+		if (sofia_cfg.alwaysauthreject) {
+			char realm_buf[MAXHOSTNAMELEN];
+			const char *realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
+			sofia_send_auth_challenge(nua, nh, sip, realm, "SUBSCRIBE", "UnknownPeer");
+		} else {
+			ast_log(LOG_NOTICE, "Sofia presence: SUBSCRIBE from unknown peer '%s' — 404\n", from_user);
+			nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
+		}
+		return;
+	}
+
+	if (!peer->allowsubscribe) {
+		ast_log(LOG_NOTICE,
+			"Sofia presence: SUBSCRIBE from peer '%s' rejected by allowsubscribe=no — 403\n",
+			peer->name);
+		nua_respond(nh, 403, "Forbidden (policy)", NUTAG_WITH_THIS(nua), TAG_END());
+		sofia_emit_subscribe_rejected(sip, peer->name, event, "AllowSubscribeClosed");
+		ao2_ref(peer, -1);
+		return;
+	}
+
+	/* Resolve hint context + snapshot peer name: peer subscribecontext > peer
+	 * context > "default". Snapshot reload-mutable stringfields under peer->lock. */
+	ast_mutex_lock(&peer->lock);
+	if (!ast_strlen_zero(peer->subscribecontext)) {
+		ast_copy_string(l_context, peer->subscribecontext, sizeof(l_context));
+	} else if (!ast_strlen_zero(peer->context)) {
+		ast_copy_string(l_context, peer->context, sizeof(l_context));
+	} else {
+		ast_copy_string(l_context, "default", sizeof(l_context));
+	}
+	ast_copy_string(l_peername, peer->name, sizeof(l_peername));
+	ast_mutex_unlock(&peer->lock);
+	ao2_ref(peer, -1);
+	peer = NULL;
+
+	/* The watched extension must have a dialplan hint, else nothing to watch. */
+	if (!ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, l_context, to_user)) {
+		ast_log(LOG_NOTICE,
+			"Sofia presence: no hint for %s@%s (watcher SIP/%s) — 404\n",
+			to_user, l_context, l_peername);
+		nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
+		return;
+	}
+
+	/* Logical key: at most ONE subscription per (watcher, watched-exten, context).
+	 * A re-SUBSCRIBE on a fresh dialog (phone reboot) or an Expires:0 unsubscribe
+	 * is correlated here — NOT by nh, which sofia-sip does not reliably reuse. */
+	ast_copy_string(l_exten, to_user, sizeof(l_exten));	/* bound the wire To-user up front */
+	snprintf(subkey, sizeof(subkey), "%s|%s|%s", l_peername, l_exten, l_context);
+	/* Expires: ex_delta is unsigned long; clamp to our max before the int cast so
+	 * a pathological value > INT_MAX cannot wrap negative and be misread as an
+	 * unsubscribe (expires <= 0). */
+	if (!sip || !sip->sip_expires) {
+		expires = SOFIA_PRESENCE_DEFAULT_EXPIRY;
+	} else if (sip->sip_expires->ex_delta > (unsigned long) SOFIA_PRESENCE_DEFAULT_EXPIRY) {
+		expires = SOFIA_PRESENCE_DEFAULT_EXPIRY;
+	} else {
+		expires = (int) sip->sip_expires->ex_delta;
+	}
+
+	/* Replace/terminate any existing subscription for this key. */
+	{
+		struct sofia_presence_sub keyobj;
+		struct sofia_presence_sub *old;
+		memset(&keyobj, 0, sizeof(keyobj));
+		ast_copy_string(keyobj.subkey, subkey, sizeof(keyobj.subkey));
+		old = ao2_find(presence_subs, &keyobj, OBJ_POINTER);
+
+		if (expires <= 0) {
+			/* Unsubscribe. sofia-sip delivers this on a fresh handle (verified:
+			 * not the notifier handle), so accept it and send the terminating
+			 * NOTIFY (RFC 6665 — 200 + final NOTIFY). nua_respond alone (no
+			 * notifier) makes the stack emit a spurious 500. */
+			const char *norm = (!strcasecmp(event, "dialog") || !strcasecmp(event, "dialog-info"))
+				? "dialog" : "presence";
+			int nh_is_old = (old && old->nh == nh);
+			nua_respond(nh, SIP_200_OK, NUTAG_WITH_THIS(nua),
+				SIPTAG_EXPIRES_STR("0"), TAG_END());
+			nua_notify(nh,
+				SIPTAG_EVENT_STR(norm),
+				NUTAG_SUBSTATE(nua_substate_terminated),
+				SIPTAG_SUBSCRIPTION_STATE_STR("terminated;reason=timeout"),
+				TAG_END());
+			if (old) {
+				sofia_presence_teardown(old, 0);	/* destroys old->nh */
+				ao2_ref(old, -1);
+			}
+			/* Reap the fresh server handle sofia-sip created for this unsubscribe
+			 * (SUBSCRIBE is an APPL_METHOD — the stack will not auto-destroy it),
+			 * unless teardown already freed it (old->nh == nh). MWI discipline. */
+			if (!nh_is_old) {
+				nua_handle_bind(nh, NULL);
+				nua_handle_destroy(nh);
+			}
+			if (sofia_debug) {
+				ast_verbose("Sofia presence: UNSUBSCRIBE — watcher SIP/%s -> %s@%s\n",
+					l_peername, to_user, l_context);
+			}
+			return;
+		}
+
+		if (old) {
+			if (old->nh == nh) {
+				/* True in-dialog refresh on the same handle. SUBSCRIBE is an
+				 * APPL_METHOD so sofia-sip will NOT auto-answer it — we MUST
+				 * nua_respond(202) (else the watcher retransmits then drops the
+				 * subscription at the first refresh). Extend the lifetime, then
+				 * re-emit current state. */
+				char eb[16];
+				int st;
+				old->expires = expires;
+				old->expires_at = time(NULL) + expires;
+				snprintf(eb, sizeof(eb), "%d", expires);
+				nua_respond(nh, SIP_202_ACCEPTED, NUTAG_WITH_THIS(nua),
+					SIPTAG_EXPIRES_STR(eb), TAG_END());
+				st = ast_extension_state(NULL, old->context, old->exten);
+				sofia_presence_emit_notify(old, st, 0);
+				ao2_ref(old, -1);
+				return;
+			}
+			/* Stale dialog (new handle): drop the old watcher, create fresh below. */
+			sofia_presence_teardown(old, 0);
+			ao2_ref(old, -1);
+		}
+	}
+
+	/* Allocate + populate the new subscription object. */
+	sub = ao2_alloc(sizeof(*sub), presence_sub_destructor);
+	if (!sub) {
+		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
+		return;
+	}
+	sub->nh = nh;
+	sub->stateid = -1;
+	sub->laststate = -10;	/* "unknown" so the first NOTIFY always reflects a transition */
+	sub->version = 0;
+	sub->expires = expires;
+	sub->expires_at = time(NULL) + expires;
+	sub->terminated = 0;
+	ast_copy_string(sub->subkey, subkey, sizeof(sub->subkey));
+	ast_copy_string(sub->exten, l_exten, sizeof(sub->exten));
+	ast_copy_string(sub->context, l_context, sizeof(sub->context));
+	ast_copy_string(sub->peername, l_peername, sizeof(sub->peername));
+	snprintf(sub->entity, sizeof(sub->entity), "sip:%s@%s", to_user,
+		!ast_strlen_zero(to_host) ? to_host : (!ast_strlen_zero(sofia_cfg.realm) ? sofia_cfg.realm : "localhost"));
+	sofia_get_source_addr(sip, &src);
+	ast_copy_string(sub->watcher_addr, ast_sockaddr_stringify(&src), sizeof(sub->watcher_addr));
+
+	/* Event package -> body format + NOTIFY Event header. dialog -> dialog-info;
+	 * presence -> pidf/xpidf/cpim by Accept. */
+	if (!strcasecmp(event, "dialog") || !strcasecmp(event, "dialog-info")) {
+		sub->format = SOFIA_SUB_DIALOG_INFO;
+		ast_copy_string(sub->event, "dialog", sizeof(sub->event));
+	} else {
+		sip_accept_t *ac = sip->sip_accept;
+		sub->format = SOFIA_SUB_PIDF;
+		for (; ac; ac = ac->ac_next) {
+			if (ac->ac_type && !strcasecmp(ac->ac_type, "application/xpidf+xml")) {
+				sub->format = SOFIA_SUB_XPIDF; break;
+			} else if (ac->ac_type && !strcasecmp(ac->ac_type, "application/cpim-pidf+xml")) {
+				sub->format = SOFIA_SUB_CPIM_PIDF; break;
+			} else if (ac->ac_type && !strcasecmp(ac->ac_type, "application/dialog-info+xml")) {
+				sub->format = SOFIA_SUB_DIALOG_INFO; break;
+			}
+		}
+		ast_copy_string(sub->event,
+			sub->format == SOFIA_SUB_DIALOG_INFO ? "dialog" : "presence", sizeof(sub->event));
+	}
+
+	/* Link into the registry (container holds the ref; drop our creation ref). */
+	ao2_link(presence_subs, sub);
+
+	/* Register the hint watcher with the core. The +1 ref is owned by the
+	 * registration and dropped by sofia_presence_sub_destroy_cb. THIS is what
+	 * makes `core show hints` count the Watcher. */
+	ao2_ref(sub, +1);
+	sub->stateid = ast_extension_state_add_destroy(sub->context, sub->exten,
+		sofia_presence_state_cb, sofia_presence_sub_destroy_cb, sub);
+	if (sub->stateid < 0) {
+		ast_log(LOG_WARNING, "Sofia presence: ast_extension_state_add_destroy failed for %s@%s\n",
+			sub->exten, sub->context);
+		ao2_ref(sub, -1);	/* undo the registration ref we pre-took */
+		ao2_unlink(presence_subs, sub);
+		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
+		ao2_ref(sub, -1);	/* creation ref */
+		return;
+	}
+
+	/* Accept the SUBSCRIBE with a 2xx (sofia-sip server idiom: nua_respond +
+	 * NUTAG_WITH_THIS binds the response to THIS pending SUBSCRIBE transaction —
+	 * nua_notifier does NOT answer the request and leaves it to fail 500 at
+	 * teardown, per sofia-sip tests/test_simple.c). Then push the initial NOTIFY
+	 * (RFC 6665 §4.4.1); NUTAG_SUBSTATE makes sofia-sip own Subscription-State +
+	 * expiry/refresh. */
+	{
+		char expires_buf[16];
+		snprintf(expires_buf, sizeof(expires_buf), "%d", expires);
+		nua_respond(nh, SIP_202_ACCEPTED, NUTAG_WITH_THIS(nua),
+			SIPTAG_EXPIRES_STR(expires_buf), TAG_END());
+	}
+
+	firststate = ast_extension_state(NULL, sub->context, sub->exten);
+	sofia_presence_emit_notify(sub, firststate, 0);
+
+	ao2_ref(sub, -1);	/* drop creation ref; container + registration hold it */
+
+	if (sofia_debug) {
+		ast_verbose("Sofia presence: SUBSCRIBE accepted — watcher SIP/%s -> %s@%s (%s)\n",
+			l_peername, sub->exten, sub->context, sofia_presence_mime(sub->format));
+	}
+}
+
 static void sofia_process_subscribe(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
 		sip_t const *sip, tagi_t tags[])
 {
@@ -12589,6 +13396,7 @@ static void sofia_process_subscribe(nua_t *nua, nua_handle_t *nh, struct sofia_p
 	if (sip && sip->sip_event && sip->sip_event->o_type) {
 		event = sip->sip_event->o_type;
 	}
+
 
 	/* post-T56 allowsubscribe global ban gate (2026-04-27): chan_sip parity at
 	 * chan_sip.c:25856 — when sofia_cfg.allowsubscribe (DERIVED) is FALSE, NO
@@ -12608,6 +13416,13 @@ static void sofia_process_subscribe(nua_t *nua, nua_handle_t *nh, struct sofia_p
 	 * behavior; future T-tasks will add presence/dialog/etc. paths here). */
 	if (event && !strcasecmp(event, "message-summary")) {
 		sofia_process_mwi_subscribe(nua, nh, op, sip, tags);
+		return;
+	}
+
+	/* presence / dialog (BLF) -> the extension-state notifier path. */
+	if (event && (!strcasecmp(event, "dialog") || !strcasecmp(event, "dialog-info")
+			|| !strcasecmp(event, "presence"))) {
+		sofia_process_presence_subscribe(nua, nh, op, sip, tags);
 		return;
 	}
 
@@ -14119,6 +14934,8 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 						"PeerStatus: %s\r\n"
 						"Time: %d\r\n",
 						peer->name, new_name, peer->lastms);
+					/* BLF/presence: reachability changed -> re-evaluate hint. */
+					ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
 					/* post-T56 regextenonqualify parity (2026-04-27): qualify-state-coupled
 					 * dialplan auto-extension. ADD on transition INTO REACHABLE (chan_sip
 					 * parity at chan_sip.c:22087 is_reachable&&regextenonqualify). REMOVE
@@ -14170,6 +14987,16 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	case nua_r_notify:
 		if (sofia_debug)
 			ast_verbose("Sofia: NOTIFY response %d %s\n", status, phrase);
+		/* Expiry/terminate of a presence subscription: sofia-sip auto-sends the
+		 * final NOTIFY and reports nua_substate_terminated here. Correlate to the
+		 * watcher by handle (type-safe iteration) and free it. */
+		if (sofia_substate_terminated(tags)) {
+			struct sofia_presence_sub *psub = sofia_presence_find_by_nh(nh);
+			if (psub) {
+				sofia_presence_teardown(psub, 0);
+				ao2_ref(psub, -1);
+			}
+		}
 		break;
 	case nua_r_refer:
 		if (sofia_debug)
@@ -14434,7 +15261,24 @@ static void *sofia_thread_func(void *data)
 			TPTAG_LOG(1), TAG_END());
 	}
 
+	/* Presence/BLF expiry sweep. sofia-sip does not auto-expire app-responded
+	 * (nua_respond) subscriptions, so we run our own recurring teardown of stale
+	 * watchers. The su_timer fires on THIS thread (sofia_thread) — the single
+	 * owner of presence_subs and all nua_* — so no cross-thread dispatch needed. */
+	presence_expiry_timer = su_timer_create(su_root_task(sofia_root), SOFIA_PRESENCE_SWEEP_MS);
+	if (presence_expiry_timer) {
+		su_timer_set_for_ever(presence_expiry_timer, sofia_presence_expiry_sweep, NULL);
+	} else {
+		ast_log(LOG_WARNING, "Sofia presence: expiry sweep timer create failed — stale "
+			"subscriptions will only clear on explicit unsubscribe\n");
+	}
+
 	su_root_run(sofia_root);
+
+	if (presence_expiry_timer) {
+		su_timer_destroy(presence_expiry_timer);
+		presence_expiry_timer = NULL;
+	}
 
 	/* T40: ownership-correct teardown. su_root_destroy enforces same-thread-as-
 	 * su_root_create (sofia-sip internal assert; verified via T40 Phase 1 gdb
@@ -19725,6 +20569,13 @@ static int load_module(void)
 		rc = AST_MODULE_LOAD_FAILURE;
 		goto err_cleanup;
 	}
+	presence_subs = ao2_container_alloc(MAX_PRESENCE_SUB_BUCKETS,
+		presence_sub_hash_fn, presence_sub_cmp_fn);
+	if (!presence_subs) {
+		ast_log(LOG_ERROR, "Unable to create Sofia presence subscriptions container\n");
+		rc = AST_MODULE_LOAD_FAILURE;
+		goto err_cleanup;
+	}
 
 	if (sofia_load_config(0)) {
 		ast_log(LOG_ERROR, "Unable to load config %s\n", SOFIA_CONFIG);
@@ -19881,6 +20732,12 @@ err_cleanup:
 		ao2_ref(sofia_blacklist, -1);
 		sofia_blacklist = NULL;
 	}
+	if (presence_subs) {
+		/* Empty at load-failure time (watcher subs are only created by inbound
+		 * SUBSCRIBE, which cannot run during load). */
+		ao2_ref(presence_subs, -1);
+		presence_subs = NULL;
+	}
 	if (dialogs) {
 		ao2_ref(dialogs, -1);
 		dialogs = NULL;
@@ -20004,6 +20861,10 @@ static int unload_module(void)
 	if (sofia_blacklist) {
 		ao2_ref(sofia_blacklist, -1);
 		sofia_blacklist = NULL;
+	}
+	if (presence_subs) {
+		ao2_ref(presence_subs, -1);
+		presence_subs = NULL;
 	}
 
 	return 0;
