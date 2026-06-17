@@ -3884,10 +3884,27 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 						chosen = ast_best_codec(pvt->capability & AST_FORMAT_AUDIO_MASK);
 					}
 					if (chosen) {
-						pvt->owner->nativeformats =
-							(pvt->owner->nativeformats & ~AST_FORMAT_AUDIO_MASK) | chosen;
-						ast_set_read_format(pvt->owner, chosen);
-						ast_set_write_format(pvt->owner, chosen);
+						/* Mutating channel format state needs the CHANNEL lock — the
+						 * channel thread reads nativeformats and a concurrent
+						 * hangup/masquerade can null/swap pvt->owner. Ref+lock+
+						 * revalidate: channel locks are recursive so the re-INVITE /
+						 * directmedia callers (which already hold the channel lock +
+						 * pvt->lock) nest safely without inverting; the 180/183/200/
+						 * ACK callers pin pvt->owner with a ref before calling, so
+						 * this fresh channel lock cannot race the channel free. */
+						struct ast_channel *o = pvt->owner;
+						if (o) {
+							ast_channel_ref(o);
+							ast_channel_lock(o);
+							if (pvt->owner == o) {
+								o->nativeformats =
+									(o->nativeformats & ~AST_FORMAT_AUDIO_MASK) | chosen;
+								ast_set_read_format(o, chosen);
+								ast_set_write_format(o, chosen);
+							}
+							ast_channel_unlock(o);
+							ast_channel_unref(o);
+						}
 					}
 				}
 			}
@@ -6304,9 +6321,13 @@ static enum ast_rtp_glue_result sofia_get_rtp_peer(struct ast_channel *chan,
 				if (denied) {
 					ast_debug(2, "Sofia: get_rtp_peer LOCAL — direct media to %s denied by bridge-partner '%s' directmedia ACL\n",
 						ast_sockaddr_stringify(&them), l_name);
+					ast_channel_unref(bridged_chan);	/* T3: helper returns a +1 ref */
 					return AST_RTP_GLUE_RESULT_LOCAL;
 				}
 			}
+		}
+		if (bridged_chan) {
+			ast_channel_unref(bridged_chan);	/* T3: helper returns a +1 ref */
 		}
 	}
 	return AST_RTP_GLUE_RESULT_REMOTE;
@@ -10954,7 +10975,12 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 
 	/* If peer has no secret, accept without auth */
 	if (ast_strlen_zero(peer->secret)) {
-		int expires = sip->sip_expires ? sip->sip_expires->ex_delta : DEFAULT_EXPIRY;
+		/* Clamp ex_delta (unsigned long) before the int cast: a value > INT_MAX
+		 * wraps negative / to 0 (spurious 423 or self-deregister). Real min/max
+		 * bounds are applied by sofia_check_register_expiry below. */
+		int expires = sip->sip_expires
+			? (sip->sip_expires->ex_delta > (unsigned long) INT_MAX ? INT_MAX : (int) sip->sip_expires->ex_delta)
+			: DEFAULT_EXPIRY;
 		/* post-T56 registration TTL bounds + 423 Interval Too Brief parity (2026-04-27):
 		 * chan_sip parity at chan_sip.c:25699-25702 — bounds check BEFORE
 		 * sofia_update_peer_contacts. Helper emits 423 + Min-Expires + AMI on reject
@@ -11027,7 +11053,11 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 	}
 
 	{
-			int expires = sip->sip_expires ? sip->sip_expires->ex_delta : DEFAULT_EXPIRY;
+			/* Clamp ex_delta before the int cast (see no-secret path) — prevents
+			 * a >INT_MAX Expires from wrapping to 0/negative. */
+			int expires = sip->sip_expires
+				? (sip->sip_expires->ex_delta > (unsigned long) INT_MAX ? INT_MAX : (int) sip->sip_expires->ex_delta)
+				: DEFAULT_EXPIRY;
 			/* post-T56 registration TTL bounds + 423 Interval Too Brief parity (2026-04-27):
 			 * second wire-in site (auth-OK path). Helper emits 423 + Min-Expires + AMI
 			 * on reject (caller MUST return immediately). */
@@ -12145,8 +12175,15 @@ static int sofia_change_redirecting_info(struct sofia_pvt *pvt, struct ast_chann
 		params = param_end;
 	}
 
-	/* Apply to pvt->owner->redirecting (chan_sip L20826-20838 parity).
-	 * ast_free of existing strs BEFORE ast_strdup — prevents leak. */
+	/* Apply to owner->redirecting (chan_sip L20826-20838 parity). ast_free of
+	 * existing strs BEFORE ast_strdup — prevents leak. Hold the CHANNEL lock for
+	 * the mutation: the channel thread reads redirecting.from.*.str, and freeing
+	 * /reallocating it here without the lock is a data-race/UAF. All callers pass
+	 * an owner that is not under pvt->lock (8688 fresh inbound chan, REFER and the
+	 * 2xx path snapshot+unlock first), so locking the channel here cannot invert
+	 * channel->pvt; channel locks are recursive so pbx_builtin_setvar_helper's
+	 * own lock nests safely. */
+	ast_channel_lock(owner);
 	if (!ast_strlen_zero(redir_num)) {
 		ast_free(owner->redirecting.from.number.str);
 		owner->redirecting.from.number.str = ast_strdup(redir_num);
@@ -12166,6 +12203,7 @@ static int sofia_change_redirecting_info(struct sofia_pvt *pvt, struct ast_chann
 	if (!ast_strlen_zero(domain)) {
 		pbx_builtin_setvar_helper(owner, "__SIPRDNISDOMAIN", domain);
 	}
+	ast_channel_unlock(owner);
 
 	return 1;
 }
@@ -12398,30 +12436,38 @@ static void transmit_mwi_notify_for_peer(struct sofia_peer *peer)
 		ast_mutex_unlock(&peer->lock);
 		return;
 	}
-	/* Sum counts across all configured mailboxes. ast_app_inboxcount2 is the
-	 * RFC 3842 form (urgent + new + old); we capture urgent for accuracy. */
-	AST_LIST_TRAVERSE(&peer->mailboxes, mb, list) {
-		int new_msgs = 0, old_msgs = 0, urgent_msgs = 0;
-		char mailbox_full[160];
-		snprintf(mailbox_full, sizeof(mailbox_full), "%s@%s", mb->mailbox, mb->context);
-		if (ast_app_inboxcount2(mailbox_full, &urgent_msgs, &new_msgs, &old_msgs) == 0) {
-			total_new    += new_msgs;
-			total_old    += old_msgs;
-			total_urgent += urgent_msgs;
+	/* Snapshot the mailbox specs (mb->mailbox/context are fixed 80-byte arrays)
+	 * under peer->lock, then count OUTSIDE the lock: ast_app_inboxcount2 dispatches
+	 * to the voicemail backend (IMAP/ODBC network I/O or a filesystem dir-scan) of
+	 * unbounded latency, and holding peer->lock across it stalls every other
+	 * peer->lock holder for that peer. Matches the snapshot-first idiom used
+	 * elsewhere; the MWI 1-cap means the per-peer mailbox count is small. */
+	{
+		char mboxes[32][160];
+		int nmb = 0, i;
+		AST_LIST_TRAVERSE(&peer->mailboxes, mb, list) {
+			if (nmb >= (int) ARRAY_LEN(mboxes)) {
+				break;
+			}
+			snprintf(mboxes[nmb], sizeof(mboxes[nmb]), "%s@%s", mb->mailbox, mb->context);
+			nmb++;
+		}
+		/* NOTE: fromdomain copies the POINTER (aliases peer->fromdomain's pool),
+		 * dereferenced after the unlock — safe because every caller runs on
+		 * sofia_thread, serialised against the reload writer (same thread) that
+		 * would free the old stringfield pool. */
+		fromdomain = !ast_strlen_zero(peer->fromdomain) ? peer->fromdomain : sofia_cfg.realm;
+		ast_mutex_unlock(&peer->lock);
+
+		for (i = 0; i < nmb; i++) {
+			int new_msgs = 0, old_msgs = 0, urgent_msgs = 0;
+			if (ast_app_inboxcount2(mboxes[i], &urgent_msgs, &new_msgs, &old_msgs) == 0) {
+				total_new    += new_msgs;
+				total_old    += old_msgs;
+				total_urgent += urgent_msgs;
+			}
 		}
 	}
-	/* NOTE: this only copies the POINTER (fromdomain = peer->fromdomain),
-	 * NOT the string content - fromdomain aliases peer->fromdomain's pool
-	 * and is dereferenced below (Message-Account line) AFTER peer->lock is
-	 * released. That lock-free deref is safe NOT because of any snapshot,
-	 * but because every caller of transmit_mwi_notify_for_peer runs on
-	 * sofia_thread (mwi_notify_callback dispatched there; the nua_i_subscribe
-	 * handler is already there), so it is serialized against the reload
-	 * writer sofia_parse_peer_config (also sofia_thread), which is the thread
-	 * that would free the old stringfield pool. peer->lock here only guards
-	 * the mwi_subscription_handle read + the mailbox traversal above. */
-	fromdomain = !ast_strlen_zero(peer->fromdomain) ? peer->fromdomain : sofia_cfg.realm;
-	ast_mutex_unlock(&peer->lock);
 
 	body = ast_str_create(256);
 	if (!body) {
@@ -13470,16 +13516,24 @@ static struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op)
 		return NULL;
 	}
 
-	/* Method 1: _bridge pointer */
+	/* Returns a +1-REFFED channel (or NULL) — the CALLER must ast_channel_unref()
+	 * it when done. The old "borrowed pointer kept alive by the bridge partner"
+	 * contract was a UAF: a REFER/hangup dissolves exactly that bridge, so the
+	 * borrowed channel could be freed while the caller still derefs it
+	 * (ast_async_goto / tech_pvt). T3 fix. */
+
+	/* Method 1: _bridge pointer (borrowed → take a ref) */
 	bridged = ast_bridged_channel(op->owner);
 	if (bridged) {
+		ast_channel_ref(bridged);
 		if (sofia_debug) {
 			ast_verbose("Sofia: bridged-finder method 1 (_bridge): %s\n", bridged->name);
 		}
 		return bridged;
 	}
 
-	/* Method 2: BRIDGEPEER channel-var (set by ast_bridge_call) */
+	/* Method 2: BRIDGEPEER channel-var (ast_channel_get_by_name_prefix already +1's
+	 * it — KEEP that ref and hand it to the caller). */
 	bridgepeer_name = pbx_builtin_getvar_helper(op->owner, "BRIDGEPEER");
 	if (bridgepeer_name && !ast_strlen_zero(bridgepeer_name)) {
 		bridged = ast_channel_get_by_name_prefix(bridgepeer_name, strlen(bridgepeer_name));
@@ -13488,31 +13542,35 @@ static struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op)
 				ast_verbose("Sofia: bridged-finder method 2 (BRIDGEPEER=%s): %s\n",
 					bridgepeer_name, bridged->name);
 			}
-			/* ast_channel_get_by_name_prefix bumps +1; drop it now so this helper
-			 * returns a borrowed pointer consistent with Methods 1/3. Callers use
-			 * it synchronously and the channel stays alive via its bridge partner. */
-			ast_channel_unref(bridged);
-			return bridged;
+			return bridged;	/* already +1 */
 		}
 	}
 
-	/* Method 3: dialogs container linkedid walk (sibling Sofia leg) */
+	/* Method 3: dialogs linkedid walk (sibling Sofia leg). Read each sibling's
+	 * owner ONCE under its pvt->lock and ref it there (the sibling's sofia_hangup
+	 * nulls p->owner under p->lock then frees the channel). */
 	{
 		struct ao2_iterator it = ao2_iterator_init(dialogs, 0);
 		struct sofia_pvt *p;
+		const char *my_linkedid = op->owner->linkedid;
 		while ((p = ao2_iterator_next(&it))) {
-			if (p != op && p->owner && p->owner->linkedid &&
-				op->owner->linkedid &&
-				!strcmp(p->owner->linkedid, op->owner->linkedid)) {
-				bridged = p->owner;
-				if (sofia_debug) {
-					ast_verbose("Sofia: bridged-finder method 3 (linkedid=%s): %s\n",
-						op->owner->linkedid, bridged->name);
+			if (p != op && my_linkedid) {
+				struct ast_channel *po;
+				ast_mutex_lock(&p->lock);
+				po = p->owner;
+				if (po && po->linkedid && !strcmp(po->linkedid, my_linkedid)) {
+					bridged = ast_channel_ref(po);
 				}
-				ao2_ref(p, -1);
-				break;
+				ast_mutex_unlock(&p->lock);
 			}
 			ao2_ref(p, -1);
+			if (bridged) {
+				if (sofia_debug) {
+					ast_verbose("Sofia: bridged-finder method 3 (linkedid=%s): %s\n",
+						my_linkedid, bridged->name);
+				}
+				break;
+			}
 		}
 		ao2_iterator_destroy(&it);
 	}
@@ -13694,16 +13752,28 @@ static int sofia_local_attended_transfer(struct sofia_pvt *transferer, const str
 		return 1; /* Not local; caller may fall back to remote attended behavior. */
 	}
 
-	if (!target_pvt->owner) {
-		ast_log(LOG_WARNING, "Sofia: attended transfer Replaces call '%s' has no owner channel\n",
-			replaces->callid);
+	/* TOCTOU/UAF fix: ref each owner UNDER its pvt->lock (sofia_hangup nulls
+	 * pvt->owner under that lock on the channel thread, then the core frees the
+	 * channel). Snapshot the two owners SEQUENTIALLY — never hold two pvt->locks at
+	 * once — so there is no pvt-vs-pvt lock-ordering hazard. */
+	ast_mutex_lock(&transferer->lock);
+	transferer_chan = transferer->owner ? ast_channel_ref(transferer->owner) : NULL;
+	ast_mutex_unlock(&transferer->lock);
+	if (!transferer_chan) {
 		ao2_ref(target_pvt, -1);
 		return -1;
 	}
-
-	transferer_chan = ast_channel_ref(transferer->owner);
+	ast_mutex_lock(&target_pvt->lock);
+	target_chan = target_pvt->owner ? ast_channel_ref(target_pvt->owner) : NULL;
+	ast_mutex_unlock(&target_pvt->lock);
+	if (!target_chan) {
+		ast_log(LOG_WARNING, "Sofia: attended transfer Replaces call '%s' has no owner channel\n",
+			replaces->callid);
+		ast_channel_unref(transferer_chan);
+		ao2_ref(target_pvt, -1);
+		return -1;
+	}
 	transferee_chan = sofia_ref_bridged_channel(transferer_chan);
-	target_chan = ast_channel_ref(target_pvt->owner);
 	target_peer_chan = sofia_ref_bridged_channel(target_chan);
 
 	if (!transferee_chan || !target_peer_chan) {
@@ -13936,10 +14006,29 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 		return;
 	}
 
+	/* TOCTOU/UAF fix: snapshot+ref op->owner under op->lock for the whole transfer
+	 * body. sofia_hangup (channel thread) nulls pvt->owner under op->lock then the
+	 * core frees the channel; this handler derefs the owner across blocking ops
+	 * (redirecting mutation, ast_queue_hangup, the bridged-finder, ast_async_goto),
+	 * so the +1 ref pins the channel for the duration. Use the local `owner`, not
+	 * op->owner, for every direct deref below. Must be released on every exit. */
+	{
+	struct ast_channel *owner;
+	ast_mutex_lock(&op->lock);
+	owner = op->owner;
+	if (owner) {
+		ast_channel_ref(owner);
+	}
+	ast_mutex_unlock(&op->lock);
+	if (!owner) {
+		ast_log(LOG_WARNING, "Sofia: REFER — owner gone before transfer\n");
+		return;
+	}
+
 	/* post-T56 identity-headers parity SS5 (2026-04-27): REFER may carry
 	 * Diversion header for transfer-source attribution. Update redirecting
 	 * chain before transfer dispatch so child Dial inherits the chain. */
-	sofia_change_redirecting_info(op, op->owner, sip);
+	sofia_change_redirecting_info(op, owner, sip);
 
 	if (is_attended) {
 		int attended_res;
@@ -13947,10 +14036,12 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 		attended_res = sofia_local_attended_transfer(op, &replaces);
 		if (attended_res == 0) {
 			sofia_send_refer_notify(op, "200 OK", 1);
-			ast_queue_hangup(op->owner);
+			ast_queue_hangup(owner);
+			ast_channel_unref(owner);
 			return;
 		} else if (attended_res < 0) {
 			sofia_send_refer_notify(op, "486 Busy Here", 1);
+			ast_channel_unref(owner);
 			return;
 		}
 
@@ -14046,8 +14137,13 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 			/* No bridged peer to redirect — tear the transferer leg down
 			 * immediately (chan_sip parity: failure path does not set
 			 * SIP_DEFER_BYE_ON_TRANSFER at chan_sip.c:25002). */
-			ast_queue_hangup(op->owner);
+			ast_queue_hangup(owner);
 		}
+		if (bridged) {
+			ast_channel_unref(bridged);	/* T3: helper now returns a +1 ref */
+		}
+	}
+	ast_channel_unref(owner);
 	}
 }
 
@@ -14097,16 +14193,30 @@ static void sofia_process_info(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *o
 	}
 
 	if (digit && digit != ' ') {
+		/* TOCTOU/UAF fix: snapshot+ref op->owner under op->lock (sofia_hangup nulls
+		 * pvt->owner under the same lock on the channel thread, then the core frees
+		 * the channel); ast_queue_frame takes the channel lock so queue outside
+		 * op->lock with the +1 ref pinning the channel. Mirrors sofia_process_bye. */
+		struct ast_channel *owner;
 		struct ast_frame f = {
 			.frametype = AST_FRAME_DTMF_BEGIN,
 			.subclass.integer = digit,
 			.src = __PRETTY_FUNCTION__,
 		};
-		ast_queue_frame(op->owner, &f);
+		ast_mutex_lock(&op->lock);
+		owner = op->owner;
+		if (owner) {
+			ast_channel_ref(owner);
+		}
+		ast_mutex_unlock(&op->lock);
+		if (owner) {
+			ast_queue_frame(owner, &f);
 
-		f.frametype = AST_FRAME_DTMF_END;
-		f.len = duration;
-		ast_queue_frame(op->owner, &f);
+			f.frametype = AST_FRAME_DTMF_END;
+			f.len = duration;
+			ast_queue_frame(owner, &f);
+			ast_channel_unref(owner);
+		}
 
 		if (sofia_debug)
 			ast_verbose("Sofia: Received DTMF '%c' via SIP INFO (duration=%u)\n", digit, duration);
@@ -14136,14 +14246,25 @@ static void sofia_process_ack(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op
 		sip_t const *sip, tagi_t tags[])
 {
 	if (op) {
+		struct ast_channel *owner;
 		ast_mutex_lock(&op->lock);
 		op->state = SOFIA_DIALOG_STATE_UP;
+		owner = op->owner;
+		if (owner) {
+			/* Pin the owner across sofia_parse_sdp (UAF fix): the late-offer ACK
+			 * path took no ref, so a concurrent sofia_hangup could free the channel
+			 * while sofia_parse_sdp mutates its format state. */
+			ast_channel_ref(owner);
+		}
 		ast_mutex_unlock(&op->lock);
 		/* For late-offer INVITEs (no SDP in INVITE), the ACK may carry SDP */
 		if (sip && sip->sip_payload && sip->sip_payload->pl_data && op->rtp) {
 			sofia_parse_sdp(op, sip);
 			if (sofia_debug)
 				ast_verbose("Sofia: ACK with SDP, remote RTP set\n");
+		}
+		if (owner) {
+			ast_channel_unref(owner);
 		}
 	}
 }
@@ -14905,6 +15026,20 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		if (hmagic) {
 			struct sofia_peer *peer = (struct sofia_peer *)hmagic;
 			int pingtime = ast_tvdiff_ms(ast_tvnow(), peer->qualify_sent);
+			/* Compute the new status + snapshot what the blocking bookkeeping needs
+			 * UNDER peer->lock, then RELEASE the lock and do manager_event /
+			 * ast_devstate_changed / register_peer_exten (dialplan contexts rwlock) /
+			 * nua_handle_destroy OUTSIDE it. This avoids nesting peer->lock over the
+			 * contexts rwlock (the file's only such inversion) + a long blocking hold
+			 * of peer->lock, matching the REGISTER-success path (which calls
+			 * register_peer_exten only after dropping peer->lock). The peer cannot be
+			 * freed across the unlock: reload's mark-and-sweep runs on sofia_thread,
+			 * the same thread as this handler, so they are serialised. */
+			int transitioned = 0, do_regexten_add = 0, do_regexten_remove = 0, l_lastms = -1;
+			const char *new_name = "";
+			char l_name[256] = "";
+			nua_handle_t *old_qnh = NULL;
+
 			if (pingtime < 1)
 				pingtime = 1;
 
@@ -14923,57 +15058,58 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					peer->lastms = -1;
 				}
 				if (old_status != peer->peer_status) {
-					const char *new_name =
+					transitioned = 1;
+					new_name =
 						peer->peer_status == PEER_REACHABLE ? "Reachable" :
 						peer->peer_status == PEER_LAGGED ? "Lagged" : "Unreachable";
-					ast_verbose("Sofia: Peer '%s' is now %s (%dms)\n",
-						peer->name, new_name, peer->lastms);
-					manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
-						"ChannelType: SIP\r\n"
-						"Peer: SIP/%s\r\n"
-						"PeerStatus: %s\r\n"
-						"Time: %d\r\n",
-						peer->name, new_name, peer->lastms);
-					/* BLF/presence: reachability changed -> re-evaluate hint. */
-					ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
-					/* post-T56 regextenonqualify parity (2026-04-27): qualify-state-coupled
-					 * dialplan auto-extension. ADD on transition INTO REACHABLE (chan_sip
-					 * parity at chan_sip.c:22087 is_reachable&&regextenonqualify). REMOVE
-					 * on transition INTO UNREACHABLE (chan_sip parity at chan_sip.c:27574
-					 * regextenonqualify). LAGGED transition fires neither (chan_sip
-					 * ambiguity preserved — safe default). All gated on
-					 * sofia_cfg.regextenonqualify; helper itself further gates on
-					 * sofia_cfg.regcontext non-empty. */
+					l_lastms = peer->lastms;
+					ast_copy_string(l_name, peer->name, sizeof(l_name));
 					if (sofia_cfg.regextenonqualify) {
 						if (peer->peer_status == PEER_REACHABLE) {
-							register_peer_exten(peer, 1);
+							do_regexten_add = 1;
 						} else if (peer->peer_status == PEER_UNREACHABLE) {
-							register_peer_exten(peer, 0);
+							do_regexten_remove = 1;
 						}
 					}
 				}
 			}
 			if (peer->qualify_nh) {
-				/* Detach hmagic before destroying the previous qualify
-				 * cycle's handle.  Same rationale as the MWI re-subscribe
-				 * branch (L11633+): we're on sofia_thread and peer is alive,
-				 * so this is not a UAF — but a late response (delayed
-				 * 200/4xx for the previous OPTIONS) arriving on old
-				 * qualify_nh between the destroy dispatch and execution
-				 * would reach sofia_event_callback with magic = peer; the
-				 * callback would then run sofia_qualify_response against
-				 * the wrong handle.  bind(NULL) makes the old handle inert
-				 * so the late event sees magic == NULL and the gates
-				 * short-circuit it cleanly. */
-				nua_handle_t *old_qnh = peer->qualify_nh;
+				/* Detach hmagic before destroying the previous qualify cycle's
+				 * handle (see the MWI re-subscribe rationale): bind(NULL) is
+				 * synchronous + thread-safe so it stays under the lock; the
+				 * nua_handle_destroy is moved outside. */
+				old_qnh = peer->qualify_nh;
 				peer->qualify_nh = NULL;
 				nua_handle_bind(old_qnh, NULL);
-				nua_handle_destroy(old_qnh);
 			}
 			/* Reset qualify_sent so next cycle calculates fresh pingtime */
 			memset(&peer->qualify_sent, 0, sizeof(peer->qualify_sent));
 			peer->last_qualify = ast_tvnow();
 			ast_mutex_unlock(&peer->lock);
+
+			/* Blocking / contexts-rwlock / nua_* bookkeeping, OUTSIDE peer->lock. */
+			if (transitioned) {
+				ast_verbose("Sofia: Peer '%s' is now %s (%dms)\n", l_name, new_name, l_lastms);
+				manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
+					"ChannelType: SIP\r\n"
+					"Peer: SIP/%s\r\n"
+					"PeerStatus: %s\r\n"
+					"Time: %d\r\n",
+					l_name, new_name, l_lastms);
+				/* BLF/presence: reachability changed -> re-evaluate hint. */
+				ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", l_name);
+				/* post-T56 regextenonqualify parity: ADD into REACHABLE, REMOVE into
+				 * UNREACHABLE (LAGGED fires neither). Gated on regextenonqualify; the
+				 * helper further gates on regcontext non-empty. */
+				if (do_regexten_add) {
+					register_peer_exten(peer, 1);
+				} else if (do_regexten_remove) {
+					register_peer_exten(peer, 0);
+				}
+			}
+			if (old_qnh) {
+				nua_handle_destroy(old_qnh);
+			}
 		}
 		break;
 	case nua_r_message:

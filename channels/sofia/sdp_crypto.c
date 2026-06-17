@@ -438,7 +438,12 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 		}
 	}
 
-	if (!memcmp(p->remote_key, remote_key, sizeof(p->remote_key))) {
+	/* Gate the "unchanged key" short-circuit on a prior activation (p->tag set
+	 * only after the first sdp_crypto_activate). p->remote_key is zero-initialised
+	 * by ast_calloc, so an all-zero inbound master key on the FIRST offer would
+	 * otherwise match and skip activation, leaving an RTP/SAVP session with NO SRTP
+	 * policy installed. With p->tag NULL we always activate on the first crypto. */
+	if (p->tag && !memcmp(p->remote_key, remote_key, sizeof(p->remote_key))) {
 		ast_debug(1, "SRTP remote key unchanged; maintaining current policy\n");
 		return 0;
 	}
