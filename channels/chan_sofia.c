@@ -153,6 +153,7 @@
 #include "gabpbx/logger.h"
 #include "gabpbx/module.h"
 #include "gabpbx/pbx.h"
+#include "gabpbx/taskprocessor.h"
 #include "gabpbx/utils.h"
 #include "gabpbx/lock.h"
 #include "gabpbx/cli.h"
@@ -313,8 +314,11 @@
 #define SOFIA_OVERLAP_NO        0
 #define SOFIA_OVERLAP_YES       1
 #define SOFIA_OVERLAP_DTMF      2
-#define MAX_PEER_BUCKETS 16381
-#define MAX_DIALOG_BUCKETS 8191
+/* Hash-table bucket caps sized for carrier scale: a low load factor at 10k+
+ * registered peers and high concurrent-dialog volume, so peer/dialog lookups
+ * stay O(1) under load. Primes give an even ao2 bucket distribution. */
+#define MAX_PEER_BUCKETS 65521    /* ~2^16 prime: ~50k peers at load factor < 1 */
+#define MAX_DIALOG_BUCKETS 32749  /* ~2^15 prime: concurrent-dialog headroom */
 
 #define SOFIA_TYPE_PEER    (1 << 0)
 #define SOFIA_TYPE_USER    (1 << 1)
@@ -858,6 +862,9 @@ static struct {
 	 * :14630+L14743 verbatim combined-gate pattern; covers 5 ast_update_realtime
 	 * sites. rtupdate=no skips ALL realtime DB writes regardless of rtsavesysname. */
 	int peer_rtupdate;
+	/* Phase 1 bounded REGISTER realtime-DB-write offload pool (kill-switch, default OFF). */
+	int register_pool;          /* offload the realtime REGISTER DB writes to a bounded pool */
+	int register_pool_workers;  /* lane count; 0 = auto = clamp(ncpu/2+1, 2, 16) */
 	/* post-T56 rtcachefriends [general] parity (2026-04-28, REAL OPERATOR DRIVER on
 	 * production sofia.conf rtcachefriends=yes silently-ignored prior to this commit;
 	 * finally honored on next reload as parse-clean migration matching chan_sofia
@@ -1116,6 +1123,17 @@ static struct ao2_container *sofia_blacklist;
 static int sofia_blacklist_max = SOFIA_BLACKLIST_MAX_DEFAULT;
 static int sofia_blacklist_count = SOFIA_BLACKLIST_COUNT_DEFAULT;
 AST_MUTEX_DEFINE_STATIC(sofia_blacklist_lock);
+
+/* Phase 1 — bounded REGISTER realtime-DB-write offload pool (kill-switch, default OFF).
+ * The ast_update_realtime() writes in sofia_process_register() are the only slow blocking
+ * I/O left on the single sofia_thread under a registration storm; offloading them to a
+ * small fixed pool of taskprocessor lanes keeps INVITE/OPTIONS signalling responsive when
+ * the realtime DB is slow.  Lanes are keyed by peer name so all writes for one account stay
+ * FIFO-ordered on one lane (a de-REGISTER can never overtake a prior REGISTER). */
+#define SOFIA_REGPOOL_MAX 16
+static struct ast_taskprocessor *sofia_regpool[SOFIA_REGPOOL_MAX];
+static int sofia_regpool_n;                 /* active lane count (0 = not created) */
+static int sofia_regpool_enabled;           /* runtime gate: config ON && lanes created */
 /* Guards the GLOBAL sofia_cfg.localha ast_ha list: read by the channel-thread
  * SDP build (sofia_should_use_externaddr) while sip reload frees+rebuilds it on
  * sofia_thread. */
@@ -1355,6 +1373,7 @@ struct sofia_peer {
 		AST_STRING_FIELD(cid_name);   /* post-T56 cid bundle parity (2026-04-28): per-peer CID name; chan_sip parity sip_peer.cid_name. Set via fullname / cid_name (chan_sofia surpass alias) / callerid combined-form / trunkname (clears). Used at sofia_resolve_identity as base/default fallback when channel connected.id.name empty (chan_sip-verbatim L5957 dialog-inheritance Option 6-B). */
 		AST_STRING_FIELD(cid_num);    /* post-T56 cid bundle parity (2026-04-28): per-peer CID number; chan_sip parity sip_peer.cid_num at chan_sip.c:28752-28753 + L5957 dialog-inheritance. Set via cid_number / callerid combined-form. Used at sofia_resolve_identity as base/default fallback when channel connected.id.number empty (channel CID via dialplan CALLERID() overrides per chan_sip-verbatim semantic). */
 		AST_STRING_FIELD(cid_tag);    /* post-T56 cid bundle parity (2026-04-28): per-peer CID tag; chan_sip parity sip_peer.cid_tag at chan_sip.c:28754-28755 + L5959 dialog-inheritance. Set via cid_tag key. Used at sofia_build_from to override sofia-sip auto-generated From-tag when set. */
+		AST_STRING_FIELD(forceddiversion);  /* CLI-forward compliance (2026-06-16): per-trunk redirecting DID forced into the outbound Diversion header (RFC 5806) on a FORWARDED call, so the carrier receives a trunk-owned number it can validate instead of whatever the channel's redirecting chain carried. Empty = disabled (default; legacy data-driven Diversion behaviour preserved byte-for-byte). Read by sofia_add_diversion under peer->lock; set by both peer config parsers + readable via SIPPEER(<peer>,forceddiversion). */
 		AST_STRING_FIELD(nonce);
 		AST_STRING_FIELD(outboundproxy);	/* T56.1 (2026-04-27): per-peer outbound proxy override; empty = inherit sofia_cfg.outboundproxy or no Route */
 		AST_STRING_FIELD(srtpcipher);		/* post-T56 srtpcipher operator option (2026-04-27): comma-separated SRTP suite preference (e.g. "AEAD_AES_256_GCM,AES_CM_128_HMAC_SHA1_80"); empty = inherit sofia_cfg.default_srtpcipher or sdp_crypto.c default AES_CM_128_HMAC_SHA1_80 */
@@ -5461,6 +5480,10 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			ast_string_field_set(peer, fromuser, v->value);
 		} else if (!strcasecmp(v->name, "fromdomain")) {
 			ast_string_field_set(peer, fromdomain, v->value);
+		} else if (!strcasecmp(v->name, "forceddiversion")) {
+			/* CLI-forward compliance: per-trunk redirecting DID forced into the
+			 * outbound Diversion header on forwarded calls. See sofia_add_diversion. */
+			ast_string_field_set(peer, forceddiversion, v->value);
 		} else if (!strcasecmp(v->name, "callerid")) {
 			ast_string_field_set(peer, callerid, v->value);
 		} else if (!strcasecmp(v->name, "regexten")) {
@@ -9078,6 +9101,8 @@ static int func_sofia_sippeer(struct ast_channel *chan, const char *cmd,
 		ast_copy_string(buf, peer->fromuser, len);
 	} else if (!strcasecmp(colname, "fromdomain")) {
 		ast_copy_string(buf, peer->fromdomain, len);
+	} else if (!strcasecmp(colname, "forceddiversion")) {
+		ast_copy_string(buf, peer->forceddiversion, len);
 	} else if (!strcasecmp(colname, "accountcode")) {
 		/* post-T56 accountcode per-peer parity (2026-04-27): SIPPEER(<peer>,accountcode)
 		 * dialplan reader; chan_sip parity at chan_sip.c:20662-20663 verbatim. */
@@ -10628,6 +10653,196 @@ static int sofia_check_lockuseragent(nua_t *nua, nua_handle_t *nh,
 	return -1;
 }
 
+/* === Phase 1: bounded REGISTER realtime-DB-write offload ===================== */
+
+struct sofia_rtupdate_ctx {
+	int registered;          /* selects the registered vs cleared ast_update_realtime shape */
+	int syslabel_regserver;  /* 1 => syslabel key is "regserver", 0 => NULL */
+	int sysname_null;        /* 1 => sysname value is NULL */
+	char table[16];
+	char name[256];          /* peer->name is an unbounded stringfield — match the file's char[256] convention (no truncation of the realtime key) */
+	char ipaddr[64];
+	char port[16];
+	char regseconds[24];
+	char fullcontact[256];
+	char sysname[128];
+};
+
+/* The single ast_update_realtime() emitter shared by the inline and the worker paths so
+ * both produce byte-identical DB writes (mirrors the original inline blocks verbatim). */
+static void sofia_rtupdate_emit(const char *table, const char *name, int registered,
+		const char *ipaddr, const char *port, const char *regseconds,
+		const char *fullcontact, const char *syslabel, const char *sysname)
+{
+	if (registered) {
+		ast_update_realtime(table, "name", name,
+			"ipaddr", ipaddr,
+			"port", port,
+			"regseconds", regseconds,
+			"fullcontact", fullcontact,
+			syslabel, sysname,
+			SENTINEL);
+	} else {
+		ast_update_realtime(table, "name", name,
+			"ipaddr", "",
+			"regseconds", "0",
+			"fullcontact", "",
+			syslabel, sysname,
+			SENTINEL);
+	}
+}
+
+/* Inline (legacy) path: resolve the args from peer/sip on sofia_thread and write now.
+ * Identical behaviour to the original inline blocks; used when the pool is OFF or full. */
+static void sofia_rtupdate_inline(struct sofia_peer *peer, sip_t const *sip)
+{
+	const char *table = ast_check_realtime("sipregs") ? "sipregs" : "sippeers";
+	const char *sysname = ast_config_AST_SYSTEM_NAME;
+	const char *syslabel = NULL;
+
+	if (ast_strlen_zero(sysname)) {
+		sysname = NULL;
+	} else if (sofia_cfg.rtsave_sysname) {
+		syslabel = "regserver";
+	}
+	if (peer->registered) {
+		char port_str[32], regsec_str[32];
+		const char *contact_str = sip->sip_contact ?
+			sip->sip_contact->m_url->url_host : "";
+		snprintf(port_str, sizeof(port_str), "%d", ast_sockaddr_port(&peer->src_addr));
+		snprintf(regsec_str, sizeof(regsec_str), "%ld", (long)time(NULL));
+		sofia_rtupdate_emit(table, peer->name, 1,
+			ast_sockaddr_stringify_host(&peer->src_addr),
+			port_str, regsec_str, contact_str, syslabel, sysname);
+	} else {
+		sofia_rtupdate_emit(table, peer->name, 0, "", "", "", "", syslabel, sysname);
+	}
+}
+
+/* Lane worker: writes the DB row from the snapshot only — zero peer/sip access. */
+static int sofia_rtupdate_task_exe(void *data)
+{
+	struct sofia_rtupdate_ctx *c = data;
+	const char *syslabel = c->syslabel_regserver ? "regserver" : NULL;
+	const char *sysname = c->sysname_null ? NULL : c->sysname;
+
+	sofia_rtupdate_emit(c->table, c->name, c->registered,
+		c->ipaddr, c->port, c->regseconds, c->fullcontact, syslabel, sysname);
+	ast_free(c);
+	return 0;
+}
+
+/* Called on sofia_thread at each realtime-update site.  Pool OFF → inline write (byte-
+ * identical to the original).  Pool ON → snapshot everything the worker needs (deep-copying
+ * peer->name and the contact host, since the worker must never touch peer/sip) and push it
+ * to the lane keyed by peer name.
+ *
+ * Once the pool is enabled EVERY write for a peer goes through its lane — never an inline
+ * bypass — because an inline write runs synchronously on sofia_thread and could overtake a
+ * still-queued write for the SAME peer, inverting REGISTER vs de-REGISTER order in the DB.
+ * The lane (taskprocessor) queue is the single strict-FIFO path per account; it absorbs a
+ * slow DB and drains (threads stay bounded at N; the queue is the natural back-pressure,
+ * visible in `core show taskprocessors`).  If the write genuinely cannot be queued (OOM, or
+ * the taskprocessor is gone — rare/degenerate) we log and DROP this one update rather than
+ * reorder; the next REGISTER refresh re-writes the row. */
+static void sofia_rtupdate_submit(struct sofia_peer *peer, sip_t const *sip)
+{
+	int lane;
+	const char *sysname;
+	struct sofia_rtupdate_ctx *c;
+
+	if (!sofia_regpool_enabled) {
+		sofia_rtupdate_inline(peer, sip);
+		return;
+	}
+	/* unsigned modulo: ast_str_case_hash() can return a negative int (abs(INT_MIN)); with a
+	 * non-power-of-two lane count a signed modulo could otherwise yield a negative (OOB) index. */
+	lane = (int)(((unsigned int)ast_str_case_hash(peer->name)) % (unsigned int)sofia_regpool_n);
+	if (!(c = ast_calloc(1, sizeof(*c)))) {
+		ast_log(LOG_WARNING, "Sofia: register_pool OOM — dropped realtime update for peer '%s' (next REGISTER refreshes it)\n", peer->name);
+		return;
+	}
+	c->registered = peer->registered ? 1 : 0;
+	ast_copy_string(c->table, ast_check_realtime("sipregs") ? "sipregs" : "sippeers", sizeof(c->table));
+	ast_copy_string(c->name, peer->name, sizeof(c->name));
+	sysname = ast_config_AST_SYSTEM_NAME;
+	if (ast_strlen_zero(sysname)) {
+		c->sysname_null = 1;
+		c->syslabel_regserver = 0;
+	} else {
+		c->sysname_null = 0;
+		c->syslabel_regserver = sofia_cfg.rtsave_sysname ? 1 : 0;
+		ast_copy_string(c->sysname, sysname, sizeof(c->sysname));
+	}
+	if (c->registered) {
+		const char *contact_str = sip->sip_contact ?
+			sip->sip_contact->m_url->url_host : "";
+		ast_copy_string(c->ipaddr, ast_sockaddr_stringify_host(&peer->src_addr), sizeof(c->ipaddr));
+		snprintf(c->port, sizeof(c->port), "%d", ast_sockaddr_port(&peer->src_addr));
+		snprintf(c->regseconds, sizeof(c->regseconds), "%ld", (long)time(NULL));
+		ast_copy_string(c->fullcontact, contact_str, sizeof(c->fullcontact));
+	}
+	if (ast_taskprocessor_push(sofia_regpool[lane], sofia_rtupdate_task_exe, c) < 0) {
+		ast_log(LOG_WARNING, "Sofia: register_pool push failed — dropped realtime update for peer '%s' (next REGISTER refreshes it)\n", peer->name);
+		ast_free(c);
+	}
+}
+
+/* Create the lane taskprocessors once (idempotent).  On any lane failure it unwinds and
+ * leaves the pool disabled (sofia_regpool_n stays 0 → REGISTER stays fully inline). */
+static void sofia_regpool_create(void)
+{
+	int n, i;
+
+	if (sofia_regpool_n > 0) {
+		return;
+	}
+	if (sofia_cfg.register_pool_workers > 0) {
+		n = sofia_cfg.register_pool_workers;
+	} else {
+		long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+		n = (cpus > 0) ? (int)(cpus / 2 + 1) : 2;
+	}
+	if (n < 2) {
+		n = 2;
+	}
+	if (n > SOFIA_REGPOOL_MAX) {
+		n = SOFIA_REGPOOL_MAX;
+	}
+	for (i = 0; i < n; i++) {
+		char tps_name[32];
+		snprintf(tps_name, sizeof(tps_name), "sofia/regpool-%02d", i);
+		sofia_regpool[i] = ast_taskprocessor_get(tps_name, TPS_REF_DEFAULT);
+		if (!sofia_regpool[i]) {
+			ast_log(LOG_WARNING, "Sofia: register_pool lane %d failed to create; pool disabled\n", i);
+			while (--i >= 0) {
+				sofia_regpool[i] = ast_taskprocessor_unreference(sofia_regpool[i]);
+			}
+			return;
+		}
+	}
+	sofia_regpool_n = n;
+	ast_log(LOG_NOTICE, "Sofia: register_pool created with %d lane(s)\n", n);
+}
+
+/* Reconcile the pool with config; called at the end of every sofia_apply_config (boot and
+ * reload), so register_pool=yes/no toggles the kill-switch at runtime via `sofia reload`. */
+static void sofia_regpool_update(void)
+{
+	if (sofia_cfg.register_pool && sofia_regpool_n == 0) {
+		sofia_regpool_create();
+	}
+	/* register_pool_workers is fixed at first pool creation: taskprocessors cannot be torn
+	 * down at runtime (the module also refuses unload), so a changed lane count needs a full
+	 * gabpbx restart.  Tell the operator instead of silently ignoring a reload-time change. */
+	if (sofia_regpool_n > 0 && sofia_cfg.register_pool_workers > 0
+			&& sofia_cfg.register_pool_workers != sofia_regpool_n) {
+		ast_log(LOG_NOTICE, "Sofia: register_pool_workers=%d ignored — pool already has %d lane(s); restart gabpbx to change\n",
+			sofia_cfg.register_pool_workers, sofia_regpool_n);
+	}
+	sofia_regpool_enabled = (sofia_cfg.register_pool && sofia_regpool_n > 0);
+}
+
 static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
 		sip_t const *sip, tagi_t tags[])
 {
@@ -10740,40 +10955,9 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		 * Enginer R6 verdict): chan_sip parity at chan_sip.c:14630+L14743 verbatim
 		 * combined-gate pattern. rtupdate=no skips ALL realtime DB writes. */
 		if (peer->is_realtime && sofia_cfg.peer_rtupdate) {
-			/* post-T56 rtsavesysname [general] parity (2026-04-28): inline 2-var setup
-			 * mirroring chan_sip.c.bk:5103-5151 canonical realtime_update_peer pattern.
-			 * NULL-key pair appended to ast_update_realtime varargs = no-op when
-			 * sofia_cfg.rtsave_sysname clear OR AST_SYSTEM_NAME empty. */
-			const char *sysname = ast_config_AST_SYSTEM_NAME;
-			const char *syslabel = NULL;
-			if (ast_strlen_zero(sysname)) {
-				sysname = NULL;
-			} else if (sofia_cfg.rtsave_sysname) {
-				syslabel = "regserver";
-			}
-			if (peer->registered) {
-				char port_str[32], regsec_str[32];
-				const char *contact_str = sip->sip_contact ?
-					sip->sip_contact->m_url->url_host : "";
-				snprintf(port_str, sizeof(port_str), "%d",
-					ast_sockaddr_port(&peer->src_addr));
-				snprintf(regsec_str, sizeof(regsec_str), "%ld",
-					(long)time(NULL));
-				ast_update_realtime(ast_check_realtime("sipregs") ? "sipregs" : "sippeers", "name", peer->name,
-					"ipaddr", ast_sockaddr_stringify_host(&peer->src_addr),
-					"port", port_str,
-					"regseconds", regsec_str,
-					"fullcontact", contact_str,
-					syslabel, sysname,
-					SENTINEL);
-			} else {
-				ast_update_realtime(ast_check_realtime("sipregs") ? "sipregs" : "sippeers", "name", peer->name,
-					"ipaddr", "",
-					"regseconds", "0",
-					"fullcontact", "",
-					syslabel, sysname,
-					SENTINEL);
-			}
+			/* Phase 1: offload the realtime DB write to the bounded pool when enabled;
+			 * kill-switch OFF runs it inline, byte-identical to the original block. */
+			sofia_rtupdate_submit(peer, sip);
 		}
 		nua_respond(nh, SIP_200_OK,
 			SIPTAG_CONTACT(sip->sip_contact),
@@ -10835,38 +11019,9 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		/* post-T56 rtupdate [general] parity (2026-04-28, Option C combined-gate per
 		 * Enginer R6 verdict): auth-OK path realtime updates gated by combined check. */
 		if (peer->is_realtime && sofia_cfg.peer_rtupdate) {
-			/* post-T56 rtsavesysname [general] parity (2026-04-28): inline 2-var setup
-			 * mirroring chan_sip.c.bk:5103-5151 canonical realtime_update_peer pattern. */
-			const char *sysname = ast_config_AST_SYSTEM_NAME;
-			const char *syslabel = NULL;
-			if (ast_strlen_zero(sysname)) {
-				sysname = NULL;
-			} else if (sofia_cfg.rtsave_sysname) {
-				syslabel = "regserver";
-			}
-			if (peer->registered) {
-				char port_str[32], regsec_str[32];
-				const char *contact_str = sip->sip_contact ?
-					sip->sip_contact->m_url->url_host : "";
-				snprintf(port_str, sizeof(port_str), "%d",
-					ast_sockaddr_port(&peer->src_addr));
-				snprintf(regsec_str, sizeof(regsec_str), "%ld",
-					(long)time(NULL));
-				ast_update_realtime(ast_check_realtime("sipregs") ? "sipregs" : "sippeers", "name", peer->name,
-					"ipaddr", ast_sockaddr_stringify_host(&peer->src_addr),
-					"port", port_str,
-					"regseconds", regsec_str,
-					"fullcontact", contact_str,
-					syslabel, sysname,
-					SENTINEL);
-			} else {
-				ast_update_realtime(ast_check_realtime("sipregs") ? "sipregs" : "sippeers", "name", peer->name,
-					"ipaddr", "",
-					"regseconds", "0",
-					"fullcontact", "",
-					syslabel, sysname,
-					SENTINEL);
-			}
+			/* Phase 1: offload the realtime DB write to the bounded pool when enabled;
+			 * kill-switch OFF runs it inline, byte-identical to the original block. */
+			sofia_rtupdate_submit(peer, sip);
 		}
 
 		nua_respond(nh, SIP_200_OK,
@@ -11467,17 +11622,28 @@ static int sofia_reason_str_to_code(const char *str)
  * derived from AST_PRES_RESTRICTION on redirecting.from presentation
  * (R11-revised — Diversion-side privacy alongside RPID/PAI Privacy: id).
  *
+ * forceddiversion (CLI-forward compliance, 2026-06-16): if the peer sets
+ * forceddiversion=<DID>, the emitted diverting number is OVERRIDDEN with that
+ * trunk-owned DID (privacy forced off) so a downstream carrier validates the
+ * forwarded call against a number it provisions for this trunk, instead of the
+ * relayed redirecting number. Emission still requires a redirect indication
+ * (a redirecting-from number OR an explicit REDIRECTING(reason)); a plain
+ * non-forwarded call never gets a Diversion. When forceddiversion is empty the
+ * behaviour is byte-for-byte the legacy data-driven path.
+ *
  * On entry: pvt non-NULL; header_buf points to writable buffer of len bytes.
  * On exit: header_buf populated with "Diversion: <value>\r\n" or empty.
  * Returns: 0 on no-emit, 1 on emit. */
 static int sofia_add_diversion(struct sofia_pvt *pvt, char *header_buf, size_t header_len)
 {
 	const char *diverting_number;
-	const char *diverting_name;
+	const char *diverting_name = NULL;
 	const char *reason;
 	const char *privacy_str;
+	const char *forced = NULL;
 	char fromhost[128];
 	int redir_pres;
+	int have_redirect;
 
 	if (!header_buf || header_len < 2) {
 		return 0;
@@ -11489,13 +11655,48 @@ static int sofia_add_diversion(struct sofia_pvt *pvt, char *header_buf, size_t h
 	}
 
 	diverting_number = pvt->owner->redirecting.from.number.str;
-	if (!pvt->owner->redirecting.from.number.valid
-			|| ast_strlen_zero(diverting_number)) {
-		return 0;
+	have_redirect = pvt->owner->redirecting.from.number.valid
+			&& !ast_strlen_zero(diverting_number);
+
+	/* forceddiversion (CLI-forward compliance, 2026-06-16): when the peer
+	 * configures a forced redirecting DID, present THAT trunk-owned number as
+	 * the diverting party per RFC 5806 — a number the carrier can validate —
+	 * instead of whatever the channel's redirecting chain (or an inbound
+	 * Diversion) carried. Emission still requires a redirect indication (a
+	 * redirecting-from number OR an explicit REDIRECTING(reason)), so a plain
+	 * non-forwarded call is NEVER mislabeled as diverted. The caller holds
+	 * pvt->peer->lock across this whole builder block (single-contact 7029 +
+	 * fork-child 6858), so reading the peer stringfield here is reload-UAF-safe
+	 * (no snapshot needed; same lock span as fromdomain below). */
+	if (pvt->peer && !ast_strlen_zero(pvt->peer->forceddiversion)) {
+		forced = pvt->peer->forceddiversion;
 	}
 
-	reason = sofia_reason_code_to_str(pvt->owner->redirecting.reason);
-	diverting_name = pvt->owner->redirecting.from.name.str;
+	if (forced) {
+		if (!have_redirect
+				&& pvt->owner->redirecting.reason == AST_REDIRECTING_REASON_UNKNOWN) {
+			/* No redirect marker at all -> direct call, not a desvio. Never
+			 * stamp a Diversion on a call that was not forwarded. */
+			return 0;
+		}
+		diverting_number = forced;
+		diverting_name = NULL;   /* the configured DID owns no display name */
+	} else {
+		if (!have_redirect) {
+			return 0;
+		}
+		diverting_name = (pvt->owner->redirecting.from.name.valid
+				&& !ast_strlen_zero(pvt->owner->redirecting.from.name.str))
+			? pvt->owner->redirecting.from.name.str : NULL;
+	}
+
+	/* reason from the channel's redirecting state; a forced diversion with no
+	 * explicit reason defaults to unconditional (the desvio default). */
+	if (forced && pvt->owner->redirecting.reason == AST_REDIRECTING_REASON_UNKNOWN) {
+		reason = "unconditional";
+	} else {
+		reason = sofia_reason_code_to_str(pvt->owner->redirecting.reason);
+	}
 
 	if (!ast_sockaddr_isnull(&pvt->ourip)) {
 		ast_copy_string(fromhost,
@@ -11508,14 +11709,19 @@ static int sofia_add_diversion(struct sofia_pvt *pvt, char *header_buf, size_t h
 		ast_copy_string(fromhost, "gabpbx", sizeof(fromhost));
 	}
 
-	/* R11-revised: privacy parameter from redirecting.from presentation —
-	 * SEPARATE identity from pvt->callingpres (the outbound caller's
-	 * presentation). The redirecting party is its own party_id. */
-	redir_pres = ast_party_id_presentation(&pvt->owner->redirecting.from);
-	privacy_str = ((redir_pres & AST_PRES_RESTRICTION) != AST_PRES_ALLOWED) ? "full" : "off";
+	/* privacy: for a forced trunk-owned DID we WANT the carrier to see it
+	 * (privacy=off) — an anonymous diversion DID defeats the very validation
+	 * we are trying to satisfy. For the relayed case, derive from the
+	 * redirecting party's presentation (R11-revised: SEPARATE identity from
+	 * pvt->callingpres, the outbound caller's presentation). */
+	if (forced) {
+		privacy_str = "off";
+	} else {
+		redir_pres = ast_party_id_presentation(&pvt->owner->redirecting.from);
+		privacy_str = ((redir_pres & AST_PRES_RESTRICTION) != AST_PRES_ALLOWED) ? "full" : "off";
+	}
 
-	if (!pvt->owner->redirecting.from.name.valid
-			|| ast_strlen_zero(diverting_name)) {
+	if (ast_strlen_zero(diverting_name)) {
 		snprintf(header_buf, header_len,
 			"Diversion: <sip:%s@%s>;reason=%s;privacy=%s\r\n",
 			diverting_number, fromhost, reason, privacy_str);
@@ -16460,6 +16666,12 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			 * gate at 3 sofia_process_register `if (peer->is_realtime)` blocks
 			 * mirroring chan_sip.c:14630+L14743 verbatim combined-gate pattern. */
 			sofia_cfg.peer_rtupdate = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "register_pool")) {
+			/* Phase 1: offload realtime REGISTER DB writes to a bounded taskprocessor
+			 * pool (default OFF).  Takes effect on reload — the kill-switch toggle. */
+			sofia_cfg.register_pool = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "register_pool_workers")) {
+			sofia_cfg.register_pool_workers = atoi(v->value);
 		} else if (!strcasecmp(v->name, "rtcachefriends")) {
 			/* post-T56 rtcachefriends [general] parity (2026-04-28): chan_sip parity
 			 * at chan_sip.c:29588-29589 verbatim ast_set2_flag(global_flags[1],
@@ -16876,6 +17088,10 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			ast_string_field_set(peer, fromuser, v->value);
 		} else if (!strcasecmp(v->name, "fromdomain")) {
 			ast_string_field_set(peer, fromdomain, v->value);
+		} else if (!strcasecmp(v->name, "forceddiversion")) {
+			/* CLI-forward compliance: per-trunk redirecting DID forced into the
+			 * outbound Diversion header on forwarded calls. See sofia_add_diversion. */
+			ast_string_field_set(peer, forceddiversion, v->value);
 		} else if (!strcasecmp(v->name, "type")) {
 			if (!strcasecmp(v->value, "friend")) {
 				peer->type = SOFIA_TYPE_FRIEND;
@@ -17753,6 +17969,9 @@ static int sofia_apply_config(struct ast_config *cfg)
 	 * per chan_sip.c:29480 verbatim explicit default-init. Wire-in via Option C
 	 * combined-gate at 3 sofia_process_register `if (peer->is_realtime)` blocks. */
 	sofia_cfg.peer_rtupdate = 1;
+	/* Phase 1 register pool: default OFF (dark launch) + auto lane count. */
+	sofia_cfg.register_pool = 0;
+	sofia_cfg.register_pool_workers = 0;
 	/* post-T56 rtcachefriends [general] parity (2026-04-28): chan_sip parity default
 	 * FALSE per BSS static-zero of global_flags[1] SIP_PAGE2_RTCACHEFRIENDS bit.
 	 * PARSE-COMPAT-ONLY (chan_sofia ao2 peer registry intrinsic-equivalent-to-yes
@@ -17902,6 +18121,9 @@ static int sofia_apply_config(struct ast_config *cfg)
 	 * (chan_sofia ARCHITECTURAL ADVANTAGE 8th-instance vs chan_sip per-peer-build
 	 * duplication). */
 	sofia_post_config_derive_allowsubscribe();
+
+	/* Phase 1: create/toggle the bounded REGISTER pool per config (boot + reload). */
+	sofia_regpool_update();
 
 	return 0;
 }

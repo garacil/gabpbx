@@ -1187,6 +1187,41 @@ srvlookup=yes
 ;rtupdate = yes
 
 ;
+; --- register_pool (signalling resilience under a slow realtime DB) ---
+; When yes, the realtime DB writes that a successful REGISTER performs
+; (ast_update_realtime: ipaddr/port/regseconds/fullcontact) are handed to a
+; small fixed pool of background worker threads instead of running inline on
+; the single SIP signalling thread.  This keeps call signalling (INVITE/OPTIONS)
+; responsive during a registration storm when the realtime database is slow —
+; the worker pool absorbs the DB latency instead of head-of-line-blocking calls.
+;
+; Default no (off): REGISTER behaves exactly as before (the DB write runs
+; inline).  Turning it on or off takes effect on `module reload chan_sofia.so`,
+; so it doubles as a runtime kill-switch.
+;
+; Trade-off (operator-honest): with the pool on, the 200 OK is sent before the
+; realtime row is persisted (eventual consistency).  The in-memory registration
+; is authoritative immediately; only the DB row catches up a moment later.
+; Lanes are keyed by account, so all writes for one peer stay STRICTLY ORDERED on
+; one lane (a de-REGISTER can never overtake a prior REGISTER) — the lane is the
+; single path; there is no inline bypass once the pool is on.  Under a slow DB the
+; lane queue absorbs the backlog and drains; watch its depth in
+; `core show taskprocessors` (the worker threads stay bounded regardless).  In a
+; rare failure to enqueue (out of memory) the single update is logged and dropped,
+; and the next REGISTER refresh re-writes the row.  If a worker DB write itself
+; fails it is logged.  Only realtime peers with rtupdate=yes are affected.
+;
+; register_pool_workers sets the lane count; 0 (default) auto-sizes to about
+; half the CPU cores (clamped 2..16).  The lanes appear in
+; `core show taskprocessors` as sofia/regpool-NN.  NOTE: the lane count is fixed
+; at the first time the pool is enabled and cannot change on reload (taskprocessors
+; are not torn down at runtime) — changing register_pool_workers needs a full
+; `systemctl restart gabpbx`.
+;
+;register_pool = no
+;register_pool_workers = 0
+
+;
 ; --- rtcachefriends (post-T56 chan_sip parity, PARSE-COMPAT-ONLY ship) ---
 ; chan_sip semantic: when yes, realtime peers are kept in memory after first
 ; lookup like static peers (speeds subsequent lookups; reduces DB churn;
@@ -2525,6 +2560,7 @@ srvlookup=yes
 ;callingpres=allowed_not_screened ; per-peer presentation override; AST_PRES_* values per [general] callingpres list
 ;sendrpid=pai                ; per-peer RPID/PAI emission (no/pai/rpid); typical trunk: pai
 ;trustrpid=yes               ; per-peer trust on inbound PAI/RPID; typical trunk: yes (trusted upstream)
+;forceddiversion=34931234567 ; CLI-forward compliance (RFC 5806): force a trunk-owned DID as the diverting party in the outbound Diversion header on FORWARDED (desvio) calls, so the carrier validates the diversion against a number it provisions for this trunk (RULE 2). Emitted ONLY when the channel carries a redirect marker — set REDIRECTING(from-num) or REDIRECTING(reason) in the dialplan before Dial(); a non-forwarded direct call NEVER gets a Diversion. Keep RULE 1 (From=original caller): do NOT overwrite CALLERID(num) and do NOT set fromuser= to the DID. Empty = disabled (legacy data-driven Diversion).
 ;call-limit=5                ; max simultaneous calls; alias accepted: call_limit
 ;busylevel=3                 ; return BUSY (486) when 3 calls already in progress
 ;callcounter=yes             ; shorthand: unlimited tracking + 480 enforcement at hard cap
@@ -2662,6 +2698,15 @@ srvlookup=yes
 ; sendrpid       - outbound RPID/PAI emission: no (default), pai (RFC 3325), rpid
 ; trustrpid      - yes/no: trust inbound PAI/RPID (default: no);
 ;                  set yes only for trusted upstream proxies / SBCs
+; forceddiversion - per-peer DID forced into the outbound Diversion header
+;                  (RFC 5806) on forwarded calls, so a carrier validates the
+;                  diversion against a trunk-owned number (CLI-forward RULE 2).
+;                  Emitted ONLY when the channel carries a redirect marker
+;                  (REDIRECTING(from-num) or REDIRECTING(reason) set in dialplan);
+;                  never on a direct call. Empty (default) = legacy behaviour
+;                  (Diversion only when the redirecting chain already supplies a
+;                  number). Keep From = original caller for full compliance.
+;                  Readable via SIPPEER(<peer>,forceddiversion).
 ;
 ; --- Call-limit (post-T56 call-limit parity) ---
 ; callcounter    - yes/no shorthand: yes -> call-limit=INT_MAX (unlimited
