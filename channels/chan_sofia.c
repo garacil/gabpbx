@@ -169,7 +169,7 @@
 #include "gabpbx/rtp_engine.h"
 #include "gabpbx/dsp.h"  /* post-T56 inband DTMF detect parity (2026-04-27): ast_dsp_new + ast_dsp_process + ast_dsp_set_features for inbound DTMF tone detection */
 #include "gabpbx/dnsmgr.h"  /* post-T56 dnsmgr per-peer parity (2026-04-27): ast_dnsmgr_lookup_cb + ast_dnsmgr_release for async hostname-tracking on peers with host=hostname (non-IP) */
-#include "gabpbx/udptl.h"  /* post-T56 Task #8 T.38 fax UDPTL parity SS2 (2026-04-28): ast_udptl_protocol + ast_udptl_proto_register/unregister + ast_udptl_destroy public API + struct ast_control_t38_parameters via frame.h. Skeleton + lifecycle this SS; SDP/state-machine/relay/queryoption arriving SS3a-SS5 per CHAN_SOFIA_T38_DESIGN.md §3 */
+#include "gabpbx/udptl.h"  /* post-T56 Task #8 T.38 fax UDPTL parity SS2 (2026-04-28): ast_udptl_protocol + ast_udptl_proto_register/unregister + ast_udptl_destroy public API + struct ast_control_t38_parameters via frame.h. Skeleton + lifecycle this SS; SDP/state-machine/relay/queryoption arriving SS3a-SS5 per the T.38 design notes §3 */
 #include "gabpbx/sched.h"  /* post-T56 Task #8 T.38 fax UDPTL parity SS4 (2026-04-28): ast_sched_thread_create/destroy/add/del for sofia_t38_abort 5s reINVITE timeout per SS1.5 N2 LOAD-BEARING (chan_sip.c:24288 ast_sched_add 5000ms). chan_sofia uses ast_sched_thread managed-thread API (sched.h:316-403) — sofia owns separate sched-thread vs chan_sip's monitor-thread sched_runq pattern; equivalent semantic + cleaner thread-ownership */
 #include "gabpbx/causes.h"
 #include "gabpbx/acl.h"
@@ -254,7 +254,7 @@
 #define SOFIA_FAX_DETECT_BOTH   3
 
 /* post-T56 Task #8 T.38 fax UDPTL parity SS2 (2026-04-28, skeleton + lifecycle;
- * full state machine SS4 per CHAN_SOFIA_T38_DESIGN.md §1.4):
+ * full state machine SS4 per the T.38 design notes §1.4):
  *
  * 4-state T.38 negotiation machine mirroring chan_sip.c:5765-5811 verbatim
  * semantic. State transitions queue AST_CONTROL_T38_PARAMETERS for 3 of 4
@@ -1166,7 +1166,7 @@ static int sofia_blacklist_check_sip(sip_t const *sip);
 /* post-T56 match_auth_username (2026-04-28): forward-decl for sofia_pick_auth_username
  * Pattern 5 helper #28 — definition at ~L5297 after sofia_au_get_unq cluster; called
  * earlier from sofia_process_invite L4462 + sofia_process_register L5470 (distance
- * >500 LoC per chan-sip-compat-naming-rules.md ADDENDUM #4 forward-decl discipline). */
+ * >500 LoC per the chan_sip naming rules ADDENDUM #4 forward-decl discipline). */
 static const char *sofia_pick_auth_username(sip_t const *sip,
 		const char *fallback_user, char *buf, size_t len);
 
@@ -1890,7 +1890,7 @@ struct sofia_pvt {
 
 	/* post-T56 Task #8 T.38 fax UDPTL parity SS2 (2026-04-28, skeleton +
 	 * lifecycle; full state machine + 6-op interpret + max_ifp wiring +
-	 * t38id 5s timer arrive at SS4 per CHAN_SOFIA_T38_DESIGN.md §1.4):
+	 * t38id 5s timer arrive at SS4 per the T.38 design notes §1.4):
 	 *
 	 *   udptl: per-dialog UDPTL session pointer; NULL when no T.38 in flight.
 	 *     Allocated lazily (chan_sip pattern at chan_sip.c:7591 verbatim) on
@@ -2833,7 +2833,7 @@ static void sofia_change_t38_state(struct sofia_pvt *pvt, int new_state)
 		}
 		manager_event(EVENT_FLAG_SYSTEM, "T38FaxNegotiation",
 			/* SS7 BUG #1 fix (2026-04-28): chan_sip_compat policy parity per
-			 * chan-sip-compat-naming-rules.md GOLDEN RULE — all 14 other
+			 * the chan_sip naming rules GOLDEN RULE — all 14 other
 			 * chan_sofia AMI sites emit "ChannelType: SIP" not "Sofia"; SS6
 			 * doxygen claim of T35/T55 "Sofia" precedent was incorrect. */
 			"ChannelType: SIP\r\n"
@@ -7837,7 +7837,7 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 		 * — try chan_sip "exten@peer" syntax before falling back to bare-peer-name. Per
 		 * chan_sip sip_request_call parsing, dial string before '@' is the Request-URI user
 		 * (extension/number to dial), part after '@' is the configured peer name used for
-		 * routing. Required for drop-in compatibility (chan-sip-compat-naming-rules.md):
+		 * routing. Required for drop-in compatibility (the chan_sip naming rules):
 		 * production dialplans like Dial(SIP/EXTEN#NUMBER@trunkX) MUST resolve to
 		 * peer=trunkX, exten=EXTEN#NUMBER — without this fix peer lookup fails on
 		 * the full string and the call ends in CHANUNAVAIL. If neither '/' nor '@' is
