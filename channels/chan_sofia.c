@@ -14699,6 +14699,11 @@ static void sofia_cli_peer_subline(struct ast_str **out, const char *label, cons
 		SOFIA_CLI_PEER_LABEL_WIDTH, SOFIA_CLI_PEER_LABEL_WIDTH, label, value);
 }
 
+/* Forward decl: peer-name tab-completion helper (defined later, used by the
+ * CLI_GENERATE case below so "sip show peer <TAB>" lists the peers in RAM,
+ * chan_sip parity). only_realtime=0 => offer every peer. */
+static char *complete_sofia_peer(const char *word, int state, int only_realtime);
+
 static char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
 	struct sofia_peer *peer;
@@ -14723,6 +14728,11 @@ static char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cl
 			   "       Show detailed info for a Sofia-SIP peer\n";
 		return NULL;
 	case CLI_GENERATE:
+		/* "sip show peer <name>": complete the peer name (token 3) from the
+		 * peers held in RAM, by prefix. chan_sip parity. */
+		if (a->pos == 3) {
+			return complete_sofia_peer(a->word, a->n, 0);
+		}
 		return NULL;
 	}
 
