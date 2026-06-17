@@ -72,6 +72,28 @@ bindport=5080
 realm=gabpbx
 
 ;
+; --- auth_algorithms (digest algorithm offer; [general] only, GLOBAL) ---
+; Which digest algorithm(s) chan_sofia OFFERS in the WWW-Authenticate challenge.
+; This is a GLOBAL switch: the same offer is made to ALL peers — there is no
+; per-peer override (one thing to everyone, or the other to everyone). The server
+; then accepts ONLY what it offered (a client answering with an algorithm that was
+; not advertised is rejected 400), so a sha256-only deployment cannot be silently
+; downgraded to MD5.
+;
+;   both    - offer MD5 + SHA-256 (MD5 listed first for legacy phones; built-in default if unset)
+;   md5     - offer MD5 only (chan_sip drop-in parity, maximum handset compatibility)
+;   sha256  - offer SHA-256 only (RFC 7616; refuse the weaker MD5)
+;
+; This file ships md5 ACTIVE (below) for maximum compatibility / chan_sip parity.
+; Remove the line to fall back to the built-in default (both = MD5 + SHA-256).
+;
+; Note: a peer configured with md5secret (a pre-hashed MD5 credential) and no
+; plaintext secret can only authenticate with MD5; keep auth_algorithms at md5 or
+; both for such deployments, otherwise those peers cannot register.
+;
+auth_algorithms = md5
+
+;
 ; Allow guest calls (calls from unknown peers)
 ; Default: yes
 ;

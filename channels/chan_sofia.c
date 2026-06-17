@@ -357,6 +357,14 @@
 #define SOFIA_NONCE_TTL_SEC_DEFAULT 3600
 #define SOFIA_NONCE_TTL_SEC_LEGACY  300  /* for operator-honest disclosure / migration reference */
 
+/* Which digest algorithm(s) chan_sofia OFFERS in the WWW-Authenticate challenge.
+ * Verification accepts exactly what was offered (anti-downgrade). Operator-
+ * selectable via [general] auth_algorithms = both | md5 | sha256. Built-in default
+ * BOTH = offer MD5 + SHA-256 (the shipped sofia.conf sets md5). */
+#define SOFIA_AUTH_ALG_BOTH   0   /* offer MD5 + SHA-256 (default) */
+#define SOFIA_AUTH_ALG_MD5    1   /* offer MD5 only */
+#define SOFIA_AUTH_ALG_SHA256 2   /* offer SHA-256 only */
+
 #define DEFAULT_QUALIFYFREQ   60
 #define DEFAULT_QUALIFYTIMEOUT 3
 #define DEFAULT_FREQ_NOTOK    10
@@ -387,6 +395,7 @@ static struct {
 	int srtp_per_suite_keys;          /* post-T56 Task 7b SRTP per-suite-fresh-key option (2026-04-28, deferred from #7a 612759d R4 strategy (b) — chan_sofia surpass dimension feature-not-in-chan_sip-at-all): 0 = shared-key mode default (current behavior; #7a strategy (a) — single 46-byte master_key shared across all suites in multi-cipher offer; peer picks one so unused key material discarded on answer) / 1 = per-suite-fresh-key mode (forensic-grade key separation; each suite gets independent fresh random master_key via res_srtp->get_random; key material recovery from one suite cannot decrypt others — MIKEY/DTLS-SRTP convention). [general]-only operator option (no per-peer override; operator-policy is global). chan_sofia surpass dimension — no chan_sip equivalent (chan_sip has no multi-suite SRTP offer mechanism therefore no shared-vs-per-suite key strategy choice). Wire-in via module-scope sofia_srtp_per_suite_keys mirror (set in sofia_load_config; consumed by sdp_crypto.c sdp_crypto_offer_list multi-cipher loop + sdp_crypto_activate suite-key selection). Mem cost ~1.7 KB per active SRTP call when enabled (16-slot static arrays in struct sdp_crypto). */
 	int force_invite_auth;            /* post-T56 Task #3 INVITE digest auth SS3 (2026-04-28, R18 chan_sofia surpass dimension operator-policy-global-security-override + SW6 INSECURE_INVITE-visibility-vs-chan_sip-silent NEW DIMENSION): 0 = drop-in chan_sip parity baseline (per-peer insecure=invite bypass active) / 1 = global lockdown override (ALL inbound INVITEs require digest auth regardless of per-peer insecure=invite config). [general]-only operator security-lockdown switch. chan_sofia surpass — no chan_sip equivalent (chan_sip has only per-peer insecure=invite; no global override mechanism). Use cases: compliance audit during scheduled review (temporarily disable bypass), incident response (lock down auth in response to detected attack), default-deny posture (progressive operator hardening). When force_invite_auth=1 AND a peer hits with insecure=invite, LOG_NOTICE fires "Sofia: force_invite_auth=yes overrides per-peer insecure=invite for peer X — auth required" so operator sees policy taking effect. Mirrors sofia_srtp_per_suite_keys [general]-only design pattern. */
 	int nonce_ttl_seconds;            /* Digest auth nonce TTL override. 0 = use SOFIA_NONCE_TTL_SEC_DEFAULT (3600s); positive value = explicit operator override. Consumed by sofia_verify_digest_auth nonce-staleness check. */
+	int auth_algorithms;              /* SOFIA_AUTH_ALG_BOTH/MD5/SHA256: which digest algorithm(s) to OFFER in the WWW-Authenticate challenge. [general] auth_algorithms = both|md5|sha256. Built-in default BOTH = MD5 + SHA-256 (the shipped sofia.conf sets md5). GLOBAL — same offer to all peers, no per-peer override. Verification accepts exactly what was offered (anti-downgrade). */
 	/* post-T56 session timers (RFC 4028) (2026-04-27): chan_sip-parity 4-key dual-scope config inherited by sofia_peer_alloc; sofia-sip handles wire mechanics via NUTAG_SESSION_TIMER + NUTAG_MIN_SE + NUTAG_SESSION_REFRESHER (Pattern 16 sofia-sip-native-mechanics-chan_sofia-config-wiring; ~6.7x leverage vs chan_sip handcoded). */
 	int default_session_timers;       /* SESSION_TIMERS_OFF/ACCEPT/ORIGINATE/REFUSE; default=ACCEPT per chan_sip parity (honor inbound, no initiate) */
 	int default_session_expires;      /* default Session-Expires seconds; chan_sip parity 1800s (RFC 4028 §4 typical) */
@@ -9822,13 +9831,6 @@ static const char *sofia_pick_auth_username(sip_t const *sip,
  * for nonce-stale-challenge regen path; defined later in same translation unit
  * to keep adjacent to existing nonce-state-management code. */
 static void sofia_regen_nonce_locked(struct sofia_peer *peer, char *out_buf, size_t out_len);
-/* SS5 forward-decl for sofia_peer_offers_sha256 — called from sofia_verify_
- * digest_auth (Pattern 5 helper #34) per Finding #2 per-peer-algorithm-offer;
- * defined at sofia_send_auth_challenge cluster ~L7508 (distance >300 LoC;
- * forward-decl-when-distance discipline). NOTE: sofia_emit_timing_equalized_
- * reject + sofia_send_auth_challenge moved to early forward-decl cluster
- * (L992+) for sofia_process_invite visibility. */
-static int sofia_peer_offers_sha256(struct sofia_peer *peer);
 
 /* post-T56 Task #3 INVITE digest auth SS2 (2026-04-28, Pattern 5 helper #36 +
  * SW1 timing-attack fix + N6 compiler-elision hardening): constant-time memory
@@ -10026,6 +10028,60 @@ static void sofia_compute_digest(struct sofia_peer *peer, const char *realm,
  * cluster (visible to sofia_process_invite at L5745) per SS3 wire-in.
  */
 
+/* Which digest algorithm(s) to OFFER, per the [general] auth_algorithms switch.
+ * GLOBAL and uniform for ALL peers: both -> MD5 + SHA-256, md5 -> MD5 only,
+ * sha256 -> SHA-256 only. Verification uses the SAME function so it accepts
+ * exactly what was offered (anti-downgrade). */
+static void sofia_auth_offered(int *want_md5, int *want_sha256)
+{
+	*want_md5    = (sofia_cfg.auth_algorithms != SOFIA_AUTH_ALG_SHA256);
+	*want_sha256 = (sofia_cfg.auth_algorithms != SOFIA_AUTH_ALG_MD5);
+}
+
+/* Emit the WWW-Authenticate digest challenge(s) for a 401, per the global
+ * [general] auth_algorithms switch. MD5 is listed first (legacy-client
+ * compatibility). stale!=0 appends ", stale=true". The caller generates the
+ * nonce (under peer->lock for a known peer) and owns any surrounding logging. */
+static void sofia_emit_auth_challenge(nua_t *nua, nua_handle_t *nh,
+		const char *realm, const char *nonce, int stale)
+{
+	int want_md5, want_sha256;
+	char hdr_md5[256];
+	char hdr_sha256[256];
+	const char *stale_str = stale ? ", stale=true" : "";
+
+	sofia_auth_offered(&want_md5, &want_sha256);
+
+	if (want_md5) {
+		snprintf(hdr_md5, sizeof(hdr_md5),
+			"Digest realm=\"%s\", nonce=\"%s\", qop=\"auth\", algorithm=MD5%s",
+			realm, nonce, stale_str);
+	}
+	if (want_sha256) {
+		snprintf(hdr_sha256, sizeof(hdr_sha256),
+			"Digest realm=\"%s\", nonce=\"%s\", qop=\"auth\", algorithm=SHA-256%s",
+			realm, nonce, stale_str);
+	}
+
+	if (want_md5 && want_sha256) {
+		nua_respond(nh, SIP_401_UNAUTHORIZED,
+			SIPTAG_WWW_AUTHENTICATE_STR(hdr_md5),
+			SIPTAG_WWW_AUTHENTICATE_STR(hdr_sha256),
+			NUTAG_WITH_THIS(nua),
+			TAG_END());
+	} else if (want_sha256) {
+		nua_respond(nh, SIP_401_UNAUTHORIZED,
+			SIPTAG_WWW_AUTHENTICATE_STR(hdr_sha256),
+			NUTAG_WITH_THIS(nua),
+			TAG_END());
+	} else {
+		nua_respond(nh, SIP_401_UNAUTHORIZED,
+			SIPTAG_WWW_AUTHENTICATE_STR(hdr_md5),
+			NUTAG_WITH_THIS(nua),
+			TAG_END());
+	}
+}
+
 static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		nua_t *nua, nua_handle_t *nh,
 		sip_t const *sip,
@@ -10060,45 +10116,19 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	 * clients that can select the stronger RFC 7616 algorithm. */
 	if (!au) {
 		char nonce[64];
-		char auth_header_md5[256];
-		char auth_header_sha256[256];
 
 		ast_mutex_lock(&peer->lock);
 		sofia_regen_nonce_locked(peer, nonce, sizeof(nonce));
 		ast_mutex_unlock(&peer->lock);
 
-		snprintf(auth_header_sha256, sizeof(auth_header_sha256),
-			"Digest realm=\"%s\", nonce=\"%s\", qop=\"auth\", algorithm=SHA-256",
-			realm, nonce);
-		snprintf(auth_header_md5, sizeof(auth_header_md5),
-			"Digest realm=\"%s\", nonce=\"%s\", qop=\"auth\", algorithm=MD5",
-			realm, nonce);
+		sofia_emit_auth_challenge(nua, nh, realm, nonce, 0);
 
-		/* SS5 Finding #2 audit hardening: per-peer algorithm offer. md5secret-
-		 * only peer (no plaintext secret) cannot satisfy SHA-256 path — peer's
-		 * client cannot derive matching SHA-256 HA1 from a pre-MD5-hashed
-		 * secret. Omit SHA-256 from challenge offer in that case. Closes
-		 * silent-403 case where md5secret peer sees SHA-256 challenge + retries
-		 * with SHA-256 + fails forever. SS6 Finding #6 audit hardening:
-		 * cache sofia_peer_offers_sha256 result to local int (was called twice
-		 * — once for dispatch + once for sofia_debug log). */
-		int offer_sha256 = sofia_peer_offers_sha256(peer);
-		if (offer_sha256) {
-			nua_respond(nh, SIP_401_UNAUTHORIZED,
-				SIPTAG_WWW_AUTHENTICATE_STR(auth_header_md5),
-				SIPTAG_WWW_AUTHENTICATE_STR(auth_header_sha256),
-				NUTAG_WITH_THIS(nua),
-				TAG_END());
-		} else {
-			nua_respond(nh, SIP_401_UNAUTHORIZED,
-				SIPTAG_WWW_AUTHENTICATE_STR(auth_header_md5),
-				NUTAG_WITH_THIS(nua),
-				TAG_END());
-		}
 		if (sofia_debug) {
+			int want_md5, want_sha256;
+			sofia_auth_offered(&want_md5, &want_sha256);
 			ast_verbose("Sofia: Challenging %s from '%s' (nonce=%s, algorithms=%s)\n",
 				method, peer->name, nonce,
-				offer_sha256 ? "MD5+SHA-256" : "MD5-only");
+				(want_md5 && want_sha256) ? "MD5+SHA-256" : (want_sha256 ? "SHA-256" : "MD5"));
 		}
 		return SOFIA_AUTH_CHALLENGE;
 	}
@@ -10115,20 +10145,47 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	auth_algorithm = sofia_au_get_unq(au, "algorithm", auth_algorithm_buf, sizeof(auth_algorithm_buf));
 
 		/* N9 audit hardening: algorithm-parameter strict-parse per RFC 7616 §3.3
-		 * (case-insensitive enum match). Reject 400 on unknown/unoffered algorithm.
-		 * Default MD5 only when client OMITS algorithm= entirely (RFC 2617
-		 * backward-compat). chan_sofia verifies MD5 and SHA-256; reject any other
-		 * claimed algorithm. */
-	if (auth_algorithm) {
-		if (!strcasecmp(auth_algorithm, "MD5")) {
-			algorithm = SOFIA_DIGEST_MD5;
-		} else if (!strcasecmp(auth_algorithm, "SHA-256")) {
-			algorithm = SOFIA_DIGEST_SHA256;
-		} else {
+		 * (case-insensitive enum match). Anti-downgrade: accept ONLY an algorithm
+		 * that was actually offered per the [general] auth_algorithms switch (same
+		 * sofia_auth_offered() used to build the challenge). A client claiming an
+		 * un-offered algorithm — or omitting algorithm= (RFC 2617 implies MD5) when
+		 * MD5 was not offered — is rejected 400. chan_sofia computes MD5 and SHA-256;
+		 * any other token is rejected. */
+	{
+		int want_md5, want_sha256;
+		sofia_auth_offered(&want_md5, &want_sha256);
+
+		if (auth_algorithm) {
+			if (!strcasecmp(auth_algorithm, "MD5")) {
+				if (!want_md5) {
+					nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
+					ast_verbose("Sofia: %s auth rejected for '%s' - MD5 not offered (auth_algorithms)\n",
+						method, peer->name);
+					sofia_blacklist_add_sip(sip, "digest algorithm not offered");
+					return SOFIA_AUTH_REJECT;
+				}
+				algorithm = SOFIA_DIGEST_MD5;
+			} else if (!strcasecmp(auth_algorithm, "SHA-256")) {
+				if (!want_sha256) {
+					nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
+					ast_verbose("Sofia: %s auth rejected for '%s' - SHA-256 not offered (auth_algorithms)\n",
+						method, peer->name);
+					sofia_blacklist_add_sip(sip, "digest algorithm not offered");
+					return SOFIA_AUTH_REJECT;
+				}
+				algorithm = SOFIA_DIGEST_SHA256;
+			} else {
+				nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
+				ast_verbose("Sofia: %s auth rejected for '%s' - unknown algorithm '%s'\n",
+					method, peer->name, auth_algorithm);
+				sofia_blacklist_add_sip(sip, "digest unknown algorithm");
+				return SOFIA_AUTH_REJECT;
+			}
+		} else if (!want_md5) {
 			nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
-			ast_verbose("Sofia: %s auth rejected for '%s' - unknown algorithm '%s' (server offers MD5 + SHA-256)\n",
-				method, peer->name, auth_algorithm);
-			sofia_blacklist_add_sip(sip, "digest unknown algorithm");
+			ast_verbose("Sofia: %s auth rejected for '%s' - algorithm= required (MD5 not offered)\n",
+				method, peer->name);
+			sofia_blacklist_add_sip(sip, "digest algorithm required");
 			return SOFIA_AUTH_REJECT;
 		}
 	}
@@ -10149,22 +10206,10 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	 * uses dual-algorithm offer for client retry-with-different-algorithm. */
 	if (!auth_realm || strcmp(auth_realm, realm) != 0) {
 		char fresh_nonce[64];
-		char auth_stale_sha256[256];
-		char auth_stale_md5[256];
 		ast_mutex_lock(&peer->lock);
 		sofia_regen_nonce_locked(peer, fresh_nonce, sizeof(fresh_nonce));
 		ast_mutex_unlock(&peer->lock);
-		snprintf(auth_stale_sha256, sizeof(auth_stale_sha256),
-			"Digest realm=\"%s\", nonce=\"%s\", qop=\"auth\", algorithm=SHA-256, stale=true",
-			realm, fresh_nonce);
-		snprintf(auth_stale_md5, sizeof(auth_stale_md5),
-			"Digest realm=\"%s\", nonce=\"%s\", qop=\"auth\", algorithm=MD5, stale=true",
-			realm, fresh_nonce);
-		nua_respond(nh, SIP_401_UNAUTHORIZED,
-			SIPTAG_WWW_AUTHENTICATE_STR(auth_stale_md5),
-			SIPTAG_WWW_AUTHENTICATE_STR(auth_stale_sha256),
-			NUTAG_WITH_THIS(nua),
-			TAG_END());
+		sofia_emit_auth_challenge(nua, nh, realm, fresh_nonce, 1);
 		ast_verbose("Sofia: %s auth realm mismatch for '%s' - expected '%s' got '%s'\n",
 			method, peer->name, realm, auth_realm ? auth_realm : "(none)");
 		return SOFIA_AUTH_CHALLENGE;
@@ -10207,21 +10252,9 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 
 	if (need_regen) {
 		char fresh_nonce[64];
-		char auth_stale_sha256[256];
-		char auth_stale_md5[256];
 		sofia_regen_nonce_locked(peer, fresh_nonce, sizeof(fresh_nonce));
 		ast_mutex_unlock(&peer->lock);
-		snprintf(auth_stale_sha256, sizeof(auth_stale_sha256),
-			"Digest realm=\"%s\", nonce=\"%s\", qop=\"auth\", algorithm=SHA-256, stale=true",
-			realm, fresh_nonce);
-		snprintf(auth_stale_md5, sizeof(auth_stale_md5),
-			"Digest realm=\"%s\", nonce=\"%s\", qop=\"auth\", algorithm=MD5, stale=true",
-			realm, fresh_nonce);
-		nua_respond(nh, SIP_401_UNAUTHORIZED,
-			SIPTAG_WWW_AUTHENTICATE_STR(auth_stale_md5),
-			SIPTAG_WWW_AUTHENTICATE_STR(auth_stale_sha256),
-			NUTAG_WITH_THIS(nua),
-			TAG_END());
+		sofia_emit_auth_challenge(nua, nh, realm, fresh_nonce, 1);
 		if (sofia_debug) {
 			ast_verbose("Sofia: %s auth challenge for '%s' - stale/replay; fresh nonce=%s\n",
 				method, peer->name, fresh_nonce);
@@ -10409,25 +10442,6 @@ static int sofia_auth_str_safe(const char *s)
 	return 1;
 }
 
-/* Determine whether the server can offer SHA-256 to a peer.
- * When peer has only md5secret + no secret, offer MD5 only (SHA-256 with
- * md5secret-pre-hash would silent-fail — peer's client cannot compute
- * matching SHA-256 HA1 from a pre-MD5-hashed secret). When peer has secret
- * (with or without md5secret), offer both algorithms. NULL peer (unknown-
- * peer challenge path) offers both algorithms for oracle parity. MD5 is
- * emitted first at challenge sites for chan_sip/legacy-client compatibility. */
-static int sofia_peer_offers_sha256(struct sofia_peer *peer)
-{
-	if (!peer) {
-		return 1;  /* unknown-peer: offer both for oracle-parity */
-	}
-	/* md5secret-only (no plaintext secret) → cannot derive SHA-256 HA1 */
-	if (!ast_strlen_zero(peer->md5secret) && ast_strlen_zero(peer->secret)) {
-		return 0;
-	}
-	return 1;
-}
-
 static void sofia_send_auth_challenge(nua_t *nua, nua_handle_t *nh, sip_t const *sip,
 		const char *realm, const char *method, const char *reason)
 {
@@ -10437,8 +10451,6 @@ static void sofia_send_auth_challenge(nua_t *nua, nua_handle_t *nh, sip_t const 
 	 * SS5 Finding #3 audit hardening: dual-algorithm offer (MD5 + SHA-256)
 	 * mirroring sofia_verify_digest_auth pattern at 3 challenge sites. */
 	char fresh_nonce[64];
-	char auth_md5[256];
-	char auth_sha256[256];
 	struct ast_sockaddr src;
 	char addr_buf[80];
 
@@ -10463,20 +10475,10 @@ static void sofia_send_auth_challenge(nua_t *nua, nua_handle_t *nh, sip_t const 
 	 * (REGISTER/SUBSCRIBE/INVITE unknown-peer) uniformly. */
 	sofia_emit_timing_equalized_reject();
 
-	snprintf(auth_sha256, sizeof(auth_sha256),
-		"Digest realm=\"%s\", nonce=\"%s\", qop=\"auth\", algorithm=SHA-256",
-		realm, fresh_nonce);
-	snprintf(auth_md5, sizeof(auth_md5),
-		"Digest realm=\"%s\", nonce=\"%s\", qop=\"auth\", algorithm=MD5",
-		realm, fresh_nonce);
-
-	/* Unknown-peer challenge offers both algorithms, MD5 first for legacy clients
-	 * that fail instead of skipping an unsupported first challenge. */
-	nua_respond(nh, SIP_401_UNAUTHORIZED,
-		SIPTAG_WWW_AUTHENTICATE_STR(auth_md5),
-		SIPTAG_WWW_AUTHENTICATE_STR(auth_sha256),
-		NUTAG_WITH_THIS(nua),
-		TAG_END());
+	/* Unknown-peer challenge — same global offer as everyone else. The [general]
+	 * auth_algorithms selection is applied inside the helper (MD5 first for
+	 * legacy-client compatibility). */
+	sofia_emit_auth_challenge(nua, nh, realm, fresh_nonce, 0);
 
 	sofia_get_source_addr(sip, &src);
 	ast_copy_string(addr_buf, ast_sockaddr_stringify(&src), sizeof(addr_buf));
@@ -10843,6 +10845,32 @@ static void sofia_regpool_update(void)
 	sofia_regpool_enabled = (sofia_cfg.register_pool && sofia_regpool_n > 0);
 }
 
+/* Uniform REGISTER outcome logging. On every attempt — success or failure — emit
+ * one NOTICE line with the SIP user (AOR) it was attempted for, the source IP, and
+ * the User-Agent (to identify the handset/phone model). Source IP comes from
+ * sofia_get_source_addr (Via received= / sent-by); the User-Agent from the SIP
+ * header. AOR is the peer name (known peer) or the From user (unknown/unmatched). */
+static void sofia_log_register_outcome(const char *result, const char *aor, sip_t const *sip)
+{
+	struct ast_sockaddr src;
+	const char *ua = (sip && sip->sip_user_agent && sip->sip_user_agent->g_string)
+		? sip->sip_user_agent->g_string : "(unknown)";
+
+	sofia_get_source_addr(sip, &src);
+	ast_log(LOG_NOTICE, "Sofia REGISTER %s: user='%s' ip=%s useragent='%s'\n",
+		result, S_OR(aor, "(unknown)"), ast_sockaddr_stringify(&src), ua);
+}
+
+/* A successful REGISTER is logged only when it CHANGES registration state — a new
+ * registration, an unregister, or a contact add/remove/move — not on every routine
+ * keepalive refresh (which would flood the log every ~60s per phone). Mirrors the
+ * "interesting event" set used by sofia_verbose_register_update. */
+static int sofia_register_changed(const struct sofia_register_update *u)
+{
+	return u && (u->wildcard_removed || u->contacts_removed || u->contacts_added
+		|| u->contacts_moved || (u->was_registered != u->now_registered));
+}
+
 static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
 		sip_t const *sip, tagi_t tags[])
 {
@@ -10871,12 +10899,10 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 	}
 
 	if (!user) {
-		char auth_empty[256];
-		snprintf(auth_empty, sizeof(auth_empty),
-			"Digest realm=\"%s\", nonce=\"empty\", qop=\"auth\", algorithm=MD5", realm);
-		nua_respond(nh, SIP_401_UNAUTHORIZED,
-			SIPTAG_WWW_AUTHENTICATE_STR(auth_empty),
-			TAG_END());
+		/* Malformed REGISTER (no From user) — emit a bogus nonce challenge then
+		 * reject. Honor [general] auth_algorithms for the advertised algorithm so
+		 * a sha256-only deployment never advertises MD5, even on this dead path. */
+		sofia_emit_auth_challenge(nua, nh, realm, "empty", 0);
 		sofia_blacklist_add_sip(sip, "REGISTER missing user");
 		return;
 	}
@@ -10901,6 +10927,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			nua_respond(nh, SIP_403_FORBIDDEN, TAG_END());
 			ast_verbose("Sofia: Registration rejected for unknown peer '%s'\n", user);
 		}
+		sofia_log_register_outcome("REJECT (unknown peer)", user, sip);
 		sofia_blacklist_add_sip(sip, "REGISTER unknown peer");
 		return;
 	}
@@ -10911,8 +10938,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		struct ast_sockaddr src;
 		sofia_get_source_addr(sip, &src);
 		if (ast_apply_ha(peer->ha, &src) != AST_SENSE_ALLOW) {
-			ast_log(LOG_NOTICE, "Sofia: REGISTER from %s rejected by peer '%s' ACL\n",
-				ast_sockaddr_stringify(&src), peer->name);
+			sofia_log_register_outcome("REJECT (ACL)", peer->name, sip);
 			nua_respond(nh, SIP_403_FORBIDDEN,
 				NUTAG_WITH_THIS(nua), TAG_END());
 			sofia_blacklist_add_sip(sip, "REGISTER peer ACL reject");
@@ -10929,12 +10955,14 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		 * sofia_update_peer_contacts. Helper emits 423 + Min-Expires + AMI on reject
 		 * (caller MUST return immediately). */
 		if (sofia_check_register_expiry(nua, nh, peer, &expires) < 0) {
+			sofia_log_register_outcome("REJECT (interval too brief)", peer->name, sip);
 			ao2_ref(peer, -1);
 			return;
 		}
 		/* post-T56 lockuseragent gate (2026-04-27): chan_sip parity at chan_sip.c:15839
 		 * placement (post-auth-success, pre-contact-update). no-secret path wire-in. */
 		if (sofia_check_lockuseragent(nua, nh, sip, peer) < 0) {
+			sofia_log_register_outcome("REJECT (user-agent lock)", peer->name, sip);
 			sofia_blacklist_add_sip(sip, "REGISTER user-agent lock reject");
 			ao2_ref(peer, -1);
 			return;
@@ -10945,6 +10973,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		if (rc < 0) {
 			ast_verbose("Sofia: REGISTER from peer '%s' rejected with 403 \xe2\x80\x94 too many registered devices (limit=%d)\n",
 				peer->name, peer->max_contacts);
+			sofia_log_register_outcome("REJECT (max contacts)", peer->name, sip);
 			nua_respond(nh, SIP_403_FORBIDDEN,
 				NUTAG_WITH_THIS(nua),
 				TAG_END());
@@ -10964,6 +10993,9 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			NUTAG_WITH_THIS(nua),
 			TAG_END());
 		sofia_verbose_register_update(peer, &reg_update);
+		if (sofia_register_changed(&reg_update)) {
+			sofia_log_register_outcome("OK", peer->name, sip);
+		}
 		ao2_ref(peer, -1);
 		return;
 	}
@@ -10981,6 +11013,9 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		enum sofia_auth_result auth_res = sofia_verify_digest_auth(peer,
 			nua, nh, sip, sip->sip_authorization, "REGISTER", realm);
 		if (auth_res != SOFIA_AUTH_OK) {
+			if (auth_res == SOFIA_AUTH_REJECT) {
+				sofia_log_register_outcome("REJECT (auth)", peer->name, sip);
+			}
 			ao2_ref(peer, -1);
 			return;
 		}
@@ -10992,12 +11027,14 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			 * second wire-in site (auth-OK path). Helper emits 423 + Min-Expires + AMI
 			 * on reject (caller MUST return immediately). */
 			if (sofia_check_register_expiry(nua, nh, peer, &expires) < 0) {
+				sofia_log_register_outcome("REJECT (interval too brief)", peer->name, sip);
 				ao2_ref(peer, -1);
 				return;
 			}
 			/* post-T56 lockuseragent gate (2026-04-27): chan_sip parity at chan_sip.c:15839
 			 * placement (post-auth-success, pre-contact-update). auth-OK path wire-in. */
 			if (sofia_check_lockuseragent(nua, nh, sip, peer) < 0) {
+				sofia_log_register_outcome("REJECT (user-agent lock)", peer->name, sip);
 				sofia_blacklist_add_sip(sip, "REGISTER user-agent lock reject");
 				ao2_ref(peer, -1);
 				return;
@@ -11008,6 +11045,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			if (rc < 0) {
 				ast_verbose("Sofia: REGISTER from peer '%s' rejected with 403 \xe2\x80\x94 too many registered devices (limit=%d)\n",
 					peer->name, peer->max_contacts);
+				sofia_log_register_outcome("REJECT (max contacts)", peer->name, sip);
 				nua_respond(nh, SIP_403_FORBIDDEN,
 					NUTAG_WITH_THIS(nua),
 					TAG_END());
@@ -11029,6 +11067,9 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			NUTAG_WITH_THIS(nua),
 			TAG_END());
 		sofia_verbose_register_update(peer, &reg_update);
+		if (sofia_register_changed(&reg_update)) {
+			sofia_log_register_outcome("OK", peer->name, sip);
+		}
 		/* post-T56 regexten parity (2026-04-27): auto-add dialplan extension on
 		 * REGISTER success (chan_sip parity). No-op if sofia_cfg.regcontext empty. */
 		register_peer_exten(peer, 1);
@@ -16203,6 +16244,22 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 					v->value, SOFIA_NONCE_TTL_SEC_DEFAULT);
 				sofia_cfg.nonce_ttl_seconds = 0;
 			}
+		} else if (!strcasecmp(v->name, "auth_algorithms")) {
+			/* Which digest algorithm(s) to OFFER in the WWW-Authenticate challenge.
+			 * both (default) = MD5 + SHA-256; md5 = MD5 only; sha256 = SHA-256 only.
+			 * Verification then accepts exactly what was offered for the peer
+			 * (anti-downgrade). Invalid value falls back to both with LOG_WARNING. */
+			if (!strcasecmp(v->value, "both") || !strcasecmp(v->value, "md5+sha256")) {
+				sofia_cfg.auth_algorithms = SOFIA_AUTH_ALG_BOTH;
+			} else if (!strcasecmp(v->value, "md5")) {
+				sofia_cfg.auth_algorithms = SOFIA_AUTH_ALG_MD5;
+			} else if (!strcasecmp(v->value, "sha256") || !strcasecmp(v->value, "sha-256")) {
+				sofia_cfg.auth_algorithms = SOFIA_AUTH_ALG_SHA256;
+			} else {
+				ast_log(LOG_WARNING, "Sofia: invalid auth_algorithms '%s' "
+					"(use both|md5|sha256); using default both\n", v->value);
+				sofia_cfg.auth_algorithms = SOFIA_AUTH_ALG_BOTH;
+			}
 		} else if (!strcasecmp(v->name, "session-timers")) {
 			/* post-T56 session timers (RFC 4028) (2026-04-27): [general] default; chan_sip parity. */
 			if (!strcasecmp(v->value, "originate"))      sofia_cfg.default_session_timers = SESSION_TIMERS_ORIGINATE;
@@ -17761,6 +17818,9 @@ static int sofia_apply_config(struct ast_config *cfg)
 	/* Default 0 = use SOFIA_NONCE_TTL_SEC_DEFAULT (3600s).
 	 * Operator override via [general] nonce_ttl_seconds=N. */
 	sofia_cfg.nonce_ttl_seconds = 0;
+	/* Built-in default BOTH = offer MD5 + SHA-256. Operator selects via [general]
+	 * auth_algorithms = both|md5|sha256 (the shipped sofia.conf sets md5). */
+	sofia_cfg.auth_algorithms = SOFIA_AUTH_ALG_BOTH;
 	/* post-T56 session timers (RFC 4028) (2026-04-27): chan_sip-parity defaults. */
 	sofia_cfg.default_session_timers = SESSION_TIMERS_ACCEPT; /* honor inbound; no initiate */
 	sofia_cfg.default_session_expires = 1800;                  /* RFC 4028 §4 typical */
