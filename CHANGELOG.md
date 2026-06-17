@@ -1,5 +1,31 @@
 # GABPBX Changelog
 
+## Unreleased
+
+`chan_sofia` scaling and call-forwarding work, building on the 1.0 correctness base.
+
+### Performance & scaling
+
+- **Bounded REGISTER offload pool** (`register_pool`, default **OFF**). Offloads the
+  realtime-database writes for REGISTER to a small fixed pool of AOR-keyed worker
+  lanes, so a slow-database REGISTER storm no longer head-of-line-blocks
+  INVITE/OPTIONS on the single signaling thread. Bounded (fixed lanes + in-flight
+  cap), reversible at runtime with `sofia reload`, and byte-for-byte the legacy
+  inline path until enabled. Same separation Kamailio gets from its async
+  usrloc/worker model and FreeSWITCH from its thread pools.
+- **Carrier-scale hash sizing.** Peer and dialog hash bucket caps enlarged
+  (`MAX_PEER_BUCKETS` 16381 → 65521, `MAX_DIALOG_BUCKETS` 8191 → 32749) so O(1)
+  peer/dialog lookups keep a load factor below 1 into tens of thousands of peers
+  and high concurrent-dialog volume.
+
+### Call forwarding
+
+- **`forceddiversion`** (per-peer). Forces a trunk-owned DID as the diverting party
+  in the outbound `Diversion` header (RFC 5806) on forwarded calls, so a carrier can
+  validate the diversion against a number it provisions for the trunk. Emitted only
+  when the channel carries a redirect marker; empty (default) keeps the legacy
+  data-driven behavior.
+
 ## 1.0
 
 The first tagged GABPBX release. `chan_sofia` — the Sofia-SIP based `chan_sip`

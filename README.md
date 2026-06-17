@@ -541,6 +541,48 @@ SessionTimerRefresh
 T38FaxNegotiation
 ```
 
+### chan_sofia Performance & Scaling
+
+chan_sofia borrows the parts of Kamailio and FreeSWITCH that matter for carrier
+scale and applies them to a drop-in chan_sip replacement: O(1) data structures on
+the hot path (as Kamailio does for its location and dialog stores), work taken off
+the single signaling thread (as both projects do with asynchronous workers and
+thread pools), with Sofia-SIP itself as the event-driven transport.
+
+**O(1) peer and dialog lookups.** Peers and active dialogs live in real hash
+tables with proper hash functions, so a deployment with thousands of registered
+peers and a high call rate never degrades to a linear scan on the signaling path.
+
+**Carrier-scale hash sizing.** The bucket caps are sized so the load factor stays
+below 1 well into tens of thousands of peers and high concurrent-dialog volume:
+
+```c
+#define MAX_PEER_BUCKETS   65521   /* ~2^16 prime: ~50k peers at load factor < 1 */
+#define MAX_DIALOG_BUCKETS 32749   /* ~2^15 prime: concurrent-dialog headroom   */
+```
+
+Primes give an even bucket distribution; the extra memory is a few hundred KB.
+
+**Bounded REGISTER offload pool (`register_pool`, default OFF).** Under a slow
+realtime-database REGISTER storm, the single Sofia signaling thread would
+otherwise block on the database write for each registration, head-of-line-blocking
+every INVITE and OPTIONS queued behind it. With `register_pool=yes`, the
+realtime-DB writes for REGISTER are handed to a small, fixed pool of worker lanes
+keyed by AOR — so per-AOR ordering is preserved while the signaling thread returns
+immediately. This is the same separation Kamailio gets from its asynchronous
+usrloc/worker model and FreeSWITCH from its thread pools. The pool is bounded
+(fixed lane count, fixed in-flight cap), ships behind a kill-switch that is **OFF
+by default** (behavior is byte-for-byte the legacy inline path until you enable
+it), and is reversible at runtime with a `sofia reload`.
+
+**Where this is going.** The REGISTER pool is Phase 1: it offloads only the
+database write, and it ships "dark" (default OFF) so the win can be measured on a
+real deployment before it is trusted. The direction is a signaling thread that
+never blocks on the database — the property both Kamailio and FreeSWITCH depend on
+for carrier-scale registration churn — by moving progressively more of the REGISTER
+path (and other sessionless work) onto the bounded worker pool as the Phase 1
+numbers justify it.
+
 ### chan_sofia Future Roadmap
 
 The project is conservative about roadmap claims: features listed here are not
@@ -568,6 +610,9 @@ Planned or staged work:
 - Per-peer dynamic T1 timer adjustment based on qualify RTT.
 - Text RTP QoS handling for `tos_text` and `cos_text`.
 - Video direct-media support after audio/direct-media behavior remains stable.
+- REGISTER offload pool Phase 2+: move more of the REGISTER path (digest auth,
+  contact bookkeeping) onto the bounded worker pool once Phase 1's measured numbers
+  justify it, toward a signaling thread that never blocks on the realtime database.
 - Better clean-reload and clean-unload behavior where Sofia-SIP thread ownership
   permits it. For now, restarting GABPBX is the correct operational method after
   changing the active SIP channel driver.
