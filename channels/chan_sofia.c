@@ -3099,6 +3099,23 @@ static int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct as
  * reschedule (one-shot). Drops the ao2 ref taken at ast_sched_thread_add.
  * Locks pvt for state read; releases before queue (avoids deadlock with
  * channel-locks in ast_queue_control_data). */
+/* Round5 #1 (Codex consensus): the 488 Not Acceptable Here emitted when aborting a peer
+ * T.38 re-INVITE is a nua_* call and must run on sofia_thread, not this ast_sched thread.
+ * The owner-dance + sofia_change_t38_state (which only queues a channel frame) stay on the
+ * sched thread; only the nua_respond is marshaled, with a FRESH +1 pvt ref. */
+static int sofia_dispatch_to_root_thread(void (*callback)(void *), void *data);
+static void sofia_t38_respond_488_root(void *data)
+{
+	struct sofia_pvt *pvt = data;
+
+	ast_mutex_lock(&pvt->lock);
+	if (pvt->nh) {
+		nua_respond(pvt->nh, 488, "Not Acceptable Here", TAG_END());
+	}
+	ast_mutex_unlock(&pvt->lock);
+	ao2_ref(pvt, -1);
+}
+
 static int sofia_t38_abort(const void *data)
 {
 	struct sofia_pvt *pvt = (struct sofia_pvt *)data;
@@ -3164,7 +3181,13 @@ static int sofia_t38_abort(const void *data)
 			 * status-phrase per sofia-sip-quirks SIPTAG_REASON_STR-causes-500
 			 * catalog avoidance. */
 			if (was_peer_reinvite && pvt->nh) {
-				nua_respond(pvt->nh, 488, "Not Acceptable Here", TAG_END());
+				/* Round5 #1: marshal the nua_respond onto sofia_thread with a FRESH +1
+				 * pvt ref (the scheduler ref stays with this callback for its ao2_ref(-1)
+				 * below); sofia_t38_respond_488_root drops the fresh ref. */
+				ao2_ref(pvt, +1);
+				if (sofia_dispatch_to_root_thread(sofia_t38_respond_488_root, pvt) < 0) {
+					ao2_ref(pvt, -1);
+				}
 			}
 		}
 		ast_mutex_unlock(&pvt->lock);
@@ -3204,16 +3227,14 @@ static void sofia_alreadygone(struct sofia_pvt *pvt)
  * BYE arrives within SOFIA_DEFER_BYE_TIMEOUT_MS this callback fires nua_bye
  * itself so we don't leak the dialog. Returns 0 = one-shot. Drops the ao2 ref
  * taken at ast_sched_thread_add. */
-static int sofia_defer_bye_cb(const void *data)
+/* Round5 #1 (Codex consensus): nua_bye must run on sofia_thread, NOT this ast_sched
+ * thread. The sofia_thread handler does the actual nua_bye; the sched callback only clears
+ * its sched-id and marshals (sofia_dispatch_to_root_thread is forward-declared above). */
+static void sofia_defer_bye_root(void *data)
 {
-	struct sofia_pvt *pvt = (struct sofia_pvt *)data;
-
-	if (!pvt) {
-		return 0;
-	}
+	struct sofia_pvt *pvt = data;
 
 	ast_mutex_lock(&pvt->lock);
-	pvt->defer_bye_sched_id = -1;
 	if (pvt->defer_bye && pvt->nh) {
 		char target_url[256];
 		int use_target = sofia_pvt_build_nat_target_url(pvt, target_url, sizeof(target_url));
@@ -3233,8 +3254,36 @@ static int sofia_defer_bye_cb(const void *data)
 	 * finishes processing the outbound BYE we just queued. */
 	ao2_unlink(dialogs, pvt);
 
-	/* Drop the ref we took when we scheduled. */
+	/* The scheduler's pvt ref was TRANSFERRED to this dispatch — drop it now. */
 	ao2_ref(pvt, -1);
+}
+
+static int sofia_defer_bye_cb(const void *data)
+{
+	struct sofia_pvt *pvt = (struct sofia_pvt *)data;
+
+	if (!pvt) {
+		return 0;
+	}
+
+	ast_mutex_lock(&pvt->lock);
+	pvt->defer_bye_sched_id = -1;
+	ast_mutex_unlock(&pvt->lock);
+
+	/* Round5 #1: marshal the nua_bye onto sofia_thread, TRANSFERRING the scheduler's pvt
+	 * ref to the dispatch (sofia_defer_bye_root drops it). On dispatch failure tear the
+	 * dialog down here so the pvt is not leaked (the deferred BYE is then lost). */
+	if (sofia_dispatch_to_root_thread(sofia_defer_bye_root, pvt) < 0) {
+		/* Round5 (Codex): mirror the handler's terminal state on the failure path too —
+		 * the deferred BYE is lost, but the dialog must still transition DOWN and be
+		 * collected (otherwise defer_bye stays set and the state is left mid-teardown). */
+		ast_mutex_lock(&pvt->lock);
+		pvt->defer_bye = 0;
+		pvt->state = SOFIA_DIALOG_STATE_DOWN;
+		ast_mutex_unlock(&pvt->lock);
+		ao2_unlink(dialogs, pvt);
+		ao2_ref(pvt, -1);
+	}
 	return 0;
 }
 
