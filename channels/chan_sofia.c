@@ -1480,6 +1480,7 @@ struct sofia_peer {
 	/* Qualify/NAT fields */
 	int qualify;
 	int qualifyfreq;
+	int qualify_pending;             /* Round5 #1: 1 = a qualify dispatch onto sofia_thread is in flight; gates the aux-thread timer from piling up duplicates */
 	int qualifytimeout;
 	enum sofia_peer_status peer_status;
 	struct timeval last_response;
@@ -15159,6 +15160,14 @@ static void sofia_qualify_peer(struct sofia_peer *peer)
 		TAG_END());
 }
 
+/* Round5 #1: defined here (was below) so sofia_qualify_thread can marshal a per-peer
+ * qualify onto sofia_thread via sofia_dispatch_to_root_thread, like the AMI SIPqualify. */
+struct sipqualifypeer_data {
+	struct sofia_peer *peer;	/* +1 ref TRANSFERRED to callback (caller doesn't drop) */
+	int clear_pending;		/* Round5 #1: 1 = timer dispatch owns peer->qualify_pending (callback clears it); 0 = AMI manual qualify (leaves the timer gate alone) */
+};
+static void sipqualifypeer_callback(void *data);
+
 static void *sofia_qualify_thread(void *data)
 {
 	while (sofia_nua) {
@@ -15172,16 +15181,46 @@ static void *sofia_qualify_thread(void *data)
 
 		i = ao2_iterator_init(peers, 0);
 		while ((peer = ao2_iterator_next(&i))) {
-			if (peer->qualify && peer->registered) {
+			/* Round5 #1 (Codex consensus + refinement): nua_handle()/nua_options() must
+			 * run on sofia_thread (same-thread-as-create, T40 assert), NOT this aux
+			 * qualify pthread — marshal the qualify via sofia_dispatch_to_root_thread,
+			 * exactly like the AMI SIPqualify action. Evaluate the due predicate AND set
+			 * the gate under peer->lock (the same lock that guards qualify_nh): gate on
+			 * !qualify_pending (a dispatch is queued but its callback has not run) AND
+			 * !qualify_nh (a prior OPTIONS is still in flight) so a slow sofia_thread does
+			 * not enqueue a no-op root callback every second. */
+			int do_dispatch = 0;
+			ast_mutex_lock(&peer->lock);
+			if (peer->qualify && peer->registered && !peer->qualify_pending && !peer->qualify_nh) {
 				time_t now = time(NULL);
-				time_t last_check = peer->last_qualify.tv_sec;
 				int freq = peer->qualifyfreq > 0 ? peer->qualifyfreq : DEFAULT_QUALIFYFREQ;
-
-				if (peer->peer_status == PEER_UNREACHABLE)
+				if (peer->peer_status == PEER_UNREACHABLE) {
 					freq = DEFAULT_FREQ_NOTOK;
+				}
+				if ((now - peer->last_qualify.tv_sec) >= freq) {
+					peer->qualify_pending = 1;
+					do_dispatch = 1;
+				}
+			}
+			ast_mutex_unlock(&peer->lock);
 
-				if ((now - last_check) >= freq) {
-					sofia_qualify_peer(peer);
+			if (do_dispatch) {
+				struct sipqualifypeer_data *qd = ast_calloc(1, sizeof(*qd));
+				if (qd) {
+					qd->peer = peer;
+					qd->clear_pending = 1;	/* timer owns the gate */
+					ao2_ref(peer, +1);	/* dispatch ref; sipqualifypeer_callback drops it */
+					if (sofia_dispatch_to_root_thread(sipqualifypeer_callback, qd) < 0) {
+						ast_mutex_lock(&peer->lock);
+						peer->qualify_pending = 0;
+						ast_mutex_unlock(&peer->lock);
+						ao2_ref(peer, -1);
+						ast_free(qd);
+					}
+				} else {
+					ast_mutex_lock(&peer->lock);
+					peer->qualify_pending = 0;
+					ast_mutex_unlock(&peer->lock);
 				}
 			}
 			ao2_ref(peer, -1);
@@ -21369,16 +21408,22 @@ static int manager_sofia_show_peer(struct mansession *s, const struct message *m
  * thread + sofia_qualify_peer creates a nua_handle (would hit the T40 same-
  * thread-as-create assert if called directly from manager thread). */
 
-struct sipqualifypeer_data {
-	struct sofia_peer *peer;	/* +1 ref TRANSFERRED to callback (caller doesn't drop) */
-};
-
 static void sipqualifypeer_callback(void *data)
 {
 	struct sipqualifypeer_data *d = data;
 	if (d) {
 		if (d->peer) {
 			sofia_qualify_peer(d->peer);
+			/* Round5 #1: only a TIMER dispatch (clear_pending=1) releases the gate — an
+			 * AMI manual qualify (clear_pending=0) must NOT clear a timer dispatch's
+			 * qualify_pending, or it would let the aux thread re-enqueue early. Cleared
+			 * under peer->lock (same lock the timer set it under). The OPTIONS handle
+			 * stays gated separately via peer->qualify_nh until its response/timeout. */
+			if (d->clear_pending) {
+				ast_mutex_lock(&d->peer->lock);
+				d->peer->qualify_pending = 0;
+				ast_mutex_unlock(&d->peer->lock);
+			}
 			ao2_ref(d->peer, -1);
 		}
 		ast_free(d);
