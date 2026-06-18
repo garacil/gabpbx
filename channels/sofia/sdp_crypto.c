@@ -407,10 +407,20 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 		method = strsep(&key_param, ":");
 		info = strsep(&key_param, ";");
 
-		if (!strcmp(method, "inline")) {
+		if (method && !strcmp(method, "inline")) {
 			key_salt = strsep(&info, "|");
 			lifetime = strsep(&info, "|");
 
+			/* A bare "inline" keyword with no ':' leaves info (and hence key_salt)
+			 * NULL; passing that to ast_base64decode below would NULL-deref and
+			 * crash the sofia thread on a single crafted inbound a=crypto. Reject it
+			 * here. ("inline:" with an empty remainder yields an empty-string
+			 * key_salt, not NULL — harmless, rejected downstream by the length
+			 * check.) */
+			if (!key_salt) {
+				ast_log(LOG_WARNING, "SRTP inline crypto attribute has no key-salt — rejecting\n");
+				continue;
+			}
 			if (lifetime) {
 				ast_log(LOG_NOTICE, "Crypto life time unsupported: %s\n", attr);
 				continue;
