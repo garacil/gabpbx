@@ -4194,8 +4194,15 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 				 * channel-exists ordering (sofia_new only attaches if udptl
 				 * pre-existed at channel-alloc time; this path covers
 				 * lazy-create-after-channel-exists). */
-				if (pvt->owner) {
-					pvt->owner->fds[5] = ast_udptl_fd(pvt->udptl);
+				/* Round3 deferred#3 (Codex#4 consensus): snapshot pvt->owner ONCE to
+				 * remove the double-read NULL-deref TOCTOU — a concurrent sofia_hangup
+				 * can null pvt->owner between the check and the fds[5] write. Callers
+				 * hold pvt/channel locks or an owner ref (or have no owner), so `o`
+				 * stays alive; the direct fds[] write matches the driver's audio/video
+				 * idiom (no channel lock pushed, no lock-order hazard). */
+				struct ast_channel *o = pvt->owner;
+				if (o) {
+					o->fds[5] = ast_udptl_fd(pvt->udptl);
 				}
 			}
 
