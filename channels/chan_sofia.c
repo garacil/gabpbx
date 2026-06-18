@@ -2124,11 +2124,19 @@ static int sofia_pvt_build_nat_target_url(struct sofia_pvt *pvt, char *buf, size
 	buf[0] = '\0';
 
 	contact = pvt->active_contact;
-	if (!contact || ast_sockaddr_isnull(&contact->src_addr)) {
+	if (!contact) {
 		return 0;
 	}
-
+	/* Codex#4: snapshot the contact's mutable src_addr under its ao2 lock — a
+	 * concurrent REGISTER refresh rewrites it (memcpy of a sockaddr), so an unlocked
+	 * read could observe a torn address and route the BYE to the wrong target.
+	 * contact->port/host/contact_uri are set once at contact creation (safe). */
+	ao2_lock(contact);
 	src = contact->src_addr;
+	ao2_unlock(contact);
+	if (ast_sockaddr_isnull(&src)) {
+		return 0;
+	}
 	if (contact->port == ast_sockaddr_port(&src) &&
 			!strcasecmp(contact->host, ast_sockaddr_stringify_host(&src))) {
 		return 0;
@@ -2243,7 +2251,13 @@ static struct sofia_contact *sofia_peer_find_contact_by_addr(struct sofia_peer *
 		return NULL;
 	ci = ao2_iterator_init(peer->contacts, 0);
 	while ((c = ao2_iterator_next(&ci))) {
-		if (ast_sockaddr_cmp(&c->src_addr, addr) == 0) {
+		int match;
+		/* Codex#4: compare the mutable src_addr under the contact lock (a REGISTER
+		 * refresh rewrites it concurrently). */
+		ao2_lock(c);
+		match = (ast_sockaddr_cmp(&c->src_addr, addr) == 0);
+		ao2_unlock(c);
+		if (match) {
 			found = c;
 			/* keep the ref from ao2_iterator_next */
 			break;
@@ -6815,7 +6829,13 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 
 		ci = ao2_iterator_init(pvt->peer->contacts, 0);
 		while ((c = ao2_iterator_next(&ci))) {
-			if (c->expires > now)
+			time_t c_exp;
+			/* Codex#4: snapshot the mutable expires under the contact lock (a
+			 * concurrent REGISTER refresh rewrites it). */
+			ao2_lock(c);
+			c_exp = c->expires;
+			ao2_unlock(c);
+			if (c_exp > now)
 				live++;
 			ao2_ref(c, -1);
 		}
@@ -6856,8 +6876,13 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 			while ((c = ao2_iterator_next(&ci))) {
 				struct sofia_pvt *child;
 				char ruri[256];
+				time_t c_exp;
 
-				if (c->expires <= now) {
+				/* Codex#4: snapshot expires under the contact lock (refresh race). */
+				ao2_lock(c);
+				c_exp = c->expires;
+				ao2_unlock(c);
+				if (c_exp <= now) {
 					ao2_ref(c, -1);
 					continue;
 				}
@@ -9239,7 +9264,10 @@ static int func_sofia_sippeer(struct ast_channel *chan, const char *cmd,
 	} else if (!strcasecmp(colname, "useragent")) {
 		struct sofia_contact *c = sofia_peer_first_contact(peer);
 		if (c) {
+			/* Codex#4: snapshot the mutable user_agent under the contact lock. */
+			ao2_lock(c);
 			ast_copy_string(buf, S_OR(c->user_agent, ""), len);
+			ao2_unlock(c);
 			ao2_ref(c, -1);
 		}
 	} else if (!strcasecmp(colname, "regexpire") || !strcasecmp(colname, "expire")) {
@@ -9397,7 +9425,15 @@ static void sofia_get_source_addr(sip_t const *sip, struct ast_sockaddr *addr)
 {
 	sip_via_t const *via;
 
-	if (!sip || !addr)
+	if (!addr)
+		return;
+	/* Codex#1: always leave addr in a well-defined state. Callers pass an
+	 * uninitialized stack struct ast_sockaddr; on any early return below (no sip,
+	 * no Via, no host, or a failed parse) it must be NULL, not garbage, so the
+	 * ACL / log / contact src_addr consumers don't read stack junk. */
+	ast_sockaddr_setnull(addr);
+
+	if (!sip)
 		return;
 
 	via = sip->sip_via;
@@ -9655,6 +9691,25 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 	struct ast_sockaddr src;
 	sip_contact_t *m;
 
+	/* Codex#3: a wildcard "Contact: *" (url_any) is valid ONLY as the sole Contact
+	 * with Expires:0 (RFC 3261 §10.2.2 — bulk unregister). A wildcard with a
+	 * non-zero expiry (no host -> bogus empty-host contact if stored) OR mixed with
+	 * other contacts is malformed -> reject the REGISTER with 400 (caller maps the
+	 * -2 return). The legitimate Expires:0 sole-wildcard unregister below is
+	 * unaffected. */
+	{
+		int has_wildcard = 0, n_contacts = 0;
+		for (m = sip->sip_contact; m; m = m->m_next) {
+			n_contacts++;
+			if (m->m_url->url_type == url_any) {
+				has_wildcard = 1;
+			}
+		}
+		if (has_wildcard && (expires != 0 || n_contacts > 1)) {
+			return -2;
+		}
+	}
+
 	sofia_get_source_addr(sip, &src);
 	if (update) {
 		memset(update, 0, sizeof(*update));
@@ -9745,7 +9800,12 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 
 			c = ao2_find(peer->contacts, uri, OBJ_POINTER);
 			if (c) {
-				/* Refresh existing contact */
+				/* Refresh existing contact. Codex#4: the mutable fields (expires,
+				 * src_addr, user_agent) are read off-thread by BYE-NAT-target / CLI /
+				 * AMI paths, so compare/copy/write them under the contact's own ao2
+				 * lock (peer->lock -> contact lock is the established order — no
+				 * inversion). */
+				ao2_lock(c);
 				if (update) {
 					update->contacts_refreshed++;
 					if (ast_sockaddr_cmp(&c->src_addr, &src)) {
@@ -9760,6 +9820,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				if (sip->sip_user_agent && sip->sip_user_agent->g_string)
 					ast_copy_string(c->user_agent, sip->sip_user_agent->g_string,
 						sizeof(c->user_agent));
+				ao2_unlock(c);
 				ao2_ref(c, -1);
 				if (sofia_debug)
 					ast_verbose("Sofia: Refreshed contact %s (expires in %ds)\n", uri, expires);
@@ -11094,6 +11155,52 @@ static int sofia_register_changed(const struct sofia_register_update *u)
 		|| u->contacts_moved || (u->was_registered != u->now_registered));
 }
 
+/* Codex#2: answer a Contact-less REGISTER — a binding QUERY (RFC 3261 §10.2.3),
+ * NOT a (de)registration — with the peer's CURRENT bindings and ZERO registration-
+ * state side-effects (no expiry bounds, no lockuseragent capture, no contact
+ * mutation, no realtime/regexten/devstate/PeerStatus). Caller must have
+ * authenticated/accepted first. Emits a 200 OK whose Contact list echoes the stored
+ * contacts (bare 200 with no Contact if none are registered). */
+static void sofia_respond_register_query(nua_t *nua, nua_handle_t *nh, struct sofia_peer *peer)
+{
+	struct ast_str *contacts = ast_str_create(256);
+	time_t now = time(NULL);
+
+	if (contacts && peer->contacts) {
+		struct ao2_iterator ci = ao2_iterator_init(peer->contacts, 0);
+		struct sofia_contact *c;
+		while ((c = ao2_iterator_next(&ci))) {
+			char uri[256];
+			long ttl;
+			/* contact_uri is set once at contact creation; expires is refreshed, so
+			 * read both under the contact lock (Codex#4 discipline). */
+			ao2_lock(c);
+			ast_copy_string(uri, c->contact_uri, sizeof(uri));
+			ttl = (long)(c->expires - now);
+			ao2_unlock(c);
+			if (ttl < 0) {
+				ttl = 0;
+			}
+			ast_str_append(&contacts, 0, "%s<%s>;expires=%ld",
+				ast_str_strlen(contacts) ? ", " : "", uri, ttl);
+			ao2_ref(c, -1);
+		}
+		ao2_iterator_destroy(&ci);
+	}
+	if (contacts && ast_str_strlen(contacts)) {
+		nua_respond(nh, SIP_200_OK,
+			SIPTAG_CONTACT_STR(ast_str_buffer(contacts)),
+			NUTAG_WITH_THIS(nua), TAG_END());
+	} else {
+		nua_respond(nh, SIP_200_OK, NUTAG_WITH_THIS(nua), TAG_END());
+	}
+	ast_free(contacts);
+	if (sofia_debug) {
+		ast_verbose("Sofia: REGISTER query (no Contact) for peer '%s' — returned current bindings\n",
+			peer->name);
+	}
+}
+
 static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
 		sip_t const *sip, tagi_t tags[])
 {
@@ -11175,6 +11282,13 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 	 * md5secret-only peer MUST go through the auth path — checking only peer->secret
 	 * let such a peer register with zero authentication (Contact hijack). */
 	if (ast_strlen_zero(peer->secret) && ast_strlen_zero(peer->md5secret)) {
+		/* Codex#2: a Contact-less REGISTER is a binding QUERY — answer with the
+		 * peer's current bindings and run NO registration-state side-effects. */
+		if (!sip->sip_contact) {
+			sofia_respond_register_query(nua, nh, peer);
+			ao2_ref(peer, -1);
+			return;
+		}
 		/* Clamp ex_delta (unsigned long) before the int cast: a value > INT_MAX
 		 * wraps negative / to 0 (spurious 423 or self-deregister). Real min/max
 		 * bounds are applied by sofia_check_register_expiry below. */
@@ -11201,6 +11315,13 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		ast_mutex_lock(&peer->lock);
 		int rc = sofia_update_peer_contacts(peer, sip, expires, &reg_update);
 		ast_mutex_unlock(&peer->lock);
+		if (rc == -2) {
+			/* Codex#3: wildcard "Contact: *" with non-zero Expires -> 400 (no-secret path). */
+			sofia_log_register_outcome("REJECT (bad wildcard contact)", peer->name, sip);
+			nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
+			ao2_ref(peer, -1);
+			return;
+		}
 		if (rc < 0) {
 			ast_verbose("Sofia: REGISTER from peer '%s' rejected with 403 \xe2\x80\x94 too many registered devices (limit=%d)\n",
 				peer->name, peer->max_contacts);
@@ -11253,6 +11374,13 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 	}
 
 	{
+			/* Codex#2: a Contact-less REGISTER is a binding QUERY (post-auth) —
+			 * answer with current bindings, run NO registration-state side-effects. */
+			if (!sip->sip_contact) {
+				sofia_respond_register_query(nua, nh, peer);
+				ao2_ref(peer, -1);
+				return;
+			}
 			/* Clamp ex_delta before the int cast (see no-secret path) — prevents
 			 * a >INT_MAX Expires from wrapping to 0/negative. */
 			int expires = sip->sip_expires
@@ -11277,6 +11405,13 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			ast_mutex_lock(&peer->lock);
 			int rc = sofia_update_peer_contacts(peer, sip, expires, &reg_update);
 			ast_mutex_unlock(&peer->lock);
+			if (rc == -2) {
+				/* Codex#3: wildcard "Contact: *" with non-zero Expires -> 400. */
+				sofia_log_register_outcome("REJECT (bad wildcard contact)", peer->name, sip);
+				nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
+				ao2_ref(peer, -1);
+				return;
+			}
 			if (rc < 0) {
 				ast_verbose("Sofia: REGISTER from peer '%s' rejected with 403 \xe2\x80\x94 too many registered devices (limit=%d)\n",
 					peer->name, peer->max_contacts);
@@ -16485,22 +16620,28 @@ static char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cl
 		sofia_cli_peer_line(&buf, "Contact count", "%d", contacts_used);
 		ci = ao2_iterator_init(peer->contacts, 0);
 		while ((c = ao2_iterator_next(&ci))) {
-			long ttl = (long)(c->expires - now);
 			char ttl_buf[32];
 			char contact_status[32];
 			char contact_label[32];
+			char src_buf[64];
 			int active_calls;
-			const char *src = !ast_sockaddr_isnull(&c->src_addr) ?
-				ast_sockaddr_stringify(&c->src_addr) : "(unknown)";
+			long ttl;
+			const char *src;
 
-			/* Snapshot active_calls under the contact lock that the
-			 * sofia_pvt_set/clear_active_contact writers hold, then use the
-			 * snapshot for the consistent test+print below.  Lock order is
-			 * peer->lock (already held) -> contact lock, matching every other
-			 * contact-lock holder. */
+			/* Snapshot the mutable contact fields (active_calls AND, per Codex#4,
+			 * expires + src_addr — a concurrent REGISTER refresh rewrites them) under
+			 * the contact lock, then use the snapshots for the consistent test+print
+			 * below.  Lock order is peer->lock (already held) -> contact lock,
+			 * matching every other contact-lock holder. */
+			char ua_buf[256];
 			ao2_lock(c);
+			ttl = (long)(c->expires - now);
+			ast_copy_string(src_buf, !ast_sockaddr_isnull(&c->src_addr) ?
+				ast_sockaddr_stringify(&c->src_addr) : "(unknown)", sizeof(src_buf));
+			ast_copy_string(ua_buf, c->user_agent[0] ? c->user_agent : "(none)", sizeof(ua_buf));
 			active_calls = c->active_calls;
 			ao2_unlock(c);
+			src = src_buf;
 
 			snprintf(ttl_buf, sizeof(ttl_buf), "%lds", ttl > 0 ? ttl : 0);
 			if (active_calls > 0) {
@@ -16514,8 +16655,7 @@ static char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cl
 			sofia_cli_peer_subline(&buf, "State", "%s", contact_status);
 			sofia_cli_peer_subline(&buf, "TTL", "%s", ttl_buf);
 			sofia_cli_peer_subline(&buf, "Source", "%s", src);
-			sofia_cli_peer_subline(&buf, "User-Agent", "%s",
-				c->user_agent[0] ? c->user_agent : "(none)");
+			sofia_cli_peer_subline(&buf, "User-Agent", "%s", ua_buf);
 			ao2_ref(c, -1);
 		}
 		ao2_iterator_destroy(&ci);
@@ -20684,7 +20824,16 @@ static int manager_sofia_show_peer(struct mansession *s, const struct message *m
 		ast_str_append(&buf, 0, "\r\n");
 	}
 	ast_str_append(&buf, 0, "Status: %s\r\n", status);
-	ast_str_append(&buf, 0, "SIP-Useragent: %s\r\n", contact ? S_OR(contact->user_agent, "") : "");
+	{
+		/* Codex#4: snapshot the mutable user_agent under the contact lock. */
+		char ua[256] = "";
+		if (contact) {
+			ao2_lock(contact);
+			ast_copy_string(ua, S_OR(contact->user_agent, ""), sizeof(ua));
+			ao2_unlock(contact);
+		}
+		ast_str_append(&buf, 0, "SIP-Useragent: %s\r\n", ua);
+	}
 	ast_str_append(&buf, 0, "Reg-Contact: %s\r\n", contact ? S_OR(contact->contact_uri, "") : "");
 	ast_str_append(&buf, 0, "QualifyFreq: %d ms\r\n", peer->qualifyfreq);
 	ast_str_append(&buf, 0, "Parkinglot: \r\n");
@@ -20790,10 +20939,25 @@ static int manager_sofia_show_registry(struct mansession *s, const struct messag
 
 	iter = ao2_iterator_init(peers, 0);
 	while ((peer = ao2_iterator_next(&iter))) {
+		/* Codex#5: snapshot the registry fields UNDER peer->lock, release it, then
+		 * astman_append — astman_append writes the AMI socket and blocks on a slow
+		 * client, so holding peer->lock across it stalls REGISTER/reload. */
+		int is_regline, port = 5060, registered = 0;
+		long refresh_secs = 0, reg_time = 0;
+		char l_host[256] = "", l_user[256] = "", l_domain[256] = "";
 		ast_mutex_lock(&peer->lock);
-		if (peer->is_register_line) {
-			long refresh_secs = peer->reg_expiry > now ? (long)(peer->reg_expiry - now) : 0;
-			int port = peer->port ? peer->port : 5060;
+		is_regline = peer->is_register_line;
+		if (is_regline) {
+			refresh_secs = peer->reg_expiry > now ? (long)(peer->reg_expiry - now) : 0;
+			port = peer->port ? peer->port : 5060;
+			registered = peer->registered;
+			reg_time = (long)peer->reg_expiry;
+			ast_copy_string(l_host, S_OR(peer->host, ""), sizeof(l_host));
+			ast_copy_string(l_user, S_OR(peer->defaultuser, ""), sizeof(l_user));
+			ast_copy_string(l_domain, S_OR(peer->fromdomain, ""), sizeof(l_domain));
+		}
+		ast_mutex_unlock(&peer->lock);
+		if (is_regline) {
 			astman_append(s,
 				"Event: RegistryEntry\r\n"
 				"%s"
@@ -20806,18 +20970,10 @@ static int manager_sofia_show_registry(struct mansession *s, const struct messag
 				"State: %s\r\n"
 				"RegistrationTime: %ld\r\n"
 				"\r\n",
-				idText,
-				S_OR(peer->host, ""),
-				port,
-				S_OR(peer->defaultuser, ""),
-				S_OR(peer->fromdomain, ""),
-				port,
-				refresh_secs,
-				peer->registered ? "Registered" : "Unregistered",
-				(long)peer->reg_expiry);
+				idText, l_host, port, l_user, l_domain, port,
+				refresh_secs, registered ? "Registered" : "Unregistered", reg_time);
 			count++;
 		}
-		ast_mutex_unlock(&peer->lock);
 		ao2_ref(peer, -1);
 	}
 	ao2_iterator_destroy(&iter);
