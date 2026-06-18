@@ -6492,18 +6492,34 @@ static struct sofia_peer *sofia_find_peer_realtime(const char *name)
 		}
 	}
 
+	peer->is_realtime = 1;
+	/* Publish the peer into the container FIRST, then create the side effects.
+	 * sofia_find_peer holds ao2_lock(peers) across this whole realtime build, so two
+	 * concurrent cache-miss builds for the same name are already serialised — link-
+	 * first does NOT reintroduce the duplicate-build race the old ordering avoided.
+	 * The win: on an ao2_link OOM nothing has been created yet, so there is no orphan
+	 * dialplan hint, dnsmgr entry or global contact_ha deny rule to unwind — we just
+	 * drain MWI, drop the build ref and fail the lookup. (R5 Codex#11 OOM unwind.) */
+	if (!ao2_link(peers, peer)) {
+		sofia_peer_drain_mwi(peer);
+		ao2_ref(peer, -1);
+		return NULL;
+	}
+
 	/* post-T56 germanico dynamic hints parity (2026-04-27): create static
 	 * presence-hint extension per chan_sip.c:5599-5606 mirror — gated on
 	 * peer->subscribecontext + peer->regexten both non-empty. Helper handles
 	 * chan_sip-parity ast_context_find_or_create + ast_add_extension2 +
-	 * AMI HintCreated surpass. Wire-in placement matches chan_sip site
-	 * (after build_peer-equivalent + before peer-publish). */
+	 * AMI HintCreated surpass. R5 Codex#11: now runs AFTER ao2_link (link-first) so
+	 * an ao2_link OOM never leaves an orphan hint around an unlinked peer. */
 	sofia_create_peer_hint(peer, "realtime");
 
 	/* post-T56 dnsmgr per-peer parity (2026-04-27): register async DNS lookup if
-	 * peer->host is hostname (not IP literal). chan_sip parity at chan_sip.c:29137-29161
-	 * placement (peer-build conclusion before publish). Helper handles IP-literal
-	 * pre-check + ao2_bump for callback ref + system-wide-dnsmgr-disabled fallback. */
+	 * peer->host is hostname (not IP literal). chan_sip parity at chan_sip.c:29137-29161.
+	 * R5 Codex#11: now runs AFTER ao2_link (link-first); on an OOM publish failure the
+	 * destructor would have released the dnsmgr anyway, but link-first means it is never
+	 * set up on the failing path. Helper handles IP-literal pre-check + ao2_bump for
+	 * callback ref + system-wide-dnsmgr-disabled fallback. */
 	sofia_dnsmgr_setup_peer(peer);
 
 	/* post-T56 dynamic_exclude_static [general] parity (2026-04-28): mirror of
@@ -6525,23 +6541,6 @@ static struct sofia_peer *sofia_find_peer_realtime(const char *name)
 					peer->name, peer->host);
 			}
 		}
-	}
-
-	peer->is_realtime = 1;
-	/* NOTE: this function is now called ONLY with ao2_lock(peers) held by
-	 * sofia_find_peer (see the atomicity comment there).  That serialises
-	 * concurrent realtime-cache-miss builds so no two threads can ever
-	 * link duplicate peer structs for the same name into the container.
-	 * Avoids the rollback problem an "optimistic build + post-lock dup-
-	 * check" approach would have: by the time we get here we have ALREADY
-	 * registered a dialplan hint, an ast_dnsmgr_entry with a peer ao2
-	 * ref-bump, and possibly appended a dynamic_exclude_static entry to
-	 * sofia_cfg.contact_ha — none of which can be cleanly unwound. */
-	if (!ao2_link(peers, peer)) {
-		/* Codex#1 edge: OOM — the peer never entered the container, so no removal
-		 * path will drain its MWI subscriptions before its final unref reaches the
-		 * destructor (the only remaining resurrection site). Drain here. */
-		sofia_peer_drain_mwi(peer);
 	}
 
 	/* post-T56 allowsubscribe derive (2026-04-27): runtime-added realtime peer —
@@ -6596,10 +6595,13 @@ static struct sofia_peer *sofia_find_peer(const char *name)
 	 * optional sipregs overlay + hint create + dnsmgr setup) briefly
 	 * serialises realtime cache-miss work across threads.  This is the
 	 * correct trade-off: the alternative — optimistic-build outside the
-	 * lock + post-lock dup-check — would leak the LOSER thread's hint
-	 * extension, dnsmgr entry and any sofia_cfg.contact_ha append (from
-	 * dynamic_exclude_static) because those side effects cannot be
-	 * cleanly rolled back.  Cache hits (the common case for live peers)
+	 * lock + post-lock dup-check — would still need this serialisation to
+	 * keep two builders from racing duplicate links.  (R5 Codex#11: the
+	 * realtime build now PUBLISHES the peer via ao2_link BEFORE it creates
+	 * the hint / dnsmgr / global contact_ha side effects, so an ao2_link
+	 * OOM fails cleanly with nothing to unwind; the global ACL append still
+	 * cannot be removed on normal peer teardown, but it is no longer created
+	 * on the OOM path.)  Cache hits (the common case for live peers)
 	 * never invoke the realtime path so concurrency on hot peers is
 	 * unaffected.  Container locks in gabpbx ao2 are recursive, so
 	 * helpers invoked under the lock (sofia_create_peer_hint,
@@ -19999,6 +20001,21 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 	 * gain presence-hint dialplan injection). Helper differentiates origin via
 	 * "config" source argument → "sofia_config_peer" registrar (operator visibility
 	 * into hint origin via `core show hints` Replace registrar). */
+	/* Link the newly allocated peer FIRST, before the hint/dnsmgr/global-ACL side
+	 * effects below, so an ao2_link OOM never orphans those around an unlinked peer
+	 * (R5 Codex#11). An existing (surviving) reload peer is already in the container —
+	 * re-linking it would duplicate the node and leak a container ref, so only a
+	 * new_alloc peer is linked here. */
+	if (new_alloc) {
+		if (!ao2_link(peers, peer)) {
+			/* OOM — drain MWI before the peer's final unref reaches the destructor,
+			 * drop the build ref and bail without creating any side effect to orphan. */
+			sofia_peer_drain_mwi(peer);
+			ao2_ref(peer, -1);
+			return;
+		}
+	}
+
 	sofia_create_peer_hint(peer, "config");
 
 	/* post-T56 dnsmgr per-peer parity (2026-04-27): register async DNS lookup
@@ -20028,17 +20045,6 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		}
 	}
 
-	/* Only link a newly allocated peer.  An existing (surviving) config peer
-	 * is already in the container; re-linking it would duplicate the node and
-	 * leak a container ref on every reload (see new_alloc comment above and
-	 * the identical guard in the register=> parser). */
-	if (new_alloc) {
-		if (!ao2_link(peers, peer)) {
-			/* Codex#1 edge: OOM — drain MWI before the peer's final unref reaches
-			 * the destructor, since it never entered the container. */
-			sofia_peer_drain_mwi(peer);
-		}
-	}
 	ao2_ref(peer, -1);
 }
 
