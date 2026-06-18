@@ -1894,6 +1894,8 @@ struct sofia_pvt {
 	struct sofia_contact *active_contact;  /* contact this call is on (holds ao2 ref) */
 	struct ast_sockaddr redirip;     /* directmedia: peer's RTP target; zero = relay through PBX */
 	int reinvite_pending;            /* 1 = directmedia re-INVITE in flight; gates response handler */
+	unsigned long sess_id;           /* Round5 M8: SDP o= session-id, set ONCE per dialog (RFC 4566 5.2 / RFC 3264 8 require it constant across all offers/answers) */
+	unsigned long sess_version;      /* Round5 M8: SDP o= session-version, bumped on each generated SDP */
 	int hold_state;                  /* 1 = peer holding us (a=sendonly/inactive); 0 = active (sendrecv) */
 	struct sofia_srtp *srtp;         /* T37: audio SDES-SRTP context (NULL = plain RTP); freed in destructor */
 	struct sofia_srtp *vsrtp;        /* T37: video SDES-SRTP context (NULL = plain RTP); freed in destructor */
@@ -2483,6 +2485,14 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	master->nh = child->nh;
 	child->nh = NULL;
 	nua_handle_bind(master->nh, master);
+
+	/* Round5 M8 (Codex): the winner CHILD generated the initial SDP offer (its
+	 * sess_id/sess_version), and the dialog is now continued on the master. Inherit the
+	 * child's o= session identity so the first master-generated re-INVITE keeps the same
+	 * sess-id (a fresh master->sess_id would otherwise change it, breaking RFC 3264 §8
+	 * in-dialog session identity after a forked call). */
+	master->sess_id = child->sess_id;
+	master->sess_version = child->sess_version;
 
 	/* Set active contact on master from winner child's ruri (sip:exten@host:port) */
 	if (master->peer && !ast_strlen_zero(child->ruri)) {
@@ -3684,6 +3694,15 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 	}
 
 	/* Assemble audio SDP — m= proto switches to RTP/SAVP when SRTP active */
+	/* Round5 M8: set the o= session-id ONCE per dialog and bump only the session-version
+	 * on each generated SDP (RFC 4566 5.2 / RFC 3264 8 — the id MUST stay constant across
+	 * all offers/answers in a dialog; only the version increments when the SDP changes).
+	 * Previously both were time(NULL) on every call, so a re-offer looked like a brand-new
+	 * session to strict peers. */
+	if (!pvt->sess_id) {
+		pvt->sess_id = (unsigned long)time(NULL);
+	}
+	pvt->sess_version++;
 	snprintf(buf, len,
 		"v=0\r\n"
 		"o=- %lu %lu IN %s %s\r\n"
@@ -3693,7 +3712,7 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 		"m=audio %d %s %s\r\n"
 		"%s"
 		"a=sendrecv\r\n",
-		(unsigned long)time(NULL), (unsigned long)time(NULL),
+		pvt->sess_id, pvt->sess_version,
 		sdp_family, host, sdp_family, host, port,
 		(pvt->srtp && pvt->srtp->crypto) ? "RTP/SAVP" : "RTP/AVP",
 		payload_buf, rtpmap_buf);
