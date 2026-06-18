@@ -10035,7 +10035,21 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				c->expires = now + expires;
 				memcpy(&c->src_addr, &src, sizeof(src));
 				ao2_lock(peer->contacts);
-				if (ao2_container_count(peer->contacts) >= peer->max_contacts) {
+				/* Round5 #6 + Codex A-2 refinement: LINK the new binding FIRST and only
+				 * evict the oldest AFTERWARDS, so an ao2_link OOM never costs the phone an
+				 * existing contact (eviction-before-link could drop a good binding and
+				 * then fail to store the new one). __ao2_link returns NULL on OOM -> the
+				 * binding was NOT stored: undo the add accounting and return -3 so the
+				 * caller answers 500 instead of a bogus 200 OK with no stored contact. */
+				if (!ao2_link(peer->contacts, c)) {
+					if (update) {
+						update->contacts_added--;
+					}
+					ao2_unlock(peer->contacts);
+					ao2_ref(c, -1);
+					return -3;
+				}
+				if (ao2_container_count(peer->contacts) > peer->max_contacts) {
 					/* chan_sip parity: peer is at max_contacts and a NEW Contact
 					 * URI just arrived (the refresh branch above didn't match).
 					 * chan_sip never rejected in this case — it replaced the
@@ -10050,6 +10064,14 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 
 					i = ao2_iterator_init(peer->contacts, 0);
 					while ((cand = ao2_iterator_next(&i))) {
+						if (cand == c) {
+							/* Round5 Codex A-2 recheck: never evict the binding we just
+							 * linked — a short-TTL new contact can have the smallest
+							 * expires and would otherwise be picked as the LRU victim,
+							 * re-introducing the "200 OK with no stored binding" bug. */
+							ao2_ref(cand, -1);
+							continue;
+						}
 						if (!oldest || cand->expires < oldest->expires) {
 							if (oldest) {
 								ao2_ref(oldest, -1);
@@ -10077,7 +10099,6 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 						ao2_ref(oldest, -1);
 					}
 				}
-				ao2_link(peer->contacts, c);
 				ao2_unlock(peer->contacts);
 				ao2_ref(c, -1);
 				if (sofia_debug)
@@ -11554,6 +11575,14 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			ao2_ref(peer, -1);
 			return;
 		}
+		if (rc == -3) {
+			/* Round5 #6: contact storage failed (ao2_link OOM) — answer 500, not a
+			 * bogus 200 OK with no stored binding. */
+			sofia_log_register_outcome("REJECT (contact storage failed)", peer->name, sip);
+			nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
+			ao2_ref(peer, -1);
+			return;
+		}
 		if (rc < 0) {
 			ast_verbose("Sofia: REGISTER from peer '%s' rejected with 403 \xe2\x80\x94 too many registered devices (limit=%d)\n",
 				peer->name, peer->max_contacts);
@@ -11654,6 +11683,14 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 				/* Codex#3: wildcard "Contact: *" with non-zero Expires -> 400. */
 				sofia_log_register_outcome("REJECT (bad wildcard contact)", peer->name, sip);
 				nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
+				ao2_ref(peer, -1);
+				return;
+			}
+			if (rc == -3) {
+				/* Round5 #6: contact storage failed (ao2_link OOM) — answer 500, not a
+				 * bogus 200 OK with no stored binding. */
+				sofia_log_register_outcome("REJECT (contact storage failed)", peer->name, sip);
+				nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
 				ao2_ref(peer, -1);
 				return;
 			}
@@ -21522,7 +21559,12 @@ static void sipnotify_callback(void *data)
 			TAG_IF(header_buf, SIPTAG_HEADER_STR(header_buf ? ast_str_buffer(header_buf) : "")),
 			TAG_IF(!ast_strlen_zero(d->content), SIPTAG_PAYLOAD_STR(d->content)),
 			TAG_END());
-		/* nua_handle is reaped by sofia-sip when the NOTIFY transaction completes. */
+		/* Round5 #3/#10 (DEFERRED — Codex): this is an APPLICATION-created one-shot
+		 * handle that sofia-sip does NOT auto-reap (the old "reaped by sofia-sip"
+		 * comment was wrong), so each AMI SIPnotify leaks a nua_handle + su_home.
+		 * Destroying it immediately here is UNSAFE — it would drop the queued NOTIFY
+		 * before it reaches the wire. The correct fix is to bind a sentinel magic and
+		 * destroy on the final nua_r_notify; tracked as a dedicated change. */
 	} else {
 		ast_log(LOG_WARNING, "Sofia SIPnotify: nua_handle creation failed for target %s\n",
 			d->target_uri);
@@ -21618,10 +21660,20 @@ static int manager_sofia_notify(struct mansession *s, const struct message *m)
 			resized = ast_realloc(dispatch->headers,
 				(dispatch->header_count + 1) * sizeof(*dispatch->headers));
 			if (resized) {
+				char *hn = ast_strdup(v->name);
+				char *hv = ast_strdup(v->value);
 				dispatch->headers = resized;
-				dispatch->headers[dispatch->header_count].name = ast_strdup(v->name);
-				dispatch->headers[dispatch->header_count].value = ast_strdup(v->value);
-				dispatch->header_count++;
+				/* Round5 Codex#4: only COUNT the header when BOTH strdups succeed —
+				 * the callback formats "%s: %s" over name/value, so a NULL from a failed
+				 * strdup would deref NULL. On partial failure free what we got and skip. */
+				if (hn && hv) {
+					dispatch->headers[dispatch->header_count].name = hn;
+					dispatch->headers[dispatch->header_count].value = hv;
+					dispatch->header_count++;
+				} else {
+					ast_free(hn);
+					ast_free(hv);
+				}
 			}
 		}
 	}
