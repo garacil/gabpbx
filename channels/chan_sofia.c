@@ -2534,13 +2534,18 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	master->vsrtp = child->vsrtp;
 	child->vsrtp = NULL;
 
-	/* Update master channel file descriptors from stolen RTP instances */
-	if (master->owner && master->rtp) {
-		master->owner->fds[0] = ast_rtp_instance_fd(master->rtp, 0);
-		master->owner->fds[1] = ast_rtp_instance_fd(master->rtp, 1);
+	/* Round4 C8 (Codex consensus): compute the stolen-RTP fds HERE (under master->lock,
+	 * where master->rtp/vrtp are stable) but DEFER writing them into the channel's
+	 * fds[] until below, under the CHANNEL lock on the reffed m_owner. Writing
+	 * owner->fds[] here re-read master->owner unlocked and raced ast_do_masquerade's
+	 * fd swap. */
+	int win_fd[4] = { -1, -1, -1, -1 };
+	if (master->rtp) {
+		win_fd[0] = ast_rtp_instance_fd(master->rtp, 0);
+		win_fd[1] = ast_rtp_instance_fd(master->rtp, 1);
 		if (master->vrtp) {
-			master->owner->fds[2] = ast_rtp_instance_fd(master->vrtp, 0);
-			master->owner->fds[3] = ast_rtp_instance_fd(master->vrtp, 1);
+			win_fd[2] = ast_rtp_instance_fd(master->vrtp, 0);
+			win_fd[3] = ast_rtp_instance_fd(master->vrtp, 1);
 		}
 	}
 
@@ -2557,6 +2562,27 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	ast_mutex_unlock(&master->lock);
 
 	if (m_owner) {
+		/* Round4 C8: write the stolen-RTP fds under the CHANNEL lock (master->lock is
+		 * already dropped, so this is the canonical channel->pvt order) — serializes
+		 * with ast_do_masquerade's fds[] swap instead of racing it. */
+		if (win_fd[0] >= 0) {
+			ast_channel_lock(m_owner);
+			ast_mutex_lock(&master->lock);
+			/* Round4 C8 (Codex refinement): revalidate the owner under the channel
+			 * lock — a masquerade between dropping master->lock above and here could
+			 * have swapped master->owner, so only write fds[] when m_owner is STILL
+			 * the master's channel (channel->pvt lock order, no inversion). */
+			if (master->owner == m_owner) {
+				m_owner->fds[0] = win_fd[0];
+				m_owner->fds[1] = win_fd[1];
+				if (win_fd[2] >= 0) {
+					m_owner->fds[2] = win_fd[2];
+					m_owner->fds[3] = win_fd[3];
+				}
+			}
+			ast_mutex_unlock(&master->lock);
+			ast_channel_unlock(m_owner);
+		}
 		ast_queue_control(m_owner, AST_CONTROL_ANSWER);
 		ast_setstate(m_owner, AST_STATE_UP);
 		ast_channel_unref(m_owner);
@@ -7142,8 +7168,22 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 						 * dialogs). Only children that reach nua_invite are linked/counted,
 						 * so a child that failed nh/rtp/crypto setup is never counted (its
 						 * ao2_ref(child,-1) below frees it) — fork->child_count stays exact. */
-						ao2_link(fork->children, child);
-						ao2_link(dialogs, child);
+						/* Round4 #1 (Codex consensus): __ao2_link returns NULL on OOM. An
+						 * INVITE for a child NOT in `dialogs` (unfindable -> master hangs,
+						 * response unroutable) or NOT in fork->children (uncancellable loser)
+						 * corrupts the fork — require BOTH links before counting + inviting;
+						 * undo a partial link and skip the invite on failure. The child's
+						 * creation ref is dropped by the ao2_ref(child,-1) below, which frees
+						 * the now-unlinked child. */
+						int child_linked = 0;
+						if (ao2_link(fork->children, child)) {
+							if (ao2_link(dialogs, child)) {
+								child_linked = 1;
+							} else {
+								ao2_unlink(fork->children, child);
+							}
+						}
+						if (child_linked) {
 						ast_mutex_lock(&fork->lock);
 						fork->child_count++;
 						ast_mutex_unlock(&fork->lock);
@@ -7172,6 +7212,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 								TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
 								SIPTAG_MAX_FORWARDS_STR(mf_str_child),
 								TAG_END());
+						}
 						}
 					}
 				}
@@ -16967,11 +17008,15 @@ static char *sofia_cli_show_inuse(struct ast_cli_entry *e, int cmd, struct ast_c
 		}
 		snprintf(iused, sizeof(iused), "%d/%d/%d",
 			peer->inUse, peer->inRinging, peer->onHold);
-		if (showall || peer->call_limit > 0 || peer->busy_level > 0
-				|| peer->inUse > 0 || peer->inRinging > 0 || peer->onHold > 0) {
+		/* Round4 C4 (Codex consensus): decide under the ao2 lock, RELEASE it, then do
+		 * the blocking ast_cli — l_name/iused/ilimits are already local snapshots, so
+		 * the lock is not held across the CLI write. */
+		int show = (showall || peer->call_limit > 0 || peer->busy_level > 0
+				|| peer->inUse > 0 || peer->inRinging > 0 || peer->onHold > 0);
+		ao2_unlock(peer);
+		if (show) {
 			ast_cli(a->fd, FORMAT2, l_name, iused, ilimits);
 		}
-		ao2_unlock(peer);
 		ao2_ref(peer, -1);
 	}
 	ao2_iterator_destroy(&iter);
@@ -17597,6 +17642,11 @@ static char *sofia_cli_show_blacklist(struct ast_cli_entry *e, int cmd, struct a
 	}
 
 	ast_cli(a->fd, BLACKLIST_FORMAT, "IP", "Counter", "First seen", "Last seen");
+	/* Round4 C3 (Codex consensus): accumulate the rows into a heap buffer UNDER the
+	 * lock, then emit them with a single ast_cli AFTER releasing it — the auth-failure
+	 * path on sofia_thread also takes sofia_blacklist_lock, so a blocking CLI write
+	 * held across the iteration stalls signaling. */
+	struct ast_str *bl_buf = ast_str_create(2048);
 	ast_mutex_lock(&sofia_blacklist_lock);
 	iter = ao2_iterator_init(sofia_blacklist, 0);
 		while ((entry = ao2_iterator_next(&iter))) {
@@ -17617,13 +17667,19 @@ static char *sofia_cli_show_blacklist(struct ast_cli_entry *e, int cmd, struct a
 		snprintf(counter, sizeof(counter), "%d/%d",
 			entry->counter, sofia_blacklist_count);
 
-		ast_cli(a->fd, BLACKLIST_FORMAT, entry->ip, counter, first, last);
+		if (bl_buf) {
+			ast_str_append(&bl_buf, 0, BLACKLIST_FORMAT, entry->ip, counter, first, last);
+		}
 		ao2_ref(entry, -1);
 		total++;
 	}
 	ao2_iterator_destroy(&iter);
 	ast_mutex_unlock(&sofia_blacklist_lock);
 
+	if (bl_buf) {
+		ast_cli(a->fd, "%s", ast_str_buffer(bl_buf));
+		ast_free(bl_buf);
+	}
 	ast_cli(a->fd, "Total %d/%d\n", total, sofia_blacklist_max);
 	return CLI_SUCCESS;
 #undef BLACKLIST_FORMAT
