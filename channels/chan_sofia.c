@@ -6720,6 +6720,12 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 	snprintf(mf_str, sizeof(mf_str), "%d", mf);
 
 	if (!pvt || !pvt->nh || !sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf))) {
+		/* Round5 #1: nothing was sent — release the reinvite gate so a future bridge
+		 * tick can retry (the directmedia marshal pre-sets reinvite_pending before
+		 * dispatching here; without this clear a guard-fail would leave it stuck). */
+		if (pvt) {
+			pvt->reinvite_pending = 0;
+		}
 		return;
 	}
 	pvt->reinvite_pending = 1;
@@ -6732,6 +6738,33 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 		pvt->callid ? pvt->callid : "(no-callid)",
 		ast_sockaddr_stringify_host(&pvt->redirip),
 		ast_sockaddr_port(&pvt->redirip));
+}
+
+/* Round5 #1 (Codex consensus): the directmedia re-INVITE (nua_invite) must run on
+ * sofia_thread, NOT the bridge thread that invokes .update_peer (sofia_set_rtp_peer).
+ * sofia_set_rtp_peer stashes the new redirip + sets pvt->reinvite_pending under pvt->lock
+ * and dispatches this handler with a +1 pvt ref; here we re-lock pvt and run
+ * sofia_send_reinvite on sofia_thread (which NULL-guards pvt->nh and, on a guard-fail,
+ * clears reinvite_pending so the gate is released). */
+static void sofia_directmedia_reinvite_root(void *data)
+{
+	struct sofia_pvt *pvt = data;
+
+	ast_mutex_lock(&pvt->lock);
+	/* Round5 #1 (Codex marshal-window fix): REVALIDATE the same guards the bridge thread
+	 * checked before dispatch — hangup can run between that dispatch and this callback,
+	 * and sofia_hangup can leave pvt->nh non-NULL while moving the dialog DOWN, so without
+	 * this we could send a late re-INVITE after BYE/CANCEL teardown started. Clear the gate
+	 * and bail if the call is gone / not up / handle dropped. */
+	if (pvt->alreadygone || pvt->state != SOFIA_DIALOG_STATE_UP || !pvt->nh) {
+		pvt->reinvite_pending = 0;
+		ast_mutex_unlock(&pvt->lock);
+		ao2_ref(pvt, -1);
+		return;
+	}
+	sofia_send_reinvite(pvt);
+	ast_mutex_unlock(&pvt->lock);
+	ao2_ref(pvt, -1);
 }
 
 static int sofia_set_rtp_peer(struct ast_channel *chan, struct ast_rtp_instance *instance,
@@ -6775,8 +6808,19 @@ static int sofia_set_rtp_peer(struct ast_channel *chan, struct ast_rtp_instance 
 		return 0;
 	}
 	ast_sockaddr_copy(&pvt->redirip, &new_redirip);
-	sofia_send_reinvite(pvt);
+	/* Round5 #1: marshal the re-INVITE onto sofia_thread. Set reinvite_pending so a
+	 * concurrent bridge tick takes the "already pending" gate above (just updating
+	 * redirip) rather than dispatching again, take a +1 pvt ref, drop pvt->lock, then
+	 * dispatch. On dispatch failure clear reinvite_pending + drop the ref. */
+	pvt->reinvite_pending = 1;
+	ao2_ref(pvt, +1);
 	ast_mutex_unlock(&pvt->lock);
+	if (sofia_dispatch_to_root_thread(sofia_directmedia_reinvite_root, pvt) < 0) {
+		ast_mutex_lock(&pvt->lock);
+		pvt->reinvite_pending = 0;
+		ast_mutex_unlock(&pvt->lock);
+		ao2_ref(pvt, -1);
+	}
 	return 0;
 }
 
