@@ -554,6 +554,8 @@ static struct {
 	char tlsbindaddr[64];
 	int  tlsbindport;        /* 0 = disabled; common: 5061 */
 	char tlscertfile[256];   /* directory containing agent.pem (combined cert+key) */
+	int  tlsverify;          /* Round4 #3: verify the peer cert chain on TLS/WSS (default 0
+	                          * = OFF, sofia-sip default; opt-in, requires a CA bundle). */
 	char wsbindaddr[64];
 	int  wsbindport;         /* 0 = disabled; common: 5066 */
 	char wssbindaddr[64];
@@ -16089,6 +16091,16 @@ static void *sofia_thread_func(void *data)
 			TAG_IF(wss_url[0], NUTAG_WSS_URL(wss_url)),
 			TAG_IF(needs_cert && !ast_strlen_zero(sofia_cfg.tlscertfile),
 				NUTAG_CERTIFICATE_DIR(sofia_cfg.tlscertfile)),
+			/* Round4 #3 (Codex+Claude, dual-found): opt-in peer-certificate
+			 * verification. Default OFF keeps sofia-sip's TPTLS_VERIFY_NONE (current
+			 * behavior, no handshake change). With tlsverify=yes the OUTGOING
+			 * (client-side) server certificate chain + subject + validity date are
+			 * verified against the CA material in tlscertfile — closes the silent
+			 * accept-any-cert MITM exposure on outbound TLS/WSS trunks/registrations. */
+			TAG_IF(needs_cert && sofia_cfg.tlsverify,
+				TPTAG_TLS_VERIFY_POLICY(TPTLS_VERIFY_SUBJECTS_OUT)),
+			TAG_IF(needs_cert && sofia_cfg.tlsverify,
+				TPTAG_TLS_VERIFY_DATE(1)),
 			NUTAG_MEDIA_ENABLE(0),
 			NUTAG_ALLOW("INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, REFER, MESSAGE, INFO, PUBLISH, PRACK"),
 			NUTAG_APPL_METHOD("REGISTER"),
@@ -18031,6 +18043,11 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			sofia_cfg.tlsbindport = atoi(v->value);
 		} else if (!strcasecmp(v->name, "tlscertfile") || !strcasecmp(v->name, "tlscertdir")) {
 			ast_copy_string(sofia_cfg.tlscertfile, v->value, sizeof(sofia_cfg.tlscertfile));
+		} else if (!strcasecmp(v->name, "tlsverify") || !strcasecmp(v->name, "tlsverifyserver")) {
+			/* Round4 #3: opt-in TLS peer-certificate verification (default OFF). When
+			 * enabled, outbound TLS/WSS connections validate the server cert chain +
+			 * subject against the configured CA material (tlscertfile dir). */
+			sofia_cfg.tlsverify = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "wsbindaddr")) {
 			ast_copy_string(sofia_cfg.wsbindaddr, v->value, sizeof(sofia_cfg.wsbindaddr));
 		} else if (!strcasecmp(v->name, "wsbindport")) {
@@ -20293,10 +20310,10 @@ static int sofia_dispatch_to_root_thread(void (*callback)(void *), void *data)
  *  worker. The CLI caller posts the request, blocks on a condvar with a
  *  30-second deadline, and reports the worker's verdict.
  *
- *  Listener-config changes (the 11 fields baked into nua_create at
+ *  Listener-config changes (the 12 fields baked into nua_create at
  *  sofia_thread startup — bindaddr, bindport, tlsbindaddr, tlsbindport,
- *  tlscertfile, wsbindaddr, wsbindport, wssbindaddr, wssbindport,
- *  timert1, timerb) are pre-validated BEFORE any sofia_cfg mutation:
+ *  tlscertfile, tlsverify, wsbindaddr, wsbindport, wssbindaddr,
+ *  wssbindport, timert1, timerb) are pre-validated BEFORE any sofia_cfg mutation:
  *  sofia_reload_listener_changed reads them from the parsed config via
  *  ast_variable_retrieve and compares against the live sofia_cfg. Any
  *  diff aborts the reload with a clear error — silent recreation of the
@@ -20338,7 +20355,7 @@ static void sofia_reload_req_destructor(void *obj)
 	ast_mutex_destroy(&req->mutex);
 }
 
-/* Compare the 11 listener-baked fields in the freshly-parsed cfg against
+/* Compare the 12 listener-baked fields in the freshly-parsed cfg against
  * the live sofia_cfg. Returns 1 if any differs (reload must be refused),
  * 0 if all match. Does NOT mutate sofia_cfg — reads the new values
  * straight from ast_variable_retrieve so the abort path is safe even if
@@ -20406,6 +20423,23 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 					written += snprintf(buf + written, sizeof(buf) - written,
 						"%s%s", written ? "," : "", fields[i].key);
 				}
+			}
+		}
+	}
+
+	/* Round4 #3 (Codex refinement): tlsverify is a BOOLEAN knob (yes/no) wired into the
+	 * TLS listener at nua_create, so changing it needs a listener restart too — compare
+	 * with ast_true, not the atoi path above (atoi("yes")==0 would never detect it). */
+	{
+		const char *nv = ast_variable_retrieve(cfg, "general", "tlsverify");
+		if (!nv) {
+			nv = ast_variable_retrieve(cfg, "general", "tlsverifyserver");
+		}
+		if (nv && (!!sofia_cfg.tlsverify != !!ast_true(nv))) {
+			changed = 1;
+			if (written < (int)sizeof(buf) - 16) {
+				written += snprintf(buf + written, sizeof(buf) - written,
+					"%s%s", written ? "," : "", "tlsverify");
 			}
 		}
 	}
