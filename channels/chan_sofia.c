@@ -15569,6 +15569,15 @@ static struct sofia_pvt *sofia_pvt_ref_if_linked(nua_hmagic_t *hmagic)
 	return ao2_find(dialogs, hmagic, OBJ_POINTER);
 }
 
+/* R5 Codex#3/#4: sentinel hmagic for AMI SIPnotify one-shot handles. Its ADDRESS is
+ * a unique value that can never equal a heap sofia_pvt / sofia_peer / sofia_presence_sub
+ * pointer, so sofia_event_callback can recognise the app-owned out-of-dialog NOTIFY
+ * handle (which sofia-sip never auto-reaps) purely by pointer equality and destroy it
+ * when the NOTIFY transaction reaches its final response. NON-const so the
+ * nua_hmagic_t* cast does not discard a qualifier. */
+static char sofia_sipnotify_sentinel;
+#define SOFIA_SIPNOTIFY_HMAGIC ((nua_hmagic_t *)&sofia_sipnotify_sentinel)
+
 static void sofia_event_callback(nua_event_t event, int status, char const *phrase,
 		nua_t *nua, nua_magic_t *magic,
 		nua_handle_t *nh, nua_hmagic_t *hmagic,
@@ -15582,6 +15591,26 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	 * the pvt local, so that is correct. */
 	struct sofia_pvt *dialog_pvt = NULL;
 	const char *event_name = nua_event_name(event);
+
+	/* R5 Codex#3/#4: AMI SIPnotify one-shot handle — recognised by its sentinel hmagic.
+	 * Destroy the app-owned out-of-dialog NOTIFY handle once the transaction reaches a
+	 * final response (sofia-sip never auto-reaps it; NOTIFY is a non-INVITE transaction
+	 * so the single final nua_r_notify carries status>=200 — 200/481, or 408 on timeout;
+	 * provisional/retry reports status 100). Handled HERE, before the debug logging, the
+	 * blacklist switch and the dialog teardown-race ref guard, so the pvt/peer/presence-
+	 * sub dispatch never sees the sentinel. dialog_pvt is still NULL at this point, so the
+	 * early return skips no ref cleanup. nua_handle_destroy is legal here because this
+	 * callback and sipnotify_callback both run on sofia_thread (T40 same-thread rule). */
+	if (hmagic == SOFIA_SIPNOTIFY_HMAGIC) {
+		if (event == nua_r_notify && status >= 200) {
+			if (sofia_debug) {
+				ast_verbose("Sofia SIPnotify: NOTIFY final response %d %s — destroying one-shot handle\n",
+					status, phrase);
+			}
+			nua_handle_destroy(nh);
+		}
+		return;
+	}
 
 	/* Debug-gated event logging for peer/ip filter modes */
 	if (sofia_debug > 1 && sip) {
@@ -22053,19 +22082,19 @@ static void sipnotify_callback(void *data)
 		}
 	}
 
-	nh = nua_handle(sofia_nua, NULL, NUTAG_URL(d->target_uri), TAG_END());
+	/* R5 Codex#3/#4: bind the SIPnotify sentinel hmagic so sofia_event_callback can
+	 * recognise this app-owned one-shot handle and destroy it on the final nua_r_notify
+	 * (sofia-sip does NOT auto-reap it — each AMI SIPnotify would otherwise leak a
+	 * nua_handle + su_home). Destroying it here, right after nua_notify, is UNSAFE — it
+	 * would drop the queued NOTIFY before it reaches the wire — so the destroy is deferred
+	 * to the transaction's final response. */
+	nh = nua_handle(sofia_nua, SOFIA_SIPNOTIFY_HMAGIC, NUTAG_URL(d->target_uri), TAG_END());
 	if (nh) {
 		nua_notify(nh,
 			SIPTAG_EVENT_STR(d->event),
 			TAG_IF(header_buf, SIPTAG_HEADER_STR(header_buf ? ast_str_buffer(header_buf) : "")),
 			TAG_IF(!ast_strlen_zero(d->content), SIPTAG_PAYLOAD_STR(d->content)),
 			TAG_END());
-		/* Round5 #3/#10 (DEFERRED — Codex): this is an APPLICATION-created one-shot
-		 * handle that sofia-sip does NOT auto-reap (the old "reaped by sofia-sip"
-		 * comment was wrong), so each AMI SIPnotify leaks a nua_handle + su_home.
-		 * Destroying it immediately here is UNSAFE — it would drop the queued NOTIFY
-		 * before it reaches the wire. The correct fix is to bind a sentinel magic and
-		 * destroy on the final nua_r_notify; tracked as a dedicated change. */
 	} else {
 		ast_log(LOG_WARNING, "Sofia SIPnotify: nua_handle creation failed for target %s\n",
 			d->target_uri);
