@@ -1233,6 +1233,13 @@ struct sofia_register_update {
 	int contacts_removed;
 	int contacts_moved;
 	int wildcard_removed;
+	/* Round5 (b): set by sofia_update_peer_contacts (under peer->lock, pure accumulator)
+	 * and consumed by sofia_emit_register_side_effects AFTER unlock — moves the
+	 * register_peer_exten / PeerStatus AMI / ast_devstate_changed emissions (dialplan
+	 * conlock + AMI + hint recompute) out from under peer->lock. emit_unregister is
+	 * mutually exclusive with the registered tail (Codex). */
+	int emit_unregister;
+	const char *unregister_cause;	/* string literal: "Wildcard" / "Expired" */
 	char changed_uri[256];
 	struct ast_sockaddr old_src;
 	struct ast_sockaddr new_src;
@@ -10129,17 +10136,15 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 					update->contacts_after = 0;
 					sofia_register_update_set_uri(update, "*");
 				}
-				/* post-T56 regexten parity (2026-04-27): auto-remove dialplan extension on
-				 * wildcard unregister (chan_sip parity). No-op if sofia_cfg.regcontext empty. */
-				register_peer_exten(peer, 0);
-				manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
-					"ChannelType: SIP\r\n"
-					"Peer: SIP/%s\r\n"
-					"PeerStatus: Unregistered\r\n"
-					"Cause: Wildcard\r\n",
-					peer->name);
-				/* BLF/presence: re-evaluate SIP/<peer> hint state (now offline). */
-				ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
+				/* Round5 (b): defer the unregister side-effects (regexten dialplan /
+				 * PeerStatus AMI / devstate hint recompute) to the caller AFTER peer->lock
+				 * is released — they take the global contexts lock + emit AMI + fan out BLF,
+				 * which must not run under the peer mutex. emit_unregister is mutually
+				 * exclusive with the registered tail. */
+				if (update) {
+					update->emit_unregister = 1;
+					update->unregister_cause = "Wildcard";
+				}
 				return 0;
 				}
 			}
@@ -10330,17 +10335,11 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 		if (update && update->was_registered && !update->contacts_removed) {
 			update->contacts_removed = update->contacts_before;
 		}
-		/* post-T56 regexten parity (2026-04-27): auto-remove dialplan extension on
-		 * expiry-driven unregister (chan_sip parity). No-op if sofia_cfg.regcontext empty. */
-		register_peer_exten(peer, 0);
-		manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
-			"ChannelType: SIP\r\n"
-			"Peer: SIP/%s\r\n"
-			"PeerStatus: Unregistered\r\n"
-			"Cause: Expired\r\n",
-			peer->name);
-		/* BLF/presence: re-evaluate SIP/<peer> hint state (now offline). */
-		ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
+		/* Round5 (b): defer the unregister side-effects to the caller after unlock. */
+		if (update) {
+			update->emit_unregister = 1;
+			update->unregister_cause = "Expired";
+		}
 	}
 	if (update) {
 		update->now_registered = peer->registered;
@@ -10898,6 +10897,22 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	}
 
 	using_qop = (auth_qop && !strcasecmp(auth_qop, "auth"));
+
+	/* Round5 (Codex#8 + re-review): we ALWAYS challenge with qop="auth", so a PRESENT qop
+	 * that is not exactly "auth" is malformed / a downgrade attempt — without this it would
+	 * fall through to the legacy RFC 2069 no-qop digest, bypassing the nc/cnonce replay
+	 * tracking a qop=auth challenge mandates. Check RAW header presence (msg_header_find_param)
+	 * rather than the parsed auth_qop: sofia_au_get_unq returns NULL on an OVERSIZED value, so
+	 * an oversized qop would otherwise be misread as "no qop" and slip through. A MISSING qop
+	 * is deliberately still accepted (legacy RFC 2069 compat is a separate, config-gated,
+	 * deferred decision). */
+	if (au && msg_header_find_param(au->au_common, "qop") && !using_qop) {
+		nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
+		ast_verbose("Sofia: %s auth rejected for '%s' - unsupported/oversized qop (only qop=auth is offered)\n",
+			method, peer->name);
+		sofia_blacklist_add_sip(sip, "digest unsupported qop");
+		return SOFIA_AUTH_REJECT;
+	}
 
 	/* RFC 2617 §3.2.2: if qop is sent, nc and cnonce MUST also be present. */
 	if (auth_qop && (!auth_nc || !auth_cnonce)) {
@@ -11662,6 +11677,53 @@ static void sofia_respond_register_query(nua_t *nua, nua_handle_t *nh, struct so
 	}
 }
 
+/* Round5 (b): emit the REGISTER side-effects — dialplan regexten + PeerStatus AMI + BLF/
+ * presence devstate — AFTER peer->lock is released (sofia_update_peer_contacts is now a pure
+ * accumulator that records the intent in `update`). These take the global contexts lock, emit
+ * AMI, and fan out BLF, none of which should run under the peer mutex. emit_unregister is
+ * MUTUALLY EXCLUSIVE with the registered tail (a wildcard/expiry unregister never also fires
+ * PeerStatus Registered — this also fixes a prior auth-path double-emit). Called by BOTH the
+ * no-secret and auth REGISTER 200-OK paths so their side-effects are identical (parity fix). */
+static void sofia_emit_register_side_effects(struct sofia_peer *peer, sip_t const *sip,
+		const struct sofia_register_update *update)
+{
+	if (!peer || !update) {
+		return;
+	}
+	if (update->emit_unregister) {
+		register_peer_exten(peer, 0);
+		manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
+			"ChannelType: SIP\r\n"
+			"Peer: SIP/%s\r\n"
+			"PeerStatus: Unregistered\r\n"
+			"Cause: %s\r\n",
+			peer->name, update->unregister_cause ? update->unregister_cause : "Unregister");
+		ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
+		return;	/* mutually exclusive with the registered tail */
+	}
+	/* Registered / refresh: regexten + PeerStatus Registered fire on every real 200 OK,
+	 * devstate only on an actual registration transition (sofia_register_changed). */
+	register_peer_exten(peer, 1);
+	if (sofia_register_changed(update)) {
+		ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
+	}
+	manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
+		"ChannelType: SIP\r\n"
+		"Peer: SIP/%s\r\n"
+		"PeerStatus: Registered\r\n"
+		"Address: %s\r\n"
+		"RegContact: %s\r\n"
+		"UserAgent: %s\r\n"
+		"Context: %s\r\n",
+		peer->name,
+		ast_sockaddr_stringify(&update->new_src),	/* Codex: use the snapshot, not a post-unlock peer->src_addr read */
+		(sip && sip->sip_contact && sip->sip_contact->m_url->url_host) ?
+			sip->sip_contact->m_url->url_host : "",
+		(sip && sip->sip_user_agent && sip->sip_user_agent->g_string) ?
+			sip->sip_user_agent->g_string : "",
+		peer->context);
+}
+
 static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
 		sip_t const *sip, tagi_t tags[])
 {
@@ -11826,6 +11888,9 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		if (sofia_register_changed(&reg_update)) {
 			sofia_log_register_outcome("OK", peer->name, sip);
 		}
+		/* Round5 (b) PARITY FIX: the no-secret REGISTER path previously skipped the
+		 * post-success side-effects the auth path runs — emit them here too. */
+		sofia_emit_register_side_effects(peer, sip, &reg_update);
 		ao2_ref(peer, -1);
 		return;
 	}
@@ -11936,31 +12001,10 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		if (sofia_register_changed(&reg_update)) {
 			sofia_log_register_outcome("OK", peer->name, sip);
 		}
-		/* post-T56 regexten parity (2026-04-27): auto-add dialplan extension on
-		 * REGISTER success (chan_sip parity). No-op if sofia_cfg.regcontext empty. */
-		register_peer_exten(peer, 1);
-		/* BLF/presence: re-evaluate SIP/<peer> hint state ONLY on a real
-		 * registration transition (offline->online / contact change). A plain
-		 * ~60s refresh REGISTER changes nothing, so gating on sofia_register_changed
-		 * avoids a needless devstate recompute + BLF fan-out per refresh per peer. */
-		if (sofia_register_changed(&reg_update)) {
-			ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
-		}
-		manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
-			"ChannelType: SIP\r\n"
-			"Peer: SIP/%s\r\n"
-			"PeerStatus: Registered\r\n"
-			"Address: %s\r\n"
-			"RegContact: %s\r\n"
-			"UserAgent: %s\r\n"
-			"Context: %s\r\n",
-			peer->name,
-			ast_sockaddr_stringify(&peer->src_addr),
-			(sip && sip->sip_contact && sip->sip_contact->m_url->url_host) ?
-				sip->sip_contact->m_url->url_host : "",
-			(sip && sip->sip_user_agent && sip->sip_user_agent->g_string) ?
-				sip->sip_user_agent->g_string : "",
-			peer->context);
+		/* Round5 (b): the REGISTER side-effects (regexten + PeerStatus Registered +
+		 * devstate) are now emitted by sofia_emit_register_side_effects, post-unlock and
+		 * shared with the no-secret path. */
+		sofia_emit_register_side_effects(peer, sip, &reg_update);
 		ao2_ref(peer, -1);
 }
 
