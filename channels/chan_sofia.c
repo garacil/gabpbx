@@ -8872,6 +8872,16 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		sofia_send_auth_challenge(nua, nh, sip, realm, "INVITE", "UnknownPeer");
 		ao2_ref(pvt, -1);
 		return;
+	} else if (!sofia_cfg.allowguest) {
+		/* Round4 Codex#2: an unknown / unauthenticated caller with allowguest=no is
+		 * rejected with 403 instead of routing an unauthenticated INVITE to the
+		 * dialplan (toll-fraud). alwaysauthreject (above) still challenges first when
+		 * set; IP-validated / host=ip peers are matched non-NULL upstream and never
+		 * reach this guest branch. chan_sip AUTH_SECRET_FAILED -> 403 parity. */
+		ast_log(LOG_NOTICE, "Sofia: INVITE from unknown peer rejected — allowguest=no\n");
+		nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
+		ao2_ref(pvt, -1);
+		return;
 	}
 
 	/* post-T56 inband DTMF detect parity SS1 R4 (2026-04-27): inbound enable
