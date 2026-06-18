@@ -5519,6 +5519,111 @@ static void sofia_dnsmgr_setup_peer(struct sofia_peer *peer)
 	}
 }
 
+/* Round5 M3-full (config-reload full-reset): the config-derived defaults shared by
+ * a freshly allocated peer (sofia_peer_alloc) AND an existing peer being re-parsed on
+ * reload (sofia_parse_peer_config cache-hit). Previously only sofia_peer_alloc set
+ * these, so a peer that survived a reload kept the stale value of any per-peer key the
+ * operator REMOVED (e.g. maxcallbitrate/session_expires/allowtransfer/faxdetect/
+ * language/srtpcipher all stuck at their old per-peer value). The reload path used to
+ * re-default only an 8-field security subset (md5secret/insecure/encryption/directmedia/
+ * qualify/nat/call_limit/busy_level); this helper makes the WHOLE default set uniform.
+ *
+ * Differences from the old inline alloc block, all deliberate:
+ *  - Inherited stringfields (srtpcipher/disallowed_methods/subscribecontext/moh*) are
+ *    set UNCONDITIONALLY via S_OR(default,"") instead of "only if the [general] default
+ *    is non-empty". The conditional form is fine for a zero-initialized new peer but on
+ *    reload it would leave a stale per-peer value when the global default is empty, so
+ *    a removed per-peer srtpcipher= (etc.) would never clear. Behaviour-identical for a
+ *    new peer (empty stays empty).
+ *  - Adds md5secret=""/insecure=0/qualify=0 (the 3 security fields the legacy alloc
+ *    block did not set explicitly — new peers got them via zero-alloc; the reload path
+ *    needs them set so this helper can fully replace the 8-field subset).
+ *  - EXCLUDES runtime/structural anchors (handled by the caller, NOT defaulted here):
+ *    the ao2 alloc, string-field init, mutex, name, the peer->contacts container, the
+ *    is_realtime/is_register_line/_reload_marked flags, and the captured
+ *    locked_user_agent registration anchor (the caller preserves it across reload when
+ *    lockuseragent stays enabled — clearing it would open a re-capture window).
+ *
+ * Called under peer->lock in the reload path; the global contact_ha dup below takes
+ * sofia_contactha_lock, which is a LEAF (no site holds it while acquiring peer->lock),
+ * so peer->lock -> contactha_lock has no inversion. */
+static void sofia_peer_set_defaults(struct sofia_peer *peer)
+{
+	ast_string_field_set(peer, context, sofia_cfg.context);
+	peer->type = 0;
+	peer->port = DEFAULT_SIP_PORT;
+	peer->transport = SOFIA_TRANSPORT_UDP;
+	ast_sockaddr_setnull(&peer->defaddr);
+	peer->maxcallbitrate = sofia_cfg.default_maxcallbitrate;
+	peer->amaflags = 0;
+	peer->subscribemwi = 0;
+	peer->preferred_codec_only = sofia_cfg.default_preferred_codec_only;
+	peer->ignoresdpversion = sofia_cfg.default_ignoresdpversion;
+	peer->promiscredir = sofia_cfg.default_promiscredir;
+	peer->autoframing = sofia_cfg.default_autoframing;
+	peer->faxdetect_mode = sofia_cfg.default_faxdetect_mode;
+	peer->t38pt_udptl = 0;
+	peer->t38_ec_mode = SOFIA_T38_EC_FEC;
+	peer->t38_maxdatagram = sofia_cfg.default_t38_maxdatagram;
+	peer->t38pt_usertpsource = 0;
+	peer->timer_b = sofia_cfg.default_timer_b;
+	peer->timer_t1 = sofia_cfg.default_timer_t1;
+	peer->allowoverlap_mode = sofia_cfg.default_allowoverlap_mode;
+	peer->progressinband = sofia_cfg.default_progressinband;
+	peer->rtptimeout = sofia_cfg.default_rtptimeout;
+	peer->rtpholdtimeout = sofia_cfg.default_rtpholdtimeout;
+	peer->rtpkeepalive = sofia_cfg.default_rtpkeepalive;
+	peer->expiresecs = sofia_cfg.default_expiry > 0 ? sofia_cfg.default_expiry : DEFAULT_EXPIRY;
+	peer->capability = sofia_cfg.capability;
+	peer->prefs = sofia_cfg.prefs;
+	peer->dtmfmode = SOFIA_DTMF_RFC2833;
+	peer->directmedia = 0;
+	peer->nat = SOFIA_NAT_FORCE_RPORT;
+	peer->busy_on_active = sofia_cfg.busy_on_active;
+	peer->max_contacts = sofia_cfg.max_contacts ? sofia_cfg.max_contacts : 6;
+	peer->encryption = 0;
+	ast_string_field_set(peer, srtpcipher, S_OR(sofia_cfg.default_srtpcipher, ""));
+	peer->session_timers = sofia_cfg.default_session_timers;
+	peer->session_expires = sofia_cfg.default_session_expires;
+	peer->session_minse = sofia_cfg.default_session_minse;
+	peer->session_refresher = sofia_cfg.default_session_refresher;
+	peer->callingpres = sofia_cfg.default_callingpres;
+	peer->sendrpid = sofia_cfg.default_sendrpid;
+	peer->trustrpid = sofia_cfg.default_trustrpid;
+	peer->call_limit = sofia_cfg.default_call_limit;
+	peer->busy_level = sofia_cfg.default_busy_level;
+	peer->allowtransfer = sofia_cfg.default_allowtransfer;
+	peer->allowsubscribe = sofia_cfg.default_allowsubscribe;
+	peer->buggymwi = 0;
+	peer->lockuseragent = 0;
+	ast_string_field_set(peer, lockuseragent_prefixes, "");
+	peer->usereqphone = sofia_cfg.default_usereqphone;
+	peer->maxforwards = sofia_cfg.default_max_forwards;
+	ast_string_field_set(peer, disallowed_methods, S_OR(sofia_cfg.disallowed_methods, ""));
+	/* Re-inherit the global contact ACL (matches new-peer semantics — the per-peer
+	 * contactpermit/deny parser appends to this afterwards). reload-UAF: contact_ha is
+	 * a freeable global; serialize the read against the reload writer. */
+	ast_rwlock_rdlock(&sofia_contactha_lock);
+	if (sofia_cfg.contact_ha) {
+		peer->contactha = ast_duplicate_ha_list(sofia_cfg.contact_ha);
+	}
+	ast_rwlock_unlock(&sofia_contactha_lock);
+	ast_string_field_set(peer, subscribecontext, S_OR(sofia_cfg.default_subscribecontext, ""));
+	ast_string_field_set(peer, language, sofia_cfg.default_language);
+	ast_string_field_set(peer, parkinglot, sofia_cfg.default_parkinglot);
+	ast_string_field_set(peer, mohinterpret, S_OR(sofia_cfg.default_mohinterpret, ""));
+	ast_string_field_set(peer, mohsuggest, S_OR(sofia_cfg.default_mohsuggest, ""));
+	peer->qualifyfreq = 60;
+	/* The 3 security fields the legacy alloc block did not set explicitly but the prior
+	 * M3 hotfix subset DID reset on reload — keep resetting them here so B2 fully
+	 * subsumes that subset (a stale md5secret/insecure must not survive). Other
+	 * never-reset per-peer fields (qualifytimeout/forceddiversion/callbackextension/
+	 * outboundproxy/groups) are a separate follow-up, deliberately NOT folded into B2. */
+	ast_string_field_set(peer, md5secret, "");
+	peer->insecure = 0;
+	peer->qualify = 0;
+}
+
 static struct sofia_peer *sofia_peer_alloc(const char *name)
 {
 	struct sofia_peer *peer;
@@ -5534,198 +5639,14 @@ static struct sofia_peer *sofia_peer_alloc(const char *name)
 	}
 
 	ast_string_field_set(peer, name, name);
-	ast_string_field_set(peer, context, sofia_cfg.context);
 	ast_mutex_init(&peer->lock);
-	peer->type = 0;
-	peer->port = DEFAULT_SIP_PORT;
-	/* peer->transport is decorative in chan_sofia: per-listener bindings
-	 * control which transports the server accepts, per-Contact transport is
-	 * derived from the Contact URL scheme at REGISTER-time (sofia_contact at
-	 * L8704-8712), and the parsers no longer write this field — the operator's
-	 * `transport=` value is accepted for chan_sip drop-in template compatibility
-	 * and otherwise ignored. Defensive explicit init so CLI/AMI display and the
-	 * outbound-extern-port switch at sofia_build_ourip see a defined value. */
-	peer->transport = SOFIA_TRANSPORT_UDP;
-	/* post-T56 defaultip per-peer parity (2026-04-28): chan_sip parity at
-	 * chan_sip.c:28452 verbatim ast_sockaddr_setnull(peer->defaddr) default-init.
-	 * Set non-empty by per-peer parser via ast_get_ip(peer->defaddr, v->value). */
-	ast_sockaddr_setnull(&peer->defaddr);
-	/* post-T56 maxcallbitrate per-peer parity (2026-04-28): inherit [general]
-	 * default_maxcallbitrate; chan_sip parity at chan_sip.c:28454 verbatim. */
-	peer->maxcallbitrate = sofia_cfg.default_maxcallbitrate;
-	/* post-T56 amaflags per-peer parity (2026-04-28): default 0 (no AMA flags) per
-	 * chan_sip drop-in; per-peer-only ([general] ABSENT). Channel-core default
-	 * preserved when peer has no AMA flags (sofia_new gated on non-zero per
-	 * chan_sip.c:7947-7948 verbatim). */
-	peer->amaflags = 0;
-	/* post-T56 subscribemwi per-peer parity (2026-04-28): default 0 FALSE per
-	 * chan_sip drop-in (sip.h:324 SIP_PAGE2_SUBSCRIBEMWIONLY default-clear).
-	 * PARSE-COMPAT-ONLY ship — Pattern 12 17th-instance NEW sub-pattern
-	 * chan_sofia-architectural-divergence. */
-	peer->subscribemwi = 0;
-	/* post-T56 preferred_codec_only per-peer parity (2026-04-28): inherit [general]
-	 * default_preferred_codec_only before per-peer parser overrides; chan_sip parity
-	 * default-FALSE drop-in. Consumed at sofia_generate_sdp Option 6-A direction-
-	 * symmetric narrowing (chan_sofia helper-architecture-advantage 12th-instance). */
-	peer->preferred_codec_only = sofia_cfg.default_preferred_codec_only;
-	/* post-T56 ignoresdpversion per-peer parity (2026-04-28): inherit [general] default
-	 * before per-peer parser overrides. PARSE-COMPAT-ONLY (chan_sofia processes every
-	 * SDP unconditionally; flag has no behavioral effect). */
-	peer->ignoresdpversion = sofia_cfg.default_ignoresdpversion;
-	/* post-T56 promiscredir per-peer parity (2026-04-28): inherit [general] default
-	 * before per-peer parser overrides. PARSE-COMPAT-ONLY (chan_sofia nua_r_redirect
-	 * handler ABSENT; flag has no behavioral effect). */
-	peer->promiscredir = sofia_cfg.default_promiscredir;
-	/* post-T56 autoframing per-peer parity (2026-04-28): inherit [general] default
-	 * before per-peer parser overrides. PARSE-COMPAT-ONLY (chan_sofia sofia_parse_
-	 * sdp ptime gate not wired today; flag has no behavioral effect). */
-	peer->autoframing = sofia_cfg.default_autoframing;
-	/* post-T56 faxdetect per-peer multi-mode parity (2026-04-28): inherit [general]
-	 * default 4-state. SS6 (2026-04-28): chan_sofia fax-CNG + T.38 reinvite wire-
-	 * in IMPLEMENTED — closes 55d4444 KNOWN LIMITATION. */
-	peer->faxdetect_mode = sofia_cfg.default_faxdetect_mode;
-	/* post-T56 Task #8 T.38 fax UDPTL parity SS2 (2026-04-28): T.38 defaults
-	 * inherit from [general] before per-peer parser overrides. t38pt_udptl
-	 * default 0 (chan_sip drop-in — operator opts in explicitly per peer);
-	 * t38_ec_mode default FEC matches chan_sip `t38pt_udptl=yes` semantic;
-	 * t38_maxdatagram inherits sofia_cfg.default_t38_maxdatagram (-1 sentinel
-	 * = use SOFIA_T38_MAXDATAGRAM_BUILTIN 200); t38pt_usertpsource default 0. */
-	peer->t38pt_udptl = 0;
-	peer->t38_ec_mode = SOFIA_T38_EC_FEC;
-	peer->t38_maxdatagram = sofia_cfg.default_t38_maxdatagram;
-	peer->t38pt_usertpsource = 0;
-	/* post-T56 timerb per-peer parity (2026-04-28): inherit [general] default
-	 * Timer B before per-peer parser overrides. Pattern 16 sofia-sip-native via
-	 * NTATAG_SIP_T1X64 nua_create wire-in serves global default; per-peer dynamic
-	 * override deferred per t1min ac8d1ef precedent. */
-	peer->timer_b = sofia_cfg.default_timer_b;
-	/* post-T56 timert1 per-peer parity (2026-04-28): inherit [general] default
-	 * T1 retransmission interval before per-peer parser overrides per chan_sip.c
-	 * :28482 verbatim. Pattern 16 sofia-sip-native 7th-instance REWIRED via
-	 * NTATAG_SIP_T1 nua_create wire-in serves global default; per-peer dynamic
-	 * override deferred per Pattern 12 sub-pattern 3rd-instance (NTATAG_*_T1
-	 * family deferral: t1min ac8d1ef + timerb a2e16b7 + this timert1). */
-	peer->timer_t1 = sofia_cfg.default_timer_t1;
-	/* post-T56 allowoverlap per-peer parity (2026-04-28, Option A FULL WIRE-IN):
-	 * inherit [general] default before per-peer parser overrides. Default YES per
-	 * chan_sip drop-in critical default (chan_sip.c:29479). Wire-in active at 3
-	 * sites: sofia_process_invite + sofia_indicate AST_CONTROL_INCOMPLETE +
-	 * nua_r_invite 484. */
-	peer->allowoverlap_mode = sofia_cfg.default_allowoverlap_mode;
-	/* post-T56 progressinband per-peer parity (2026-04-28): inherit [general] default
-	 * tri-state. Option B partial wire-in at sofia_indicate AST_CONTROL_RINGING
-	 * honors NEVER + YES exactly; NO degrades to NEVER (KNOWN LIMITATION). */
-	peer->progressinband = sofia_cfg.default_progressinband;
-	/* post-T56 rtp-timeout bundle per-peer parity (2026-04-28): inherit [general]
-	 * 3 defaults before per-peer parser overrides; chan_sip parity at
-	 * chan_sip.c:28455-28456 verbatim. Consumed at sofia_rtp_init. */
-	peer->rtptimeout = sofia_cfg.default_rtptimeout;
-	peer->rtpholdtimeout = sofia_cfg.default_rtpholdtimeout;
-	peer->rtpkeepalive = sofia_cfg.default_rtpkeepalive;
-	/* post-T56 registration TTL bounds parity (2026-04-27): Option A dual-scope —
-	 * peer->expiresecs inherits [general] default_expiry. Per-peer expiresecs= /
-	 * defaultexpiry= (legacy chan_sofia alias) overrides at parser branches. If
-	 * sofia_load_config has already initialized sofia_cfg.default_expiry to
-	 * DEFAULT_DEFAULT_EXPIRY=120, this is identical to the prior DEFAULT_EXPIRY=120
-	 * macro — no behavior change for operators not using [general] defaultexpiry. */
-	peer->expiresecs = sofia_cfg.default_expiry > 0 ? sofia_cfg.default_expiry : DEFAULT_EXPIRY;
-	peer->capability = sofia_cfg.capability;
-	peer->prefs = sofia_cfg.prefs;
-	peer->dtmfmode = SOFIA_DTMF_RFC2833;
-	peer->directmedia = 0;
-	/* chan_sip defaults nat=force_rport. Keep the same default so migrated
-	 * sip.conf peers behind NAT do not silently route in-dialog requests to
-	 * private Contact addresses unless nat=no is explicitly configured. */
-	peer->nat = SOFIA_NAT_FORCE_RPORT;
-	peer->busy_on_active = sofia_cfg.busy_on_active;
-	peer->max_contacts = sofia_cfg.max_contacts ? sofia_cfg.max_contacts : 6;
-	/* Encryption must be opt-in per peer. A missing/NULL/empty realtime field is
-	 * treated as encryption=no, even if [general] has encryption=yes. */
-	peer->encryption = 0;
-	/* post-T56 srtpcipher operator option (2026-04-27): inherit default cipher list from [general]; empty default = sdp_crypto.c hardcoded fallback. */
-	if (!ast_strlen_zero(sofia_cfg.default_srtpcipher)) {
-		ast_string_field_set(peer, srtpcipher, sofia_cfg.default_srtpcipher);
-	}
-	/* post-T56 session timers (RFC 4028) (2026-04-27): inherit defaults from [general].
-	 * Default mode = ACCEPT per chan_sip parity (honor inbound, no initiate). */
-	peer->session_timers = sofia_cfg.default_session_timers;
-	peer->session_expires = sofia_cfg.default_session_expires;
-	peer->session_minse = sofia_cfg.default_session_minse;
-	peer->session_refresher = sofia_cfg.default_session_refresher;
-	/* post-T56 identity-headers parity (2026-04-27): inherit identity defaults from [general]. */
-	peer->callingpres = sofia_cfg.default_callingpres; /* AST_PRES_ALLOWED_USER_NUMBER_NOT_SCREENED == 0 by static-zero */
-	peer->sendrpid = sofia_cfg.default_sendrpid;
-	peer->trustrpid = sofia_cfg.default_trustrpid;
-	/* post-T56 call-limit parity SS1 (2026-04-27): inherit call-limit defaults; inUse/inRinging/onHold zero-init (runtime-only). */
-	peer->call_limit = sofia_cfg.default_call_limit;
-	peer->busy_level = sofia_cfg.default_busy_level;
-	/* post-T56 allowtransfer per-peer parity (2026-04-27): inherit REFER policy
-	 * default from [general]; chan_sip parity at chan_sip.c:8571 + L28458. Static-zero
-	 * default == TRANSFER_OPENFORALL (chan_sip.c:29476 backwards-compat behavior). */
-	peer->allowtransfer = sofia_cfg.default_allowtransfer;
-	/* post-T56 allowsubscribe per-peer parity (2026-04-27): inherit SUBSCRIBE policy
-	 * default from [general]; chan_sip parity at chan_sip.c:29478 global_flags[1]
-	 * SIP_PAGE2_ALLOWSUBSCRIBE default TRUE (sip.h:478). */
-	peer->allowsubscribe = sofia_cfg.default_allowsubscribe;
-	/* post-T56 buggymwi per-peer parity (2026-04-27): default 0 (FALSE) — chan_sip
-	 * per-peer-only flag with no [general] default. Operators with buggy-stack phones
-	 * explicitly set buggymwi=yes; standard RFC 3842 phones use the (0/0) suffix. */
-	peer->buggymwi = 0;
-	/* post-T56 lockuseragent per-peer parity (2026-04-27): default 0 (FALSE) — chan_sip
-	 * per-peer-only flag with no [general] default. locked_user_agent empty until first
-	 * successful REGISTER captures the User-Agent string under the lock. */
-	peer->lockuseragent = 0;
+	/* All config-derived defaults live in sofia_peer_set_defaults so the reload
+	 * cache-hit path (sofia_parse_peer_config) re-applies the identical set and a
+	 * removed per-peer key reverts to its [general] default (R5 M3-full). */
+	sofia_peer_set_defaults(peer);
+	/* Runtime/structural anchors NOT defaulted by the helper (handled here / by the
+	 * caller): the captured registration anchor stays empty on a fresh peer. */
 	peer->locked_user_agent[0] = '\0';
-	/* lockuseragent_prefixes per-peer allowlist (2026-05-17): default empty —
-	 * empty value preserves the strict capture-on-first-REGISTER semantics. */
-	ast_string_field_set(peer, lockuseragent_prefixes, "");
-	/* post-T56 usereqphone parity (2026-04-27): inherit ;user=phone policy default
-	 * from [general]; chan_sip parity at chan_sip.c:29660-29661 global_flags[0]
-	 * SIP_USEREQPHONE; default 0 (off) per chan_sip flag-bit static-zero. */
-	peer->usereqphone = sofia_cfg.default_usereqphone;
-	/* post-T56 maxforwards parity (2026-04-27): inherit RFC 3261 §20.22 default
-	 * from [general]; chan_sip parity at chan_sip.c:8519 verbatim. Default
-	 * DEFAULT_MAX_FORWARDS=70 unless operator overrides via [general] maxforwards. */
-	peer->maxforwards = sofia_cfg.default_max_forwards;
-	/* post-T56 disallowed_methods parity (2026-04-27): inherit [general] default;
-	 * chan_sip parity at chan_sip.c:28485. Pattern 12 9th-instance PARSE-COMPAT-ONLY
-	 * string-storage shortcut; full-feature dynamic NUTAG_ALLOW deferred. */
-	if (!ast_strlen_zero(sofia_cfg.disallowed_methods)) {
-		ast_string_field_set(peer, disallowed_methods, sofia_cfg.disallowed_methods);
-	}
-	/* post-T56 contactpermit/contactdeny per-peer parity (2026-04-27): inherit
-	 * [general] default ACL via ast_duplicate_ha_list when peer omits per-peer
-	 * contactpermit/contactdeny. chan_sip parity (chan_sip.c sip_alloc-equivalent
-	 * peer-build pattern). NULL passthrough handled by ast_duplicate_ha_list. */
-	/* reload-UAF fix: contact_ha is a freeable global the reload frees+rebuilds
-	 * on sofia_thread; this realtime peer-build read runs off sofia_thread. */
-	ast_rwlock_rdlock(&sofia_contactha_lock);
-	if (sofia_cfg.contact_ha) {
-		peer->contactha = ast_duplicate_ha_list(sofia_cfg.contact_ha);
-	}
-	ast_rwlock_unlock(&sofia_contactha_lock);
-	/* post-T56 subscribecontext per-peer parity (2026-04-27): inherit SUBSCRIBE
-	 * dispatch-context default from [general] when peer omits subscribecontext=.
-	 * chan_sip parity at chan_sip.c:28446 sip_cfg.default_subscribecontext fallback. */
-	if (!ast_strlen_zero(sofia_cfg.default_subscribecontext)) {
-		ast_string_field_set(peer, subscribecontext, sofia_cfg.default_subscribecontext);
-	}
-	/* post-T56 MOH per-peer parity (2026-04-27): inherit MOH class defaults; chan_sip parity at L8568-8569. */
-	/* post-T56 language per-peer parity (2026-04-27): inherit [general] default_language
-	 * before per-peer parser overrides; chan_sip parity at chan_sip.c:28447 verbatim
-	 * ast_string_field_set(peer, language, default_language). */
-	ast_string_field_set(peer, language, sofia_cfg.default_language);
-	/* post-T56 parkinglot per-peer parity (2026-04-28): inherit [general] default_parkinglot
-	 * before per-peer parser overrides; chan_sip parity at chan_sip.c:8577 verbatim
-	 * ast_string_field_set(p, parkinglot, default_parkinglot). */
-	ast_string_field_set(peer, parkinglot, sofia_cfg.default_parkinglot);
-	if (!ast_strlen_zero(sofia_cfg.default_mohinterpret)) {
-		ast_string_field_set(peer, mohinterpret, sofia_cfg.default_mohinterpret);
-	}
-	if (!ast_strlen_zero(sofia_cfg.default_mohsuggest)) {
-		ast_string_field_set(peer, mohsuggest, sofia_cfg.default_mohsuggest);
-	}
-	peer->qualifyfreq = 60;
 	peer->is_realtime = 0;
 		peer->is_register_line = 0;
 	peer->_reload_marked = 0;
@@ -19450,25 +19371,19 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			ast_variables_destroy(peer->chanvars);
 			peer->chanvars = NULL;
 		}
-		/* Round5 M3 (HIGH security SUBSET; full config-default reset deferred): re-default
-		 * the security/behavior int+enum fields that a REMOVED config key must not
-		 * silently retain on reload. Defaults match sofia_peer_alloc exactly (Codex:
-		 * nat=FORCE_RPORT and call_limit/busy_level from [general], NOT zero; md5secret/
-		 * insecure/encryption/directmedia/qualify default to empty/0). Sharp cases this
-		 * closes: a stale md5secret keeps authenticating the OLD password (precedence over
-		 * secret in sofia_compute_a1_hash); a retained insecure=invite keeps INVITE auth
-		 * off (toll-fraud); a removed encryption= stays on. The remaining codecs/session/
-		 * identity/transfer/stringfield/ACL defaults are a separate full set_peer_defaults
-		 * refactor — the alloc default block dups contact_ha under sofia_contactha_lock, so
-		 * moving it under peer->lock needs a lock-order analysis first. */
-		ast_string_field_set(peer, md5secret, "");
-		peer->insecure = 0;
-		peer->encryption = 0;
-		peer->directmedia = 0;
-		peer->qualify = 0;
-		peer->nat = SOFIA_NAT_FORCE_RPORT;
-		peer->call_limit = sofia_cfg.default_call_limit;
-		peer->busy_level = sofia_cfg.default_busy_level;
+		/* Round5 M3-full (config-reload full-reset): re-apply the COMPLETE config-default
+		 * set, not just the security subset. A REMOVED per-peer key must revert to its
+		 * [general] default instead of silently retaining the prior load's value — a
+		 * stale md5secret keeps authenticating the OLD password, a retained insecure=invite
+		 * keeps INVITE auth off (toll-fraud), a removed encryption= stays on, and likewise
+		 * for every codec/session/identity/transfer/timer/ACL default. The helper is the
+		 * same one sofia_peer_alloc uses, called here under the peer->lock already held
+		 * (contact_ha is duped under sofia_contactha_lock, a verified LEAF — no inversion).
+		 * It runs AFTER the peer->ha/contactha/directmediaha frees above so the contact_ha
+		 * re-inherit is leak-free; the per-peer permit/deny parsers below then append. The
+		 * captured locked_user_agent anchor is preserved here and only cleared after the
+		 * parse loop if lockuseragent ends up disabled. */
+		sofia_peer_set_defaults(peer);
 		/* peer->lock stays held here through the repopulate loop + defaults;
 		 * it is released after the defaulting block below. */
 	}
@@ -20049,7 +19964,16 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 	 * defaultip=<hostname> resolves via blocking ast_get_ip inside the widened
 	 * window (rare, bounded — a misconfiguration; the common IP literal is
 	 * non-blocking). */
+	/* Round5 M3-full: sofia_peer_set_defaults reset the lockuseragent CONFIG flag and
+	 * deliberately left the captured locked_user_agent registration anchor untouched
+	 * (runtime state). Now that the parse loop has applied the new config, clear the
+	 * anchor ONLY if lockuseragent ended up disabled — otherwise a reload would drop the
+	 * locked UA and let a different User-Agent re-capture it on the next REGISTER (Codex).
+	 * Done under the still-held peer->lock. */
 	if (locked) {
+		if (!peer->lockuseragent) {
+			peer->locked_user_agent[0] = '\0';
+		}
 		ast_mutex_unlock(&peer->lock);
 	}
 
