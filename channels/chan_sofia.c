@@ -20437,6 +20437,22 @@ static int sofia_apply_config(struct ast_config *cfg)
 	 * COMPAT-ONLY (chan_sofia sofia_should_use_externaddr signature divergence;
 	 * future-fix path documented in sample.conf). */
 	sofia_cfg.matchexternaddrlocally = 0;
+	/* Round5 M12 (config-reload full-reset): the externaddr/externhost NAT bundle and
+	 * the localnet display string were the only [general] knobs missing from this
+	 * pre-parse defaults block, so a REMOVED externaddr=/externhost=/externport=
+	 * line silently kept the stale public IP/port on reload (calls advertised the old
+	 * NAT address). Reset them here so sofia_parse_general_config below repopulates
+	 * only what the new config still contains. localha (the live ACL) is already
+	 * freed+rebuilt below; localnet is the display/storage twin (write-only today) so
+	 * it is reset for consistency. externexpire/externrefresh are the DDNS lazy-refresh
+	 * pair — clear the deadline, restore the documented 10s default interval. */
+	sofia_cfg.externaddr[0] = '\0';
+	sofia_cfg.externhost[0] = '\0';
+	sofia_cfg.externtcpport = 0;
+	sofia_cfg.externtlsport = 0;
+	sofia_cfg.externexpire = 0;
+	sofia_cfg.externrefresh = 10;
+	sofia_cfg.localnet[0] = '\0';
 	/* post-T56 rtp-timeout bundle [general] parity (2026-04-28): chan_sip parity at
 	 * chan_sip.c:721-723 verbatim 3 globals default 0 (disabled) chan_sip drop-in.
 	 * Inherited by sofia_peer_alloc; sofia_rtp_init wires gabpbx-core APIs
@@ -20865,83 +20881,197 @@ static void sofia_reload_req_destructor(void *obj)
 static int sofia_reload_listener_changed(struct ast_config *cfg,
 		char *errmsg, size_t errmsglen)
 {
+	/* Round5 M13 (config-reload full-reset): the listeners are baked at nua_create
+	 * and only a `systemctl restart gabpbx` rebinds them, so this guard warns when the
+	 * new file's EFFECTIVE listener config differs from what is running. The previous
+	 * version compared each present key against live sofia_cfg and did `if (!new_val)
+	 * continue;`, so a REMOVED listener key (e.g. operator deletes tlsbindport=) read
+	 * as "no change" even though a restart would drop that listener. Fix (Codex):
+	 * build a SCRATCH listener config from compiled defaults + only the listener keys
+	 * the new file still carries — mirroring sofia_parse_general_config exactly,
+	 * including the udpbindaddr host:port split, the tlscertdir / tlsverifyserver
+	 * aliases, and the t1min/timerb/timert1 cross-validation — then compare that
+	 * effective state to live sofia_cfg. A removed key now surfaces as default-vs-live
+	 * and is correctly flagged. A flat {key, default} table can't do this because of
+	 * the aliases and because t1min canonically rewrites the effective timer_t1/b. */
 	struct {
-		const char *key;
-		const char *alt_key;        /* secondary key name (e.g. tlscertfile / tlscertdir) */
-		int  is_string;
-		void *current_value;        /* pointer into sofia_cfg */
-		size_t string_size;         /* for string fields, size of the sofia_cfg buffer */
-	} fields[] = {
-		{ "bindaddr",      NULL,         1, sofia_cfg.bindaddr,     sizeof(sofia_cfg.bindaddr) },
-		{ "bindport",      NULL,         0, &sofia_cfg.bindport,    0 },
-		{ "tlsbindaddr",   NULL,         1, sofia_cfg.tlsbindaddr,  sizeof(sofia_cfg.tlsbindaddr) },
-		{ "tlsbindport",   NULL,         0, &sofia_cfg.tlsbindport, 0 },
-		{ "tlscertfile",   "tlscertdir", 1, sofia_cfg.tlscertfile,  sizeof(sofia_cfg.tlscertfile) },
-		{ "wsbindaddr",    NULL,         1, sofia_cfg.wsbindaddr,   sizeof(sofia_cfg.wsbindaddr) },
-		{ "wsbindport",    NULL,         0, &sofia_cfg.wsbindport,  0 },
-		{ "wssbindaddr",   NULL,         1, sofia_cfg.wssbindaddr,  sizeof(sofia_cfg.wssbindaddr) },
-		{ "wssbindport",   NULL,         0, &sofia_cfg.wssbindport, 0 },
-		{ "timert1",       NULL,         0, &sofia_cfg.default_timer_t1, 0 },
-		{ "timerb",        NULL,         0, &sofia_cfg.default_timer_b,  0 },
-	};
-	const size_t nfields = sizeof(fields) / sizeof(fields[0]);
-	size_t i;
+		char bindaddr[128];
+		int bindport;
+		char tlsbindaddr[64];
+		int tlsbindport;
+		char tlscertfile[256];
+		char wsbindaddr[64];
+		int wsbindport;
+		char wssbindaddr[64];
+		int wssbindport;
+		int tlsverify;
+		int t1min;
+		int timer_t1;
+		int timer_b;
+	} s;
+	int timert1_set = 0, timerb_set = 0;
+	struct ast_variable *v;
 	char buf[256];
 	int changed = 0;
 	int written = 0;
 
 	buf[0] = '\0';
 
-	for (i = 0; i < nfields; i++) {
-		const char *new_val = ast_variable_retrieve(cfg, "general", fields[i].key);
-		if (!new_val && fields[i].alt_key) {
-			new_val = ast_variable_retrieve(cfg, "general", fields[i].alt_key);
-		}
-		/* Absent key means the operator did not touch this knob — treat
-		 * as "no change" rather than comparing to a synthetic zero/empty,
-		 * which would false-alarm on every reload for keys whose runtime
-		 * defaults are non-zero (timert1=500, timerb=32000, ...). */
-		if (!new_val) {
-			continue;
-		}
-		if (fields[i].is_string) {
-			const char *cur = (const char *)fields[i].current_value;
-			if (strcmp(cur, new_val) != 0) {
-				changed = 1;
-				if (written < (int)sizeof(buf) - 16) {
-					written += snprintf(buf + written, sizeof(buf) - written,
-						"%s%s", written ? "," : "", fields[i].key);
+	/* Compiled defaults — identical to a fresh module load: sofia_apply_config's
+	 * explicit resets for bindaddr/bindport/t1min/timers, and static-zero/empty for
+	 * the TLS/WS fields it leaves at their initial value. Using fresh defaults (rather
+	 * than live sofia_cfg) is exactly what lets a removed key be detected. */
+	ast_copy_string(s.bindaddr, DEFAULT_BINDADDR, sizeof(s.bindaddr));
+	s.bindport = DEFAULT_SIP_PORT;
+	s.tlsbindaddr[0] = '\0';
+	s.tlsbindport = 0;
+	s.tlscertfile[0] = '\0';
+	s.wsbindaddr[0] = '\0';
+	s.wsbindport = 0;
+	s.wssbindaddr[0] = '\0';
+	s.wssbindport = 0;
+	s.tlsverify = 0;
+	s.t1min = DEFAULT_T1MIN;
+	s.timer_t1 = 500;
+	s.timer_b = 32000;
+
+	for (v = ast_variable_browse(cfg, "general"); v; v = v->next) {
+		if (!strcasecmp(v->name, "bindaddr")) {
+			ast_copy_string(s.bindaddr, v->value, sizeof(s.bindaddr));
+		} else if (!strcasecmp(v->name, "bindport") || !strcasecmp(v->name, "udpbindaddr")) {
+			/* IPv6-aware host:port split on a LOCAL copy — mirrors
+			 * sofia_parse_general_config so a bracketed [2001:db8::1]:5060 is not
+			 * truncated at its first colon. */
+			char hpbuf[128];
+			ast_copy_string(hpbuf, v->value, sizeof(hpbuf));
+			if (hpbuf[0] == '[') {
+				char *end = strchr(hpbuf, ']');
+				if (end) {
+					char *port = (end[1] == ':') ? end + 2 : NULL;
+					*end = '\0';
+					ast_copy_string(s.bindaddr, hpbuf + 1, sizeof(s.bindaddr));
+					if (port && *port) {
+						s.bindport = atoi(port);
+					}
+				}
+			} else {
+				char *first = strchr(hpbuf, ':');
+				char *last = strrchr(hpbuf, ':');
+				if (first && first == last) {
+					*first = '\0';
+					ast_copy_string(s.bindaddr, hpbuf, sizeof(s.bindaddr));
+					s.bindport = atoi(first + 1);
+				} else if (first) {
+					ast_copy_string(s.bindaddr, hpbuf, sizeof(s.bindaddr));
+				} else {
+					s.bindport = atoi(hpbuf);
 				}
 			}
-		} else {
-			int cur_int = *((int *)fields[i].current_value);
-			int new_int = atoi(new_val);
-			if (cur_int != new_int) {
-				changed = 1;
-				if (written < (int)sizeof(buf) - 16) {
-					written += snprintf(buf + written, sizeof(buf) - written,
-						"%s%s", written ? "," : "", fields[i].key);
-				}
+		} else if (!strcasecmp(v->name, "port")) {
+			s.bindport = atoi(v->value);
+		} else if (!strcasecmp(v->name, "tlsbindaddr")) {
+			ast_copy_string(s.tlsbindaddr, v->value, sizeof(s.tlsbindaddr));
+		} else if (!strcasecmp(v->name, "tlsbindport")) {
+			s.tlsbindport = atoi(v->value);
+		} else if (!strcasecmp(v->name, "tlscertfile") || !strcasecmp(v->name, "tlscertdir")) {
+			ast_copy_string(s.tlscertfile, v->value, sizeof(s.tlscertfile));
+		} else if (!strcasecmp(v->name, "tlsverify") || !strcasecmp(v->name, "tlsverifyserver")) {
+			s.tlsverify = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "wsbindaddr")) {
+			ast_copy_string(s.wsbindaddr, v->value, sizeof(s.wsbindaddr));
+		} else if (!strcasecmp(v->name, "wsbindport")) {
+			s.wsbindport = atoi(v->value);
+		} else if (!strcasecmp(v->name, "wssbindaddr")) {
+			ast_copy_string(s.wssbindaddr, v->value, sizeof(s.wssbindaddr));
+		} else if (!strcasecmp(v->name, "wssbindport")) {
+			s.wssbindport = atoi(v->value);
+		} else if (!strcasecmp(v->name, "t1min")) {
+			int v_int = 0;
+			if (sscanf(v->value, "%30d", &v_int) != 1 || v_int < 10) {
+				s.t1min = DEFAULT_T1MIN;
+			} else {
+				s.t1min = v_int;
 			}
+		} else if (!strcasecmp(v->name, "timerb")) {
+			int tmp_b = atoi(v->value);
+			if (tmp_b < 500) {
+				s.timer_b = s.t1min * 64;
+			} else {
+				s.timer_b = tmp_b;
+			}
+			timerb_set = 1;
+		} else if (!strcasecmp(v->name, "timert1")) {
+			int tmp_t1;
+			if ((sscanf(v->value, "%30d", &tmp_t1) != 1) || tmp_t1 < 200) {
+				s.timer_t1 = 500;
+			} else {
+				s.timer_t1 = tmp_t1;
+			}
+			timert1_set = 1;
 		}
 	}
 
-	/* Round4 #3 (Codex refinement): tlsverify is a BOOLEAN knob (yes/no) wired into the
-	 * TLS listener at nua_create, so changing it needs a listener restart too — compare
-	 * with ast_true, not the atoi path above (atoi("yes")==0 would never detect it). */
-	{
-		const char *nv = ast_variable_retrieve(cfg, "general", "tlsverify");
-		if (!nv) {
-			nv = ast_variable_retrieve(cfg, "general", "tlsverifyserver");
-		}
-		if (nv && (!!sofia_cfg.tlsverify != !!ast_true(nv))) {
-			changed = 1;
-			if (written < (int)sizeof(buf) - 16) {
-				written += snprintf(buf + written, sizeof(buf) - written,
-					"%s%s", written ? "," : "", "tlsverify");
+	/* Same post-parse timer cross-validation as sofia_apply_config so the EFFECTIVE
+	 * (not raw) timer_t1/timer_b are compared. t1min is itself a timer input here even
+	 * though it is not a listener key on its own: it floors timer_t1 and seeds the
+	 * timerb< 500 fallback, so a changed t1min can shift the effective timers (and thus
+	 * the NTATAG_SIP_T1/T1X64 baked at nua_create) — that is why it is parsed into the
+	 * scratch above. timerb= is order-sensitive on t1min in the real parser too; t1min
+	 * appears before timerb in practice and the < 500 branch already used s.t1min. */
+	if (s.timer_t1 < s.t1min) {
+		s.timer_t1 = s.t1min;
+	}
+	if (s.timer_b < s.timer_t1 * 64) {
+		if (timerb_set && timert1_set) {
+			/* warn-only in the real parser — no value rewrite */
+		} else if (timerb_set) {
+			s.timer_t1 = s.timer_b / 64;
+			if (s.timer_t1 < s.t1min) {
+				s.timer_t1 = s.t1min;
+				s.timer_b = s.timer_t1 * 64;
 			}
+		} else {
+			s.timer_b = s.timer_t1 * 64;
 		}
 	}
+
+	/* Compare effective scratch vs live sofia_cfg; name each changed knob. */
+#define SOFIA_LISTENER_FLAG(_name) do { \
+		if (written < (int)sizeof(buf) - 24) { \
+			written += snprintf(buf + written, sizeof(buf) - written, "%s%s", written ? "," : "", (_name)); \
+		} \
+		changed = 1; \
+	} while (0)
+#define SOFIA_LISTENER_CMP_STR(_field, _name) do { \
+		if (strcmp(sofia_cfg._field, s._field) != 0) { SOFIA_LISTENER_FLAG(_name); } \
+	} while (0)
+#define SOFIA_LISTENER_CMP_INT(_field, _name) do { \
+		if (sofia_cfg._field != s._field) { SOFIA_LISTENER_FLAG(_name); } \
+	} while (0)
+
+	SOFIA_LISTENER_CMP_STR(bindaddr, "bindaddr");
+	SOFIA_LISTENER_CMP_INT(bindport, "bindport");
+	SOFIA_LISTENER_CMP_STR(tlsbindaddr, "tlsbindaddr");
+	SOFIA_LISTENER_CMP_INT(tlsbindport, "tlsbindport");
+	SOFIA_LISTENER_CMP_STR(tlscertfile, "tlscertfile");
+	SOFIA_LISTENER_CMP_STR(wsbindaddr, "wsbindaddr");
+	SOFIA_LISTENER_CMP_INT(wsbindport, "wsbindport");
+	SOFIA_LISTENER_CMP_STR(wssbindaddr, "wssbindaddr");
+	SOFIA_LISTENER_CMP_INT(wssbindport, "wssbindport");
+	/* scratch field names diverge here (s.timer_t1 vs sofia_cfg.default_timer_t1). */
+	if (sofia_cfg.default_timer_t1 != s.timer_t1) {
+		SOFIA_LISTENER_FLAG("timert1");
+	}
+	if (sofia_cfg.default_timer_b != s.timer_b) {
+		SOFIA_LISTENER_FLAG("timerb");
+	}
+	if (!!sofia_cfg.tlsverify != !!s.tlsverify) {
+		SOFIA_LISTENER_FLAG("tlsverify");
+	}
+
+#undef SOFIA_LISTENER_CMP_INT
+#undef SOFIA_LISTENER_CMP_STR
+#undef SOFIA_LISTENER_FLAG
 
 	if (changed && errmsg && errmsglen > 0) {
 		snprintf(errmsg, errmsglen,
