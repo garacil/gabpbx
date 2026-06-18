@@ -3352,6 +3352,31 @@ static int sofia_rtp_init(struct sofia_pvt *pvt)
 	return 0;
 }
 
+/* Round3 #H1: is payload type `pt` already present as a whole token in the
+ * space-separated SDP m= payload list? Used to avoid emitting telephone-event on a
+ * PT a negotiated codec already took (a duplicate PT is malformed; some UAs reject
+ * the whole m= line). */
+static int sofia_sdp_pt_in_use(const char *list, int pt)
+{
+	char needle[8];
+	const char *p;
+	size_t nl;
+
+	if (ast_strlen_zero(list)) {
+		return 0;
+	}
+	snprintf(needle, sizeof(needle), "%d", pt);
+	nl = strlen(needle);
+	for (p = list; (p = strstr(p, needle)); p += nl) {
+		char before = (p == list) ? ' ' : p[-1];
+		char after = p[nl];
+		if ((before == ' ' || before == '\0') && (after == ' ' || after == '\0')) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 {
 	struct ast_sockaddr rtp_addr;
@@ -3522,12 +3547,30 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 		emitted |= fmt;
 	}
 
-	/* Hardcoded telephone-event (PT 101) */
-	if (!first)
-		strcat(payload_buf, " ");
-	strcat(payload_buf, "101");
-	strcat(rtpmap_buf, "a=rtpmap:101 telephone-event/8000\r\n");
-	strcat(rtpmap_buf, "a=fmtp:101 0-16\r\n");
+	/* telephone-event — Round3 #H1: prefer PT 101 (interop default) but if a
+	 * negotiated codec already took it (dynamic PTs 96..127 are assigned to
+	 * opus/ilbc/g726/etc and one can land on 101), pick the first free dynamic PT so
+	 * the emitted m= line has no duplicate payload type. */
+	{
+		int te_pt = 101;
+		if (sofia_sdp_pt_in_use(payload_buf, te_pt)) {
+			for (te_pt = 96; te_pt <= 127 && sofia_sdp_pt_in_use(payload_buf, te_pt); te_pt++) {
+				;
+			}
+			if (te_pt > 127) {
+				te_pt = 101;	/* no free dynamic PT — collision unavoidable */
+			}
+		}
+		if (!first) {
+			strcat(payload_buf, " ");
+		}
+		snprintf(tmp_buf, sizeof(tmp_buf), "%d", te_pt);
+		strcat(payload_buf, tmp_buf);
+		snprintf(tmp_buf, sizeof(tmp_buf), "a=rtpmap:%d telephone-event/8000\r\n", te_pt);
+		strcat(rtpmap_buf, tmp_buf);
+		snprintf(tmp_buf, sizeof(tmp_buf), "a=fmtp:%d 0-16\r\n", te_pt);
+		strcat(rtpmap_buf, tmp_buf);
+	}
 
 	/* T37: append local a=crypto for SDES-SRTP. sdp_crypto_attrib returns the
 	 * full "a=crypto:tag suite inline:key64\r\n" string including prefix + CRLF. */
@@ -3940,7 +3983,31 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 				/* Step 3: extract negotiated formats */
 				ast_rtp_codecs_payload_formats(&newaudiortp, &offered, &noncodec);
 
-				/* Step 4: intersect with local capability */
+				/* Step 4: intersect with local capability.
+				 * Round3 #6 (Codex consensus): if audio was OFFERED but we share NO
+				 * common audio codec, reject 488 instead of accepting with
+				 * un-negotiated codecs (which yields one-way / dead audio) — UNLESS the
+				 * same SDP also offers a T.38/image leg (carve-out, chan_sip
+				 * udptlportno parity), where the m=image handling below takes over. Do
+				 * NOT overwrite pvt->capability on the reject path. */
+				if ((local_cap & offered & AST_FORMAT_AUDIO_MASK) == 0) {
+					int has_t38 = 0;
+					sdp_media_t *mm;
+					for (mm = sdp->sdp_media; mm; mm = mm->m_next) {
+						if (mm->m_type == sdp_media_image
+								&& mm->m_proto == sdp_proto_udptl
+								&& mm->m_port != 0) {
+							has_t38 = 1;
+							break;
+						}
+					}
+					if (!has_t38) {
+						ast_log(LOG_WARNING, "Sofia: no common audio codec with peer — rejecting (488 Not Acceptable Here)\n");
+						ast_rtp_codecs_payloads_clear(&newaudiortp, NULL);
+						sdp_parser_free(parser);
+						return -1;
+					}
+				}
 				pvt->capability = local_cap & offered;
 				if (pvt->capability == 0) {
 					ast_log(LOG_WARNING, "Sofia: No common codec with peer; falling back to local capability\n");
@@ -6398,18 +6465,30 @@ static enum ast_rtp_glue_result sofia_get_rtp_peer(struct ast_channel *chan,
 	{
 		struct ast_channel *bridged_chan = sofia_find_bridged_channel(pvt);
 		if (bridged_chan && bridged_chan->tech == &sofia_tech) {
-			struct sofia_pvt *bridged_pvt = bridged_chan->tech_pvt;
-			struct sofia_peer *bpeer = bridged_pvt ? bridged_pvt->peer : NULL;
+			/* Round3 #M4 (Codex consensus): the +1 ref from sofia_find_bridged_channel
+			 * keeps the partner CHANNEL alive but NOT its tech_pvt/peer — a concurrent
+			 * sofia_hangup(partner) clears tech_pvt and frees the partner pvt, so
+			 * reading bridged_pvt->peer and then locking it is a UAF. Pin the partner's
+			 * peer UNDER the partner channel lock (trylock to avoid ABBA against THIS
+			 * leg's already-held channel lock; on contention fall through to REMOTE like
+			 * the other defensive fall-throughs), then hold an ao2 ref so bpeer survives
+			 * the channel unlock. */
+			struct sofia_peer *bpeer = NULL;
+			if (!ast_channel_trylock(bridged_chan)) {
+				struct sofia_pvt *bridged_pvt = bridged_chan->tech_pvt;
+				bpeer = (bridged_pvt && bridged_pvt->peer) ? bridged_pvt->peer : NULL;
+				if (bpeer) {
+					ao2_ref(bpeer, +1);
+				}
+				ast_channel_unlock(bridged_chan);
+			}
 			if (bpeer) {
 				/* reload-UAF: the bridge partner's peer->directmediaha is an
 				 * ast_ha LIST that sofia_parse_peer_config frees (ast_free_ha
 				 * + NULL) under peer->lock during a reload. A pointer can't be
 				 * snapshotted, so HOLD bpeer->lock across the ast_apply_ha
-				 * consume. peer->lock is a leaf here (we hold only THIS leg's
-				 * channel lock; the partner pvt/channel/peer are all unheld) so
-				 * taking it cannot invert the channel->pvt->peer order.
-				 * peer->name is a freeable unbounded stringfield — snapshot it
-				 * under the same lock for the debug line. */
+				 * consume. peer->name is a freeable unbounded stringfield —
+				 * snapshot it under the same lock for the debug line. */
 				int denied = 0;
 				char l_name[256];
 				struct ast_sockaddr them = { { 0, }, };
@@ -6421,6 +6500,7 @@ static enum ast_rtp_glue_result sofia_get_rtp_peer(struct ast_channel *chan,
 					ast_copy_string(l_name, bpeer->name, sizeof(l_name));
 				}
 				ast_mutex_unlock(&bpeer->lock);
+				ao2_ref(bpeer, -1);
 				if (denied) {
 					ast_debug(2, "Sofia: get_rtp_peer LOCAL — direct media to %s denied by bridge-partner '%s' directmedia ACL\n",
 						ast_sockaddr_stringify(&them), l_name);
@@ -15032,7 +15112,13 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		sofia_process_ack(nua, nh, pvt, sip, tags);
 		break;
 
-	case nua_r_register:
+	case nua_r_register: {
+		/* Round3 #9 (Codex+Claude, dual-found): pin the peer for the whole handler
+		 * with the proven A8 idiom — a late REGISTER response on sofia_thread races
+		 * `sip prune realtime peer` on the CLI thread, and the 200 branch reads peer
+		 * fields outside peer->lock, so the REF (not just the lock) is load-bearing.
+		 * NULL => peer was unlinked/freed: nothing to do. */
+		struct sofia_peer *peer = hmagic ? sofia_peer_ref_if_linked((struct sofia_peer *)hmagic) : NULL;
 		ast_verbose("Sofia: REGISTER response %d %s\n", status, phrase);
 		if (status == 200) {
 			if (sip && sip->sip_contact) {
@@ -15043,8 +15129,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					expires = atoi(sip->sip_contact->m_expires);
 				}
 				ast_verbose("Sofia: Registration OK, expires=%d\n", expires);
-				if (hmagic) {
-					struct sofia_peer *peer = (struct sofia_peer *)hmagic;
+				if (peer) {
 					ast_mutex_lock(&peer->lock);
 					peer->registered = 1;
 					peer->reg_expiry = time(NULL) + expires - 10;
@@ -15082,8 +15167,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					}
 				}
 			} else if (status == 401 || status == 407) {
-			if (hmagic) {
-				struct sofia_peer *peer = (struct sofia_peer *)hmagic;
+			if (peer) {
 				char auth_creds[256];
 				char uri[256];
 
@@ -15097,6 +15181,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					ast_log(LOG_NOTICE, "Sofia: Registration attempts exhausted for peer '%s' (reg_attempts=%d cap=%d) — giving up\n",
 						peer->name, peer->reg_attempts, sofia_cfg.register_attempts);
 					ast_mutex_unlock(&peer->lock);
+					ao2_ref(peer, -1);
 					break;
 				}
 
@@ -15137,8 +15222,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			}
 		} else if (status >= 300) {
 			ast_verbose("Sofia: Registration failed %d %s\n", status, phrase);
-			if (hmagic) {
-				struct sofia_peer *peer = (struct sofia_peer *)hmagic;
+			if (peer) {
 				ast_mutex_lock(&peer->lock);
 				peer->registered = 0;
 				ast_mutex_unlock(&peer->lock);
@@ -15151,7 +15235,11 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					peer->defaultuser, peer->host, status, phrase ? phrase : "");
 			}
 		}
+		if (peer) {
+			ao2_ref(peer, -1);
+		}
 		break;
+	}
 	case nua_r_invite:
 		if (sofia_debug)
 			ast_verbose("Sofia: INVITE response %d %s\n", status, phrase);
