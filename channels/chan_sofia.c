@@ -1502,6 +1502,14 @@ struct sofia_peer {
 	 * never needs a lock. Outside reload, always 0. */
 	int _reload_marked;
 	struct ast_sockaddr src_addr;
+	/* Round5 transport-route (Codex#7): registration-route transport snapshot,
+	 * paired with src_addr above. Set under peer->lock by sofia_update_peer_contacts
+	 * from the registering Contact's ;transport= (sofia_resolve_peer_target and the
+	 * NAT-proxy helpers append it so ACK/INVITE/NOTIFY/BYE to a TCP/TLS-registered
+	 * phone don't silently default to UDP). "udp"/empty -> no param emitted (the
+	 * existing UDP fleet is byte-identical). ws/wss are stored on the contact but
+	 * NOT yet synthesized into RURIs here (flow/Path routing is deferred). */
+	char reg_transport[8];
 	/* post-T56 maxcallbitrate per-peer parity (2026-04-28): per-peer SDP video
 	 * bandwidth ceiling emitted as b=CT:%d media-level attribute per RFC 4566
 	 * §5.8. chan_sip parity sip.h:218 DEFAULT_MAX_CALL_BITRATE=384 verbatim +
@@ -2086,6 +2094,65 @@ static void sofia_uri_user_from_contact(const char *uri, const char *fallback,
 	buf[user_len] = '\0';
 }
 
+/* Round5 transport-route (Codex#7): derive the registration transport from a
+ * Contact URL. RFC 3261 §19.1.1: an explicit ;transport= parameter wins; failing
+ * that, a sips: scheme implies tls, otherwise udp. The legacy code derived this
+ * from the url_scheme alone (sip/sips) so a "sip:user@host;transport=tcp" Contact
+ * was wrongly stored as udp. Writes a lowercase token (udp/tcp/tls/ws/wss) into
+ * out (>= 8 bytes); unknown/oversized values fall back to udp. */
+static void sofia_contact_transport_from_url(const url_t *url, char *out, size_t outlen)
+{
+	char buf[16] = "";
+
+	ast_copy_string(out, "udp", outlen);
+	if (!url) {
+		return;
+	}
+	if (url->url_params) {
+		/* url_param returns the value length (0 if absent); guard against an
+		 * oversized value that would be truncated (>= sizeof(buf)). */
+		isize_t r = url_param(url->url_params, "transport", buf, sizeof(buf));
+		if (r > 0 && r < (isize_t)sizeof(buf)) {
+			char *p;
+			for (p = buf; *p; p++) {
+				*p = tolower((unsigned char)*p);
+			}
+			if (!strcmp(buf, "udp") || !strcmp(buf, "tcp") || !strcmp(buf, "tls")
+					|| !strcmp(buf, "ws") || !strcmp(buf, "wss")) {
+				ast_copy_string(out, buf, outlen);
+				return;
+			}
+		}
+	}
+	if (url->url_scheme && !strcasecmp(url->url_scheme, "sips")) {
+		ast_copy_string(out, "tls", outlen);
+	}
+}
+
+/* Round5 transport-route (Codex#7): append ;transport= to an outbound URI so a
+ * call/ACK/NOTIFY/BYE to a TCP/TLS-registered phone is routed over the same
+ * transport it registered on (sofia-sip otherwise defaults to UDP). Only tcp/tls
+ * are routed today: udp / empty / unknown / ws / wss are no-ops, which keeps every
+ * existing UDP-registered phone byte-identical and leaves WS/WSS for the deferred
+ * flow/Path-routing item. Per Codex, we do NOT rewrite the scheme to sips: —
+ * ";transport=tls" alone selects TLS in sofia routing without changing SIP/SIPS
+ * semantics. */
+static void sofia_uri_append_transport(char *url, size_t len, const char *transport)
+{
+	size_t cur;
+
+	if (!url || ast_strlen_zero(transport)) {
+		return;
+	}
+	if (strcasecmp(transport, "tcp") && strcasecmp(transport, "tls")) {
+		return;
+	}
+	cur = strlen(url);
+	if (cur < len) {
+		snprintf(url + cur, len - cur, ";transport=%s", transport);
+	}
+}
+
 /* Build NAT-traversal proxy URL from peer->src_addr for outbound in-dialog
  * messages when peer has nat=force_rport (or comedia). Used by sofia_call to
  * disable sofia-sip's auto-ACK and the nua_r_invite 200-OK handler to emit
@@ -2124,6 +2191,10 @@ static int sofia_build_nat_proxy_url_from_peer(const struct sofia_peer *peer,
 		sofia_uri_format_host(ast_sockaddr_stringify_host(&peer->src_addr),
 			host_buf, sizeof(host_buf)),
 		port);
+	/* Round5 transport-route: a TCP/TLS-registered NAT phone must get its
+	 * ACK/NOTIFY/BYE proxy route over the same transport, else sofia-sip opens a
+	 * fresh UDP flow to the registered source and the in-dialog request is lost. */
+	sofia_uri_append_transport(buf, len, peer->reg_transport);
 	return 1;
 }
 
@@ -2133,6 +2204,7 @@ static int sofia_pvt_build_nat_target_url(struct sofia_pvt *pvt, char *buf, size
 	struct sofia_contact *contact;
 	char user[128];
 	char host[80];
+	char transport[8];
 
 	if (!pvt || !buf || !len) {
 		return 0;
@@ -2146,9 +2218,12 @@ static int sofia_pvt_build_nat_target_url(struct sofia_pvt *pvt, char *buf, size
 	/* Codex#4: snapshot the contact's mutable src_addr under its ao2 lock — a
 	 * concurrent REGISTER refresh rewrites it (memcpy of a sockaddr), so an unlocked
 	 * read could observe a torn address and route the BYE to the wrong target.
-	 * contact->port/host/contact_uri are set once at contact creation (safe). */
+	 * contact->port/host/contact_uri are set once at contact creation (safe).
+	 * Round5 transport-route: transport is now likewise refresh-mutable, so
+	 * snapshot it here too. */
 	ao2_lock(contact);
 	src = contact->src_addr;
+	ast_copy_string(transport, contact->transport, sizeof(transport));
 	ao2_unlock(contact);
 	if (ast_sockaddr_isnull(&src)) {
 		return 0;
@@ -2167,6 +2242,8 @@ static int sofia_pvt_build_nat_target_url(struct sofia_pvt *pvt, char *buf, size
 	snprintf(buf, len, "sip:%s@%s:%d", user,
 		sofia_uri_format_host(ast_sockaddr_stringify_host(&src), host, sizeof(host)),
 		ast_sockaddr_port(&src) ? ast_sockaddr_port(&src) : 5060);
+	/* Round5 transport-route: send the in-dialog BYE over the contact's transport. */
+	sofia_uri_append_transport(buf, len, transport);
 	return 1;
 }
 
@@ -2213,6 +2290,10 @@ static void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
 	const char *target_host = peer->host;
 	int target_port = peer->port;
 	char addr_buf[128];
+	/* Round5 transport-route: only the registered-source branch below carries a
+	 * learned transport; a statically-configured host routes per its (decorative)
+	 * config, so leave it UDP-as-today. */
+	int routed_via_registration = 0;
 
 	if (peer->registered && !ast_sockaddr_isnull(&peer->src_addr)
 		&& ((peer->nat & SOFIA_NAT_FORCE_RPORT)
@@ -2220,6 +2301,7 @@ static void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
 		ast_copy_string(addr_buf, ast_sockaddr_stringify_host(&peer->src_addr), sizeof(addr_buf));
 		target_host = addr_buf;
 		target_port = ast_sockaddr_port(&peer->src_addr);
+		routed_via_registration = 1;
 	} else if (!strcasecmp(peer->host, "dynamic") && !ast_sockaddr_isnull(&peer->defaddr)) {
 		/* post-T56 defaultip per-peer parity (2026-04-28): chan_sip parity at
 		 * chan_sip.c:5913-5915 verbatim dialog->sa = isnull(addr) ? defaddr : addr
@@ -2240,6 +2322,11 @@ static void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
 		char hbuf[80];
 		snprintf(out_url, out_len, "sip:%s@%s:%d", user ? user : "",
 			sofia_uri_format_host(target_host, hbuf, sizeof(hbuf)), target_port);
+	}
+	/* Round5 transport-route: route a call/qualify to a TCP/TLS-registered phone
+	 * over the transport it registered on (no-op for UDP -> byte-identical). */
+	if (routed_via_registration) {
+		sofia_uri_append_transport(out_url, out_len, peer->reg_transport);
 	}
 	/* post-T56 usereqphone parity (2026-04-27): chan_sofia ARCHITECTURAL ADVANTAGE
 	 * — single helper internal extension catches all 3 outbound URI consumers
@@ -7283,9 +7370,16 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				 * Contact URI parsing — helper #45 wraps for RFC 3261 §19.1.2). */
 				{
 					char hbuf[80];
+					char c_transport[8];
 					snprintf(ruri, sizeof(ruri), "sip:%s@%s:%d", pvt->exten,
 						sofia_uri_format_host(c->host, hbuf, sizeof(hbuf)),
 						c->port);
+					/* Round5 transport-route: fork each branch over its own
+					 * contact's transport (snapshot the refresh-mutable field). */
+					ao2_lock(c);
+					ast_copy_string(c_transport, c->transport, sizeof(c_transport));
+					ao2_unlock(c);
+					sofia_uri_append_transport(ruri, sizeof(ruri), c_transport);
 				}
 				ast_string_field_set(child, ruri, ruri);
 
@@ -8507,19 +8601,16 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 			 * outgoing dialog messages to peer->src_addr — the registered/
 			 * resolved public address — so ACK reaches the phone, suppressing
 			 * the 200 OK retransmit loop and unblocking the call. */
+			/* Round5 transport-route: route this sticky dialog proxy through the
+			 * shared helper instead of hand-building sip:host:port — the helper
+			 * applies the same nat/src_addr guards AND appends peer->reg_transport,
+			 * so a TCP/TLS NAT peer's ACK/BYE don't default to UDP (Codex). Read
+			 * lock-free here (peer->lock was released at the sofia_resolve_ourip
+			 * block above): nat/src_addr/port/reg_transport are all fixed peer
+			 * struct members, not freeable stringfields — same safety class the
+			 * prior inline build already relied on. */
 			char proxy_url[128] = "";
-			if (peer && (peer->nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA))
-			    && !ast_sockaddr_isnull(&peer->src_addr)) {
-				char host_buf[80];
-				int port = ast_sockaddr_port(&peer->src_addr);
-				if (!port) {
-					port = peer->port ? peer->port : 5060;
-				}
-				snprintf(proxy_url, sizeof(proxy_url), "sip:%s:%d",
-					sofia_uri_format_host(ast_sockaddr_stringify_host(&peer->src_addr),
-						host_buf, sizeof(host_buf)),
-					port);
-			}
+			sofia_build_nat_proxy_url_from_peer(peer, proxy_url, sizeof(proxy_url));
 			if (sofia_nua) {
 				pvt->nh = nua_handle(sofia_nua, pvt,
 					NUTAG_URL(url),
@@ -10091,6 +10182,10 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 	time_t now = time(NULL);
 	struct ast_sockaddr src;
 	sip_contact_t *m;
+	/* Round5 transport-route: transport of the last contact processed in the
+	 * registration loop below. Snapshotted into peer->reg_transport alongside
+	 * peer->src_addr (both denormalize the "current registered route"). */
+	char reg_transport[8] = "udp";
 
 	/* Codex#3: a wildcard "Contact: *" (url_any) is valid ONLY as the sole Contact
 	 * with Expires:0 (RFC 3261 §10.2.2 — bulk unregister). A wildcard with a
@@ -10129,6 +10224,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 					NULL, NULL);
 				peer->registered = 0;
 				memset(&peer->src_addr, 0, sizeof(peer->src_addr));
+				ast_copy_string(peer->reg_transport, "udp", sizeof(peer->reg_transport));
 				if (update) {
 					update->wildcard_removed = 1;
 					update->contacts_removed = update->contacts_before;
@@ -10174,6 +10270,12 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 
 			sofia_contact_uri_from_url(uri, sizeof(uri), m->m_url);
 
+			/* Round5 transport-route: resolve this Contact's transport from its
+			 * ;transport= param (falling back to scheme) ONCE; both the refresh and
+			 * new-contact branches store it on c->transport, and the last value seen
+			 * is snapshotted into peer->reg_transport after the loop. */
+			sofia_contact_transport_from_url(m->m_url, reg_transport, sizeof(reg_transport));
+
 			/* post-T56 contactpermit/contactdeny per-peer parity (2026-04-27):
 			 * apply BOTH sofia_cfg.contact_ha (global) AND peer->contactha
 			 * against the Contact: URL host:port. Short-circuit OR (either rejects
@@ -10216,6 +10318,11 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				}
 				c->expires = now + expires;
 				memcpy(&c->src_addr, &src, sizeof(src));
+				/* Round5 transport-route: a re-REGISTER from the same
+				 * user/host/port that switches transport (e.g. UDP->TCP) lands
+				 * here; refresh c->transport too or the stored binding keeps the
+				 * stale transport and routes over the wrong one (Codex). */
+				ast_copy_string(c->transport, reg_transport, sizeof(c->transport));
 				if (sip->sip_user_agent && sip->sip_user_agent->g_string)
 					ast_copy_string(c->user_agent, sip->sip_user_agent->g_string,
 						sizeof(c->user_agent));
@@ -10236,12 +10343,10 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				if (m->m_url->url_host)
 					ast_copy_string(c->host, m->m_url->url_host, sizeof(c->host));
 				c->port = m->m_url->url_port ? atoi(m->m_url->url_port) : 5060;
-				if (m->m_url->url_scheme && strcasestr(m->m_url->url_scheme, "tls"))
-					ast_copy_string(c->transport, "tls", sizeof(c->transport));
-				else if (m->m_url->url_scheme && strcasestr(m->m_url->url_scheme, "tcp"))
-					ast_copy_string(c->transport, "tcp", sizeof(c->transport));
-				else
-					ast_copy_string(c->transport, "udp", sizeof(c->transport));
+				/* Round5 transport-route: store the transport resolved from the
+				 * Contact's ;transport= param (the old scheme-only derivation had a
+				 * dead "tcp" branch — url_scheme is only ever "sip"/"sips"). */
+				ast_copy_string(c->transport, reg_transport, sizeof(c->transport));
 				if (sip->sip_user_agent && sip->sip_user_agent->g_string)
 					ast_copy_string(c->user_agent, sip->sip_user_agent->g_string,
 						sizeof(c->user_agent));
@@ -10329,9 +10434,14 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 		peer->registered = 1;
 		peer->expire = expires;
 		memcpy(&peer->src_addr, &src, sizeof(peer->src_addr));
+		/* Round5 transport-route: snapshot the registration transport beside
+		 * src_addr so sofia_resolve_peer_target / the NAT-proxy helpers route to
+		 * a TCP/TLS phone over the right transport instead of defaulting to UDP. */
+		ast_copy_string(peer->reg_transport, reg_transport, sizeof(peer->reg_transport));
 	} else {
 		peer->registered = 0;
 		memset(&peer->src_addr, 0, sizeof(peer->src_addr));
+		ast_copy_string(peer->reg_transport, "udp", sizeof(peer->reg_transport));
 		if (update && update->was_registered && !update->contacts_removed) {
 			update->contacts_removed = update->contacts_before;
 		}
@@ -21920,7 +22030,14 @@ static int manager_sofia_notify(struct mansession *s, const struct message *m)
 	/* Target URI: registered contact preferred; constructed fallback for never-registered. */
 	contact = sofia_peer_first_contact(peer);
 	if (contact && !ast_strlen_zero(contact->contact_uri)) {
+		char c_transport[8];
 		ast_copy_string(target_uri, contact->contact_uri, sizeof(target_uri));
+		/* Round5 transport-route: contact_uri is the transport-less stable key —
+		 * route the NOTIFY over the contact's registered transport. */
+		ao2_lock(contact);
+		ast_copy_string(c_transport, contact->transport, sizeof(c_transport));
+		ao2_unlock(contact);
+		sofia_uri_append_transport(target_uri, sizeof(target_uri), c_transport);
 	} else {
 		/* Step A IPv6 parity SS3 (2026-04-28): bracket-wrap IPv6 host. The
 		 * peer->host fallback may be unbracketed IPv6 from operator config. */
