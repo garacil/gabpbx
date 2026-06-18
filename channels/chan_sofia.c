@@ -19050,6 +19050,25 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			ast_variables_destroy(peer->chanvars);
 			peer->chanvars = NULL;
 		}
+		/* Round5 M3 (HIGH security SUBSET; full config-default reset deferred): re-default
+		 * the security/behavior int+enum fields that a REMOVED config key must not
+		 * silently retain on reload. Defaults match sofia_peer_alloc exactly (Codex:
+		 * nat=FORCE_RPORT and call_limit/busy_level from [general], NOT zero; md5secret/
+		 * insecure/encryption/directmedia/qualify default to empty/0). Sharp cases this
+		 * closes: a stale md5secret keeps authenticating the OLD password (precedence over
+		 * secret in sofia_compute_a1_hash); a retained insecure=invite keeps INVITE auth
+		 * off (toll-fraud); a removed encryption= stays on. The remaining codecs/session/
+		 * identity/transfer/stringfield/ACL defaults are a separate full set_peer_defaults
+		 * refactor — the alloc default block dups contact_ha under sofia_contactha_lock, so
+		 * moving it under peer->lock needs a lock-order analysis first. */
+		ast_string_field_set(peer, md5secret, "");
+		peer->insecure = 0;
+		peer->encryption = 0;
+		peer->directmedia = 0;
+		peer->qualify = 0;
+		peer->nat = SOFIA_NAT_FORCE_RPORT;
+		peer->call_limit = sofia_cfg.default_call_limit;
+		peer->busy_level = sofia_cfg.default_busy_level;
 		/* peer->lock stays held here through the repopulate loop + defaults;
 		 * it is released after the defaulting block below. */
 	}
