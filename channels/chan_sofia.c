@@ -3918,6 +3918,7 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	int video_secure_offered = 0;
 	int processed_crypto_audio = 0;
 	int processed_crypto_video = 0;
+	int image_active_seen = 0;	/* Round4 C9: a live UDPTL T.38 image leg was present this parse */
 
 	if (!sip || !pvt || !pvt->rtp) {
 		return 0;
@@ -4192,6 +4193,7 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 				ast_log(LOG_WARNING, "Sofia: ignoring m=image media with non-UDPTL proto\n");
 				continue;
 			}
+			image_active_seen = 1;	/* Round4 C9: a live UDPTL T.38 image leg is present this parse */
 
 			if (!conn && sdp->sdp_connection) {
 				conn = sdp->sdp_connection;
@@ -4387,6 +4389,21 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 					}
 				}
 			}
+		}
+	}
+
+	/* Round4 C9 (Codex consensus): a re-INVITE that WITHDRAWS the image stream
+	 * (m=image port 0, or no image m= line at all) must return T.38 to DISABLED —
+	 * otherwise the fax state stays stuck active (chan_sip resets on udptlportno==-1).
+	 * If no live UDPTL image leg was seen this parse but T.38 is in a peer-established
+	 * active state, disable it and cancel the pending re-INVITE timeout. */
+	if (!image_active_seen && pvt->t38_state >= SOFIA_T38_PEER_REINVITE) {
+		sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
+		if (pvt->t38id != -1 && sofia_sched) {
+			if (ast_sched_thread_del(sofia_sched, pvt->t38id) == 0) {
+				ao2_ref(pvt, -1);
+			}
+			pvt->t38id = -1;
 		}
 	}
 
