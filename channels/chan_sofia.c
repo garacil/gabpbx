@@ -11572,8 +11572,17 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			 * kill-switch OFF runs it inline, byte-identical to the original block. */
 			sofia_rtupdate_submit(peer, sip);
 		}
+		/* Round5 M4 (HIGH, remote): echo the GRANTED (clamped/defaulted) expires in the
+		 * 200 OK so the client refreshes on the SERVER's schedule. Without it, a value
+		 * the registrar capped (sofia_check_register_expiry clamped `expires` in place
+		 * above) is invisible to the phone, which keeps its longer requested TTL — the
+		 * server binding lapses before the phone re-REGISTERs and inbound calls fail in
+		 * the gap. This registrar derives the binding TTL from the top-level Expires. */
+		char granted_exp[16];
+		snprintf(granted_exp, sizeof(granted_exp), "%d", expires);
 		nua_respond(nh, SIP_200_OK,
 			SIPTAG_CONTACT(sip->sip_contact),
+			SIPTAG_EXPIRES_STR(granted_exp),
 			NUTAG_WITH_THIS(nua),
 			TAG_END());
 		sofia_verbose_register_update(peer, &reg_update);
@@ -11605,6 +11614,9 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		}
 	}
 
+	/* Round5 M4: capture the granted expires out here so the 200 OK below (which is
+	 * outside the following block) can echo it. */
+	int granted_expires_auth = DEFAULT_EXPIRY;
 	{
 			/* Codex#2: a Contact-less REGISTER is a binding QUERY (post-auth) —
 			 * answer with current bindings, run NO registration-state side-effects. */
@@ -11626,6 +11638,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 				ao2_ref(peer, -1);
 				return;
 			}
+			granted_expires_auth = expires;	/* Round5 M4: capture for the 200 OK echo */
 			/* post-T56 lockuseragent gate (2026-04-27): chan_sip parity at chan_sip.c:15839
 			 * placement (post-auth-success, pre-contact-update). auth-OK path wire-in. */
 			if (sofia_check_lockuseragent(nua, nh, sip, peer) < 0) {
@@ -11664,8 +11677,14 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			sofia_rtupdate_submit(peer, sip);
 		}
 
+		/* Round5 M4 (HIGH, remote): echo the GRANTED (clamped/defaulted) expires in the
+		 * 200 OK so the client refreshes on the SERVER's schedule (see the matching
+		 * comment on the other REGISTER 200 OK path). */
+		char granted_exp[16];
+		snprintf(granted_exp, sizeof(granted_exp), "%d", granted_expires_auth);
 		nua_respond(nh, SIP_200_OK,
 			SIPTAG_CONTACT(sip->sip_contact),
+			SIPTAG_EXPIRES_STR(granted_exp),
 			NUTAG_WITH_THIS(nua),
 			TAG_END());
 		sofia_verbose_register_update(peer, &reg_update);
@@ -14092,7 +14111,20 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	}
 
 	/* Link into the registry (container holds the ref; drop our creation ref). */
-	ao2_link(presence_subs, sub);
+	if (!ao2_link(presence_subs, sub)) {
+		/* Round5 #7 (both auditors): __ao2_link returns NULL on OOM -> sub is NOT in
+		 * presence_subs, so refresh/unsubscribe/expiry could never find it. Do NOT go
+		 * on to register a core hint watcher + leak the handle behind an untracked
+		 * subscription: reject 500 and tear the handle down here (presence subs are
+		 * not hmagic-bound; this runs on sofia_thread). */
+		ast_log(LOG_WARNING, "Sofia presence: ao2_link failed for %s@%s — rejecting 500\n",
+			sub->exten, sub->context);
+		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
+		nua_handle_bind(nh, NULL);
+		nua_handle_destroy(nh);
+		ao2_ref(sub, -1);	/* creation ref */
+		return;
+	}
 
 	/* Register the hint watcher with the core. The +1 ref is owned by the
 	 * registration and dropped by sofia_presence_sub_destroy_cb. THIS is what
@@ -14106,6 +14138,11 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		ao2_ref(sub, -1);	/* undo the registration ref we pre-took */
 		ao2_unlink(presence_subs, sub);
 		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
+		/* Round5 #11: tear the handle down on this failure arm too. The presence-sub
+		 * destructor is a deliberate no-op (handles are destroyed explicitly on
+		 * sofia_thread), so without this the nua_handle leaks when add_destroy fails. */
+		nua_handle_bind(nh, NULL);
+		nua_handle_destroy(nh);
 		ao2_ref(sub, -1);	/* creation ref */
 		return;
 	}
@@ -18903,22 +18940,28 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		 * (heavy global locks that should not extend the hold).  The lock is
 		 * taken only on this cache-hit path; a freshly-alloced peer is not
 		 * findable until ao2_link, so it needs none — tracked by `locked`. */
+		/* Round5 M2 (ABBA deadlock fix): drop the existing dialplan hint extension
+		 * BEFORE taking peer->lock.  ast_context_remove_extension takes the global
+		 * contexts lock (conlock), so holding peer->lock across it gives the order
+		 * peer->lock -> conlock; the dialplan/core reload path runs the reverse
+		 * (conlock held across ast_add_hint -> ast_extension_state2 ->
+		 * sofia_devicestate -> peer->lock), so a concurrent `sip reload` +
+		 * `dialplan reload` would deadlock and freeze the whole sofia_thread.  This
+		 * is the reload writer (sofia_thread = the only mutator of peer config), so
+		 * the OLD subscribecontext/regexten are stable to snapshot here unlocked.
+		 * We need the OLD values to locate the right extension to remove; the fresh
+		 * hint is (re)added by sofia_create_peer_hint at the end, already OUTSIDE
+		 * peer->lock.  Without the remove, changing regexten= leaks the old hint and
+		 * an unchanged regexten= can accumulate a duplicate hint each reload. */
+		if (!ast_strlen_zero(peer->subscribecontext) && !ast_strlen_zero(peer->regexten)) {
+			char old_subctx[AST_MAX_CONTEXT];
+			char old_regexten[AST_MAX_EXTENSION];
+			ast_copy_string(old_subctx, peer->subscribecontext, sizeof(old_subctx));
+			ast_copy_string(old_regexten, peer->regexten, sizeof(old_regexten));
+			ast_context_remove_extension(old_subctx, old_regexten, PRIORITY_HINT, "sofia_config_peer");
+		}
 		ast_mutex_lock(&peer->lock);
 		locked = 1;
-		/* Drop the existing dialplan hint extension BEFORE wiping
-		 * subscribecontext / regexten — we need the OLD values to locate
-		 * the right extension to remove.  The subsequent
-		 * sofia_create_peer_hint call at the end of this function adds a
-		 * fresh hint based on the new values.  Without this, an operator
-		 * changing regexten= from one number to another on reload would
-		 * leak the old hint extension; an unchanged regexten= would
-		 * accumulate a duplicate hint on every reload (depending on
-		 * ast_add_extension2 dedup semantics, the dialplan extension
-		 * table grows linearly with reload count). */
-		if (!ast_strlen_zero(peer->subscribecontext) && !ast_strlen_zero(peer->regexten)) {
-			ast_context_remove_extension(peer->subscribecontext,
-				peer->regexten, PRIORITY_HINT, "sofia_config_peer");
-		}
 		/* Reset ACL chains so the permit/deny parsers below append onto a
 		 * fresh list instead of stacking on top of the previous load's
 		 * rules.  Without these resets, every reload of an existing peer
