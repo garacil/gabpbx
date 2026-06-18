@@ -8491,8 +8491,14 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	 * the re-INVITE (st_refresh==1 above). chan_sofia surpass — chan_sip emits
 	 * no equivalent; operators monitoring long-call stability lacked this signal. */
 	if (st_refresh) {
+		/* Round3 deferred#2 (Codex#13): write the session-timer fields under pvt->lock
+		 * — the `sip show channels` CLI reader reads them under pvt->lock off-thread,
+		 * so the writers must take it too (pvt->lock is not held here; it was released
+		 * earlier in the handler). */
+		ast_mutex_lock(&pvt->lock);
 		pvt->session_negotiated_expires = st_refresh_seconds;
 		pvt->session_last_refresh_at = time(NULL);
+		ast_mutex_unlock(&pvt->lock);
 		manager_event(EVENT_FLAG_CALL, "SessionTimerRefresh",
 			"Channel: %s\r\n"
 			"Uniqueid: %s\r\n"
@@ -8554,7 +8560,11 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	 * peer's request); the value here is the peer's offer, useful for diagnostic
 	 * display before negotiation completes. */
 	if (sip && sip->sip_session_expires) {
+		/* Round3 deferred#2 (Codex#13): session-timer field write under pvt->lock
+		 * (CLI reader holds pvt->lock; not held here). */
+		ast_mutex_lock(&pvt->lock);
 		pvt->session_negotiated_expires = sip->sip_session_expires->x_delta;
+		ast_mutex_unlock(&pvt->lock);
 	}
 
 	pvt->capability = sofia_cfg.capability ? sofia_cfg.capability : (AST_FORMAT_ULAW | AST_FORMAT_ALAW);
