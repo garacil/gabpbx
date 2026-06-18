@@ -12603,9 +12603,11 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 	}
 	peer = pvt->peer;
 
-	if (peer->call_limit == 0 && peer->busy_level == 0) {
-		return 0;
-	}
+	/* NOTE: we no longer early-return when call_limit==0 && busy_level==0. The
+	 * inUse/inRinging counters must be maintained for EVERY peer so sofia_devicestate
+	 * can report concrete RINGING/INUSE/NOT_INUSE (BLF). The call-limit *rejection*
+	 * and the PeerStatus AMI emit below stay gated on call_limit/busy_level, so
+	 * behaviour for limited peers is unchanged. */
 
 	switch (event) {
 	case SOFIA_INC_CALL_LIMIT:
@@ -12655,25 +12657,30 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 
 		/* post-T56 accountcode per-peer parity (2026-04-27): in-flight Pattern 1
 		 * stub fix #12 (companion to L6004) — second hardcoded "Accountcode: \r\n"
-		 * empty stub corrected to emit peer->accountcode actual value. */
-		manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
-			"ChannelType: SIP\r\n"
-			"Peer: SIP/%s\r\n"
-			"PeerStatus: CallCountUpdated\r\n"
-			"Address: %s\r\n"
-			"TuCloudPBXName: \r\n"
-			"Context: %s\r\n"
-			"Accountcode: %s\r\n"
-			"ActiveCalls: %d\r\n"
-			"RingingCalls: %d\r\n"
-			"CallLimit: %d\r\n"
-			"Event: %s\r\n",
-			peer->name,
-			!ast_sockaddr_isnull(&peer->src_addr) ? ast_sockaddr_stringify(&peer->src_addr) : "",
-			peer->context,
-			S_OR(peer->accountcode, ""),
-			peer->inUse, peer->inRinging, peer->call_limit,
-			event == SOFIA_INC_CALL_RINGING ? "INC_CALL_RINGING" : "INC_CALL_LIMIT");
+		 * empty stub corrected to emit peer->accountcode actual value.
+		 * Gated on call_limit/busy_level (Codex): this AMI emit previously only ran
+		 * for limited peers (the early-return guarded it); keep it that way now that
+		 * the early-return is gone, so non-limit peers don't newly emit it. */
+		if (peer->call_limit || peer->busy_level) {
+			manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
+				"ChannelType: SIP\r\n"
+				"Peer: SIP/%s\r\n"
+				"PeerStatus: CallCountUpdated\r\n"
+				"Address: %s\r\n"
+				"TuCloudPBXName: \r\n"
+				"Context: %s\r\n"
+				"Accountcode: %s\r\n"
+				"ActiveCalls: %d\r\n"
+				"RingingCalls: %d\r\n"
+				"CallLimit: %d\r\n"
+				"Event: %s\r\n",
+				peer->name,
+				!ast_sockaddr_isnull(&peer->src_addr) ? ast_sockaddr_stringify(&peer->src_addr) : "",
+				peer->context,
+				S_OR(peer->accountcode, ""),
+				peer->inUse, peer->inRinging, peer->call_limit,
+				event == SOFIA_INC_CALL_RINGING ? "INC_CALL_RINGING" : "INC_CALL_LIMIT");
+		}
 		break;
 
 	case SOFIA_DEC_CALL_LIMIT:
@@ -12699,6 +12706,19 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		break;
 	}
 
+	/* BLF/presence (chan_sip update_call_counter:6817 parity): a call-counter
+	 * transition changed this peer's device state — fire a devstate change so the
+	 * SIP/<peer> hint recomputes and the watchers' NOTIFYs go out. All locks are
+	 * released above; snapshot the name under the peer lock (Codex). The call-limit
+	 * reject path already returned -1, so reaching here is always a real (or
+	 * idempotent) INC/DEC transition. */
+	{
+		char l_name[80];
+		ao2_lock(peer);
+		ast_copy_string(l_name, peer->name, sizeof(l_name));
+		ao2_unlock(peer);
+		ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", l_name);
+	}
 	return 0;
 }
 
@@ -13080,6 +13100,10 @@ struct sofia_presence_sub {
 	char entity[256];			/* watched resource URI: sip:exten@domain */
 	char peername[80];			/* subscriber peer name (From user) for AMI */
 	char watcher_addr[64];			/* subscriber source addr for AMI */
+	char nat_proxy[128];			/* NUTAG_PROXY target (sip:src-ip:port) for NAT
+						 * (force_rport/comedia) watchers — routes NOTIFY to the
+						 * registered public source (SBC) not the private Contact,
+						 * else every NOTIFY 408s. Empty for non-NAT peers. */
 	char event[16];				/* "dialog" or "presence" (NOTIFY Event hdr) */
 	enum sofia_sub_format format;		/* negotiated body type */
 	int stateid;				/* ast_extension_state_add_destroy id (-1 = none) */
@@ -13315,6 +13339,10 @@ static void sofia_presence_emit_notify(struct sofia_presence_sub *sub, int state
 			SIPTAG_SUBSCRIPTION_STATE_STR(ss),
 			SIPTAG_CONTENT_TYPE_STR(mime),
 			SIPTAG_PAYLOAD_STR(ast_str_buffer(body)),
+			/* Problem C: route the NOTIFY to the NAT-learned source (the SBC) for
+			 * force_rport/comedia watchers — no-op (empty) for non-NAT peers, where
+			 * sofia-sip uses the normal dialog target. */
+			TAG_IF(sub->nat_proxy[0], NUTAG_PROXY(sub->nat_proxy)),
 			TAG_END());
 	}
 
@@ -13365,6 +13393,7 @@ static void sofia_presence_teardown(struct sofia_presence_sub *sub, int send_ter
 				SIPTAG_SUBSCRIPTION_STATE_STR("terminated;reason=timeout"),
 				SIPTAG_CONTENT_TYPE_STR(sofia_presence_mime(sub->format)),
 				SIPTAG_PAYLOAD_STR(ast_str_buffer(body)),
+				TAG_IF(sub->nat_proxy[0], NUTAG_PROXY(sub->nat_proxy)),	/* Problem C: NAT route */
 				TAG_END());
 			ast_free(body);
 		}
@@ -13564,12 +13593,28 @@ static int sofia_devicestate(void *data)
 		res = AST_DEVICE_UNAVAILABLE;		/* unreachable -> offline (generic can't know) */
 	} else if (peer->onHold) {
 		res = AST_DEVICE_ONHOLD;
+	} else if (peer->inRinging) {
+		/* chan_sip sip_devicestate parity: a ringing leg -> RINGING (or RINGINUSE
+		 * when some legs are already up). This is what lights the BLF on an inbound
+		 * call. */
+		res = (peer->inRinging == peer->inUse) ? AST_DEVICE_RINGING : AST_DEVICE_RINGINUSE;
 	} else if (peer->call_limit && peer->inUse >= peer->call_limit) {
 		res = AST_DEVICE_BUSY;
 	} else if (peer->call_limit && peer->busy_level && peer->inUse >= peer->busy_level) {
 		res = AST_DEVICE_BUSY;
+	} else if (peer->inUse) {
+		res = AST_DEVICE_INUSE;			/* an active call -> BLF red */
+	} else if (peer->qualify && peer->peer_status == PEER_UNREACHABLE) {
+		/* chan_sofia has no maxms; use the qualify result instead (Codex): a
+		 * registered peer that fails qualify is unreachable -> offline. */
+		res = AST_DEVICE_UNAVAILABLE;
 	} else {
-		res = AST_DEVICE_UNKNOWN;		/* registered/idle/in-call -> generic channel scan */
+		/* Registered and reachable with no call: report a CONCRETE NOT_INUSE
+		 * (available -> BLF green), matching chan_sip. Returning UNKNOWN here left
+		 * the BLF dark because, although the core would then channel-scan, the hint
+		 * only recomputes on a devstate change event — which sofia_update_call_counter
+		 * now fires on every call transition. */
+		res = AST_DEVICE_NOT_INUSE;
 	}
 	ast_mutex_unlock(&peer->lock);
 
@@ -13587,6 +13632,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	const char *to_host;
 	char l_context[AST_MAX_CONTEXT];
 	char l_peername[80];
+	char l_proxy[128] = "";			/* Problem C: NAT proxy target for the NOTIFY (empty = none) */
 	char l_exten[AST_MAX_EXTENSION];	/* bounded copy of To-user — keeps subkey consistent with sub->exten */
 	char subkey[200];
 	char hint[AST_MAX_EXTENSION];
@@ -13656,6 +13702,13 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		ast_copy_string(l_context, "default", sizeof(l_context));
 	}
 	ast_copy_string(l_peername, peer->name, sizeof(l_peername));
+	/* Problem C / Codex consensus: build the NAT proxy target from peer->src_addr
+	 * while the peer is locked + reffed. For nat=force_rport/comedia watchers this is
+	 * the registered public source (the SBC); the presence NOTIFYs are then routed
+	 * there via NUTAG_PROXY instead of the watcher's unreachable private Contact
+	 * (which makes every NOTIFY time out 408). Empty string for non-NAT peers, so the
+	 * TAG_IF below is a no-op and sofia-sip uses the normal dialog target. */
+	sofia_build_nat_proxy_url_from_peer(peer, l_proxy, sizeof(l_proxy));
 	ast_mutex_unlock(&peer->lock);
 	ao2_ref(peer, -1);
 	peer = NULL;
@@ -13737,6 +13790,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 				int st;
 				old->expires = expires;
 				old->expires_at = time(NULL) + expires;
+				ast_copy_string(old->nat_proxy, l_proxy, sizeof(old->nat_proxy));	/* refresh NAT route (source may have moved) */
 				snprintf(eb, sizeof(eb), "%d", expires);
 				nua_respond(nh, SIP_202_ACCEPTED, NUTAG_WITH_THIS(nua),
 					SIPTAG_EXPIRES_STR(eb), TAG_END());
@@ -13768,6 +13822,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	ast_copy_string(sub->exten, l_exten, sizeof(sub->exten));
 	ast_copy_string(sub->context, l_context, sizeof(sub->context));
 	ast_copy_string(sub->peername, l_peername, sizeof(sub->peername));
+	ast_copy_string(sub->nat_proxy, l_proxy, sizeof(sub->nat_proxy));	/* Problem C: NAT NOTIFY route */
 	snprintf(sub->entity, sizeof(sub->entity), "sip:%s@%s", to_user,
 		!ast_strlen_zero(to_host) ? to_host : (!ast_strlen_zero(sofia_cfg.realm) ? sofia_cfg.realm : "localhost"));
 	sofia_get_source_addr(sip, &src);
