@@ -5615,13 +5615,29 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	ast_string_field_set(peer, mohsuggest, S_OR(sofia_cfg.default_mohsuggest, ""));
 	peer->qualifyfreq = 60;
 	/* The 3 security fields the legacy alloc block did not set explicitly but the prior
-	 * M3 hotfix subset DID reset on reload — keep resetting them here so B2 fully
-	 * subsumes that subset (a stale md5secret/insecure must not survive). Other
-	 * never-reset per-peer fields (qualifytimeout/forceddiversion/callbackextension/
-	 * outboundproxy/groups) are a separate follow-up, deliberately NOT folded into B2. */
+	 * M3 hotfix subset DID reset on reload — keep resetting them here so the helper fully
+	 * subsumes that subset (a stale md5secret/insecure must not survive). */
 	ast_string_field_set(peer, md5secret, "");
 	peer->insecure = 0;
 	peer->qualify = 0;
+	/* Per-peer config fields that were never in the legacy alloc default block either
+	 * (a fresh peer got them by ao2_alloc zero-init), so the reload reset never cleared
+	 * a removed per-peer key. Default them to ""/0 here — alloc-faithful (zero behaviour
+	 * change for a new peer) and the reload reset now reverts a removed key. The empty
+	 * values keep the parser's "inherit at use-time" semantics (outboundproxy falls back
+	 * to sofia_cfg.outboundproxy; qualifytimeout=0 lets the qualify=yes parser apply the
+	 * [general]/builtin default when qualify is (re)enabled). Codex-consensus follow-up
+	 * to the M3-full config-reload reset. */
+	ast_string_field_set(peer, forceddiversion, "");
+	ast_string_field_set(peer, callbackextension, "");
+	ast_string_field_set(peer, accountcode, "");
+	ast_string_field_set(peer, cid_name, "");
+	ast_string_field_set(peer, cid_num, "");
+	ast_string_field_set(peer, cid_tag, "");
+	ast_string_field_set(peer, outboundproxy, "");
+	peer->callgroup = 0;
+	peer->pickupgroup = 0;
+	peer->qualifytimeout = 0;
 }
 
 static struct sofia_peer *sofia_peer_alloc(const char *name)
