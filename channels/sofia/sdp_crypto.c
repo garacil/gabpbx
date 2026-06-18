@@ -141,6 +141,18 @@ struct sdp_crypto {
 	char local_key64_per_suite[MAX_SDP_CRYPTO_SUITES][SRTP_MASTER_LEN64];
 	int suite_count;
 	int selected_suite_index;
+	/* Round5 C5 (crypto staging transaction): when sdp_crypto_process() is called in
+	 * `defer` mode it VALIDATES the inbound a=crypto and stashes the accepted parameters
+	 * here WITHOUT touching the live RTP (no add_srtp_policy) or the committed
+	 * p->suite/p->remote_key/p->tag. sdp_crypto_commit() then applies them to the live RTP
+	 * only AFTER sofia_parse_sdp's reject gates pass, so a re-INVITE that is ultimately
+	 * rejected never re-keys active SRTP. sdp_crypto_clear_staged() drops a stale stage. */
+	int staged_pending;
+	int staged_suite_val;
+	int staged_selected_suite_index;
+	unsigned char staged_remote_key[SRTP_MASTER_LEN];
+	char staged_suite[64];
+	char staged_tag[64];
 };
 
 static int set_crypto_policy(struct ast_srtp_policy *policy, int suite_val, const unsigned char *master_key, unsigned long ssrc, int inbound);
@@ -320,7 +332,7 @@ err:
 	return res;
 }
 
-int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_instance *rtp)
+int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_instance *rtp, int defer)
 {
 	char *str = NULL;
 	char *tag = NULL;
@@ -363,10 +375,15 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 	 * → -1 sentinel via subtraction. */
 	{
 		int parsed_tag = atoi(tag);
-		if (parsed_tag >= 1 && parsed_tag <= p->suite_count) {
-			p->selected_suite_index = parsed_tag - 1;
+		int idx = (parsed_tag >= 1 && parsed_tag <= p->suite_count) ? parsed_tag - 1 : -1;
+		/* Round5 C5 (Codex): selected_suite_index feeds sdp_crypto_activate's per-suite key
+		 * pick, so in defer mode STAGE it — do not mutate the live field before the SDP is
+		 * accepted (a rejected re-INVITE must not change key selection). Commit applies it
+		 * just before activation. */
+		if (defer) {
+			p->staged_selected_suite_index = idx;
 		} else {
-			p->selected_suite_index = -1;
+			p->selected_suite_index = idx;
 		}
 	}
 
@@ -455,6 +472,20 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 	 * policy installed. With p->tag NULL we always activate on the first crypto. */
 	if (p->tag && !memcmp(p->remote_key, remote_key, sizeof(p->remote_key))) {
 		ast_debug(1, "SRTP remote key unchanged; maintaining current policy\n");
+		p->staged_pending = 0;	/* Round5 C5: nothing to commit */
+		return 0;
+	}
+
+	if (defer) {
+		/* Round5 C5: validation passed and the key changed — STAGE the accepted crypto
+		 * but do NOT touch the live RTP or the committed p->suite/p->remote_key/p->tag.
+		 * sdp_crypto_commit() applies it once sofia_parse_sdp's reject gates have passed,
+		 * so a re-INVITE that is ultimately rejected never re-keys active SRTP. */
+		p->staged_suite_val = suite_val;
+		memcpy(p->staged_remote_key, remote_key, sizeof(p->staged_remote_key));
+		ast_copy_string(p->staged_suite, suite, sizeof(p->staged_suite));
+		ast_copy_string(p->staged_tag, tag, sizeof(p->staged_tag));
+		p->staged_pending = 1;
 		return 0;
 	}
 
@@ -477,6 +508,76 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 
 	/* Finally, rebuild the crypto line */
 	return sdp_crypto_offer(p);
+}
+
+/* Round5 C5: commit a previously-staged a=crypto (sdp_crypto_process with defer=1) onto the
+ * LIVE RTP. Called only after sofia_parse_sdp's reject gates pass, so active SRTP is re-keyed
+ * solely for an SDP we actually accept.
+ *   \retval 1  committed onto live RTP
+ *   \retval 0  no-op (nothing was staged)
+ *   \retval -1 failed BEFORE any live mutation (tag alloc) — caller may safely reject
+ *   \retval -2 activation failed AFTER a possible live mutation — caller must NOT reject */
+int sdp_crypto_commit(struct sdp_crypto *p, struct ast_rtp_instance *rtp)
+{
+	char *new_tag = NULL;
+
+	if (!p || !p->staged_pending) {
+		return 0;	/* no-op: nothing staged */
+	}
+	/* Constraint 5: pre-allocate the tag BEFORE the live add_srtp_policy so a post-
+	 * activation allocation failure can never turn an already-committed SDP into a reject.
+	 * A -1 here means nothing live was touched, so the caller may safely reject. */
+	if (!p->tag) {
+		new_tag = ast_strdup(p->staged_tag);
+		if (!new_tag) {
+			ast_log(LOG_ERROR, "Could not allocate memory for staged crypto tag\n");
+			p->staged_pending = 0;
+			return -1;
+		}
+	}
+	/* selected_suite_index is an INPUT to activation (per-suite local-key pick), so apply
+	 * the staged value just BEFORE activating (Codex fix 3 — not mutated during validate).
+	 * SAVE the old one so the -2 path can RESTORE it: on -2 we keep ALL accepted metadata
+	 * (suite/remote_key) unchanged, so the live index must not be left at the new value
+	 * either (Codex re-review). */
+	int prev_selected = p->selected_suite_index;
+	p->selected_suite_index = p->staged_selected_suite_index;
+	if (sdp_crypto_activate(p, p->staged_suite_val, p->staged_remote_key, rtp) < 0) {
+		/* Round5 C5 (Codex): ast_rtp_instance_add_srtp_policy / ast_srtp_replace can
+		 * mutate/destroy the existing SRTP BEFORE failing, so an activation failure means
+		 * the live media may already be half-changed. Return -2 (NOT -1) so the caller does
+		 * NOT 488 after a possible live mutation (that would leave the media corrupted AND
+		 * rejected). We deliberately keep ALL accepted metadata unchanged here, including
+		 * restoring selected_suite_index. */
+		p->selected_suite_index = prev_selected;
+		ast_free(new_tag);
+		p->staged_pending = 0;
+		return -2;
+	}
+	/* Activation succeeded — only NOW commit the accepted metadata (Codex fix 2), so a -2
+	 * path never leaves p->suite/p->remote_key mismatched against the live policy. */
+	ast_copy_string(p->suite, p->staged_suite, sizeof(p->suite));
+	memcpy(p->remote_key, p->staged_remote_key, sizeof(p->remote_key));
+	if (new_tag) {
+		ast_log(LOG_DEBUG, "Accepting crypto tag %s\n", new_tag);
+		p->tag = new_tag;
+	}
+	p->staged_pending = 0;
+	/* Rebuild our local crypto line. A failure here is logged but MUST NOT un-commit the
+	 * SRTP we just activated (constraint 5). */
+	if (sdp_crypto_offer(p) < 0) {
+		ast_log(LOG_WARNING, "SRTP local a=crypto rebuild failed after commit\n");
+	}
+	return 1;	/* committed live */
+}
+
+/* Round5 C5: drop any pending staged crypto (called at parse-start and on every reject path
+ * so a rejected SDP can never leave a staged key for a later parse to commit by accident). */
+void sdp_crypto_clear_staged(struct sdp_crypto *p)
+{
+	if (p) {
+		p->staged_pending = 0;
+	}
 }
 
 /* post-T56 srtpcipher operator option (2026-04-27): map suite spelling -> enum.

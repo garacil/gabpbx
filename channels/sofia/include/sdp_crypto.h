@@ -63,11 +63,26 @@ void sdp_crypto_destroy(struct sdp_crypto *crypto);
  * \param p A valid sdp_crypto struct
  * \param attr the a:crypto line from SDP
  * \param rtp The rtp instance associated with the SDP being parsed
+ * \param defer when nonzero, VALIDATE and stage the crypto only — do not touch the live
+ *        RTP (no add_srtp_policy) or the committed p->suite/p->remote_key/p->tag; the
+ *        caller must later call sdp_crypto_commit() once its SDP reject gates pass.
  *
  * \retval 0 success
  * \retval nonzero failure
  */
-int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_instance *rtp);
+int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_instance *rtp, int defer);
+
+/*! \brief Commit a crypto staged by sdp_crypto_process(..., defer=1) onto the live RTP.
+ * Re-keys active SRTP only for an SDP the caller has accepted.
+ * \retval 1 committed onto live RTP
+ * \retval 0 no-op (nothing was staged)
+ * \retval -1 failed BEFORE any live mutation (tag alloc) — safe for the caller to reject
+ * \retval -2 activation failed AFTER a possible live SRTP mutation — caller must NOT reject
+ *            (a 488 here would leave the media half-mutated and rejected) */
+int sdp_crypto_commit(struct sdp_crypto *p, struct ast_rtp_instance *rtp);
+
+/*! \brief Drop any pending staged crypto (parse-start + reject paths). */
+void sdp_crypto_clear_staged(struct sdp_crypto *p);
 
 
 /*! \brief Generate an SRTP a=crypto offer

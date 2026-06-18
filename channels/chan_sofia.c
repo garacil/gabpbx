@@ -3966,7 +3966,10 @@ static int sofia_process_crypto(struct sofia_pvt *pvt, struct ast_rtp_instance *
 		}
 	}
 	snprintf(prefixed, sizeof(prefixed), "crypto:%s", attr);
-	if (sdp_crypto_process((*srtp)->crypto, prefixed, rtp) < 0) {
+	/* Round5 C5: defer=1 — validate + stage only; the live add_srtp_policy is deferred to
+	 * sdp_crypto_commit() after sofia_parse_sdp's reject gates pass. (The was_new rollback
+	 * below still covers an immediate VALIDATION failure on this same call.) */
+	if (sdp_crypto_process((*srtp)->crypto, prefixed, rtp, 1) < 0) {
 		if (was_new) {
 			sofia_srtp_destroy(*srtp);
 			*srtp = NULL;
@@ -3975,6 +3978,29 @@ static int sofia_process_crypto(struct sofia_pvt *pvt, struct ast_rtp_instance *
 	}
 	(*srtp)->flags |= SRTP_CRYPTO_OFFER_OK;
 	return 1;
+}
+
+/* Round5 C5 (Codex consensus): on ANY sofia_parse_sdp reject, drop the staged-but-not-
+ * committed crypto and roll back an SRTP context THIS parse lazily created, so a rejected
+ * re-INVITE leaves the live media exactly as it was (no half-applied SRTP, no staged key a
+ * later parse could commit). audio_was_new/video_was_new = the context did not exist before
+ * this parse. */
+static void sofia_sdp_stage_rollback(struct sofia_pvt *pvt, int audio_was_new, int video_was_new)
+{
+	if (pvt->srtp && pvt->srtp->crypto) {
+		sdp_crypto_clear_staged(pvt->srtp->crypto);
+	}
+	if (pvt->vsrtp && pvt->vsrtp->crypto) {
+		sdp_crypto_clear_staged(pvt->vsrtp->crypto);
+	}
+	if (audio_was_new && pvt->srtp) {
+		sofia_srtp_destroy(pvt->srtp);
+		pvt->srtp = NULL;
+	}
+	if (video_was_new && pvt->vsrtp) {
+		sofia_srtp_destroy(pvt->vsrtp);
+		pvt->vsrtp = NULL;
+	}
 }
 
 static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
@@ -3990,9 +4016,25 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	int processed_crypto_audio = 0;
 	int processed_crypto_video = 0;
 	int image_active_seen = 0;	/* Round4 C9: a live UDPTL T.38 image leg was present this parse */
+	/* Round5 C5: whether THIS parse's a=crypto lazily creates the SRTP context (for reject
+	 * rollback). Captured AFTER the !pvt guard below (Codex fix 1 — do not deref pvt here). */
+	int audio_srtp_was_new = 0;
+	int video_srtp_was_new = 0;
 
 	if (!sip || !pvt || !pvt->rtp) {
 		return 0;
+	}
+
+	/* Round5 C5 (Codex fix 1): pvt is non-NULL here — capture whether THIS parse's
+	 * a=crypto lazily creates the SRTP context (for reject rollback) and clear any stale
+	 * staged crypto up front so a prior rejected parse cannot leave a key this one commits. */
+	audio_srtp_was_new = (pvt->srtp == NULL);
+	video_srtp_was_new = (pvt->vsrtp == NULL);
+	if (pvt->srtp && pvt->srtp->crypto) {
+		sdp_crypto_clear_staged(pvt->srtp->crypto);
+	}
+	if (pvt->vsrtp && pvt->vsrtp->crypto) {
+		sdp_crypto_clear_staged(pvt->vsrtp->crypto);
 	}
 
 	if (!sip->sip_payload || !sip->sip_payload->pl_data) {
@@ -4112,6 +4154,7 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 						ast_log(LOG_WARNING, "Sofia: no common audio codec with peer — rejecting (488 Not Acceptable Here)\n");
 						ast_rtp_codecs_payloads_clear(&newaudiortp, NULL);
 						sdp_parser_free(parser);
+						sofia_sdp_stage_rollback(pvt, audio_srtp_was_new, video_srtp_was_new);
 						return -1;
 					}
 				}
@@ -4483,22 +4526,74 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	/* T37: SRTP policy enforcement (mirrors chan_sip.c:9892-9938) */
 	if (audio_secure_offered && !processed_crypto_audio) {
 		ast_log(LOG_NOTICE, "Sofia: SDP rejected — m=audio RTP/SAVP without valid a=crypto\n");
+		sofia_sdp_stage_rollback(pvt, audio_srtp_was_new, video_srtp_was_new);
 		return -1;
 	}
 	if (video_secure_offered && !processed_crypto_video) {
 		ast_log(LOG_NOTICE, "Sofia: SDP rejected — m=video RTP/SAVP without valid a=crypto\n");
+		sofia_sdp_stage_rollback(pvt, audio_srtp_was_new, video_srtp_was_new);
 		return -1;
 	}
 	if (pvt->peer && pvt->peer->encryption) {
 		if (audio_offered && !audio_secure_offered) {
 			ast_log(LOG_NOTICE, "Sofia: SDP rejected — peer '%s' requires encryption, audio offer is plain RTP/AVP\n",
 				pvt->peer->name);
+			sofia_sdp_stage_rollback(pvt, audio_srtp_was_new, video_srtp_was_new);
 			return -1;
 		}
 		if (video_offered && !video_secure_offered) {
 			ast_log(LOG_NOTICE, "Sofia: SDP rejected — peer '%s' requires encryption, video offer is plain RTP/AVP\n",
 				pvt->peer->name);
+			sofia_sdp_stage_rollback(pvt, audio_srtp_was_new, video_srtp_was_new);
 			return -1;
+		}
+	}
+
+	/* Round5 C5 (Codex consensus): every reject gate has now passed — THIS is the only
+	 * place active SRTP is (re-)keyed, committing the crypto sdp_crypto_process staged
+	 * during the media loop. So a re-INVITE that would have been rejected never touched the
+	 * live SRTP. sdp_crypto_commit returns 0 (ok), -1 (failed BEFORE any live mutation —
+	 * safe to reject) or -2 (activation failed AFTER a possible live mutation). We may ONLY
+	 * 488 on a -1 from a stream that has not yet gone live (committed_any==0); once any
+	 * stream is live, or a commit may have mutated live media (-2), we must accept rather
+	 * than leave the media corrupt-AND-rejected. */
+	{
+		int committed_any = 0;
+		/* sdp_crypto_commit: 1 = committed live, 0 = no-op (nothing staged), -1 = failed
+		 * before any live mutation (safe to reject), -2 = activation failed after a
+		 * possible live mutation (must not reject). committed_any tracks ONLY a real live
+		 * commit (Codex fix 4: a 0 no-op must NOT set it). */
+		if (pvt->srtp && pvt->srtp->crypto) {
+			int crc = sdp_crypto_commit(pvt->srtp->crypto, pvt->rtp);
+			if (crc == 1) {
+				committed_any = 1;
+			} else if (crc == -2) {
+				committed_any = 1;
+				ast_log(LOG_WARNING, "Sofia: audio SRTP activation failed after a possible live mutation — accepting SDP to avoid a corrupt-and-rejected state\n");
+			} else if (crc == -1) {	/* pre-activation failure, nothing live touched */
+				ast_log(LOG_NOTICE, "Sofia: SDP rejected — audio SRTP commit failed before activation\n");
+				sofia_sdp_stage_rollback(pvt, audio_srtp_was_new, video_srtp_was_new);
+				return -1;
+			}
+			/* crc == 0: no-op (nothing staged) — committed_any unchanged */
+		}
+		if (pvt->vsrtp && pvt->vsrtp->crypto) {
+			int crc = sdp_crypto_commit(pvt->vsrtp->crypto, pvt->vrtp);
+			if (crc == 1) {
+				committed_any = 1;
+			} else if (crc == -2) {
+				committed_any = 1;
+				ast_log(LOG_WARNING, "Sofia: video SRTP activation failed after a possible live mutation — accepting SDP\n");
+			} else if (crc == -1) {
+				if (!committed_any) {	/* nothing went live yet: safe to reject */
+					ast_log(LOG_NOTICE, "Sofia: SDP rejected — video SRTP commit failed before activation\n");
+					sofia_sdp_stage_rollback(pvt, audio_srtp_was_new, video_srtp_was_new);
+					return -1;
+				}
+				/* a stream already went live: cannot reject without corrupting it */
+				ast_log(LOG_WARNING, "Sofia: video SRTP commit failed but audio is already live — accepting SDP (video without SRTP)\n");
+			}
+			/* crc == 0: no-op */
 		}
 	}
 
