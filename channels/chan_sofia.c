@@ -1302,7 +1302,11 @@ enum sofia_session_timer_mode {
 	SESSION_TIMERS_OFF       = 0, /* unset / inherit from [general] */
 	SESSION_TIMERS_ACCEPT    = 1, /* honor inbound peer Session-Expires; no initiate */
 	SESSION_TIMERS_ORIGINATE = 2, /* originate outbound Session-Expires + honor inbound */
-	SESSION_TIMERS_REFUSE    = 3, /* explicit-disable; sofia-sip emits 422 if peer offers */
+	SESSION_TIMERS_REFUSE    = 3, /* Round3 T2 (my#3): disables OUR origination only —
+	                               * NUTAG_SESSION_TIMER(0) tells sofia-sip not to run a
+	                               * refresher, it does NOT 422-refuse a peer-offered
+	                               * Session-Expires (sofia-sip still accepts inbound
+	                               * timers). Effectively equivalent-to-ACCEPT inbound. */
 };
 enum sofia_session_refresher {
 	SESSION_REFRESHER_AUTO = 0, /* sofia-sip nua_any_refresher; negotiation decides */
@@ -2960,14 +2964,19 @@ static int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct as
 	case AST_T38_NEGOTIATED:
 	case AST_T38_REQUEST_NEGOTIATE:
 		if (parameters->max_ifp == 0) {
-			/* SS1.5 N1 LOAD-BEARING REJECTION GATE — chan_sip.c:7496 verbatim */
+			/* SS1.5 N1 LOAD-BEARING REJECTION GATE — chan_sip.c:7496 verbatim.
+			 * Round3 T2 (Codex#3): snapshot the PEER_REINVITE state BEFORE the
+			 * DISABLED transition — sofia_change_t38_state() overwrites pvt->t38_state,
+			 * so testing it after the change always failed and the timer-cancel below
+			 * was dead code. */
+			int was_peer_reinvite = (pvt->t38_state == SOFIA_T38_PEER_REINVITE);
 			sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
 			/* SS4.1 BUG#1 audit fold-in (2026-04-28): cancel t38id 5s timer
 			 * per chan_sip.c:7499 verbatim ("when you delete the t38id sched,
 			 * you should dec the refcount for the stored dialog ptr").
 			 * Pattern 14 verbatim-mirror discipline — without this cancel,
 			 * scheduler holds dangling 5s ghost ref per fax flow. */
-			if (pvt->t38_state == SOFIA_T38_PEER_REINVITE && pvt->t38id != -1 && sofia_sched) {
+			if (was_peer_reinvite && pvt->t38id != -1 && sofia_sched) {
 				if (ast_sched_thread_del(sofia_sched, pvt->t38id) == 0) {
 					ao2_ref(pvt, -1);
 				}
@@ -6551,7 +6560,9 @@ static format_t sofia_get_codec(struct ast_channel *chan)
  *               inbound:  set session_timer (200-OK includes Session-Expires when peer asked) + publish min_se.
  *   ORIGINATE-> outbound: NUTAG_SESSION_TIMER(session_expires) + publish min_se + refresher per peer config.
  *               inbound:  same as ACCEPT (we are UAS; can't originate).
- *   REFUSE   -> NUTAG_SESSION_TIMER(0) explicit-disable (both directions); sofia-sip emits 422 Session Interval Too Small if peer offers. */
+ *   REFUSE   -> NUTAG_SESSION_TIMER(0): disables OUR refresher/origination only. It does
+ *               NOT 422-refuse a peer-offered Session-Expires (sofia-sip still accepts
+ *               inbound session timers), so inbound behaves like ACCEPT. (Round3 T2 my#3) */
 static void sofia_session_timer_values(const struct sofia_peer *peer, int is_outbound,
 		int *out_st_seconds, int *out_min_se, int *out_refresher)
 {
@@ -8300,10 +8311,18 @@ static int sofia_sdp_extract_hold(sip_t const *sip, su_home_t *home)
 		return 0;
 	}
 	sdp = sdp_session(parser);
-	if (sdp && sdp->sdp_media) {
-		if (sdp->sdp_media->m_mode == sdp_sendonly ||
-			sdp->sdp_media->m_mode == sdp_inactive) {
-			hold = 1;
+	if (sdp) {
+		/* Round3 T2 (my#2): inspect the AUDIO media descriptor, not just the first
+		 * m= line — when audio is not first (e.g. an m=image/T.38 or m=video leads),
+		 * reading sdp_media->m_mode mis-detects hold. */
+		sdp_media_t *m;
+		for (m = sdp->sdp_media; m; m = m->m_next) {
+			if (m->m_type == sdp_media_audio && m->m_port != 0) {
+				if (m->m_mode == sdp_sendonly || m->m_mode == sdp_inactive) {
+					hold = 1;
+				}
+				break;
+			}
 		}
 	}
 	sdp_parser_free(parser);
@@ -11584,7 +11603,17 @@ static void sofia_process_message(nua_t *nua, nua_handle_t *nh, struct sofia_pvt
 			NUTAG_WITH_THIS(nua), TAG_END());
 		return;
 	}
-	ast_copy_string(buf, body, sizeof(buf));
+	/* Round3 T2 (Codex#11): bound the copy by pl_len — sip payload data may contain
+	 * embedded NULs and is not guaranteed NUL-terminated, so an ast_copy_string /
+	 * strlen-based copy could truncate the body or over-read past pl_data. */
+	{
+		size_t n = sip->sip_payload->pl_len;
+		if (n >= sizeof(buf)) {
+			n = sizeof(buf) - 1;
+		}
+		memcpy(buf, body, n);
+		buf[n] = '\0';
+	}
 
 	/* R4 trailing-LF strip (chan_sip L17374-17378 parity). */
 	bufp = buf + strlen(buf);
@@ -14709,6 +14738,7 @@ static void sofia_process_info(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *o
 {
 	const char *content_type = NULL;
 	const char *body = NULL;
+	char bodybuf[1024];			/* Round3 T2 (Codex#11): pl_len-bounded NUL-terminated body copy */
 	char digit = '\0';
 	unsigned int duration = 250;
 
@@ -14723,7 +14753,16 @@ static void sofia_process_info(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *o
 	}
 
 	if (sip->sip_payload && sip->sip_payload->pl_data) {
-		body = sip->sip_payload->pl_data;
+		/* Round3 T2 (Codex#11): copy into a pl_len-bounded NUL-terminated buffer —
+		 * the payload may contain NULs / not be NUL-terminated, and the strstr/atol
+		 * parsing below assumes a C string. */
+		size_t n = sip->sip_payload->pl_len;
+		if (n >= sizeof(bodybuf)) {
+			n = sizeof(bodybuf) - 1;
+		}
+		memcpy(bodybuf, sip->sip_payload->pl_data, n);
+		bodybuf[n] = '\0';
+		body = bodybuf;
 	}
 
 	if (!content_type || !body) {
@@ -15124,9 +15163,16 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			if (sip && sip->sip_contact) {
 				int expires = DEFAULT_EXPIRY;
 				if (sip->sip_expires && sip->sip_expires->ex_delta) {
-					expires = sip->sip_expires->ex_delta;
+					/* Round3 T2 (Codex#10): clamp the unsigned ex_delta before the
+					 * int cast — > INT_MAX wraps negative and corrupts reg_expiry. */
+					expires = sip->sip_expires->ex_delta > (unsigned long) INT_MAX
+						? INT_MAX : (int) sip->sip_expires->ex_delta;
 				} else if (sip->sip_contact->m_expires) {
-					expires = atoi(sip->sip_contact->m_expires);
+					long e = strtol(sip->sip_contact->m_expires, NULL, 10);
+					expires = (e < 0 || e > INT_MAX) ? DEFAULT_EXPIRY : (int) e;
+				}
+				if (expires < 0) {
+					expires = DEFAULT_EXPIRY;
 				}
 				ast_verbose("Sofia: Registration OK, expires=%d\n", expires);
 				if (peer) {
@@ -17787,14 +17833,33 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 		if (!strcasecmp(v->name, "bindaddr")) {
 			ast_copy_string(sofia_cfg.bindaddr, v->value, sizeof(sofia_cfg.bindaddr));
 		} else if (!strcasecmp(v->name, "bindport") || !strcasecmp(v->name, "udpbindaddr")) {
-			if (strchr(v->value, ':')) {
-				char *port_str = strchr((char *)v->value, ':');
-				*port_str = '\0';
-				port_str++;
-				ast_copy_string(sofia_cfg.bindaddr, v->value, sizeof(sofia_cfg.bindaddr));
-				sofia_cfg.bindport = atoi(port_str);
+			/* Round3 T2 (my#9): IPv6-aware host:port split on a LOCAL copy — never
+			 * mutate v->value, and don't truncate a bracketed IPv6 like
+			 * [2001:db8::1]:5060 at its first colon. */
+			char hpbuf[128];
+			ast_copy_string(hpbuf, v->value, sizeof(hpbuf));
+			if (hpbuf[0] == '[') {				/* [IPv6]:port */
+				char *end = strchr(hpbuf, ']');
+				if (end) {
+					char *port = (end[1] == ':') ? end + 2 : NULL;
+					*end = '\0';
+					ast_copy_string(sofia_cfg.bindaddr, hpbuf + 1, sizeof(sofia_cfg.bindaddr));
+					if (port && *port) {
+						sofia_cfg.bindport = atoi(port);
+					}
+				}
 			} else {
-				sofia_cfg.bindport = atoi(v->value);
+				char *first = strchr(hpbuf, ':');
+				char *last = strrchr(hpbuf, ':');
+				if (first && first == last) {		/* exactly one colon: host:port */
+					*first = '\0';
+					ast_copy_string(sofia_cfg.bindaddr, hpbuf, sizeof(sofia_cfg.bindaddr));
+					sofia_cfg.bindport = atoi(first + 1);
+				} else if (first) {			/* multiple colons: bare IPv6, no port */
+					ast_copy_string(sofia_cfg.bindaddr, hpbuf, sizeof(sofia_cfg.bindaddr));
+				} else {				/* no colon: a bare port (legacy bindport) */
+					sofia_cfg.bindport = atoi(hpbuf);
+				}
 			}
 		} else if (!strcasecmp(v->name, "port")) {
 			sofia_cfg.bindport = atoi(v->value);
