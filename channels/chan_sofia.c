@@ -10544,9 +10544,20 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	 * clients that can select the stronger RFC 7616 algorithm. */
 	if (!au) {
 		char nonce[64];
+		time_t now_fc = time(NULL);
+		int ttl_fc = sofia_cfg.nonce_ttl_seconds > 0 ? sofia_cfg.nonce_ttl_seconds : SOFIA_NONCE_TTL_SEC_DEFAULT;
 
+		/* Round4 C2 (Codex consensus): a first challenge (no Authorization header) is
+		 * also UNVERIFIED — re-use the peer's live nonce when one exists (within TTL),
+		 * regenerating only when empty/expired, so a spoofed first request cannot
+		 * clobber a victim's in-flight challenge. */
 		ast_mutex_lock(&peer->lock);
-		sofia_regen_nonce_locked(peer, nonce, sizeof(nonce));
+		if (ast_strlen_zero(peer->nonce)
+				|| (peer->nonce_issued_at && (now_fc - peer->nonce_issued_at) > ttl_fc)) {
+			sofia_regen_nonce_locked(peer, nonce, sizeof(nonce));
+		} else {
+			ast_copy_string(nonce, peer->nonce, sizeof(nonce));
+		}
 		ast_mutex_unlock(&peer->lock);
 
 		sofia_emit_auth_challenge(nua, nh, realm, nonce, 0);
@@ -10633,11 +10644,23 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	 * replay prevention. Treat missing realm as mismatch. Stale challenge
 	 * uses dual-algorithm offer for client retry-with-different-algorithm. */
 	if (!auth_realm || strcmp(auth_realm, realm) != 0) {
-		char fresh_nonce[64];
+		char chal_nonce[64];
+		time_t now_rm = time(NULL);
+		int ttl_rm = sofia_cfg.nonce_ttl_seconds > 0 ? sofia_cfg.nonce_ttl_seconds : SOFIA_NONCE_TTL_SEC_DEFAULT;
+		/* Round4 C2 (Codex consensus): a realm-mismatched (hence UNVERIFIED) request
+		 * must NOT clobber the peer's live in-flight nonce — a spoofed-username probe
+		 * would otherwise invalidate the victim's challenge (registration/call-setup
+		 * DoS). Re-challenge with the EXISTING nonce when one is still live; regenerate
+		 * only when it is empty/expired. */
 		ast_mutex_lock(&peer->lock);
-		sofia_regen_nonce_locked(peer, fresh_nonce, sizeof(fresh_nonce));
+		if (ast_strlen_zero(peer->nonce)
+				|| (peer->nonce_issued_at && (now_rm - peer->nonce_issued_at) > ttl_rm)) {
+			sofia_regen_nonce_locked(peer, chal_nonce, sizeof(chal_nonce));
+		} else {
+			ast_copy_string(chal_nonce, peer->nonce, sizeof(chal_nonce));
+		}
 		ast_mutex_unlock(&peer->lock);
-		sofia_emit_auth_challenge(nua, nh, realm, fresh_nonce, 1);
+		sofia_emit_auth_challenge(nua, nh, realm, chal_nonce, 1);
 		ast_verbose("Sofia: %s auth realm mismatch for '%s' - expected '%s' got '%s'\n",
 			method, peer->name, realm, auth_realm ? auth_realm : "(none)");
 		return SOFIA_AUTH_CHALLENGE;
@@ -10669,25 +10692,43 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 
 	ast_mutex_lock(&peer->lock);
 
-	/* 4-condition need-regen: empty/mismatched nonce + TTL expiry +
-	 * nc-replay (using_qop && new_nc <= peer->last_nc). */
-	int need_regen = ast_strlen_zero(peer->nonce)
-		|| !auth_nonce
-		|| strcmp(auth_nonce, peer->nonce)
-		|| (peer->nonce_issued_at && (time(NULL) - peer->nonce_issued_at) >
-			(sofia_cfg.nonce_ttl_seconds > 0 ? sofia_cfg.nonce_ttl_seconds : SOFIA_NONCE_TTL_SEC_DEFAULT))
-		|| (using_qop && new_nc <= peer->last_nc);
+	/* Round4 C2 (Codex consensus): split "rotate our nonce" from "the client sent a
+	 * wrong/old nonce". ROTATE only when our stored nonce is genuinely dead
+	 * (empty/expired) or a qop nc-replay was detected AGAINST THE MATCHING nonce; a
+	 * request bearing a NON-matching nonce is re-challenged with the EXISTING live
+	 * nonce, never regenerating it — so an unauthenticated/spoofed request cannot DoS
+	 * a victim's in-flight challenge by clobbering the single per-peer nonce. */
+	{
+		time_t now_nr = time(NULL);
+		int ttl_nr = sofia_cfg.nonce_ttl_seconds > 0 ? sofia_cfg.nonce_ttl_seconds : SOFIA_NONCE_TTL_SEC_DEFAULT;
+		int nonce_dead = ast_strlen_zero(peer->nonce)
+			|| (peer->nonce_issued_at && (now_nr - peer->nonce_issued_at) > ttl_nr);
+		int nonce_matches = (auth_nonce && !ast_strlen_zero(peer->nonce)
+			&& !strcmp(auth_nonce, peer->nonce));
+		int nc_replay = (using_qop && nonce_matches && new_nc <= peer->last_nc);
 
-	if (need_regen) {
-		char fresh_nonce[64];
-		sofia_regen_nonce_locked(peer, fresh_nonce, sizeof(fresh_nonce));
-		ast_mutex_unlock(&peer->lock);
-		sofia_emit_auth_challenge(nua, nh, realm, fresh_nonce, 1);
-		if (sofia_debug) {
-			ast_verbose("Sofia: %s auth challenge for '%s' - stale/replay; fresh nonce=%s\n",
-				method, peer->name, fresh_nonce);
+		if (nonce_dead || nc_replay) {
+			char fresh_nonce[64];
+			sofia_regen_nonce_locked(peer, fresh_nonce, sizeof(fresh_nonce));
+			ast_mutex_unlock(&peer->lock);
+			sofia_emit_auth_challenge(nua, nh, realm, fresh_nonce, 1);
+			if (sofia_debug) {
+				ast_verbose("Sofia: %s auth challenge for '%s' - %s; fresh nonce=%s\n",
+					method, peer->name, nc_replay ? "nc-replay" : "stale/expired", fresh_nonce);
+			}
+			return SOFIA_AUTH_CHALLENGE;
 		}
-		return SOFIA_AUTH_CHALLENGE;
+		if (!nonce_matches) {
+			char chal_nonce[64];
+			ast_copy_string(chal_nonce, peer->nonce, sizeof(chal_nonce));
+			ast_mutex_unlock(&peer->lock);
+			sofia_emit_auth_challenge(nua, nh, realm, chal_nonce, 1);
+			if (sofia_debug) {
+				ast_verbose("Sofia: %s auth challenge for '%s' - wrong/old nonce; re-challenged with live nonce\n",
+					method, peer->name);
+			}
+			return SOFIA_AUTH_CHALLENGE;
+		}
 	}
 
 	/* md5secret carries a pre-computed MD5(user:realm:secret) usable ONLY for the
@@ -10705,7 +10746,12 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		if (want_md5) {
 			char fresh_nonce[64];
 			char hdr_md5[256];
-			sofia_regen_nonce_locked(peer, fresh_nonce, sizeof(fresh_nonce));
+			/* Round4 C2 (Codex consensus): the nonce already matched + is live here (we
+			 * passed the need_regen gate), and the digest response has NOT been verified
+			 * yet — re-challenge MD5-only with the EXISTING nonce instead of rotating it
+			 * pre-credential, so a request that knows a valid nonce but asks for SHA-256
+			 * cannot clobber the live nonce. */
+			ast_copy_string(fresh_nonce, peer->nonce, sizeof(fresh_nonce));
 			ast_mutex_unlock(&peer->lock);
 			snprintf(hdr_md5, sizeof(hdr_md5),
 				"Digest realm=\"%s\", nonce=\"%s\", qop=\"auth\", algorithm=MD5, stale=true",
