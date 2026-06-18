@@ -14263,27 +14263,11 @@ static int sofia_parse_replaces_query(const char *query, struct sofia_replaces_i
 	return -1;
 }
 
-static struct sofia_pvt *sofia_find_dialog_by_callid(const char *callid, struct sofia_pvt *exclude)
-{
-	struct ao2_iterator it;
-	struct sofia_pvt *p;
-
-	if (ast_strlen_zero(callid)) {
-		return NULL;
-	}
-
-	it = ao2_iterator_init(dialogs, 0);
-	while ((p = ao2_iterator_next(&it))) {
-		if (p != exclude && !ast_strlen_zero(p->callid) && !strcmp(p->callid, callid)) {
-			ao2_iterator_destroy(&it);
-			return p;
-		}
-		ao2_ref(p, -1);
-	}
-	ao2_iterator_destroy(&it);
-
-	return NULL;
-}
+/* Round3 deferred#1: forward-decl the A8 pvt validator (defined below near
+ * sofia_event_callback) — sofia_local_attended_transfer uses it to pin the
+ * nua_handle_by_replaces() result. The old Call-ID-only sofia_find_dialog_by_callid()
+ * was replaced by that native RFC 3891 full-identifier match and removed. */
+static struct sofia_pvt *sofia_pvt_ref_if_linked(nua_hmagic_t *hmagic);
 
 static struct ast_channel *sofia_ref_bridged_channel(struct ast_channel *owner)
 {
@@ -14333,8 +14317,40 @@ static int sofia_local_attended_transfer(struct sofia_pvt *transferer, const str
 		return -1;
 	}
 
-	target_pvt = sofia_find_dialog_by_callid(replaces->callid, transferer);
-	if (!target_pvt) {
+	/* Round3 deferred#1 (Codex consensus, RFC 3891 §3): match the FULL dialog
+	 * identifier — Call-ID + to-tag (== our LOCAL tag) + from-tag (== the REMOTE
+	 * tag) — via sofia-sip's native nua_handle_by_replaces() instead of the old
+	 * Call-ID-only scan, which could land on the WRONG forked dialog (same Call-ID,
+	 * different tags). We then convert the matched handle to our pvt with
+	 * nua_handle_magic() and PIN it with the A8 ref-if-linked guard, which also
+	 * validates the hmagic really is a live dialog pvt (a peer/presence-sub handle
+	 * is not in `dialogs` and yields NULL). Runs on sofia_thread (REFER handler), so
+	 * the nua_* dialog lookup is in-thread. A valid Replaces MUST carry both tags
+	 * (RFC 3891 §3) and sofia-sip's nta_leg_by_replaces() requires them, so an
+	 * untagged Replaces is declined for a LOCAL match (the caller falls back to
+	 * remote attended behaviour) — we do NOT resurrect the old Call-ID-only
+	 * mis-match. */
+	target_pvt = NULL;
+	if (!ast_strlen_zero(replaces->to_tag) && !ast_strlen_zero(replaces->from_tag)) {
+		su_home_t tmphome[1] = { SU_HOME_INIT(tmphome) };
+		char rstr[600];
+		sip_replaces_t *r;
+		nua_handle_t *rnh;
+
+		snprintf(rstr, sizeof(rstr), "%s;to-tag=%s;from-tag=%s",
+			replaces->callid, replaces->to_tag, replaces->from_tag);
+		r = sip_replaces_make(tmphome, rstr);
+		rnh = r ? nua_handle_by_replaces(sofia_nua, r) : NULL;
+		if (rnh) {
+			target_pvt = sofia_pvt_ref_if_linked(nua_handle_magic(rnh));
+			nua_handle_unref(rnh);	/* nua_handle_by_replaces() returns a +1 handle ref */
+		}
+		su_home_deinit(tmphome);
+	}
+	if (!target_pvt || target_pvt == transferer) {
+		if (target_pvt) {
+			ao2_ref(target_pvt, -1);	/* self-match (shouldn't happen) — release */
+		}
 		return 1; /* Not local; caller may fall back to remote attended behavior. */
 	}
 
