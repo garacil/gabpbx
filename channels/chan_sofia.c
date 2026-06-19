@@ -2517,6 +2517,65 @@ static int sofia_fork_cancel_all_cb(void *obj, void *arg, int flags)
 	return CMP_MATCH;
 }
 
+/* R6 #5 (3-way consensus): IPv6-aware host:port split for a "user@host[:port]" RURI tail.
+ * Ports the ']'-first algorithm already used at the bindaddr/active-contact sites so a
+ * bracketed [2001:db8::1]:5060 is NOT split at the first inner colon (the old inline
+ * strchr(at+1,':') mis-split bare IPv6). Fills host (bracket-stripped, NUL-terminated,
+ * clamped to hostlen) and *port; strips a trailing ;params / '>' in the no-port branch.
+ * Factored into ONE helper to stop the N-inline-copies drift that caused this bug. */
+static void sofia_split_hostport_from_uri(const char *hostport, char *host, size_t hostlen, int *port)
+{
+	const char *first, *last;
+
+	if (!host || hostlen == 0) {
+		return;
+	}
+	host[0] = '\0';
+	if (ast_strlen_zero(hostport)) {
+		return;
+	}
+
+	if (*hostport == '[') {				/* [IPv6](:port) */
+		const char *end = strchr(hostport, ']');
+		if (end) {
+			size_t hlen = end - (hostport + 1);
+			if (hlen >= hostlen) {
+				hlen = hostlen - 1;
+			}
+			memcpy(host, hostport + 1, hlen);
+			host[hlen] = '\0';
+			if (port && end[1] == ':') {	/* opencode nit: NULL-guard *port */
+				*port = atoi(end + 2);
+			}
+			return;
+		}
+		/* malformed (no closing ']') — fall through to copy raw */
+	}
+
+	first = strchr(hostport, ':');
+	last = strrchr(hostport, ':');
+	if (first && first == last) {			/* exactly one colon: host:port */
+		size_t hlen = first - hostport;
+		if (hlen >= hostlen) {
+			hlen = hostlen - 1;
+		}
+		memcpy(host, hostport, hlen);
+		host[hlen] = '\0';
+		if (port) {				/* opencode nit: NULL-guard *port */
+			*port = atoi(first + 1);
+		}
+	} else {					/* no colon (host), or bare IPv6 (>1 colon, no port) */
+		char *p;
+		ast_copy_string(host, hostport, hostlen);
+		if ((p = strchr(host, ';'))) {
+			*p = '\0';
+		}
+		if ((p = strchr(host, '>'))) {
+			*p = '\0';
+		}
+	}
+}
+
 static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *child, sip_t const *sip)
 {
 	struct sofia_pvt *master;
@@ -2594,16 +2653,7 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 		if (at) {
 			char rhost[64] = "";
 			int rport = 5060;
-			const char *colon = strchr(at + 1, ':');
-			if (colon) {
-				{ int hlen = colon - (at + 1); if (hlen >= (int)sizeof(rhost)) hlen = sizeof(rhost) - 1; ast_copy_string(rhost, at + 1, hlen + 1); }
-				rport = atoi(colon + 1);
-			} else {
-				ast_copy_string(rhost, at + 1, sizeof(rhost));
-				/* strip any trailing > or params */
-				char *semi = strchr(rhost, ';');
-				if (semi) *semi = '\0';
-			}
+			sofia_split_hostport_from_uri(at + 1, rhost, sizeof(rhost), &rport);	/* R6 #5: IPv6-aware */
 			struct sofia_contact *contact = sofia_peer_find_contact_by_host_port(master->peer, rhost, rport);
 			if (contact) {
 				sofia_pvt_set_active_contact(master, contact);
@@ -16258,15 +16308,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					if (at) {
 						char rhost[64] = "";
 						int rport = 5060;
-						const char *colon = strchr(at + 1, ':');
-						if (colon) {
-							{ int hlen = colon - (at + 1); if (hlen >= (int)sizeof(rhost)) hlen = sizeof(rhost) - 1; ast_copy_string(rhost, at + 1, hlen + 1); }
-							rport = atoi(colon + 1);
-						} else {
-							ast_copy_string(rhost, at + 1, sizeof(rhost));
-							char *semi = strchr(rhost, ';');
-							if (semi) *semi = '\0';
-						}
+						sofia_split_hostport_from_uri(at + 1, rhost, sizeof(rhost), &rport);	/* R6 #5: IPv6-aware */
 						struct sofia_contact *contact = sofia_peer_find_contact_by_host_port(pvt->peer, rhost, rport);
 						if (contact) {
 							sofia_pvt_set_active_contact(pvt, contact);
