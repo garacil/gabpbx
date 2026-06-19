@@ -310,15 +310,15 @@ To add the callbackextension column (post-T56 callbackextension per-peer parity,
 
 ALTER TABLE sippeers ADD COLUMN callbackextension VARCHAR(40) DEFAULT '';
 
-To add the progressinband column (post-T56 progressinband per-peer parity, chan_sip drop-in tri-state never/no/yes early-media in-band audio control; Pattern 12 24th-instance + chan_sofia-architectural-divergence sub-pattern 5th-instance partial-feature-parity flavor; Option B partial wire-in honors NEVER + YES exactly + NO degrades to NEVER; REAL OPERATOR DRIVER on .193 progressinband=no):
+To add the progressinband column (post-T56 progressinband per-peer parity, chan_sip drop-in tri-state never/no/yes early-media in-band audio control; Pattern 12 24th-instance + chan_sofia-architectural-divergence sub-pattern 5th-instance partial-feature-parity flavor; Option B partial wire-in honors NEVER + YES exactly + NO degrades to NEVER; REAL OPERATOR DRIVER in production progressinband=no):
 
 ALTER TABLE sippeers ADD COLUMN progressinband VARCHAR(8) DEFAULT 'never';
 
-To add the regserver column (post-T56 rtsavesysname [general] parity, multi-server gabpbx realtime tracking; Pattern 12 26th-instance behavior-change-from-chan_sofia-baseline sub-pattern 5th-sub-instance — chan_sofia restores canonical Asterisk-upstream behavior per canonical Asterisk chan_sip.c:5103-5151 wire-in pattern; active chan_sip.c FuturePBX fork has DROPPED this wire-in — flag dead in current chan_sip; chan_sofia parity-with-canonical-source-where-current-chan_sip-fork-regressed flavor; REAL OPERATOR DRIVER on .193 rtsavesysname=yes):
+To add the regserver column (post-T56 rtsavesysname [general] parity, multi-server gabpbx realtime tracking; Pattern 12 26th-instance behavior-change-from-chan_sofia-baseline sub-pattern 5th-sub-instance — chan_sofia restores canonical Asterisk-upstream behavior per canonical Asterisk chan_sip.c:5103-5151 wire-in pattern; active chan_sip.c FuturePBX fork has DROPPED this wire-in — flag dead in current chan_sip; chan_sofia parity-with-canonical-source-where-current-chan_sip-fork-regressed flavor; REAL OPERATOR DRIVER in production rtsavesysname=yes):
 
 ALTER TABLE sippeers ADD COLUMN regserver VARCHAR(20) DEFAULT '';
 
-To add the rtp-timeout bundle 3 columns (post-T56 rtp-timeout bundle per-peer parity, chan_sip drop-in RTP-stream no-traffic detection + dead-call cleanup + keepalive emission; REAL OPERATOR DRIVER on .193):
+To add the rtp-timeout bundle 3 columns (post-T56 rtp-timeout bundle per-peer parity, chan_sip drop-in RTP-stream no-traffic detection + dead-call cleanup + keepalive emission; REAL OPERATOR DRIVER in production):
 
 ALTER TABLE sippeers ADD COLUMN rtptimeout INTEGER DEFAULT 0;
 ALTER TABLE sippeers ADD COLUMN rtpholdtimeout INTEGER DEFAULT 0;
