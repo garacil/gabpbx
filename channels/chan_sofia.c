@@ -4204,6 +4204,13 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	 * negotiation ORDER-INDEPENDENT: an SDP listing m=video before m=audio no longer loses
 	 * video (the bug), and an SDP with no m=video no longer advertises stale config video.
 	 * Audio stays narrowed per-offer by the audio block, so it needs no pre-clear. */
+	/* R6 #3 close-out fix (3-way consensus): snapshot the pre-parse capability so EVERY reject
+	 * path can restore it. sofia_parse_sdp must NOT mutate pvt->capability on a rejected SDP —
+	 * without this, the pre-clear (and the audio-block narrowing) would leave a rejected
+	 * re-INVITE having stripped an ESTABLISHED call's video. Restored at the sdp_reject label.
+	 * (Broader negotiated state — vcapability / rtp-remote / codec-maps / T.38 — has the same
+	 * pre-reject-mutation issue, partly pre-existing; deferred to R7 validate-then-commit.) */
+	format_t orig_capability = pvt->capability;
 	pvt->capability &= ~AST_FORMAT_VIDEO_MASK;
 
 	for (media = sdp->sdp_media; media; media = media->m_next) {
@@ -4306,9 +4313,7 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 					if (!has_t38) {
 						ast_log(LOG_WARNING, "Sofia: no common audio codec with peer — rejecting (488 Not Acceptable Here)\n");
 						ast_rtp_codecs_payloads_clear(&newaudiortp, NULL);
-						sdp_parser_free(parser);
-						sofia_sdp_stage_rollback(pvt, audio_srtp_was_new, video_srtp_was_new);
-						return -1;
+						goto sdp_reject;	/* R6 #3: label frees parser (still live here) + rollback + restore capability */
 					}
 				}
 				/* R6 #3: narrow audio to the negotiated set, but PRESERVE this-SDP video.
@@ -4679,30 +4684,27 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	}
 
 	sdp_parser_free(parser);
+	parser = NULL;	/* R6 #3: NULL so the sdp_reject label's free is a no-op for the post-loop rejects */
 
 	/* T37: SRTP policy enforcement (mirrors chan_sip.c:9892-9938) */
 	if (audio_secure_offered && !processed_crypto_audio) {
 		ast_log(LOG_NOTICE, "Sofia: SDP rejected — m=audio RTP/SAVP without valid a=crypto\n");
-		sofia_sdp_stage_rollback(pvt, audio_srtp_was_new, video_srtp_was_new);
-		return -1;
+		goto sdp_reject;
 	}
 	if (video_secure_offered && !processed_crypto_video) {
 		ast_log(LOG_NOTICE, "Sofia: SDP rejected — m=video RTP/SAVP without valid a=crypto\n");
-		sofia_sdp_stage_rollback(pvt, audio_srtp_was_new, video_srtp_was_new);
-		return -1;
+		goto sdp_reject;
 	}
 	if (pvt->peer && pvt->peer->encryption) {
 		if (audio_offered && !audio_secure_offered) {
 			ast_log(LOG_NOTICE, "Sofia: SDP rejected — peer '%s' requires encryption, audio offer is plain RTP/AVP\n",
 				pvt->peer->name);
-			sofia_sdp_stage_rollback(pvt, audio_srtp_was_new, video_srtp_was_new);
-			return -1;
+			goto sdp_reject;
 		}
 		if (video_offered && !video_secure_offered) {
 			ast_log(LOG_NOTICE, "Sofia: SDP rejected — peer '%s' requires encryption, video offer is plain RTP/AVP\n",
 				pvt->peer->name);
-			sofia_sdp_stage_rollback(pvt, audio_srtp_was_new, video_srtp_was_new);
-			return -1;
+			goto sdp_reject;
 		}
 	}
 
@@ -4729,8 +4731,7 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 				ast_log(LOG_WARNING, "Sofia: audio SRTP activation failed after a possible live mutation — accepting SDP to avoid a corrupt-and-rejected state\n");
 			} else if (crc == -1) {	/* pre-activation failure, nothing live touched */
 				ast_log(LOG_NOTICE, "Sofia: SDP rejected — audio SRTP commit failed before activation\n");
-				sofia_sdp_stage_rollback(pvt, audio_srtp_was_new, video_srtp_was_new);
-				return -1;
+				goto sdp_reject;
 			}
 			/* crc == 0: no-op (nothing staged) — committed_any unchanged */
 		}
@@ -4744,8 +4745,7 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 			} else if (crc == -1) {
 				if (!committed_any) {	/* nothing went live yet: safe to reject */
 					ast_log(LOG_NOTICE, "Sofia: SDP rejected — video SRTP commit failed before activation\n");
-					sofia_sdp_stage_rollback(pvt, audio_srtp_was_new, video_srtp_was_new);
-					return -1;
+					goto sdp_reject;
 				}
 				/* a stream already went live: cannot reject without corrupting it */
 				ast_log(LOG_WARNING, "Sofia: video SRTP commit failed but audio is already live — accepting SDP (video without SRTP)\n");
@@ -4755,6 +4755,19 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	}
 
 	return 0;
+
+sdp_reject:
+	/* R6 #3 close-out fix (3-way consensus): single reject-cleanup. Every 'return -1' after the
+	 * pre-clear jumps here so a rejected SDP NEVER leaves pvt->capability mutated. parser is freed
+	 * here if still owned (it is NULL'd right after the unconditional sdp_parser_free below, so the
+	 * post-loop rejects do not double-free; the in-loop audio reject reaches here with parser still
+	 * live). SRTP staging is rolled back exactly once; capability is restored to its pre-parse value. */
+	if (parser) {
+		sdp_parser_free(parser);
+	}
+	sofia_sdp_stage_rollback(pvt, audio_srtp_was_new, video_srtp_was_new);
+	pvt->capability = orig_capability;
+	return -1;
 }
 
 static struct ast_channel *sofia_new(struct sofia_pvt *pvt, int state, const char *linkedid)
