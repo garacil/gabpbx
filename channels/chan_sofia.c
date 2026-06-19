@@ -4147,6 +4147,15 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 		return 0;
 	}
 
+	/* R6 #3 (3-way consensus): negotiate VIDEO from THIS SDP offer only. pvt->capability
+	 * enters the loop holding the peer's CONFIGURED audio+video, so drop the config video
+	 * bits up front; the per-media blocks below re-add ONLY the video actually offered.
+	 * Combined with the audio block preserving (local_cap & VIDEO_MASK) at ~4255, this makes
+	 * negotiation ORDER-INDEPENDENT: an SDP listing m=video before m=audio no longer loses
+	 * video (the bug), and an SDP with no m=video no longer advertises stale config video.
+	 * Audio stays narrowed per-offer by the audio block, so it needs no pre-clear. */
+	pvt->capability &= ~AST_FORMAT_VIDEO_MASK;
+
 	for (media = sdp->sdp_media; media; media = media->m_next) {
 		if (media->m_type == sdp_media_audio && media->m_port != 0) {
 			sdp_attribute_t *a;
@@ -4252,7 +4261,11 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 						return -1;
 					}
 				}
-				pvt->capability = local_cap & offered;
+				/* R6 #3: narrow audio to the negotiated set, but PRESERVE this-SDP video.
+				 * Config video was pre-cleared before the loop, so (local_cap & VIDEO_MASK)
+				 * is ONLY the video a preceding m=video block already added (video-first
+				 * case) — never stale config video. Audio-first/no-video cases leave it 0. */
+				pvt->capability = (local_cap & offered) | (local_cap & AST_FORMAT_VIDEO_MASK);
 				if (pvt->capability == 0) {
 					ast_log(LOG_WARNING, "Sofia: No common codec with peer; falling back to local capability\n");
 					pvt->capability = local_cap;
@@ -6004,7 +6017,26 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			else if (!strcasecmp(v->value, "inband")) peer->dtmfmode = SOFIA_DTMF_INBAND;
 			else if (!strcasecmp(v->value, "auto")) peer->dtmfmode = SOFIA_DTMF_AUTO;
 		} else if (!strcasecmp(v->name, "qualify")) {
-			peer->qualify = ast_true(v->value);
+			/* R6 #7 (3-way consensus): mirror the config-file parser (sofia_parse_peer_config)
+			 * so a realtime sippeers row with a NUMERIC qualify=<ms> is honored instead of
+			 * silently disabled. The old `ast_true(v->value)` returned 0 for "5000" -> qualify
+			 * OFF, so a migrated trunk lost monitoring with no warning. */
+			if (ast_true(v->value)) {
+				peer->qualify = 1;
+				peer->qualifyfreq = sofia_cfg.default_qualifyfreq > 0 ?
+					sofia_cfg.default_qualifyfreq : DEFAULT_QUALIFYFREQ;
+				peer->qualifytimeout = sofia_cfg.default_qualifytimeout > 0 ?
+					sofia_cfg.default_qualifytimeout : DEFAULT_QUALIFYTIMEOUT;
+			} else if (strcasecmp(v->value, "no")) {	/* numeric = qualify on, timeout=value */
+				peer->qualify = 1;
+				peer->qualifytimeout = atoi(v->value);
+				if (peer->qualifytimeout <= 0)
+					peer->qualifytimeout = DEFAULT_QUALIFYTIMEOUT;
+				peer->qualifyfreq = sofia_cfg.default_qualifyfreq > 0 ?
+					sofia_cfg.default_qualifyfreq : DEFAULT_QUALIFYFREQ;
+			} else {
+				peer->qualify = 0;
+			}
 		} else if (!strcasecmp(v->name, "qualifyfreq")) {
 			peer->qualifyfreq = atoi(v->value);
 			if (peer->qualifyfreq <= 0) peer->qualifyfreq = DEFAULT_QUALIFYFREQ;
@@ -10225,9 +10257,19 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 			if (sofia_cfg.contact_ha || peer->contactha) {
 				struct ast_sockaddr contact_addr;
 				char addr_buf[128];
-				snprintf(addr_buf, sizeof(addr_buf), "%s:%d",
-					m->m_url->url_host ? m->m_url->url_host : "0.0.0.0",
-					m->m_url->url_port ? atoi(m->m_url->url_port) : 5060);
+				const char *chost = m->m_url->url_host ? m->m_url->url_host : "0.0.0.0";
+				int cport = m->m_url->url_port ? atoi(m->m_url->url_port) : 5060;
+				/* R6 #2 (3-way consensus): bracket a numeric IPv6 literal so ast_sockaddr_parse
+				 * accepts it — its non-bracket split mis-parses a bare "2001:db8::1" (host="2001"
+				 * + parse fail), which would (a) wrongly fail-CLOSE a legit IPv6-registered peer
+				 * that has contactpermit= set, and (b) never actually enforce the ACL for IPv6.
+				 * With the bracket, IPv4 + numeric IPv6 ACLs are enforced; only true hostnames /
+				 * malformed hosts fall through to the fail-closed else below. */
+				if (strchr(chost, ':')) {
+					snprintf(addr_buf, sizeof(addr_buf), "[%s]:%d", chost, cport);
+				} else {
+					snprintf(addr_buf, sizeof(addr_buf), "%s:%d", chost, cport);
+				}
 				if (ast_sockaddr_parse(&contact_addr, addr_buf, 0)) {
 					if ((sofia_cfg.contact_ha && ast_apply_ha(sofia_cfg.contact_ha, &contact_addr) != AST_SENSE_ALLOW) ||
 					    (peer->contactha && ast_apply_ha(peer->contactha, &contact_addr) != AST_SENSE_ALLOW)) {
@@ -10235,6 +10277,18 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 							peer->name, uri);
 						return -1;
 					}
+				} else {
+					/* R6 #2 (3-way consensus): FAIL CLOSED. ast_sockaddr_parse is numeric-only,
+					 * so a non-IP / malformed Contact host previously SKIPPED the ACL entirely and
+					 * the binding was stored (fail-open). We deliberately do NOT DNS-resolve like
+					 * chan_sip: chan_sofia runs all signaling on the single sofia_thread, and a
+					 * blocking lookup against an attacker-controlled NS would stall ALL signaling
+					 * (amplifying DoS, violates the concurrency doctrine). This only fires when an
+					 * ACL is actually configured, so peers without contactpermit/deny are
+					 * unaffected. */
+					ast_log(LOG_NOTICE, "Sofia: REGISTER from peer '%s' Contact %s has a non-IP host with contact-ACL configured — rejecting (fail-closed)\n",
+						peer->name, uri);
+					return -1;
 				}
 			}
 
@@ -10634,10 +10688,10 @@ static void sofia_sha256_hash(char *out_buf, const char *input)
  * operator visibility. SHA-256 algorithm path: A1 = SHA-256(user:realm:secret)
  * (or md5secret-direct when set). out_hash buffer size: 33 chars for MD5;
  * 65 chars for SHA-256. Caller responsible for sufficient size. */
-static void sofia_compute_a1_hash(struct sofia_peer *peer, const char *realm,
+static int sofia_compute_a1_hash(struct sofia_peer *peer, const char *realm,
 		int algorithm, char *out_hash)
 {
-	char a1_pre[256];
+	char *a1_pre = NULL;
 
 	/* SW11 md5secret-precedence per chan_sip.c:15415-16. NOTE: md5secret is a
 	 * pre-computed MD5 hash; SHA-256 algorithm path with md5secret-set is a
@@ -10652,16 +10706,30 @@ static void sofia_compute_a1_hash(struct sofia_peer *peer, const char *realm,
 	 * REGISTER refresh / INVITE / SUBSCRIBE for peers with both fields set). */
 	if (!ast_strlen_zero(peer->md5secret)) {
 		ast_copy_string(out_hash, peer->md5secret, 33);
-		return;
+		return 0;
 	}
 
-	snprintf(a1_pre, sizeof(a1_pre), "%s:%s:%s",
-		peer->name, realm, peer->secret);
+	/* R6 #1 (3-way consensus): hash name:realm:secret over a DYNAMIC buffer so it can
+	 * NEVER be truncated. The old fixed char a1_pre[256] silently dropped the secret when
+	 * strlen(name)+strlen(realm) reached ~253 (reachable under domainsasrealm with an
+	 * attacker-chosen long domain) — the server then hashed MD5("name:realm:") which an
+	 * attacker computes from public values alone = auth bypass; legitimate clients hashing
+	 * the full secret were simultaneously false-rejected. On OOM, PROPAGATE failure (-1) so
+	 * the caller rejects (500) instead of continuing with a predictable empty hash. No
+	 * secret-scrub of a1_pre: peer->secret already persists in the stringfield pool for the
+	 * peer's lifetime (scrubbing this transient copy is theatre) and a memset-before-free is
+	 * elided at -O2 anyway — 3-way consensus: drop it. */
+	if (ast_asprintf(&a1_pre, "%s:%s:%s", peer->name, realm, peer->secret) < 0 || !a1_pre) {
+		ast_free(a1_pre);	/* Codex: defensive — free if non-NULL on the impossible -1+ptr case (ast_free(NULL) is a no-op) */
+		return -1;
+	}
 	if (algorithm == SOFIA_DIGEST_SHA256) {
 		sofia_sha256_hash(out_hash, a1_pre);
 	} else {
 		ast_md5_hash(out_hash, a1_pre);
 	}
+	ast_free(a1_pre);
+	return 0;
 }
 
 /* post-T56 Task #3 INVITE digest auth SS4 (2026-04-28, Pattern 5 helper #35
@@ -10671,23 +10739,36 @@ static void sofia_compute_a1_hash(struct sofia_peer *peer, const char *realm,
  * cnonce:qop:HA2) for qop=auth (RFC 2617) OR hash(HA1:nonce:HA2) for no-qop
  * (RFC 2069). Hash function per algorithm: MD5 (32 hex chars) or SHA-256
  * (64 hex chars). out_hash buffer size: 33 for MD5; 65 for SHA-256. */
-static void sofia_compute_digest(struct sofia_peer *peer, const char *realm,
+static int sofia_compute_digest(struct sofia_peer *peer, const char *realm,
 		const char *method, const char *uri,
 		const char *nonce, const char *nc, const char *cnonce,
 		const char *qop, int algorithm, char *out_hash)
 {
 	char a1_hash[65];
-	char a2_pre[256];
+	char *a2_pre = NULL;
 	char a2_hash[65];
 	char resp_pre[1024];
 
-	sofia_compute_a1_hash(peer, realm, algorithm, a1_hash);
-	snprintf(a2_pre, sizeof(a2_pre), "%s:%s", method, uri);
+	/* R6 #1/#4 (3-way consensus): PROPAGATE a digest-compute failure (HA1 or HA2 buffer
+	 * OOM) to the caller as -1 so it rejects (500) — never continue with an empty/
+	 * predictable hash that an attacker could match in the OOM window. */
+	if (sofia_compute_a1_hash(peer, realm, algorithm, a1_hash) != 0) {
+		return -1;
+	}
+	/* R6 #4 (3-way consensus): dynamic buffer for method:uri — a fixed [256] truncated HA2
+	 * when the client-supplied uri (up to ~255) made "METHOD:uri" exceed 256, so the server
+	 * hashed a different string than the client and false-rejected every valid REGISTER/
+	 * INVITE/SUBSCRIBE with a long Request-URI. No secret here, so no scrub. */
+	if (ast_asprintf(&a2_pre, "%s:%s", method, uri) < 0 || !a2_pre) {
+		ast_free(a2_pre);	/* Codex: defensive free on the impossible -1+ptr case */
+		return -1;
+	}
 	if (algorithm == SOFIA_DIGEST_SHA256) {
 		sofia_sha256_hash(a2_hash, a2_pre);
 	} else {
 		ast_md5_hash(a2_hash, a2_pre);
 	}
+	ast_free(a2_pre);
 
 	if (qop && !ast_strlen_zero(qop)) {
 		snprintf(resp_pre, sizeof(resp_pre), "%s:%s:%s:%s:%s:%s",
@@ -10702,6 +10783,7 @@ static void sofia_compute_digest(struct sofia_peer *peer, const char *realm,
 	} else {
 		ast_md5_hash(out_hash, resp_pre);
 	}
+	return 0;
 }
 
 /* post-T56 Task #3 INVITE digest auth SS2 (2026-04-28, Pattern 5 helper #34):
@@ -10975,6 +11057,18 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	/* Parse nc as 8-hex-digit non-zero unsigned. */
 	if (using_qop) {
 		char *endptr = NULL;
+		/* R6 #8 (3-way consensus): RFC 2617 nc is EXACTLY 8 LHEX. Validate the format
+		 * BEFORE strtoul, which otherwise accepts a leading '-' ("-1" -> ULONG_MAX -> cast
+		 * UINT_MAX) that passes the !=0 guard and poisons peer->last_nc, self-replay-DoSing
+		 * the peer until the nonce rotates. The strtoul+endptr check below stays as
+		 * belt-and-suspenders. */
+		if (strlen(auth_nc) != 8 || strspn(auth_nc, "0123456789abcdefABCDEF") != 8) {
+			nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
+			ast_verbose("Sofia: %s auth rejected for '%s' - nc not 8 hex digits: %s\n",
+				method, peer->name, auth_nc);
+			sofia_blacklist_add_sip(sip, "digest malformed nc");
+			return SOFIA_AUTH_REJECT;
+		}
 		new_nc = (unsigned int)strtoul(auth_nc, &endptr, 16);
 		if (!endptr || endptr == auth_nc || *endptr != '\0' || new_nc == 0) {
 			nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
@@ -11071,11 +11165,19 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	 * read-side stable across the helper boundary. SS4: algorithm parameter
 	 * routes through sofia_compute_digest → sofia_compute_a1_hash for MD5
 	 * vs SHA-256 dispatch. */
-	sofia_compute_digest(peer, realm, method, auth_uri,
-		peer->nonce, auth_nc, auth_cnonce,
-		using_qop ? "auth" : NULL,
-		algorithm,
-		expected_hash);
+	if (sofia_compute_digest(peer, realm, method, auth_uri,
+			peer->nonce, auth_nc, auth_cnonce,
+			using_qop ? "auth" : NULL,
+			algorithm,
+			expected_hash) != 0) {
+		/* R6 #1/#4: the digest could not be computed (OOM building HA1/HA2). Reject with
+		 * 500 — never grant or compare against a partial/empty hash. */
+		ast_mutex_unlock(&peer->lock);
+		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
+		ast_verbose("Sofia: %s auth digest-compute failed (OOM) for '%s' — rejecting\n",
+			method, peer->name);
+		return SOFIA_AUTH_REJECT;
+	}
 
 	/* SW1 timing-attack fix: constant-time digest comparison via Pattern 5
 	 * helper #36 sofia_ct_memcmp. Was strncasecmp (vulnerable). Compare
@@ -21843,7 +21945,10 @@ static int manager_sofia_show_peer(struct mansession *s, const struct message *m
 		ast_str_append(&buf, 0, "SIP-Useragent: %s\r\n", ua);
 	}
 	ast_str_append(&buf, 0, "Reg-Contact: %s\r\n", contact ? S_OR(contact->contact_uri, "") : "");
-	ast_str_append(&buf, 0, "QualifyFreq: %d ms\r\n", peer->qualifyfreq);
+	/* R6 #6 (3-way consensus): chan_sofia stores qualifyfreq in SECONDS but chan_sip's AMI
+	 * emits it in ms (it stores freq*1000). Emit *1000 and KEEP the "ms" label so migrated
+	 * NMS scripts read the same value as chan_sip (a relabel to "s" would be a silent AMI break). */
+	ast_str_append(&buf, 0, "QualifyFreq: %d ms\r\n", peer->qualifyfreq * 1000);
 	ast_str_append(&buf, 0, "Parkinglot: \r\n");
 	/* chan_sofia-only fields (T21/T22/T37) */
 	ast_str_append(&buf, 0, "BusyOnActive: %s\r\n", peer->busy_on_active ? "Y" : "N");
