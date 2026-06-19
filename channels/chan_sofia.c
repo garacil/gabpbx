@@ -342,7 +342,7 @@
  * NUTAG_WSS_URL at nua_create (T36 ec1bcd9 commit). Per-peer transport=ws
  * or transport=wss now operator-configurable; chan_sip has NO WebSocket
  * support whatsoever (verified via grep — 0 hits in chan_sip.c +
- * chan_sip.c.bk). Power-of-2 enum continues SOFIA_TRANSPORT_* bitmask
+ * canonical Asterisk chan_sip.c). Power-of-2 enum continues SOFIA_TRANSPORT_* bitmask
  * convention. */
 #define SOFIA_TRANSPORT_WS  8
 #define SOFIA_TRANSPORT_WSS 16
@@ -841,11 +841,11 @@ static struct {
 	 * chan_sip.c:29590-29591 verbatim [general] parser ast_true + sip.h:686 verbatim
 	 * field `int rtsave_sysname` (doxygen tag G: Save system name at registration?)
 	 * + chan_sip.c:19440 verbatim "Save sys. name" sip show settings display +
-	 * chan_sip.c.bk:5103-
+	 * canonical Asterisk chan_sip.c:5103-
 	 * 5151 canonical realtime_update_peer wire-in pattern (Asterisk-upstream pattern).
 	 * IMPORTANT NOTE: active chan_sip.c FuturePBX fork has DROPPED the realtime_update_
 	 * peer wire-in entirely — only parser + display present (rtsavesysname is currently
-	 * a DEAD flag in active chan_sip; canonical wire-in preserved only in chan_sip.c.bk
+	 * a DEAD flag in active chan_sip; canonical wire-in preserved only in canonical Asterisk chan_sip.c
 	 * backup). chan_sofia restores canonical Asterisk-upstream behavior — chan_sofia
 	 * parity-with-canonical-source-where-current-chan_sip-fork-regressed flavor.
 	 * Default 0 (FALSE) per chan_sip drop-in BSS static-zero (chan_sip has no explicit
@@ -893,7 +893,7 @@ static struct {
 	 * L5285+L5622+L5624+L15010+L15061+L15081+L18272+L18276+L18343+L18365+L28585+
 	 * L28619+L29046+L29051+L29310 (active chan_sip wire-in CONFIRMED — chan_sip-
 	 * parity-NOT-fork-regression-class verified via backup-fork verification;
-	 * chan_sip.c.bk has same wire-in pattern). PARSE-COMPAT-ONLY ship — chan_sofia
+	 * canonical Asterisk chan_sip.c has same wire-in pattern). PARSE-COMPAT-ONLY ship — chan_sofia
 	 * ao2 peer registry already keeps ALL peers (static + realtime) in memory after
 	 * first ao2_link; there's no "destroy after lookup" path in chan_sofia. chan_sofia
 	 * INTRINSIC behavior matches chan_sip rtcachefriends=YES regardless of flag value.
@@ -923,7 +923,7 @@ static struct {
 	 * display + 3 active use sites at L5624 (peer-flag-propagation) + L5625-5626
 	 * (AST_SCHED_REPLACE_UNREF schedule peer expire) + L14684 (re-check at expire_
 	 * register call). Backup-fork verification CONFIRMED chan_sip-parity-NOT-fork-
-	 * regression-class (chan_sip.c.bk has same wire-in pattern at corresponding lines).
+	 * regression-class (canonical Asterisk chan_sip.c has same wire-in pattern at corresponding lines).
 	 * PARSE-COMPAT-ONLY ship — chan_sofia ao2 peer registry has NO peer-level auto-
 	 * clear infrastructure (sofia_expire_contacts_cb is per-AOR per-CONTACT expiry NOT
 	 * peer-level; chan_sofia peers persist in ao2 registry until module reload). Joins
@@ -950,7 +950,7 @@ static struct {
 	 * sip.h:205) + sip.h:711 verbatim int field + chan_sip.c:11645-11673 verbatim
 	 * get_realm function pattern (check From → check To → fallback) + chan_sip.c:19293
 	 * verbatim "Use domains as realms" sip show settings wording. Backup-fork
-	 * verification CONFIRMED chan_sip-parity-NOT-fork-regression-class (chan_sip.c.bk
+	 * verification CONFIRMED chan_sip-parity-NOT-fork-regression-class (canonical Asterisk chan_sip.c
 	 * has same wire-in at L11506+L19092+L29200+L29311-29312). chan_sofia leverages
 	 * existing domain_list infrastructure from T46.2 work (chan_sofia.c:750
 	 * AST_LIST_HEAD_STATIC + L5539-5559 func_sofia_check_sipdomain walker pattern) —
@@ -1000,7 +1000,7 @@ static struct {
 	 * ABSENT — does NOT display autodomain at sip show settings (Pattern 14 source-
 	 * correction caught at R-ACK). chan_sofia surpass IN-SCOPE: sip show settings
 	 * 14th field display where chan_sip silent. Backup-fork verification CONFIRMED
-	 * chan_sip-parity-NOT-fork-regression-class (active chan_sip + chan_sip.c.bk
+	 * chan_sip-parity-NOT-fork-regression-class (active chan_sip + canonical Asterisk chan_sip.c
 	 * both have wire-in at L30295+/L30033+). chan_sofia leverages existing
 	 * domain_list infrastructure from T46.2 work + sofia_check_sip_domain helper #30
 	 * + sofia_get_realm_for_dialog helper #29 + Pattern 5 helper #31 sofia_domain_
@@ -1019,7 +1019,7 @@ static struct {
 	 * parity at chan_sip.c:29954-29955 verbatim [general] dual-key parser OR-chained
 	 * acceptance (matchexternaddrlocally + matchexterniplocally — BOTH spellings parsed
 	 * identically) + chan_sip.c:29531 verbatim default-init via DEFAULT_MATCHEXTERNADDRLOCALLY
-	 * macro + sip.h:701 verbatim int field. Backup-fork verification (chan_sip.c.bk
+	 * macro + sip.h:701 verbatim int field. Backup-fork verification (canonical Asterisk chan_sip.c
 	 * L4009 + L29270 + L29692-29693) CONFIRMED chan_sip-parity-NOT-fork-regression-class.
 	 * **Architectural divergence**: chan_sofia sofia_should_use_externaddr signature at
 	 * chan_sofia.c:1471-1478 takes peer_addr ONLY (compares peer against localnet);
@@ -1596,7 +1596,7 @@ struct sofia_peer {
 	 * but chan_sofia doesn't follow 3xx redirects regardless of flag value. Future-
 	 * fix path: implement nua_r_redirect handler + 3xx Contact parser + ast_channel
 	 * .call_forward setter (~80-120 LoC follow-up if operator demand surfaces).
-	 * Backup-fork verification (chan_sip.c.bk L27934 parser + L12283 AMI) CONFIRMED
+	 * Backup-fork verification (canonical Asterisk chan_sip.c L27934 parser + L12283 AMI) CONFIRMED
 	 * chan_sip-parity-NOT-fork-regression-class. Joins sub-pattern 9-sub-instance
 	 * series (subscribemwi 17th + notifyringing 19th + autocreatepeer 20th +
 	 * ignoresdpversion 23rd + progressinband 24th-partial + subscribe_network_change_
@@ -1626,7 +1626,7 @@ struct sofia_peer {
 	 * ship: parse + store + display but NO behavioral wire-in (sofia_parse_sdp
 	 * autoframing gate not implemented today; future-fix ~50-70 LoC follow-up
 	 * implementing SDP ptime attribute walker + ast_codec_pref_setsize wire-in if
-	 * operator demand surfaces). Backup-fork verification (chan_sip.c.bk L738 +
+	 * operator demand surfaces). Backup-fork verification (canonical Asterisk chan_sip.c L738 +
 	 * L5909 + L8408 + L10276 + L12515 + L16844 + L16978 + L18541 + L18764 + L19202)
 	 * CONFIRMED chan_sip-parity-NOT-fork-regression-class. Joins sub-pattern 11-
 	 * sub-instance series (subscribemwi 17th + notifyringing 19th + autocreatepeer
@@ -15783,7 +15783,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 						 * realtime update gated by combined check. */
 						if (peer->is_realtime && sofia_cfg.peer_rtupdate) {
 							/* post-T56 rtsavesysname [general] parity (2026-04-28): inline 2-var
-							 * setup mirroring chan_sip.c.bk:5103-5151 canonical pattern. */
+							 * setup mirroring canonical Asterisk chan_sip.c:5103-5151 canonical pattern. */
 							const char *sysname = ast_config_AST_SYSTEM_NAME;
 							const char *syslabel = NULL;
 							char port_str[32], regsec_str[32];
@@ -19026,7 +19026,7 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "rtsavesysname")) {
 			/* post-T56 rtsavesysname [general] parity (2026-04-28): chan_sip parity at
 			 * chan_sip.c:29590-29591 verbatim ast_true. Wire-in at 5 sofia_process_
-			 * register ast_update_realtime callsites mirrors chan_sip.c.bk:5103-5151
+			 * register ast_update_realtime callsites mirrors canonical Asterisk chan_sip.c:5103-5151
 			 * canonical realtime_update_peer pattern. */
 			sofia_cfg.rtsave_sysname = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "rtupdate")) {

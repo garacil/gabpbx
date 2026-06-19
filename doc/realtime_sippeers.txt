@@ -138,7 +138,7 @@ CREATE TABLE sippeers (
     -- Multi-server realtime deployment column — written by chan_sofia at REGISTER
     -- when [general] rtsavesysname=yes + gabpbx.conf systemname= non-empty
     -- (Pattern 12 26th-instance behavior-change-from-baseline 5th-sub-instance —
-    -- chan_sofia restores canonical Asterisk-upstream behavior per chan_sip.c.bk
+    -- chan_sofia restores canonical Asterisk-upstream behavior per canonical Asterisk chan_sip.c
     -- :5103-5151 wire-in pattern; active chan_sip.c FuturePBX fork has DROPPED
     -- this wire-in — flag dead in current chan_sip; chan_sofia parity-with-
     -- canonical-source-where-current-chan_sip-fork-regressed flavor).
@@ -314,7 +314,7 @@ To add the progressinband column (post-T56 progressinband per-peer parity, chan_
 
 ALTER TABLE sippeers ADD COLUMN progressinband VARCHAR(8) DEFAULT 'never';
 
-To add the regserver column (post-T56 rtsavesysname [general] parity, multi-server gabpbx realtime tracking; Pattern 12 26th-instance behavior-change-from-chan_sofia-baseline sub-pattern 5th-sub-instance — chan_sofia restores canonical Asterisk-upstream behavior per chan_sip.c.bk:5103-5151 wire-in pattern; active chan_sip.c FuturePBX fork has DROPPED this wire-in — flag dead in current chan_sip; chan_sofia parity-with-canonical-source-where-current-chan_sip-fork-regressed flavor; REAL OPERATOR DRIVER on .193 rtsavesysname=yes):
+To add the regserver column (post-T56 rtsavesysname [general] parity, multi-server gabpbx realtime tracking; Pattern 12 26th-instance behavior-change-from-chan_sofia-baseline sub-pattern 5th-sub-instance — chan_sofia restores canonical Asterisk-upstream behavior per canonical Asterisk chan_sip.c:5103-5151 wire-in pattern; active chan_sip.c FuturePBX fork has DROPPED this wire-in — flag dead in current chan_sip; chan_sofia parity-with-canonical-source-where-current-chan_sip-fork-regressed flavor; REAL OPERATOR DRIVER on .193 rtsavesysname=yes):
 
 ALTER TABLE sippeers ADD COLUMN regserver VARCHAR(20) DEFAULT '';
 

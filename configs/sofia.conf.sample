@@ -1112,7 +1112,7 @@ srvlookup=yes
 ; chan_sip parity citations: chan_sip.c:29590-29591 verbatim [general] parser
 ; ast_true + sip.h:686 verbatim `int rtsave_sysname; /*!< G: Save system
 ; name at registration? */` + chan_sip.c:19440 verbatim "Save sys. name"
-; sip show settings display + chan_sip.c.bk:5103-5151 canonical Asterisk-
+; sip show settings display + canonical Asterisk chan_sip.c:5103-5151 canonical Asterisk-
 ; upstream realtime_update_peer wire-in pattern (inline 2-var setup +
 ; appended `syslabel, sysname` pair to ast_update_realtime varargs;
 ; NULL-key pair = no-op when not active).
@@ -1120,7 +1120,7 @@ srvlookup=yes
 ; IMPORTANT: active chan_sip.c (FuturePBX fork) has DROPPED the canonical
 ; realtime_update_peer wire-in entirely — only parser + display present
 ; (rtsavesysname is currently a DEAD flag in active chan_sip; canonical
-; wire-in preserved only in chan_sip.c.bk backup). chan_sofia restores
+; wire-in preserved only in canonical Asterisk chan_sip.c backup). chan_sofia restores
 ; canonical Asterisk-upstream behavior — chan_sofia parity-with-canonical-
 ; source-where-current-chan_sip-fork-regressed flavor.
 ;
@@ -1720,7 +1720,7 @@ srvlookup=yes
 ; CNG tone + L8288 post-rtp-read handler triggers fax/T.38 reinvite when CNG
 ; flag + L10196 T38 reinvite check from peer.
 ;
-; Backup-fork verification (chan_sip.c.bk L4856+L6249+L8047+L8120+L8149+
+; Backup-fork verification (canonical Asterisk chan_sip.c L4856+L6249+L8047+L8120+L8149+
 ; L10057+L27963) CONFIRMED chan_sip-parity-NOT-fork-regression-class.
 ;
 ; Pattern 12 honest-disclosure 32nd-instance + chan_sofia-architectural-
@@ -1794,7 +1794,7 @@ srvlookup=yes
 ; key parser (mwiexpiry + mwiexpirey alternate spelling — BOTH spellings
 ; parsed identically via OR-chained acceptance) + chan_sip.c:570 verbatim
 ; static int mwi_expiry + sip.h:58 verbatim DEFAULT_MWI_EXPIRY = 3600.
-; Backup-fork verification (chan_sip.c.bk L561+L29514-29517) CONFIRMED chan_
+; Backup-fork verification (canonical Asterisk chan_sip.c L561+L29514-29517) CONFIRMED chan_
 ; sip-parity-NOT-fork-regression-class.
 ;
 ; chan_sofia 3-spelling OR-chained acceptance:
@@ -1924,7 +1924,7 @@ srvlookup=yes
 ; TIMER_T1 = 500 + chan_sip.c:19410 verbatim "Timer T1: %d" sip show settings
 ; display + chan_sip.c:18697 sip show peer "Timer T1" display.
 ;
-; Backup-fork verification (chan_sip.c.bk) CONFIRMED chan_sip-parity-NOT-
+; Backup-fork verification (canonical Asterisk chan_sip.c) CONFIRMED chan_sip-parity-NOT-
 ; fork-regression-class.
 ;
 ; **LATENT BUG FIX 2026-04-28**: prior chan_sofia commits (since t1min
