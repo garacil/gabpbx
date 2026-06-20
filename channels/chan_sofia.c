@@ -4251,6 +4251,13 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	ast_rtp_codecs_payloads_clear(&staged_audio_codecs, NULL);
 	ast_rtp_codecs_payloads_clear(&staged_video_codecs, NULL);
 
+	/* R7 batch 2c-1 (bucket D): the chosen audio channel native format is computed during the
+	 * media loop but APPLIED (o->nativeformats + ast_set_read/write_format — irreversible channel
+	 * core mutations) only in the commit phase, so a rejected SDP never reformats an established
+	 * channel. staged_chosen_audio_valid gates the deferred apply. */
+	format_t staged_chosen_audio = 0;
+	int staged_chosen_audio_valid = 0;
+
 	for (media = sdp->sdp_media; media; media = media->m_next) {
 		if (media->m_type == sdp_media_audio && media->m_port != 0) {
 			sdp_attribute_t *a;
@@ -4397,27 +4404,12 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 						chosen = ast_best_codec(pvt->capability & AST_FORMAT_AUDIO_MASK);
 					}
 					if (chosen) {
-						/* Mutating channel format state needs the CHANNEL lock — the
-						 * channel thread reads nativeformats and a concurrent
-						 * hangup/masquerade can null/swap pvt->owner. Ref+lock+
-						 * revalidate: channel locks are recursive so the re-INVITE /
-						 * directmedia callers (which already hold the channel lock +
-						 * pvt->lock) nest safely without inverting; the 180/183/200/
-						 * ACK callers pin pvt->owner with a ref before calling, so
-						 * this fresh channel lock cannot race the channel free. */
-						struct ast_channel *o = pvt->owner;
-						if (o) {
-							ast_channel_ref(o);
-							ast_channel_lock(o);
-							if (pvt->owner == o) {
-								o->nativeformats =
-									(o->nativeformats & ~AST_FORMAT_AUDIO_MASK) | chosen;
-								ast_set_read_format(o, chosen);
-								ast_set_write_format(o, chosen);
-							}
-							ast_channel_unlock(o);
-							ast_channel_unref(o);
-						}
+						/* R7 2c-1 (bucket D): DEFER applying the channel native format
+						 * (o->nativeformats + ast_set_read/write_format — irreversible) to
+						 * the commit phase so a rejected SDP never reformats an established
+						 * channel. The ref+lock+revalidate dance moves with it. */
+						staged_chosen_audio = chosen;
+						staged_chosen_audio_valid = 1;
 					}
 				}
 			}
@@ -4851,6 +4843,28 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	}
 	ast_rtp_codecs_payloads_clear(&staged_audio_codecs, NULL);
 	ast_rtp_codecs_payloads_clear(&staged_video_codecs, NULL);
+
+	/* R7 2c-1 (bucket D) COMMIT: apply the deferred audio channel native format. Only reached
+	 * after every reject gate passes, so a rejected SDP never reformats an established channel.
+	 * The ref+lock+revalidate dance is relocated verbatim from the audio block: channel locks
+	 * are recursive (re-INVITE/directmedia callers already hold channel+pvt locks → nest safely);
+	 * the 180/183/200/ACK callers pin pvt->owner with a ref → this fresh channel lock cannot race
+	 * the channel free. pvt->owner is re-snapshotted here (it may have changed since the loop). */
+	if (staged_chosen_audio_valid && pvt->owner) {
+		struct ast_channel *o = pvt->owner;
+		if (o) {
+			ast_channel_ref(o);
+			ast_channel_lock(o);
+			if (pvt->owner == o) {
+				o->nativeformats =
+					(o->nativeformats & ~AST_FORMAT_AUDIO_MASK) | staged_chosen_audio;
+				ast_set_read_format(o, staged_chosen_audio);
+				ast_set_write_format(o, staged_chosen_audio);
+			}
+			ast_channel_unlock(o);
+			ast_channel_unref(o);
+		}
+	}
 
 	return 0;
 
