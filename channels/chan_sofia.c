@@ -4242,9 +4242,17 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 			}
 
 			{
+				/* R7 C2 (3-way): never feed an uninitialized ast_sockaddr to the
+				 * RTP engine. ast_sockaddr_parse() returns 0 WITHOUT writing the
+				 * destination on a malformed/non-IP c= address, so the old
+				 * unchecked call left `remote` as stack garbage (a garbage ->len
+				 * then drives ast_sockaddr_copy's memcpy). Track parse success and
+				 * treat the NAT override as an explicit fallback source. */
 				struct ast_sockaddr remote;
-				ast_sockaddr_parse(&remote, addr, 0);
-				ast_sockaddr_set_port(&remote, media->m_port);
+				int have_remote = ast_sockaddr_parse(&remote, addr, 0);
+				if (have_remote) {
+					ast_sockaddr_set_port(&remote, media->m_port);
+				}
 				/* NAT override (chan_sip parity): if the peer is behind NAT,
 				 * the SDP c= line usually leaks its private LAN IP. Replace
 				 * the host portion with peer->src_addr (registered public IP
@@ -4257,6 +4265,17 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 					struct ast_sockaddr nat_remote = pvt->peer->src_addr;
 					ast_sockaddr_set_port(&nat_remote, media->m_port);
 					remote = nat_remote;
+					have_remote = 1;
+				}
+				/* Audio is mandatory: a c= we can neither parse nor NAT-override
+				 * is malformed SDP -> reject. sdp_reject restores capability +
+				 * staged SRTP and leaves an established call untouched (RFC 3261
+				 * §14). A garbage conn-address is rejected even if a valid m=image
+				 * (T.38) leg exists (3-way: malformed-SDP reject, distinct from the
+				 * no-common-audio-CODEC T.38 carve-out below). */
+				if (!have_remote) {
+					ast_log(LOG_WARNING, "Sofia: unparseable audio media address '%s' in SDP offer — rejecting\n", addr);
+					goto sdp_reject;
 				}
 				ast_rtp_instance_set_remote_address(pvt->rtp, &remote);
 			}
@@ -4403,9 +4422,16 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 				int noncodec = 0;
 				sdp_rtpmap_t *rm;
 				sdp_list_t *vfmt;
+				int have_remote;
 
-				ast_sockaddr_parse(&remote, addr, 0);
-				ast_sockaddr_set_port(&remote, media->m_port);
+				/* R7 C2 (3-way): same uninitialized-sockaddr guard as the audio
+				 * leg. Video is optional, so on an unparseable c= with no NAT
+				 * fallback we leave the existing video remote untouched (never
+				 * hand garbage to the RTP engine) and still negotiate codecs. */
+				have_remote = ast_sockaddr_parse(&remote, addr, 0);
+				if (have_remote) {
+					ast_sockaddr_set_port(&remote, media->m_port);
+				}
 				/* NAT override (chan_sip parity): mirror audio-side reasoning
 				 * for video — SDP c= from a NAT'd peer typically leaks the
 				 * private LAN IP; use peer->src_addr instead. */
@@ -4415,8 +4441,13 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 					struct ast_sockaddr nat_remote = pvt->peer->src_addr;
 					ast_sockaddr_set_port(&nat_remote, media->m_port);
 					remote = nat_remote;
+					have_remote = 1;
 				}
-				ast_rtp_instance_set_remote_address(pvt->vrtp, &remote);
+				if (have_remote) {
+					ast_rtp_instance_set_remote_address(pvt->vrtp, &remote);
+				} else {
+					ast_log(LOG_NOTICE, "Sofia: unparseable video media address '%s' in SDP — leaving video remote unchanged\n", addr);
+				}
 
 				ast_rtp_codecs_payloads_clear(&newvideortp, NULL);
 
@@ -4523,16 +4554,26 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 			 * UDPTL destination and fax fails. */
 			snprintf(addr, sizeof(addr), "%s", conn->c_address);
 			{
+				/* R7 C2 (3-way): the usertpsource branch fills `remote` from the
+				 * (already-validated) audio RTP remote; the else-branch parses the
+				 * image c= and MUST check the result — ast_sockaddr_parse() leaves
+				 * `remote` untouched on failure. On an unparseable c= leave the
+				 * UDPTL peer unchanged rather than set a garbage destination. */
 				struct ast_sockaddr remote;
+				int have_remote = 1;
 				if (pvt->peer && pvt->peer->t38pt_usertpsource &&
 				    (pvt->peer->nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA)) &&
 				    pvt->rtp) {
 					ast_rtp_instance_get_remote_address(pvt->rtp, &remote);
 				} else {
-					ast_sockaddr_parse(&remote, addr, 0);
+					have_remote = ast_sockaddr_parse(&remote, addr, 0);
 				}
-				ast_sockaddr_set_port(&remote, media->m_port);
-				ast_udptl_set_peer(pvt->udptl, &remote);
+				if (have_remote) {
+					ast_sockaddr_set_port(&remote, media->m_port);
+					ast_udptl_set_peer(pvt->udptl, &remote);
+				} else {
+					ast_log(LOG_NOTICE, "Sofia: unparseable T.38 media address '%s' in SDP — leaving UDPTL peer unchanged\n", addr);
+				}
 			}
 
 			/* Reset their_parms before parsing each new offer (mirrors
@@ -8769,19 +8810,14 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	ast_mutex_lock(&pvt->lock);
 	old_hold = pvt->hold_state;
 	new_hold = sofia_sdp_extract_hold(sip, pvt->home);
-	pvt->hold_state = new_hold;
 	trans = (old_hold != new_hold);
-	/* post-T56 call-limit parity SS2 R10 (2026-04-27): peer.onHold atomic
-	 * counter on hold transition. chan_sip L15487 parity.
-	 * post-T56 notifyhold [general] parity (2026-04-28): chan_sip parity at
-	 * chan_sip.c:9477-9478 verbatim semantic — sip_peer_hold (peer-counter
-	 * tracking) gated on sip_cfg.notifyhold. chan_sofia equivalent gate on
-	 * sofia_cfg.notifyhold; default 0 means counter freeze unless operator
-	 * sets [general] notifyhold=yes. AMI Hold at L4521 UNCONDITIONAL (matches
-	 * chan_sip callevents=yes typical case; chan_sip parity HOLDS). */
-	if (trans && pvt->peer && sofia_cfg.notifyhold) {
-		ast_atomic_fetchadd_int(&pvt->peer->onHold, new_hold ? +1 : -1);
-	}
+	/* R7-1 (3-way): DEFER committing pvt->hold_state + peer->onHold until
+	 * after sofia_parse_sdp() succeeds. A re-INVITE whose SDP is rejected
+	 * (488) must leave the established call's hold accounting unchanged
+	 * (RFC 3261 §14) — committing here drifted `sip show inuse` / AMI OnHold
+	 * and broke the next re-INVITE's old_hold!=new_hold detection. new_hold
+	 * and trans are computed now because the AMI Hold event + the MOH queue
+	 * below fire on the transition; the commit is deferred to post-parse. */
 	/* Re-acquire in canonical channel->pvt order so sofia_parse_sdp's
 	 * set_format (and the HOLD/UNHOLD queue below) re-enter a channel lock
 	 * we already hold instead of inverting against ast_hangup. Mirrors
@@ -8819,6 +8855,19 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 				NUTAG_WITH_THIS(nua), TAG_END());
 			return;
 		}
+	}
+	/* R7-1 (3-way): the SDP (if any) was accepted — the 488 reject path above
+	 * already returned, so a rejected re-INVITE never reaches here. NOW commit
+	 * the deferred hold state under the held pvt->lock (re-acquired by the
+	 * channel-lock dance above).
+	 * post-T56 call-limit parity SS2 R10 (2026-04-27): peer.onHold atomic
+	 * counter on hold transition (chan_sip L15487 parity); notifyhold [general]
+	 * parity (2026-04-28): chan_sip.c:9477-9478 verbatim semantic — sip_peer_hold
+	 * peer-counter tracking gated on sofia_cfg.notifyhold (default 0 = freeze
+	 * unless operator opts in). AMI Hold below stays UNCONDITIONAL. */
+	pvt->hold_state = new_hold;
+	if (trans && pvt->peer && sofia_cfg.notifyhold) {
+		ast_atomic_fetchadd_int(&pvt->peer->onHold, new_hold ? +1 : -1);
 	}
 	if (trans && owner) {
 		if (new_hold) {
