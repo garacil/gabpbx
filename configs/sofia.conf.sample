@@ -111,6 +111,18 @@ srvlookup=yes
 ; tlsbindport  = 5061                         ; non-zero enables TLS listener
 ; tlscertfile  = /etc/gabpbx/keys             ; DIR containing agent.pem (combined cert+key); alias: tlscertdir
 ;
+; TLS hardening (TLS listener only — opt-in; each unset knob keeps the sofia-sip default, no change):
+; tls_min_version  = 1.2                       ; minimum TLS version 1.0|1.1|1.2|1.3 (enables that and
+;                                              ; every higher version; TLS1.3 is always available).
+;                                              ; e.g. 1.2 refuses TLS1.0/1.1 handshakes.
+; tls_ciphers      = ECDHE+AESGCM:!aNULL:!MD5  ; OpenSSL cipher list (unset = sofia default
+;                                              ; "!eNULL:!aNULL:!EXP:!LOW:!MD5:ALL:@STRENGTH").
+; tls_verify_depth = 3                         ; max peer cert-chain depth (unset/0 = sofia default 2).
+; NOTE: these harden the TLS listener ONLY — the WSS listener builds its own SSL_CTX (which already
+; disables SSLv2/SSLv3/TLSv1) and ignores these knobs. Changing any of tlsverify / tls_min_version /
+; tls_ciphers / tls_verify_depth needs `systemctl restart gabpbx` (a `sip reload` refuses with
+; "listener config changed").
+;
 ; ws-binding for browser SIP UAs (no TLS)
 ; wsbindaddr   = 0.0.0.0
 ; wsbindport   = 5066                         ; non-zero enables WS listener

@@ -558,6 +558,17 @@ static struct {
 	char tlscertfile[256];   /* directory containing agent.pem (combined cert+key) */
 	int  tlsverify;          /* Round4 #3: verify the peer cert chain on TLS/WSS (default 0
 	                          * = OFF, sofia-sip default; opt-in, requires a CA bundle). */
+	/* feature #6: TLS hardening knobs for the TLS listener (opt-in; empty/0 = sofia-sip default, no
+	 * behavior change). These map to TPTAG_TLS_* at nua_create. They affect the TLS listener ONLY —
+	 * the WSS listener builds its own SSL_CTX (tport_type_ws.c tport_wss_create_ssl_ctx) and ignores
+	 * TPTAG_TLS_*. */
+	char tls_ciphers[256];   /* OpenSSL cipher list -> TPTAG_TLS_CIPHERS (empty = sofia default
+	                          * "!eNULL:!aNULL:!EXP:!LOW:!MD5:ALL:@STRENGTH"). */
+	char tls_min_version[8]; /* "1.0"|"1.1"|"1.2"|"1.3" -> a TPTAG_TLS_VERSION enable-bitmask of that
+	                          * protocol and every higher one (TLS1.3 is always on). Stored as the
+	                          * STRING (not the computed mask) because "1.3" maps to bitmask 0 which is
+	                          * indistinguishable from "unset"; the reload detector compares the string. */
+	int  tls_verify_depth;   /* max cert-chain depth -> TPTAG_TLS_VERIFY_DEPTH (0 = sofia default 2). */
 	char wsbindaddr[64];
 	int  wsbindport;         /* 0 = disabled; common: 5066 */
 	char wssbindaddr[64];
@@ -17113,6 +17124,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	}
 }
 
+/* feature #6: forward decl — defined near the config parser but used at nua_create below. */
+static unsigned sofia_tls_min_version_mask(const char *v);
+
 static void *sofia_thread_func(void *data)
 {
 	if (su_init() != 0) {
@@ -17232,6 +17246,15 @@ static void *sofia_thread_func(void *data)
 				TPTAG_TLS_VERIFY_POLICY(TPTLS_VERIFY_SUBJECTS_OUT)),
 			TAG_IF(needs_cert && sofia_cfg.tlsverify,
 				TPTAG_TLS_VERIFY_DATE(1)),
+			/* feature #6: TLS-listener hardening (opt-in; affects the TLS listener only — the WSS
+			 * listener builds its own SSL_CTX and ignores these). Each is applied only when the
+			 * operator set it, so an unset knob keeps sofia-sip's default (no behavior change). */
+			TAG_IF(needs_cert && !ast_strlen_zero(sofia_cfg.tls_ciphers),
+				TPTAG_TLS_CIPHERS(sofia_cfg.tls_ciphers)),
+			TAG_IF(needs_cert && !ast_strlen_zero(sofia_cfg.tls_min_version),
+				TPTAG_TLS_VERSION(sofia_tls_min_version_mask(sofia_cfg.tls_min_version))),
+			TAG_IF(needs_cert && sofia_cfg.tls_verify_depth > 0,
+				TPTAG_TLS_VERIFY_DEPTH((unsigned)sofia_cfg.tls_verify_depth)),
 			NUTAG_MEDIA_ENABLE(0),
 			NUTAG_ALLOW("INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, REFER, MESSAGE, INFO, PRACK"),
 			NUTAG_APPL_METHOD("REGISTER"),
@@ -19333,6 +19356,50 @@ static int sofia_cfg_seconds_to_ms(const char *val)
 	return (int)(s * 1000);
 }
 
+/* feature #6: is this a recognized tls_min_version string? */
+static int sofia_tls_min_version_valid(const char *v)
+{
+	return !strcmp(v, "1.0") || !strcmp(v, "1.1") || !strcmp(v, "1.2") || !strcmp(v, "1.3");
+}
+
+/* feature #6: strict parse for tls_verify_depth (Codex polish) — strtol + errno + endptr; rejects
+ * overflow / trailing garbage / non-positive -> 0 (sofia default); caps at 100. */
+static int sofia_cfg_verify_depth(const char *val)
+{
+	char *end;
+	long d;
+
+	if (ast_strlen_zero(val)) {
+		return 0;
+	}
+	errno = 0;
+	d = strtol(val, &end, 10);
+	if (errno != 0 || end == val || *end != '\0' || d <= 0) {
+		return 0;
+	}
+	return (d > 100) ? 100 : (int)d;
+}
+
+/* feature #6: map a (validated) friendly "1.0"/"1.1"/"1.2"/"1.3" minimum-TLS-version to a
+ * TPTAG_TLS_VERSION enable-bitmask = that protocol AND every higher one. tport_tls.c disables each
+ * protocol whose bit is NOT set; TLS1.3 is not in that disable list so it is always enabled. Hence
+ * "1.3" -> 0 (only TLS1.3 left on). Callers MUST gate on the source string being non-empty, since 0 is
+ * also the "unset" value. */
+static unsigned sofia_tls_min_version_mask(const char *v)
+{
+	if (!strcmp(v, "1.1")) {
+		return TPTLS_VERSION_TLSv1_1 | TPTLS_VERSION_TLSv1_2;
+	}
+	if (!strcmp(v, "1.2")) {
+		return TPTLS_VERSION_TLSv1_2;
+	}
+	if (!strcmp(v, "1.3")) {
+		return 0;
+	}
+	/* "1.0" (and, defensively, anything the parser let through) -> TLS1.0/1.1/1.2 all enabled. */
+	return TPTLS_VERSION_TLSv1 | TPTLS_VERSION_TLSv1_1 | TPTLS_VERSION_TLSv1_2;
+}
+
 static void sofia_parse_general_config(struct ast_config *cfg)
 {
 	struct ast_variable *v;
@@ -19382,6 +19449,27 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			 * enabled, outbound TLS/WSS connections validate the server cert chain +
 			 * subject against the configured CA material (tlscertfile dir). */
 			sofia_cfg.tlsverify = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "tls_ciphers")) {
+			/* feature #6: OpenSSL cipher list for the TLS listener (TPTAG_TLS_CIPHERS). */
+			ast_copy_string(sofia_cfg.tls_ciphers, v->value, sizeof(sofia_cfg.tls_ciphers));
+		} else if (!strcasecmp(v->name, "tls_min_version")) {
+			/* feature #6: minimum TLS version (1.0/1.1/1.2/1.3). Validate the string; an
+			 * unrecognized value warns and leaves the knob unset (sofia default) rather than
+			 * silently mapping to bitmask 0. */
+			if (sofia_tls_min_version_valid(v->value)) {
+				ast_copy_string(sofia_cfg.tls_min_version, v->value, sizeof(sofia_cfg.tls_min_version));
+			} else {
+				ast_log(LOG_WARNING, "Sofia: ignoring tls_min_version='%s' (expected 1.0, 1.1, 1.2 or 1.3)\n",
+					v->value);
+			}
+		} else if (!strcasecmp(v->name, "tls_verify_depth")) {
+			/* feature #6: max cert-chain depth (TPTAG_TLS_VERIFY_DEPTH); 0/invalid -> sofia default.
+			 * Warn on a non-empty-but-invalid value, for symmetry with tls_min_version (opencode). */
+			sofia_cfg.tls_verify_depth = sofia_cfg_verify_depth(v->value);
+			if (!ast_strlen_zero(v->value) && sofia_cfg.tls_verify_depth == 0) {
+				ast_log(LOG_WARNING, "Sofia: ignoring tls_verify_depth='%s' (expected a positive integer)\n",
+					v->value);
+			}
 		} else if (!strcasecmp(v->name, "wsbindaddr")) {
 			ast_copy_string(sofia_cfg.wsbindaddr, v->value, sizeof(sofia_cfg.wsbindaddr));
 		} else if (!strcasecmp(v->name, "wsbindport")) {
@@ -21049,6 +21137,11 @@ static int sofia_apply_config(struct ast_config *cfg)
 	 * the knob reverts to OFF. Socket-level SO_KEEPALIVE remains on via sofia-sip's own default. */
 	sofia_cfg.tcp_keepalive_ms = 0;
 	sofia_cfg.tcp_pingpong_ms = 0;
+	/* feature #6: TLS hardening knobs unset by default (opt-in; reset so a reload that removes them
+	 * reverts to sofia-sip's defaults). */
+	sofia_cfg.tls_ciphers[0] = '\0';
+	sofia_cfg.tls_min_version[0] = '\0';
+	sofia_cfg.tls_verify_depth = 0;
 	sofia_cfg.busy_on_active = 0;
 	sofia_cfg.max_contacts = 6;
 	sofia_cfg.encryption = 0;
@@ -21783,6 +21876,9 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 		char wssbindaddr[64];
 		int wssbindport;
 		int tlsverify;
+		char tls_ciphers[256];	/* feature #6: a change forces a listener recreate (TLS ctx is built at listener create) */
+		char tls_min_version[8];
+		int tls_verify_depth;
 		int t1min;
 		int timer_t1;
 		int timer_b;
@@ -21811,6 +21907,9 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 	s.wssbindaddr[0] = '\0';
 	s.wssbindport = 0;
 	s.tlsverify = 0;
+	s.tls_ciphers[0] = '\0';	/* feature #6: defaults match the live-parser defaults */
+	s.tls_min_version[0] = '\0';
+	s.tls_verify_depth = 0;
 	s.t1min = DEFAULT_T1MIN;
 	s.timer_t1 = 500;
 	s.timer_b = 32000;
@@ -21863,6 +21962,15 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 			s.tcp_pingpong_ms = sofia_cfg_seconds_to_ms(v->value);
 		} else if (!strcasecmp(v->name, "tlsverify") || !strcasecmp(v->name, "tlsverifyserver")) {
 			s.tlsverify = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "tls_ciphers")) {
+			ast_copy_string(s.tls_ciphers, v->value, sizeof(s.tls_ciphers));
+		} else if (!strcasecmp(v->name, "tls_min_version")) {
+			/* mirror the live parser: only store a recognized value (else it stays unset). */
+			if (sofia_tls_min_version_valid(v->value)) {
+				ast_copy_string(s.tls_min_version, v->value, sizeof(s.tls_min_version));
+			}
+		} else if (!strcasecmp(v->name, "tls_verify_depth")) {
+			s.tls_verify_depth = sofia_cfg_verify_depth(v->value);
 		} else if (!strcasecmp(v->name, "wsbindaddr")) {
 			ast_copy_string(s.wsbindaddr, v->value, sizeof(s.wsbindaddr));
 		} else if (!strcasecmp(v->name, "wsbindport")) {
@@ -21957,6 +22065,12 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 	if (!!sofia_cfg.tlsverify != !!s.tlsverify) {
 		SOFIA_LISTENER_FLAG("tlsverify");
 	}
+	/* feature #6: TLS-hardening knobs are baked into the TLS context at listener create, so a change
+	 * needs the listeners recreated. Compare the version as a STRING (its mask 0 for "1.3" collides
+	 * with unset). */
+	SOFIA_LISTENER_CMP_STR(tls_ciphers, "tls_ciphers");
+	SOFIA_LISTENER_CMP_STR(tls_min_version, "tls_min_version");
+	SOFIA_LISTENER_CMP_INT(tls_verify_depth, "tls_verify_depth");
 
 #undef SOFIA_LISTENER_CMP_INT
 #undef SOFIA_LISTENER_CMP_STR
