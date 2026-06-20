@@ -9740,7 +9740,7 @@ static void sofia_process_options(nua_t *nua, nua_handle_t *nh, struct sofia_pvt
 {
 	nua_respond(nh, SIP_200_OK,
 		SIPTAG_ALLOW_STR("INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER, "
-				"SUBSCRIBE, NOTIFY, REFER, MESSAGE, INFO, PUBLISH, PRACK"),
+				"SUBSCRIBE, NOTIFY, REFER, MESSAGE, INFO, PRACK"),	/* R7 C6: no PUBLISH (we 405 it) */
 		SIPTAG_ACCEPT_STR("application/sdp"),
 		TAG_END());
 }
@@ -15834,17 +15834,6 @@ static void sofia_process_info(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *o
 	}
 }
 
-static void sofia_process_publish(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
-		sip_t const *sip, tagi_t tags[])
-{
-	if (sofia_debug)
-		ast_verbose("Sofia: Received PUBLISH\n");
-	nua_respond(nh, SIP_200_OK,
-		NUTAG_WITH_THIS(nua),
-		SIPTAG_EXPIRES_STR("3600"),
-		TAG_END());
-}
-
 static void sofia_process_prack(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
 		sip_t const *sip, tagi_t tags[])
 {
@@ -16213,9 +16202,8 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	case nua_i_info:
 		sofia_process_info(nua, nh, pvt, sip, tags);
 		break;
-	case nua_i_publish:
-		sofia_process_publish(nua, nh, pvt, sip, tags);
-		break;
+	/* R7 C6: no nua_i_publish dispatch — PUBLISH is not APPL_METHOD'd, so the stack rejects it
+	 * (405/501) and never delivers nua_i_publish here. */
 	case nua_i_prack:
 		sofia_process_prack(nua, nh, pvt, sip, tags);
 		break;
@@ -17054,7 +17042,7 @@ static void *sofia_thread_func(void *data)
 			TAG_IF(needs_cert && sofia_cfg.tlsverify,
 				TPTAG_TLS_VERIFY_DATE(1)),
 			NUTAG_MEDIA_ENABLE(0),
-			NUTAG_ALLOW("INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, REFER, MESSAGE, INFO, PUBLISH, PRACK"),
+			NUTAG_ALLOW("INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, REFER, MESSAGE, INFO, PRACK"),
 			NUTAG_APPL_METHOD("REGISTER"),
 			NUTAG_ALLOW_EVENTS("presence"),
 			NUTAG_ALLOW_EVENTS("dialog"),
@@ -17131,13 +17119,15 @@ static void *sofia_thread_func(void *data)
 
 	nua_set_params(sofia_nua,
 		NUTAG_ENABLEMESSAGE(1),
-		NUTAG_ALLOW("INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, REFER, MESSAGE, INFO, PUBLISH, PRACK"),
+		NUTAG_ALLOW("INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, REFER, MESSAGE, INFO, PRACK"),
 		TAG_END());
 
 	/* Add methods to appl_method one at a time */
 	nua_set_params(sofia_nua, NUTAG_APPL_METHOD("REGISTER"), TAG_END());
 	nua_set_params(sofia_nua, NUTAG_APPL_METHOD("SUBSCRIBE"), TAG_END());
-	nua_set_params(sofia_nua, NUTAG_APPL_METHOD("PUBLISH"), TAG_END());
+	/* R7 C6: PUBLISH is intentionally NOT application-handled — there is no RFC 3903 event-state
+	 * server here, so the stack itself rejects an inbound PUBLISH (405/501) instead of the old stub
+	 * answering a false 200 OK (and leaking the un-reaped APPL_METHOD handle). */
 	nua_set_params(sofia_nua, NUTAG_APPL_METHOD("NOTIFY"), TAG_END());
 	nua_set_params(sofia_nua, NUTAG_APPL_METHOD("INFO"), TAG_END());
 	nua_set_params(sofia_nua, NUTAG_APPL_METHOD("REFER"), TAG_END());
