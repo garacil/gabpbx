@@ -13941,6 +13941,29 @@ static void transmit_mwi_notify_for_peer(struct sofia_peer *peer)
  * Runs on sofia_thread (nua_i_subscribe handler context). T55.5 will
  * call into transmit_mwi_notify_for_peer here for synchronous initial
  * NOTIFY emission per RFC 6665 §4.4.1. */
+/* R7 C5 (3-way): reap a SUBSCRIBE server handle on a NON-ACCEPTED path (final reject OR 401
+ * challenge). sofia-sip NEVER auto-reaps an APPL_METHOD SUBSCRIBE handle (chan_sofia.c:16020 +
+ * 14813), and nua_publish.c:480-487 documents the analog: "incoming PUBLISH creates a new handle for
+ * each incoming request not associated with an existing dialog. IF THE HANDLE nh IS NOT BOUND, YOU
+ * SHOULD PROBABLY DESTROY IT AFTER RESPONDING." A 401 establishes no dialog, so the challenged handle
+ * is orphaned and the authed re-SUBSCRIBE arrives as a FRESH handle (nua_stack_incoming_handle) —
+ * source-verified, so destroying the 401 handle is safe. detach any hmagic first (UAF guard), then
+ * destroy. Accept paths (nua_notifier) own the handle and must NOT call this. */
+static void sofia_subscribe_reject_reap(nua_handle_t *nh)
+{
+	/* Reap ONLY a fresh, UNBOUND APPL_METHOD SUBSCRIBE handle. An in-dialog re-SUBSCRIBE can arrive
+	 * on an EXISTING handle BOUND (hmagic non-NULL) to a sofia_pvt or a presence/MWI sub — that
+	 * handle is OWNED by its object and must NOT be destroyed here: a bind(NULL)+destroy would both
+	 * detach the owner's hmagic AND free a handle the owner still references → UAF the
+	 * call/subscription. nua_publish.c:484: "IF THE HANDLE nh IS NOT BOUND, you should probably
+	 * destroy it." (Codex v1 NO-GO: bound-handle guard.) For an unbound handle (magic NULL) there is
+	 * no owner and no stale hmagic, so a plain destroy is safe — no bind(NULL) needed. */
+	if (!nh || nua_handle_magic(nh) != NULL) {
+		return;
+	}
+	nua_handle_destroy(nh);
+}
+
 static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 		struct sofia_pvt *op, sip_t const *sip, tagi_t tags[])
 {
@@ -13951,6 +13974,7 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 	/* R4 Option C: To URI user-part identifies the mailbox-owning peer */
 	if (!sip || !sip->sip_to || !sip->sip_to->a_url || !sip->sip_to->a_url->url_user) {
 		nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
+		sofia_subscribe_reject_reap(nh);	/* R7 C5 */
 		return;
 	}
 	to_user = sip->sip_to->a_url->url_user;
@@ -13968,6 +13992,7 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 			ast_log(LOG_NOTICE, "Sofia MWI: SUBSCRIBE for unknown peer '%s' — 404\n", to_user);
 			nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
 		}
+		sofia_subscribe_reject_reap(nh);	/* R7 C5: reap on both the 401-challenge and the 404 branch */
 		return;
 	}
 
@@ -13985,6 +14010,7 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 		sofia_emit_subscribe_rejected(sip, peer->name, "message-summary",
 			"AllowSubscribeClosed");
 		ao2_ref(peer, -1);
+		sofia_subscribe_reject_reap(nh);	/* R7 C5 */
 		return;
 	}
 
@@ -14001,6 +14027,7 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 			nua, nh, sip, sip->sip_authorization, "SUBSCRIBE", realm);
 		if (auth_res != SOFIA_AUTH_OK) {
 			ao2_ref(peer, -1);
+			sofia_subscribe_reject_reap(nh);	/* R7 C5: reap the 401/4xx challenge handle */
 			return;
 		}
 	}
@@ -14015,6 +14042,7 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 			peer->name);
 		nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
 		ao2_ref(peer, -1);
+		sofia_subscribe_reject_reap(nh);	/* R7 C5 */
 		return;
 	}
 
@@ -14690,6 +14718,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	if (!sip || !sip->sip_to || !sip->sip_to->a_url || !sip->sip_to->a_url->url_user
 			|| !sip->sip_from || !sip->sip_from->a_url || !sip->sip_from->a_url->url_user) {
 		nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
+		sofia_subscribe_reject_reap(nh);	/* R7 C5 */
 		return;
 	}
 	to_user = sip->sip_to->a_url->url_user;
@@ -14707,6 +14736,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 			ast_log(LOG_NOTICE, "Sofia presence: SUBSCRIBE from unknown peer '%s' — 404\n", from_user);
 			nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
 		}
+		sofia_subscribe_reject_reap(nh);	/* R7 C5: reap on both the 401-challenge and the 404 branch */
 		return;
 	}
 
@@ -14717,6 +14747,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		nua_respond(nh, 403, "Forbidden (policy)", NUTAG_WITH_THIS(nua), TAG_END());
 		sofia_emit_subscribe_rejected(sip, peer->name, event, "AllowSubscribeClosed");
 		ao2_ref(peer, -1);
+		sofia_subscribe_reject_reap(nh);	/* R7 C5 */
 		return;
 	}
 
@@ -14731,6 +14762,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 			nua, nh, sip, sip->sip_authorization, "SUBSCRIBE", realm);
 		if (auth_res != SOFIA_AUTH_OK) {
 			ao2_ref(peer, -1);
+			sofia_subscribe_reject_reap(nh);	/* R7 C5: reap the 401/4xx challenge handle */
 			return;
 		}
 	}
@@ -14763,6 +14795,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 			"Sofia presence: no hint for %s@%s (watcher SIP/%s) — 404\n",
 			to_user, l_context, l_peername);
 		nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
+		sofia_subscribe_reject_reap(nh);	/* R7 C5 */
 		return;
 	}
 
@@ -14813,8 +14846,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 			 * (SUBSCRIBE is an APPL_METHOD — the stack will not auto-destroy it),
 			 * unless teardown already freed it (old->nh == nh). MWI discipline. */
 			if (!nh_is_old) {
-				nua_handle_bind(nh, NULL);
-				nua_handle_destroy(nh);
+				sofia_subscribe_reject_reap(nh);	/* R7 C5: guarded reap of the fresh unbound unsubscribe handle */
 			}
 			if (sofia_debug) {
 				ast_verbose("Sofia presence: UNSUBSCRIBE — watcher SIP/%s -> %s@%s\n",
@@ -14853,6 +14885,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	sub = ao2_alloc(sizeof(*sub), presence_sub_destructor);
 	if (!sub) {
 		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
+		sofia_subscribe_reject_reap(nh);	/* R7 C5 */
 		return;
 	}
 	sub->nh = nh;
@@ -14903,8 +14936,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		ast_log(LOG_WARNING, "Sofia presence: ao2_link failed for %s@%s — rejecting 500\n",
 			sub->exten, sub->context);
 		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
-		nua_handle_bind(nh, NULL);
-		nua_handle_destroy(nh);
+		sofia_subscribe_reject_reap(nh);	/* R7 C5: guarded reap (presence subs are not hmagic-bound) */
 		ao2_ref(sub, -1);	/* creation ref */
 		return;
 	}
@@ -14924,8 +14956,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		/* Round5 #11: tear the handle down on this failure arm too. The presence-sub
 		 * destructor is a deliberate no-op (handles are destroyed explicitly on
 		 * sofia_thread), so without this the nua_handle leaks when add_destroy fails. */
-		nua_handle_bind(nh, NULL);
-		nua_handle_destroy(nh);
+		sofia_subscribe_reject_reap(nh);	/* R7 C5: guarded reap (presence subs are not hmagic-bound) */
 		ao2_ref(sub, -1);	/* creation ref */
 		return;
 	}
@@ -14974,6 +15005,7 @@ static void sofia_process_subscribe(nua_t *nua, nua_handle_t *nh, struct sofia_p
 			NUTAG_WITH_THIS(nua), TAG_END());
 		sofia_emit_subscribe_rejected(sip, NULL,
 			S_OR(event, "(missing)"), "AllowSubscribeClosed");
+		sofia_subscribe_reject_reap(nh);	/* R7 C5: reap the APPL_METHOD handle */
 		return;
 	}
 
@@ -14992,14 +15024,18 @@ static void sofia_process_subscribe(nua_t *nua, nua_handle_t *nh, struct sofia_p
 		return;
 	}
 
-	if (sofia_debug) {
-		ast_verbose("Sofia: Received SUBSCRIBE Event=%s (unhandled, auto-202)\n",
-			S_OR(event, "(missing)"));
-	}
-	nua_respond(nh, SIP_202_ACCEPTED,
+	/* R7 C5 (3-way): an unsupported Event package -> 489 Bad Event + Allow-Events (RFC 6665 §4.3),
+	 * NOT a phantom 202 that establishes a subscription we never serve (which also leaked the
+	 * APPL_METHOD handle). The dispatched packages a watcher can actually use are message-summary,
+	 * presence, dialog, dialog-info. Then reap the handle (sofia-sip never auto-reaps it). */
+	ast_log(LOG_NOTICE, "Sofia: SUBSCRIBE Event=%s unsupported — 489 Bad Event\n",
+		S_OR(event, "(missing)"));
+	sofia_emit_subscribe_rejected(sip, NULL, S_OR(event, "(missing)"), "BadEvent");
+	nua_respond(nh, SIP_489_BAD_EVENT,
 		NUTAG_WITH_THIS(nua),
-		SIPTAG_EXPIRES_STR("3600"),
+		SIPTAG_ALLOW_EVENTS_STR("presence, dialog, dialog-info, message-summary"),
 		TAG_END());
+	sofia_subscribe_reject_reap(nh);
 }
 
 static void sofia_process_notify(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
