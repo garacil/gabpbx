@@ -14794,6 +14794,8 @@ struct sofia_publication {
 						 * single sofia_thread sweep, so 5-10k pubs never thunder-herd. */
 	int auth_attempts;			/* bounded reactive-auth counter */
 	int terminated;				/* teardown idempotency */
+	int _reload_marked;			/* reload mark-and-sweep (mirrors peer->_reload_marked): marked at
+						 * reload start, unmarked if the peer still publishes it, swept if not. */
 };
 
 #define MAX_PUBLICATION_BUCKETS 10007			/* prime; one entry per publish=yes peer — sized for
@@ -15155,7 +15157,7 @@ static int sofia_publication_entity_in_use(const char *entity)
  * the PUBLISH path — Codex). Key = peer|context|exten so distinct contexts are distinct internal
  * entries; a duplicate key OR a duplicate presentity entity is skipped (opencode 412-storm guard). */
 static void sofia_publication_create_one(struct sofia_peer *peer, const char *exten,
-		const char *context, const char *domain)
+		const char *context, const char *domain, int create)
 {
 	struct sofia_publication *pub, tmp;
 	char hint[AST_MAX_EXTENSION];
@@ -15170,19 +15172,29 @@ static void sofia_publication_create_one(struct sofia_peer *peer, const char *ex
 			peer->name, exten, context);
 		return;
 	}
-	snprintf(entity, sizeof(entity), "sip:%s@%s", exten, domain);	/* BARE exten, never ext@ctx */
-	if (sofia_publication_entity_in_use(entity)) {
-		ast_log(LOG_WARNING, "Sofia PUBLISH: presentity %s already published — skipping duplicate "
-			"(%s in context %s) to avoid an ETag conflict\n", entity, exten, context);
-		return;
-	}
+	/* Key-find FIRST (Codex): an existing peer|context|exten is already published — keep it and UNMARK
+	 * it (so a reload mark-and-sweep does not remove it) — BEFORE the entity-dedup, which only matters
+	 * when we are about to create a genuinely new presentity. */
 	if (snprintf(tmp.key, sizeof(tmp.key), "%s|%s|%s", peer->name, context, exten) >= (int) sizeof(tmp.key)) {
 		ast_log(LOG_WARNING, "Sofia PUBLISH: composite key too long for peer '%s' %s@%s — skipped\n",
 			peer->name, exten, context);
 		return;
 	}
 	if ((pub = ao2_find(publications, &tmp, OBJ_POINTER))) {
-		ao2_ref(pub, -1);	/* already published — de-dupe */
+		pub->_reload_marked = 0;	/* already published — survives this reload, do not re-create */
+		ao2_ref(pub, -1);
+		return;
+	}
+	if (!create) {
+		/* unmark-only reconcile pass: existing pubs are unmarked above; do NOT create a new pub yet — a
+		 * stale same-entity pub (about to be swept) would block it via the entity-dedup (Codex). The
+		 * create-missing pass runs AFTER the sweep. */
+		return;
+	}
+	snprintf(entity, sizeof(entity), "sip:%s@%s", exten, domain);	/* BARE exten, never ext@ctx */
+	if (sofia_publication_entity_in_use(entity)) {
+		ast_log(LOG_WARNING, "Sofia PUBLISH: presentity %s already published — skipping duplicate "
+			"(%s in context %s) to avoid an ETag conflict\n", entity, exten, context);
 		return;
 	}
 	if (!(pub = ao2_alloc(sizeof(*pub), publication_destructor))) {
@@ -15263,7 +15275,7 @@ static void sofia_publication_create_one(struct sofia_peer *peer, const char *ex
 /* Create publications for a publish=yes peer. regexten may carry multiple extensions
  * (ext1&ext2@ctx&...) — one publication per extension (Codex); the peer name is used only when
  * regexten is empty. Per-token @context overrides the peer subscribecontext default. */
-static void sofia_publication_create_for_peer(struct sofia_peer *peer)
+static void sofia_publication_create_for_peer(struct sofia_peer *peer, int create)
 {
 	char multi[256], domain[128];
 	char *stringp, *tok;
@@ -15308,7 +15320,7 @@ static void sofia_publication_create_for_peer(struct sofia_peer *peer)
 		if (ast_strlen_zero(tok)) {
 			continue;			/* skip empty token */
 		}
-		sofia_publication_create_one(peer, tok, context, domain);
+		sofia_publication_create_one(peer, tok, context, domain, create);
 	}
 }
 
@@ -15366,6 +15378,82 @@ static void sofia_publication_sweep(su_root_magic_t *magic, su_timer_t *t, su_ti
 		ao2_ref(pub, -1);
 	}
 	ao2_iterator_destroy(&it);
+}
+
+/* Reconcile the live publication set with the just-applied config on a `sip reload` (sofia_thread, at
+ * the end of sofia_reload_worker — same thread that owns publications, so teardown is UAF-safe). Mirrors
+ * the peer mark-and-sweep. `config_changed` = publish_server/domain/expires differs from before the
+ * reload (the target/entity/TTL formula changed for every pub). 3-way consensus. */
+static void sofia_publications_reconcile(int config_changed)
+{
+	struct ao2_iterator it, pit;
+	struct sofia_publication *pub;
+	struct sofia_peer *peer;
+
+	if (!publications) {
+		return;
+	}
+
+	/* publish_server removed, or the ESC/domain/TTL changed -> tear the whole set down, then (unless the
+	 * feature is now off) rebuild from publish=yes peers in a single create pass. */
+	if (config_changed || ast_strlen_zero(sofia_cfg.publish_server)) {
+		it = ao2_iterator_init(publications, 0);
+		while ((pub = ao2_iterator_next(&it))) {
+			sofia_publication_teardown(pub);	/* best-effort Expires:0 + handle destroy */
+			ao2_ref(pub, -1);
+		}
+		ao2_iterator_destroy(&it);
+		if (ast_strlen_zero(sofia_cfg.publish_server)) {
+			return;				/* feature off now — nothing to recreate */
+		}
+		pit = ao2_iterator_init(peers, 0);
+		while ((peer = ao2_iterator_next(&pit))) {
+			if (peer->publish) {
+				sofia_publication_create_for_peer(peer, 1);
+			}
+			ao2_ref(peer, -1);
+		}
+		ao2_iterator_destroy(&pit);
+		return;
+	}
+
+	/* Incremental — THREE passes so a stale same-entity pub never blocks its replacement (Codex):
+	 * (1) mark all + UNMARK every pub a publish=yes peer still maps to (no creation yet); (2) SWEEP the
+	 * still-marked stale pubs (peer gone / publish=no / key changed); (3) CREATE the missing pubs — now
+	 * the stale ones are gone, so the entity-dedup cannot wrongly block a new presentity. */
+	it = ao2_iterator_init(publications, 0);
+	while ((pub = ao2_iterator_next(&it))) {
+		pub->_reload_marked = 1;
+		ao2_ref(pub, -1);
+	}
+	ao2_iterator_destroy(&it);
+
+	pit = ao2_iterator_init(peers, 0);		/* pass 1: unmark survivors (create=0) */
+	while ((peer = ao2_iterator_next(&pit))) {
+		if (peer->publish) {
+			sofia_publication_create_for_peer(peer, 0);
+		}
+		ao2_ref(peer, -1);
+	}
+	ao2_iterator_destroy(&pit);
+
+	it = ao2_iterator_init(publications, 0);	/* pass 2: sweep stale */
+	while ((pub = ao2_iterator_next(&it))) {
+		if (pub->_reload_marked && !pub->terminated) {
+			sofia_publication_teardown(pub);
+		}
+		ao2_ref(pub, -1);
+	}
+	ao2_iterator_destroy(&it);
+
+	pit = ao2_iterator_init(peers, 0);		/* pass 3: create missing (create=1) */
+	while ((peer = ao2_iterator_next(&pit))) {
+		if (peer->publish) {
+			sofia_publication_create_for_peer(peer, 1);
+		}
+		ao2_ref(peer, -1);
+	}
+	ao2_iterator_destroy(&pit);
 }
 
 /* tech.devicestate: tell the gabpbx core the state of SIP/<peer> so hints over
@@ -18028,17 +18116,18 @@ static void *sofia_thread_func(void *data)
 	/* Outbound PUBLISH (RFC 3903): on sofia_thread (the nua_* owner), create a publication per
 	 * publish=yes peer (each is SCHEDULED, not sent inline) and arm the ~1 Hz sweep that drives all
 	 * PUBLISH emission. Feature is OFF unless publish_server is set.
-	 * RELOAD LIFECYCLE (Codex): publications are reconciled at startup ONLY — a `sip reload` that adds/
-	 * removes publish=yes, or changes publish_server/publish_domain/publish_expires, does NOT alter the
-	 * live publication set. Changing PUBLISH settings is RESTART-REQUIRED (`systemctl restart gabpbx`),
-	 * documented in sofia.conf.sample. (Full live reload-reconciliation is a v2 follow-up.) */
+	 * RELOAD LIFECYCLE: this is the STARTUP create pass. A later `sip reload` reconciles the live
+	 * publication set in sofia_publications_reconcile (called from sofia_reload_worker, also on
+	 * sofia_thread) — adding new publish=yes peers, removing (Expires:0 unpublishing) ones that dropped
+	 * publish=yes, and rebuilding when publish_server/publish_domain/publish_expires change. No restart
+	 * is needed for PUBLISH config; only a listener change (bindport/TLS/etc.) is restart-required. */
 	if (!ast_strlen_zero(sofia_cfg.publish_server) && publications) {
 		struct ao2_iterator pit = ao2_iterator_init(peers, 0);
 		struct sofia_peer *ppeer;
 
 		while ((ppeer = ao2_iterator_next(&pit))) {
 			if (ppeer->publish) {
-				sofia_publication_create_for_peer(ppeer);	/* schedules with jitter; the sweep sends */
+				sofia_publication_create_for_peer(ppeer, 1);	/* create + schedule (jittered); the sweep sends */
 			}
 			ao2_ref(ppeer, -1);
 		}
@@ -23065,19 +23154,37 @@ static void sofia_reload_worker(void *data)
 	 * sofia_parse_peer_config; remaining marked peers get swept below. */
 	ao2_callback(peers, OBJ_NODATA, sofia_peer_mark_cb, NULL);
 
-	if (sofia_apply_config(cfg) < 0) {
-		/* sofia_apply_config already logged the specifics.  Don't sweep —
-		 * the peer state may be partially populated, sweeping could remove
-		 * live peers that the partial parse didn't get to. */
-		snprintf(local_errmsg, sizeof(local_errmsg),
-			"sofia_apply_config failed — see log; no peers swept");
-		ast_config_destroy(cfg);
-		goto signal_done;
-	}
+	/* Snapshot the outbound-PUBLISH config BEFORE sofia_apply_config resets sofia_cfg, so the
+	 * post-apply reconcile can tell whether the ESC target/domain/TTL changed (full rebuild) or only
+	 * the publish=yes peer set changed (incremental mark-and-sweep). */
+	{
+		char pub_server_was[sizeof(sofia_cfg.publish_server)];
+		char pub_domain_was[sizeof(sofia_cfg.publish_domain)];
+		int pub_expires_was = sofia_cfg.publish_expires;
+		ast_copy_string(pub_server_was, sofia_cfg.publish_server, sizeof(pub_server_was));
+		ast_copy_string(pub_domain_was, sofia_cfg.publish_domain, sizeof(pub_domain_was));
 
-	/* Sweep peers that disappeared from sofia.conf. */
-	ao2_callback(peers, OBJ_NODATA | OBJ_UNLINK | OBJ_MULTIPLE,
-		sofia_peer_sweep_cb, NULL);
+		if (sofia_apply_config(cfg) < 0) {
+			/* sofia_apply_config already logged the specifics.  Don't sweep —
+			 * the peer state may be partially populated, sweeping could remove
+			 * live peers that the partial parse didn't get to. */
+			snprintf(local_errmsg, sizeof(local_errmsg),
+				"sofia_apply_config failed — see log; no peers swept");
+			ast_config_destroy(cfg);
+			goto signal_done;
+		}
+
+		/* Sweep peers that disappeared from sofia.conf. */
+		ao2_callback(peers, OBJ_NODATA | OBJ_UNLINK | OBJ_MULTIPLE,
+			sofia_peer_sweep_cb, NULL);
+
+		/* Outbound-PUBLISH reload-reconciliation: peers are now reconciled and we are on sofia_thread,
+		 * so add/remove/rebuild publications to match the new config (no restart needed). */
+		sofia_publications_reconcile(
+			strcmp(pub_server_was, sofia_cfg.publish_server) != 0
+			|| strcmp(pub_domain_was, sofia_cfg.publish_domain) != 0
+			|| pub_expires_was != sofia_cfg.publish_expires);
+	}
 
 	ast_config_destroy(cfg);
 	result = 0;

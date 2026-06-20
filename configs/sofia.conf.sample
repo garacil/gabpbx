@@ -398,8 +398,9 @@ srvlookup=yes
 ; `regexten` (or its name) and the state comes from the peer's `subscribecontext` dialplan hint — so a
 ; published peer needs `regexten` + `subscribecontext` + a real hint (no auto-create).
 ;
-; RESTART-REQUIRED: publications are reconciled at startup only. Changing any publish_* key, or a peer's
-; publish=yes, needs `systemctl restart gabpbx`; a `sip reload` does NOT change the live publication set.
+; A `sip reload` reconciles publications live: it adds peers that gained publish=yes, removes (with an
+; Expires:0 unpublish to the server) peers that dropped it, and rebuilds when publish_server/domain/
+; expires change — no restart needed. (Only a listener change, e.g. bindport/TLS, is restart-required.)
 ;
 ;publish_server   = sip:presence.example.com:60000  ; central ESC host[:port]. Empty = feature OFF. The
 ;                                                    ; ESC's SIP port is used in the PUBLISH Request-URI,
