@@ -4213,6 +4213,31 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	format_t orig_capability = pvt->capability;
 	pvt->capability &= ~AST_FORMAT_VIDEO_MASK;
 
+	/* R7 batch 2a (validate-then-commit, buckets B+C): snapshot the live media state the
+	 * media loop mutates BEFORE the post-loop reject gates, so a rejected SDP restores it and
+	 * leaves an established call untouched (RFC 3261 §14). (B) simple pvt fields; (C) RTP/UDPTL
+	 * remote addresses. pvt->rtp is guaranteed (guard above). pvt->vrtp / pvt->udptl may be NULL
+	 * now and be lazily created during the loop — those lazy creates are bucket-(D) (deferred /
+	 * was_new-rollback in batch 2c), so here we only snapshot+restore a remote on an instance
+	 * that ALREADY exists; had_vrtp/had_udptl gate the restore. */
+	struct ast_control_t38_parameters orig_t38_their_parms = pvt->t38_their_parms;	/* (B) */
+	unsigned int orig_t38_max_ifp = pvt->t38_max_ifp;				/* (B) */
+	struct ast_sockaddr orig_audio_remote;						/* (C) */
+	struct ast_sockaddr orig_video_remote;						/* (C) */
+	struct ast_sockaddr orig_udptl_peer;						/* (C) */
+	int had_vrtp = (pvt->vrtp != NULL);
+	int had_udptl = (pvt->udptl != NULL);
+	ast_sockaddr_setnull(&orig_audio_remote);
+	ast_sockaddr_setnull(&orig_video_remote);
+	ast_sockaddr_setnull(&orig_udptl_peer);
+	ast_rtp_instance_get_remote_address(pvt->rtp, &orig_audio_remote);
+	if (had_vrtp) {
+		ast_rtp_instance_get_remote_address(pvt->vrtp, &orig_video_remote);
+	}
+	if (had_udptl) {
+		ast_udptl_get_peer(pvt->udptl, &orig_udptl_peer);
+	}
+
 	for (media = sdp->sdp_media; media; media = media->m_next) {
 		if (media->m_type == sdp_media_audio && media->m_port != 0) {
 			sdp_attribute_t *a;
@@ -4808,6 +4833,20 @@ sdp_reject:
 	}
 	sofia_sdp_stage_rollback(pvt, audio_srtp_was_new, video_srtp_was_new);
 	pvt->capability = orig_capability;
+	/* R7 batch 2a (buckets B+C): restore the live media state the loop may have mutated before
+	 * this reject. Bucket (A) codec-map copies and bucket (D) irreversible side-effects are
+	 * deferred past the gates in batches 2b/2c so they were never applied on a reject and need
+	 * no restore here. Restoring an unchanged value (reject before the mutation) is a harmless
+	 * no-op. had_vrtp/had_udptl guard instances that only exist after a lazy create this parse. */
+	pvt->t38_their_parms = orig_t38_their_parms;
+	pvt->t38_max_ifp = orig_t38_max_ifp;
+	ast_rtp_instance_set_remote_address(pvt->rtp, &orig_audio_remote);
+	if (had_vrtp) {
+		ast_rtp_instance_set_remote_address(pvt->vrtp, &orig_video_remote);
+	}
+	if (had_udptl) {
+		ast_udptl_set_peer(pvt->udptl, &orig_udptl_peer);
+	}
 	return -1;
 }
 
