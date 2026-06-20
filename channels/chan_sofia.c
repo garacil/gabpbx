@@ -19011,8 +19011,82 @@ static char *sofia_cli_blacklist_clear(struct ast_cli_entry *e, int cmd, struct 
 	return CLI_SUCCESS;
 }
 
+/* Capability feature #2: `sip show registry` — list this server's OUTBOUND trunk registrations
+ * (the `register =>` synthetic peers, peer->is_register_line) + their state. chan_sip parity; the CLI
+ * companion to the existing AMI SofiaShowRegistry. Snapshot each row UNDER peer->lock, release, THEN
+ * ast_cli (which can block on a slow console) — R4 manager_sofia_show_registry lesson. */
+static char *sofia_cli_show_registry(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct ao2_iterator iter;
+	struct sofia_peer *peer;
+	int count = 0;
+	time_t now;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "sip show registry";
+		e->usage =
+			"Usage: sip show registry\n"
+			"       List this server's outbound trunk registrations (register => lines)\n"
+			"       and their current state.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	if (a->argc != 3) {
+		return CLI_SHOWUSAGE;
+	}
+
+	now = time(NULL);
+	ast_cli(a->fd, "%-42.42s  %-16.16s  %-8s  %s\n", "Host", "Username", "Refresh", "State");
+
+	iter = ao2_iterator_init(peers, 0);
+	while ((peer = ao2_iterator_next(&iter))) {
+		int is_regline, port = 5060, registered = 0, attempts = 0;
+		long refresh_secs = 0;
+		char l_host[256] = "", l_user[256] = "";
+
+		ast_mutex_lock(&peer->lock);
+		is_regline = peer->is_register_line;
+		if (is_regline) {
+			port = peer->port ? peer->port : 5060;
+			registered = peer->registered;
+			attempts = peer->reg_attempts;
+			refresh_secs = (registered && peer->reg_expiry > now)
+				? (long)(peer->reg_expiry - now) : 0;
+			ast_copy_string(l_host, S_OR(peer->host, ""), sizeof(l_host));
+			ast_copy_string(l_user, S_OR(peer->defaultuser, ""), sizeof(l_user));
+		}
+		ast_mutex_unlock(&peer->lock);
+
+		if (is_regline) {
+			char hostport[300];
+			char state[48];
+			snprintf(hostport, sizeof(hostport), "%s:%d", l_host, port);
+			if (registered) {
+				ast_copy_string(state, "Registered", sizeof(state));
+			} else if (attempts > 0) {
+				snprintf(state, sizeof(state), "Unregistered (%d attempt%s)",
+					attempts, attempts == 1 ? "" : "s");
+			} else {
+				ast_copy_string(state, "Unregistered", sizeof(state));
+			}
+			ast_cli(a->fd, "%-42.42s  %-16.16s  %-8ld  %s\n",
+				hostport, l_user, refresh_secs, state);
+			count++;
+		}
+		ao2_ref(peer, -1);
+	}
+	ao2_iterator_destroy(&iter);
+
+	ast_cli(a->fd, "%d SIP registration%s.\n", count, count == 1 ? "" : "s");
+	return CLI_SUCCESS;
+}
+
 static struct ast_cli_entry cli_sofia[] = {
 	AST_CLI_DEFINE(sofia_cli_show_peers, "List Sofia-SIP peers"),
+	AST_CLI_DEFINE(sofia_cli_show_registry, "List outbound SIP trunk registrations"),
 	AST_CLI_DEFINE(sofia_cli_show_channels, "List active Sofia-SIP channels"),
 	AST_CLI_DEFINE(sofia_cli_show_peer, "Show detailed Sofia-SIP peer info"),
 	AST_CLI_DEFINE(sofia_cli_show_inuse, "Show SIP peer call usage counters"),

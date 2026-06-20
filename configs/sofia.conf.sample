@@ -2517,6 +2517,31 @@ srvlookup=yes
 ;register => myuser:mypassword@sip.provider.com
 ;register => test:15121972@192.0.2.47:60000
 
+;
+; --- Outbound trunk authentication (capability feature) ---
+; chan_sofia answers a 401/407 digest challenge on BOTH its outbound REGISTER (the
+; register => lines above) AND its outbound INVITEs (calls placed out through a peer
+; trunk). The credentials used are the trunk peer's defaultuser/username + secret
+; (for a register => line, the user:password in the directive). No extra config is
+; required: if the upstream challenges, chan_sofia automatically re-sends the request
+; with an Authorization / Proxy-Authorization header.
+;   * Use a PLAINTEXT secret= on the trunk peer. A md5secret= (pre-hashed MD5) CANNOT
+;     be used for OUTBOUND digest — the cleartext password is needed to compute the
+;     response — so an md5secret-only trunk will not authenticate outbound
+;     calls/registrations (md5secret stays fine for INBOUND authentication).
+;   * If a single response carries both a WWW-Authenticate (endpoint/registrar) and a
+;     Proxy-Authenticate (proxy) challenge, both are answered together.
+;
+; --- Monitoring outbound registrations: "sip show registry" (CLI) ---
+; Lists every register => outbound registration and its current state:
+;     Host                          Username          Refresh   State
+;     sip.provider.com:5060         myuser            3590      Registered
+;     192.0.2.47:60000              test              0         Unregistered (3 attempts)
+;   Refresh = seconds until the next refresh (0 when not registered). State is
+;   Registered or Unregistered; the "(N attempts)" hint appears when an upstream keeps
+;   rejecting the digest (verify the trunk secret). The same data is also available via
+;   the AMI SofiaShowRegistry action.
+
 ; ============================================
 ; Outbound trunk example
 ; ============================================
