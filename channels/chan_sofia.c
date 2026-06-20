@@ -4082,7 +4082,7 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 static int sofia_process_crypto(struct sofia_pvt *pvt, struct ast_rtp_instance *rtp,
 		struct sofia_srtp **srtp, const char *attr)
 {
-	char prefixed[512];
+	char *prefixed = NULL;	/* R7 C3: dynamic — validate the FULL a=crypto line, no truncation */
 	/* A7: only tear down *srtp on failure if we allocated it in THIS call. On an
 	 * in-dialog re-INVITE *srtp may be a live, already-validated SRTP context; a
 	 * rejected/invalid a=crypto must NOT destroy it (that would silently downgrade
@@ -4109,16 +4109,33 @@ static int sofia_process_crypto(struct sofia_pvt *pvt, struct ast_rtp_instance *
 			return 0;
 		}
 	}
-	snprintf(prefixed, sizeof(prefixed), "crypto:%s", attr);
-	/* Round5 C5: defer=1 — validate + stage only; the live add_srtp_policy is deferred to
-	 * sdp_crypto_commit() after sofia_parse_sdp's reject gates pass. (The was_new rollback
-	 * below still covers an immediate VALIDATION failure on this same call.) */
-	if (sdp_crypto_process((*srtp)->crypto, prefixed, rtp, 1) < 0) {
+	/* R7 C3 (3-way): build "crypto:<attr>" DYNAMICALLY so a long a=crypto line is validated in
+	 * FULL. The old `char prefixed[512]` + unchecked snprintf truncated an overlong line, so
+	 * sdp_crypto_process validated a DIFFERENT line than the wire — an unsupported session-param
+	 * or key lifetime in the tail beyond byte 511 was silently dropped, bypassing its rejection.
+	 * sdp_crypto_process is length-safe (ast_strdupa + strsep + strcmp/atoi + bounded
+	 * ast_copy_string), so feeding it the full untruncated line cannot overflow. */
+	if (ast_asprintf(&prefixed, "crypto:%s", attr) < 0) {
+		/* OOM — treat as crypto-not-OK and reject the offer (fail-closed). */
 		if (was_new) {
 			sofia_srtp_destroy(*srtp);
 			*srtp = NULL;
 		}
 		return 0;
+	}
+	/* Round5 C5: defer=1 — validate + stage only; the live add_srtp_policy is deferred to
+	 * sdp_crypto_commit() after sofia_parse_sdp's reject gates pass. (The was_new rollback
+	 * below still covers an immediate VALIDATION failure on this same call.) */
+	{
+		int rc = sdp_crypto_process((*srtp)->crypto, prefixed, rtp, 1);
+		ast_free(prefixed);
+		if (rc < 0) {
+			if (was_new) {
+				sofia_srtp_destroy(*srtp);
+				*srtp = NULL;
+			}
+			return 0;
+		}
 	}
 	(*srtp)->flags |= SRTP_CRYPTO_OFFER_OK;
 	return 1;
@@ -16392,6 +16409,8 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			 * bridge thread (sofia_set_rtp_peer); guard with pvt->lock. */
 			int rejected = (status >= 300);
 			int has_sdp = (!rejected && sip && sip->sip_payload && sip->sip_payload->pl_data);
+			int sdp_rc = 0;		/* R7 C4: capture sofia_parse_sdp() on the 2xx */
+			int reverted_to_relay = 0;	/* R7 C4: the revert re-INVITE actually fired (vs guard-skipped) */
 			struct ast_channel *owner = NULL;
 			ast_mutex_lock(&pvt->lock);
 			/* Re-acquire in canonical channel->pvt order so sofia_parse_sdp's
@@ -16422,16 +16441,51 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				memset(&pvt->redirip, 0, sizeof(pvt->redirip));
 			} else if (has_sdp) {
 				/* 2xx — peer accepted; SDP tells us where they will send. */
-				sofia_parse_sdp(pvt, sip);
+				sdp_rc = sofia_parse_sdp(pvt, sip);
+			}
+			/* R7 C4 (3-way): unlock the owner channel BEFORE the possible relay re-INVITE so
+			 * sofia_send_reinvite runs under pvt->lock ALONE — matching the normal
+			 * directmedia-reinvite lock profile (sofia_directmedia_reinvite_root holds only
+			 * pvt->lock) and minimizing the lock-held window across nua_invite. */
+			if (owner) {
+				/* R7 C4 (Codex refinement 2): release the channel LOCK now (so the relay
+				 * re-INVITE runs under pvt->lock alone), but KEEP the owner ref — the unref is
+				 * DEFERRED until after pvt->lock is dropped, because dropping the last ref here
+				 * could run the channel destructor under pvt->lock. */
+				ast_channel_unlock(owner);
+			}
+			if (!rejected && has_sdp && sdp_rc < 0
+			    && !pvt->alreadygone && pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh) {
+				/* R7 C4: a 2xx is FINAL — we cannot 488 it. The directmedia answer was unusable
+				 * (sofia_parse_sdp rejected it; batch 2 leaves pvt media state unchanged on a
+				 * reject), so revert to PBX relay: clear redirip so sofia_generate_sdp builds a
+				 * relay SDP, and send a fresh non-directmedia re-INVITE to bring media back through
+				 * the PBX. Guarded against a teardown race (Codex refinement 1): the same
+				 * !alreadygone && state==UP && nh gate sofia_directmedia_reinvite_root uses, so a
+				 * 2xx arriving during hangup never fires a late re-INVITE. sofia_send_reinvite sets
+				 * reinvite_pending so a stray bridge tick cannot race a second re-INVITE; sofia-sip
+				 * sequences it after the 2xx is ACKed. */
+				memset(&pvt->redirip, 0, sizeof(pvt->redirip));
+				sofia_send_reinvite(pvt);
+				reverted_to_relay = 1;
 			}
 			ast_mutex_unlock(&pvt->lock);
 			if (owner) {
-				ast_channel_unlock(owner);
+				/* R7 C4 (Codex refinement 2): unref AFTER pvt->lock is dropped. */
 				ast_channel_unref(owner);
+				owner = NULL;
 			}
 			if (rejected) {
 				ast_log(LOG_NOTICE, "Sofia: directmedia re-INVITE rejected on '%s' (%d %s) — staying in relay mode\n",
 					pvt->callid ? pvt->callid : "(no-callid)", status, phrase ? phrase : "");
+			} else if (reverted_to_relay) {
+				ast_log(LOG_WARNING, "Sofia: directmedia re-INVITE 2xx had an unusable SDP on '%s' — reverted to relay\n",
+					pvt->callid ? pvt->callid : "(no-callid)");
+			} else if (has_sdp && sdp_rc < 0) {
+				/* unusable SDP but the call was no longer UP (teardown race) — the revert was
+				 * correctly skipped; nothing to do, the call is going down. */
+				ast_log(LOG_NOTICE, "Sofia: directmedia re-INVITE 2xx had an unusable SDP on '%s' but the call is no longer up — not reverting\n",
+					pvt->callid ? pvt->callid : "(no-callid)");
 			} else if (has_sdp) {
 				ast_verbose("Sofia: directmedia re-INVITE accepted on '%s'\n",
 					pvt->callid ? pvt->callid : "(no-callid)");
