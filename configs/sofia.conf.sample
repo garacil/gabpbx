@@ -388,6 +388,36 @@ srvlookup=yes
 ;allowsubscribe = yes    ; default; chan_sip drop-in (sip.h:478 default TRUE)
 
 ;
+; --- Outbound PUBLISH (RFC 3903) — publish dialog/BLF state to a CENTRAL presence server ---
+; chan_sofia can act as an Event Publication Agent (EPA): for each peer with `publish=yes`, it sends a
+; SIP PUBLISH (application/dialog-info+xml) carrying that peer's hint state to a central Event State
+; Compositor (ESC) such as Kamailio's presence module — so the ESC can NOTIFY watchers across a cluster
+; or federation. chan_sip never had this (SURPASS). The feature is OFF until `publish_server` is set.
+;
+; The peer's published presentity is sip:<exten>@<publish_domain>, where <exten> is the peer's
+; `regexten` (or its name) and the state comes from the peer's `subscribecontext` dialplan hint — so a
+; published peer needs `regexten` + `subscribecontext` + a real hint (no auto-create).
+;
+; RESTART-REQUIRED: publications are reconciled at startup only. Changing any publish_* key, or a peer's
+; publish=yes, needs `systemctl restart gabpbx`; a `sip reload` does NOT change the live publication set.
+;
+;publish_server   = sip:presence.example.com:60000  ; central ESC host[:port]. Empty = feature OFF. The
+;                                                    ; ESC's SIP port is used in the PUBLISH Request-URI,
+;                                                    ; so set it explicitly if the ESC is not on :5060.
+;publish_domain   = example.com                     ; presentity domain in sip:<exten>@<domain>. Default:
+;                                                    ; the publish_server host. Use the domain your ESC
+;                                                    ; serves/normalizes so it accepts the presentity.
+;publish_expires  = 3600                            ; PUBLISH Expires in seconds (default 3600; min 30).
+;                                                    ; Must be >= the ESC's min_expires, else the ESC 423s
+;                                                    ; and chan_sofia retries with the returned Min-Expires.
+;publish_username = pbxpublisher                     ; digest credentials, only if the ESC challenges the
+;publish_password = s3cr3t                           ; PUBLISH with 401/407 (trusted-IP ESCs need neither).
+;
+; Then opt a peer in (in its [peer] section): publish = yes
+; v1 publishes application/dialog-info+xml only. Initial sends are jittered and refreshes/state-changes
+; are serialized per presentity, so a 5000-10000 peer fleet does not thundering-herd the ESC.
+
+;
 ; --- regexten + regextenonqualify (post-T56 chan_sip parity, drop-in registration-coupled dialplan) ---
 ; Auto-add a dialplan extension when a peer registers; auto-remove when the peer
 ; unregisters or (optionally) when qualify reports the peer unreachable. Common
