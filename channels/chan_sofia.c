@@ -14796,6 +14796,7 @@ struct sofia_publication {
 	int terminated;				/* teardown idempotency */
 	int _reload_marked;			/* reload mark-and-sweep (mirrors peer->_reload_marked): marked at
 						 * reload start, unmarked if the peer still publishes it, swept if not. */
+	int last_status;			/* last final nua_r_method status (0 = no response yet) — CLI diag */
 };
 
 #define MAX_PUBLICATION_BUCKETS 10007			/* prime; one entry per publish=yes peer — sized for
@@ -14967,6 +14968,7 @@ static void sofia_publication_handle_response(int status, char const *phrase,
 		ao2_ref(pub, -1);	/* provisional — still in flight */
 		return;
 	}
+	pub->last_status = status;	/* final status — recorded for `sip show publications` diagnostics */
 
 	if ((status == 401 || status == 407) && sip) {
 		/* reactive digest auth. sofia_format_auth_creds returns 0 on SUCCESS (Codex: the v1 check was
@@ -19246,6 +19248,20 @@ static char *sofia_cli_show_settings(struct ast_cli_entry *e, int cmd, struct as
 	 * SHA-256" reports the verifier capabilities; challenges are sent MD5-first
 	 * and may omit SHA-256 for md5secret-only peers. */
 	ast_cli(a->fd, "  Auth algorithms:        MD5, SHA-256\n");
+
+	/* Outbound PUBLISH (RFC 3903) — the credential password is REDACTED (Codex non-secret). */
+	ast_cli(a->fd, "  Outbound PUBLISH:       %s\n",
+		ast_strlen_zero(sofia_cfg.publish_server) ? "(off)" : sofia_cfg.publish_server);
+	if (!ast_strlen_zero(sofia_cfg.publish_server)) {
+		ast_cli(a->fd, "    Presentity domain:    %s\n",
+			ast_strlen_zero(sofia_cfg.publish_domain) ? "(publish_server host)" : sofia_cfg.publish_domain);
+		ast_cli(a->fd, "    Expires:              %d\n",
+			sofia_cfg.publish_expires > 0 ? sofia_cfg.publish_expires : SOFIA_PUBLISH_DEFAULT_EXPIRES);
+		ast_cli(a->fd, "    Auth user:            %s\n",
+			ast_strlen_zero(sofia_cfg.publish_username) ? "(none)" : sofia_cfg.publish_username);
+		ast_cli(a->fd, "    Auth password:        %s\n",
+			ast_strlen_zero(sofia_cfg.publish_password) ? "(none)" : "<set>");
+	}
 	ast_cli(a->fd, "\n");
 
 	return CLI_SUCCESS;
@@ -19834,6 +19850,154 @@ static char *sofia_cli_blacklist_clear(struct ast_cli_entry *e, int cmd, struct 
  * (the `register =>` synthetic peers, peer->is_register_line) + their state. chan_sip parity; the CLI
  * companion to the existing AMI SofiaShowRegistry. Snapshot each row UNDER peer->lock, release, THEN
  * ast_cli (which can block on a slow console) — R4 manager_sofia_show_registry lesson. */
+/* Off-thread `sip show publications` reads the sofia_thread-owned publication set via a SYNCHRONOUS
+ * snapshot (3-way + Codex safety refinement): a builder is dispatched onto sofia_thread (the single
+ * owner), formats all rows into a ref-counted ast_str, and signals; the CLI thread waits (bounded) then
+ * prints. AO2 protects object lifetime but NOT coherent reads of etag/next_send/in_flight/last_status, so
+ * we never read those from the CLI thread. */
+struct sofia_pubsnapshot_req {
+	ast_mutex_t mutex;
+	ast_cond_t cond;
+	int done;
+	struct ast_str *out;	/* formatted output, built on sofia_thread; ref-protected (survives a CLI timeout) */
+};
+
+static void sofia_pubsnapshot_req_destructor(void *obj)
+{
+	struct sofia_pubsnapshot_req *req = obj;
+
+	ast_mutex_destroy(&req->mutex);
+	ast_cond_destroy(&req->cond);
+	ast_free(req->out);
+}
+
+static const char *sofia_pub_nextsend_str(struct sofia_publication *pub, time_t now, char *buf, size_t len)
+{
+	if (pub->in_flight) {
+		ast_copy_string(buf, "in-flight", len);
+	} else if (pub->next_send == 0) {
+		ast_copy_string(buf, "-", len);
+	} else if (pub->next_send <= now) {
+		ast_copy_string(buf, "due", len);
+	} else {
+		snprintf(buf, len, "%lds", (long)(pub->next_send - now));
+	}
+	return buf;
+}
+
+/* sofia_thread: build the publications table into req->out, then signal the waiting CLI thread. */
+static void sofia_pubsnapshot_build(void *data)
+{
+	struct sofia_pubsnapshot_req *req = data;
+	struct ao2_iterator it;
+	struct sofia_publication *pub;
+	time_t now = time(NULL);
+	int count = 0;
+
+	/* LastState = what we last PUBLISHed; Current = what the hint is NOW (Codex: the key ops diagnostic
+	 * is "is the published state stale vs the live hint state?"). */
+	ast_str_set(&req->out, 0, "%-16.16s  %-26.26s  %-11.11s  %-11.11s  %-4s  %-7s  %-9s  %-6s  %s\n",
+		"Peer", "Presentity", "LastState", "Current", "ETag", "Expires", "NextSend", "Last", "Target");
+	if (publications) {
+		it = ao2_iterator_init(publications, 0);
+		while ((pub = ao2_iterator_next(&it))) {
+			char ns[16], peername[32], laststatus[12], *bar;
+			int cur = ast_extension_state(NULL, pub->context, pub->exten);
+
+			ast_copy_string(peername, pub->key, sizeof(peername));	/* peer = key up to first '|' */
+			if ((bar = strchr(peername, '|'))) {
+				*bar = '\0';
+			}
+			if (pub->last_status) {
+				snprintf(laststatus, sizeof(laststatus), "%d", pub->last_status);
+			} else {
+				ast_copy_string(laststatus, "-", sizeof(laststatus));	/* not yet published */
+			}
+			ast_str_append(&req->out, 0, "%-16.16s  %-26.26s  %-11.11s  %-11.11s  %-4s  %-7d  %-9s  %-6s  %.40s\n",
+				peername, pub->entity,
+				pub->last_status ? ast_extension_state2str(pub->laststate) : "-",	/* last published */
+				ast_extension_state2str(cur),					/* current hint state */
+				ast_strlen_zero(pub->etag) ? "no" : "yes", pub->expires,
+				sofia_pub_nextsend_str(pub, now, ns, sizeof(ns)), laststatus, pub->target);
+			count++;
+			ao2_ref(pub, -1);
+		}
+		ao2_iterator_destroy(&it);
+	}
+	if (count == 0) {
+		ast_str_append(&req->out, 0, "%s\n", ast_strlen_zero(sofia_cfg.publish_server)
+			? "(outbound PUBLISH is off — publish_server is not set)" : "(no publications)");
+	} else {
+		ast_str_append(&req->out, 0, "%d publication%s\n", count, count == 1 ? "" : "s");
+	}
+
+	ast_mutex_lock(&req->mutex);
+	req->done = 1;
+	ast_cond_signal(&req->cond);
+	ast_mutex_unlock(&req->mutex);
+	ao2_ref(req, -1);	/* drop the builder's ref */
+}
+
+static char *sofia_cli_show_publications(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct sofia_pubsnapshot_req *req;
+	struct timeval now;
+	struct timespec ts;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "sip show publications";
+		e->usage =
+			"Usage: sip show publications\n"
+			"       List the outbound PUBLISH presentities this server maintains on a central\n"
+			"       presence server (one per publish=yes peer hint), showing the last published\n"
+			"       state and the current hint state, whether an ETag is held, the refresh\n"
+			"       interval, time to the next send, and the last result.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+	if (a->argc != 3) {
+		return CLI_SHOWUSAGE;
+	}
+	if (!(req = ao2_alloc(sizeof(*req), sofia_pubsnapshot_req_destructor))) {
+		return CLI_FAILURE;
+	}
+	ast_mutex_init(&req->mutex);
+	ast_cond_init(&req->cond, NULL);
+	req->done = 0;
+	if (!(req->out = ast_str_create(512))) {
+		ao2_ref(req, -1);
+		return CLI_FAILURE;
+	}
+
+	ao2_ref(req, +1);	/* builder's ref (dropped in sofia_pubsnapshot_build) */
+	if (sofia_dispatch_to_root_thread(sofia_pubsnapshot_build, req) < 0) {
+		ao2_ref(req, -1);	/* undo the builder ref — it will never run */
+		ao2_ref(req, -1);	/* drop the CLI ref */
+		ast_cli(a->fd, "Sofia: unable to dispatch the publications snapshot (sofia thread unavailable)\n");
+		return CLI_FAILURE;
+	}
+
+	now = ast_tvnow();		/* bounded 2s wait so a stuck sofia_thread cannot hang the CLI */
+	ts.tv_sec = now.tv_sec + 2;
+	ts.tv_nsec = now.tv_usec * 1000;
+	ast_mutex_lock(&req->mutex);
+	while (!req->done) {
+		if (ast_cond_timedwait(&req->cond, &req->mutex, &ts) == ETIMEDOUT) {
+			break;
+		}
+	}
+	if (req->done) {
+		ast_cli(a->fd, "%s", ast_str_buffer(req->out));
+	} else {
+		ast_cli(a->fd, "Sofia: publications snapshot timed out (sofia thread busy)\n");
+	}
+	ast_mutex_unlock(&req->mutex);
+	ao2_ref(req, -1);	/* drop the CLI ref (builder still holds one on timeout) */
+	return CLI_SUCCESS;
+}
+
 static char *sofia_cli_show_registry(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
 	struct ao2_iterator iter;
@@ -19989,6 +20153,7 @@ static char *sofia_cli_unregister(struct ast_cli_entry *e, int cmd, struct ast_c
 static struct ast_cli_entry cli_sofia[] = {
 	AST_CLI_DEFINE(sofia_cli_show_peers, "List Sofia-SIP peers"),
 	AST_CLI_DEFINE(sofia_cli_show_registry, "List outbound SIP trunk registrations"),
+	AST_CLI_DEFINE(sofia_cli_show_publications, "List outbound PUBLISH presentities"),
 	AST_CLI_DEFINE(sofia_cli_unregister, "Force-expire a SIP peer's inbound registration"),
 	AST_CLI_DEFINE(sofia_cli_show_channels, "List active Sofia-SIP channels"),
 	AST_CLI_DEFINE(sofia_cli_show_peer, "Show detailed Sofia-SIP peer info"),
