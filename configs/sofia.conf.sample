@@ -419,6 +419,27 @@ srvlookup=yes
 ; are serialized per presentity, so a 5000-10000 peer fleet does not thundering-herd the ESC.
 
 ;
+; --- gruu (RFC 5626 instance advertisement on outbound REGISTER — per-peer) ---
+; When this server REGISTERs to an upstream registrar AS A CLIENT (a register => trunk: host set,
+; secret set, not host=dynamic), `gruu=yes` adds a stable +sip.instance="<urn:uuid:...>" parameter to
+; the outbound REGISTER Contact (RFC 5626 §4.1). The URN is derived from this server's EID + the peer
+; name, so it is unique per peer and stable across restarts. This lets a GRUU-capable registrar or a
+; federation layer uniquely identify this UA instance — useful because chan_sofia registers its Contacts
+; under a wildcard user, so the instance is the only stable discriminator.
+;
+; Scope (Phase 1 = ADVERTISEMENT only): it adds the +sip.instance parameter and nothing else. It does
+; NOT enable reg-id / the RFC 5626 outbound flow, sends no validation or keepalive OPTIONS, and does not
+; yet consume a returned pub-gruu for use in call/dialog Contacts (that is a future phase requiring a
+; GRUU-minting registrar to validate). Default off; opt-in per peer.
+;
+;   [mytrunk]
+;   type=peer
+;   host=registrar.example.com
+;   defaultuser=...
+;   secret=...
+;   gruu=yes
+
+;
 ; --- regexten + regextenonqualify (post-T56 chan_sip parity, drop-in registration-coupled dialplan) ---
 ; Auto-add a dialplan extension when a peer registers; auto-remove when the peer
 ; unregisters or (optionally) when qualify reports the peer unreachable. Common

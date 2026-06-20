@@ -1457,6 +1457,7 @@ struct sofia_peer {
 	int allowtransfer;              /* post-T56 allowtransfer per-peer parity (2026-04-27): TRANSFER_OPENFORALL/CLOSED REFER gate; chan_sip parity sip.h:1246 (peer->allowtransfer); inherits sofia_cfg.default_allowtransfer at sofia_peer_alloc; gated at sofia_process_refer entry */
 	int allowsubscribe;             /* post-T56 allowsubscribe per-peer parity (2026-04-27): REQUEST-EVENT GATING dimension #6 sibling to allowtransfer; chan_sip parity sip.h:316 SIP_PAGE2_ALLOWSUBSCRIBE flag bit; inherits sofia_cfg.default_allowsubscribe at sofia_peer_alloc; gated at sofia_process_mwi_subscribe AFTER peer-lookup (per-peer) + sofia_process_subscribe ENTRY (global ban via DERIVED sofia_cfg.allowsubscribe). 0 = block; 1 = allow. Default inherited from default_allowsubscribe (1 TRUE per sip.h:478 chan_sip drop-in). */
 	int publish;                    /* outbound PUBLISH (RFC 3903): when 1 and [general] publish_server is set, chan_sofia PUBLISHes this peer's hint (regexten/subscribecontext) dialog-info state to the central server. Default 0. */
+	int gruu;                       /* GRUU/RFC 5626 (Phase 1): when 1, the outbound REGISTER advertises a stable +sip.instance (urn:uuid from EID+name) so a GRUU-capable registrar can mint a pub-gruu. Default 0 (opt-in). */
 	/* post-T56 buggymwi per-peer parity (2026-04-27): chan_sip parity sip.h:338
 	 * SIP_PAGE2_BUGGY_MWI flag bit (1<<22) "Buggy CISCO MWI fix". When set, the
 	 * Voice-Message: NOTIFY body line OMITS the trailing " (0/0)" suffix per
@@ -5977,6 +5978,7 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	peer->allowtransfer = sofia_cfg.default_allowtransfer;
 	peer->allowsubscribe = sofia_cfg.default_allowsubscribe;
 	peer->publish = 0;	/* outbound PUBLISH opt-in; reset each (re)build so a removed publish=yes clears */
+	peer->gruu = 0;		/* GRUU Phase 1 opt-in; reset each (re)build so a removed gruu=yes clears on reload */
 	peer->buggymwi = 0;
 	peer->lockuseragent = 0;
 	ast_string_field_set(peer, lockuseragent_prefixes, "");
@@ -6755,6 +6757,9 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			 * → chan_sofia int field. REQUEST-EVENT GATING dimension #6 sibling to
 			 * allowtransfer; gates inbound SUBSCRIBE per-peer (sofia_process_mwi_subscribe). */
 			peer->allowsubscribe = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "gruu")) {
+			/* GRUU Phase 1: advertise a stable +sip.instance on this peer's outbound REGISTER. */
+			peer->gruu = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "publish")) {
 			/* outbound PUBLISH (RFC 3903): opt this peer's hint state into central-server publication. */
 			peer->publish = ast_true(v->value);
@@ -16885,6 +16890,27 @@ static struct sofia_pvt *sofia_pvt_ref_if_linked(nua_hmagic_t *hmagic)
 static char sofia_sipnotify_sentinel;
 #define SOFIA_SIPNOTIFY_HMAGIC ((nua_hmagic_t *)&sofia_sipnotify_sentinel)
 
+/* GRUU Phase 1 (gruu=yes): build the +sip.instance Contact-header parameter for a peer's outbound
+ * REGISTER — `+sip.instance="<urn:uuid:...>"` (RFC 5626 §4.1). The URN is a stable UUID derived from the
+ * server EID + the peer name (deterministic across restarts, unique per peer). Emitted via
+ * NUTAG_M_FEATURES (a direct Contact-param append) at every REGISTER site — NOT NUTAG_INSTANCE, which
+ * would spin up the sofia outbound engine and emit unwanted validation/keepalive OPTIONS. buf is set to
+ * "" when the peer has gruu off, so callers can pass it unconditionally under a TAG_IF(peer->gruu, ...). */
+static void sofia_build_instance_feature(const struct sofia_peer *peer, char *buf, size_t len)
+{
+	char seed[128], hash[33], eidstr[32] = "";
+
+	if (!peer->gruu) {
+		buf[0] = '\0';
+		return;
+	}
+	ast_eid_to_str(eidstr, sizeof(eidstr), &ast_eid_default);
+	snprintf(seed, sizeof(seed), "gabpbx-sofia-instance:%s:%s", eidstr, S_OR(peer->name, ""));
+	ast_md5_hash(hash, seed);	/* 32 lowercase hex chars; format the 128-bit digest as a UUID */
+	snprintf(buf, len, "+sip.instance=\"<urn:uuid:%.8s-%.4s-%.4s-%.4s-%.12s>\"",
+		hash, hash + 8, hash + 12, hash + 16, hash + 20);
+}
+
 static void sofia_event_callback(nua_event_t event, int status, char const *phrase,
 		nua_t *nua, nua_magic_t *magic,
 		nua_handle_t *nh, nua_hmagic_t *hmagic,
@@ -17168,7 +17194,11 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 
 				/* post-T56 maxforwards parity (2026-04-27): RFC 3261 §20.22 outbound REGISTER. */
 				char mf_str_reg[8];
+				char instance_feature_reg[120];
 				snprintf(mf_str_reg, sizeof(mf_str_reg), "%d", peer->maxforwards);
+				/* GRUU Phase 1: keep the +sip.instance advertisement across the auth-challenge
+				 * re-REGISTER too, so the registered binding carries the instance. */
+				sofia_build_instance_feature(peer, instance_feature_reg, sizeof(instance_feature_reg));
 				/* post-T56 callbackextension per-peer parity (2026-04-28, Option A FULL
 				 * WIRE-IN site 1/3 — auth-challenge re-REGISTER): when peer has
 				 * callbackextension set, override Contact URL username via sofia-sip
@@ -17183,6 +17213,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					SIPTAG_MAX_FORWARDS_STR(mf_str_reg),
 					TAG_IF(!ast_strlen_zero(peer->callbackextension),
 						NUTAG_M_USERNAME(peer->callbackextension)),
+					TAG_IF(peer->gruu, NUTAG_M_FEATURES(instance_feature_reg)),
 					TAG_END());
 
 				peer->reg_attempts++;
@@ -21859,6 +21890,9 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			 * branch (config-file). Same chan_sip-verbatim binary semantic as the
 			 * realtime branch in sofia_apply_peer_variables. */
 			peer->allowsubscribe = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "gruu")) {
+			/* GRUU Phase 1: config-file branch (sibling of the realtime branch). */
+			peer->gruu = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "publish")) {
 			/* outbound PUBLISH (RFC 3903): config-file branch — sibling of the realtime branch in
 			 * sofia_apply_peer_variables. Without this, static-peer publish=yes was silently dropped
@@ -22592,7 +22626,10 @@ static void *sofia_reg_thread_func(void *data)
 					ast_verbose("Sofia: Re-registering %s\n", uri);
 				/* post-T56 maxforwards parity (2026-04-27): RFC 3261 §20.22 outbound REGISTER refresh. */
 				char mf_str_reregister[8];
+				char instance_feature_rereg[120];
 				snprintf(mf_str_reregister, sizeof(mf_str_reregister), "%d", peer->maxforwards);
+				/* GRUU Phase 1: re-advertise +sip.instance on the refresh REGISTER too. */
+				sofia_build_instance_feature(peer, instance_feature_rereg, sizeof(instance_feature_rereg));
 				/* post-T56 callbackextension per-peer parity (2026-04-28, Option A
 				 * FULL WIRE-IN site 2/3 — qualify-cycle re-REGISTER): same
 				 * NUTAG_M_USERNAME override as initial-register and auth-challenge
@@ -22603,6 +22640,7 @@ static void *sofia_reg_thread_func(void *data)
 					SIPTAG_MAX_FORWARDS_STR(mf_str_reregister),
 					TAG_IF(!ast_strlen_zero(peer->callbackextension),
 						NUTAG_M_USERNAME(peer->callbackextension)),
+					TAG_IF(peer->gruu, NUTAG_M_FEATURES(instance_feature_rereg)),
 					TAG_END());
 				peer->reg_expiry = now + 60;
 			}
@@ -22661,10 +22699,17 @@ static void sofia_do_register(void)
 					nua_handle_destroy(old_rnh);
 				}
 
+				/* GRUU Phase 1 (gruu=yes): advertise a stable +sip.instance on the REGISTER Contact so
+				 * a GRUU-capable registrar can mint a pub-gruu. Advertisement only — see
+				 * sofia_build_instance_feature (NUTAG_M_FEATURES, not the outbound engine). */
+				char instance_feature[120];
+				sofia_build_instance_feature(peer, instance_feature, sizeof(instance_feature));
+
 				peer->nh = nua_handle(sofia_nua, peer,
 					NUTAG_URL(uri),
 					SIPTAG_TO_STR(uri),
 					TAG_IF(route_buf[0], NUTAG_INITIAL_ROUTE_STR(route_buf)),
+					TAG_IF(peer->gruu, NUTAG_M_FEATURES(instance_feature)),
 					TAG_END());
 
 				/* post-T56 maxforwards parity (2026-04-27): RFC 3261 §20.22 outbound REGISTER. */
@@ -22680,6 +22725,7 @@ static void sofia_do_register(void)
 					SIPTAG_MAX_FORWARDS_STR(mf_str_initreg),
 					TAG_IF(!ast_strlen_zero(peer->callbackextension),
 						NUTAG_M_USERNAME(peer->callbackextension)),
+					TAG_IF(peer->gruu, NUTAG_M_FEATURES(instance_feature)),
 					TAG_END());
 
 				if (sofia_debug) {
