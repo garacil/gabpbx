@@ -1909,6 +1909,7 @@ struct sofia_pvt {
 	struct sofia_contact *active_contact;  /* contact this call is on (holds ao2 ref) */
 	struct ast_sockaddr redirip;     /* directmedia: peer's RTP target; zero = relay through PBX */
 	int reinvite_pending;            /* 1 = directmedia re-INVITE in flight; gates response handler */
+	int outbound_invite_auth_attempts; /* feature #1: count of 401/407 answered on this outbound INVITE — bounded (allows sequential WWW+Proxy challenges, caps the loop on bad creds) */
 	unsigned long sess_id;           /* Round5 M8: SDP o= session-id, set ONCE per dialog (RFC 4566 5.2 / RFC 3264 8 require it constant across all offers/answers) */
 	unsigned long sess_version;      /* Round5 M8: SDP o= session-version, bumped on each generated SDP */
 	int hold_state;                  /* 1 = peer holding us (a=sendonly/inactive); 0 = active (sendrecv) */
@@ -10927,6 +10928,67 @@ static const char *sofia_au_get_unq(sip_authorization_t const *au, const char *n
 	return buf;
 }
 
+/* Capability feature #1 (outbound INVITE/request auth): build the sofia-sip credential string for
+ * nua_authenticate()/NUTAG_AUTH in the EXACT format auc_credentials() requires
+ * (iptsec/auth_client.c:288-356):
+ *   scheme:"realm":user:pass    — all four fields, realm QUOTED.
+ * A 2-field "user:pass" is SILENTLY IGNORED by that parser (realm parses as NULL → returns 0, no
+ * credential loaded), so a challenged outbound request never gets an Authorization header. The realm
+ * is taken from the received 401/407 challenge. Returns 0 on success, -1 if the challenge carries no
+ * realm OR `secret` is empty (md5secret-only is NOT supported — NUTAG_AUTH needs the cleartext
+ * password to compute the digest response; documented limitation).
+ *
+ * LOCK-FREE by design: the caller passes already-snapshotted `user`/`secret` so this is reusable both
+ * from the outbound-INVITE handler (snapshot peer creds under peer->lock, release, then call + invoke
+ * nua_authenticate with NO lock held) and from the outbound-REGISTER 401/407 branch (already holds
+ * peer->lock). `challenge` is any SIP auth header (msg_auth_t: WWW-/Proxy-Authenticate share
+ * au_common+au_params). */
+static int sofia_format_auth_creds(msg_auth_t const *challenge, const char *user,
+		const char *secret, char *buf, size_t len)
+{
+	msg_auth_t const *au;
+	const char *realm = NULL;
+	int n;
+
+	if (!challenge || ast_strlen_zero(secret) || !buf || len == 0) {
+		return -1;
+	}
+	/* user + secret are colon-delimited fields in the creds string — a ':' in either corrupts the
+	 * format (and is not a valid unescaped SIP digest username/password character). Reject. */
+	if (strchr(S_OR(user, ""), ':') || strchr(secret, ':')) {
+		return -1;
+	}
+	/* Pick the Digest-scheme challenge (a header set may carry several schemes / sequential 401+407)
+	 * and take its realm EXACTLY as it appears on the wire — already double-quoted, with any internal
+	 * quote backslash-escaped — so we feed auc_credentials a byte-faithful quoted realm. Using the raw
+	 * token (rather than unquoting then re-escaping) avoids double-escaping an already-escaped realm
+	 * (Codex refinement). */
+	for (au = challenge; au; au = au->au_next) {
+		if (au->au_scheme && !strcasecmp(au->au_scheme, "Digest")) {
+			realm = msg_header_find_param(au->au_common, "realm");
+			if (realm) {
+				break;
+			}
+		}
+	}
+	if (!realm) {
+		return -1;	/* no Digest realm in the challenge — cannot target the credential */
+	}
+	{
+		/* require a well-formed quoted-string realm (opening + closing quote, len >= 2). sofia-sip's
+		 * header parser already validated it during parsing; this is a defensive belt. */
+		size_t rl = strlen(realm);
+		if (rl < 2 || realm[0] != '"' || realm[rl - 1] != '"') {
+			return -1;
+		}
+	}
+	n = snprintf(buf, len, "Digest:%s:%s:%s", realm, S_OR(user, ""), secret);
+	if (n < 0 || n >= (int)len) {
+		return -1;	/* truncated → reject rather than feed a malformed credential to NUA */
+	}
+	return 0;
+}
+
 /* post-T56 match_auth_username (2026-04-28): Pattern 5 helper #28 — chan_sip-parity
  * peer-lookup search-key picker. When sofia_cfg.match_auth_username is set, peer
  * lookup uses Authorization-username (or Proxy-Authorization fallback per chan_sip
@@ -16315,7 +16377,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				}
 			} else if (status == 401 || status == 407) {
 			if (peer) {
-				char auth_creds[256];
+				char www_creds[512] = "";
+				char proxy_creds[512] = "";
+				int have_www = 0, have_proxy = 0;
 				char uri[256];
 
 				ast_mutex_lock(&peer->lock);
@@ -16332,8 +16396,20 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					break;
 				}
 
-				snprintf(auth_creds, sizeof(auth_creds), "%s:%s",
-					peer->defaultuser, peer->secret);
+				/* Feature #1 bug-fix + dual-challenge: build the FULL sofia-sip credential
+				 * format Digest:"realm":user:secret for EACH challenge present (the previous
+				 * 2-field "user:secret" was silently rejected by auc_credentials → a
+				 * challenged outbound REGISTER never carried an Authorization header). A single
+				 * response may carry both WWW- and Proxy-Authenticate; feed both. Lock-free
+				 * helper, called under the peer->lock we already hold. */
+				if (sip->sip_www_authenticate && sofia_format_auth_creds(sip->sip_www_authenticate,
+						peer->defaultuser, peer->secret, www_creds, sizeof(www_creds)) == 0) {
+					have_www = 1;
+				}
+				if (sip->sip_proxy_authenticate && sofia_format_auth_creds(sip->sip_proxy_authenticate,
+						peer->defaultuser, peer->secret, proxy_creds, sizeof(proxy_creds)) == 0) {
+					have_proxy = 1;
+				}
 				/* Step A IPv6 parity SS3 (2026-04-28): bracket-wrap IPv6 host
 				 * per RFC 3261 §19.1.2 — peer->host may be raw operator-config
 				 * IPv6 literal (e.g. host=2001:db8::1). Helper #45 idempotent. */
@@ -16358,7 +16434,8 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				nua_register(peer->nh,
 					NUTAG_URL(uri),
 					SIPTAG_FROM_STR(uri),
-					NUTAG_AUTH(auth_creds),
+					TAG_IF(have_www, NUTAG_AUTH(www_creds)),
+					TAG_IF(have_proxy, NUTAG_AUTH(proxy_creds)),
 					SIPTAG_MAX_FORWARDS_STR(mf_str_reg),
 					TAG_IF(!ast_strlen_zero(peer->callbackextension),
 						NUTAG_M_USERNAME(peer->callbackextension)),
@@ -16390,6 +16467,70 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	case nua_r_invite:
 		if (sofia_debug)
 			ast_verbose("Sofia: INVITE response %d %s\n", status, phrase);
+		/* Capability feature #1 — OUTBOUND INVITE auth. Answer a 401/407 challenge from an upstream
+		 * trunk by feeding the peer's credentials to NUA, which restarts the INVITE (carrying its
+		 * original SDP) with an Authorization / Proxy-Authorization header (RFC 3261 §22). This MUST be
+		 * reactive: sofia-sip loads NUTAG_AUTH credentials only after a challenge has created nh_auth
+		 * (nua_client.c) — a proactive NUTAG_AUTH on the initial nua_invite never applies. Matches
+		 * chan_sip's reactive handle_response_invite (chan_sip.c:6846/6854). Scoped to the non-forked
+		 * dialog (a fork child's 401/407 is treated as a branch failure below; per-child outbound auth
+		 * is a follow-up). BOUNDED to a few attempts per dialog (not one bit) so SEQUENTIAL WWW+Proxy
+		 * challenges (401 then 407) both get answered, while wrong creds still can't drive an endless
+		 * challenge loop. md5secret-only peers are unsupported (NUTAG_AUTH needs the cleartext
+		 * password). User/secret are snapshotted with ast_strdupa (no fixed-buffer truncation). */
+		if (pvt && sip && !pvt->is_fork_child && !pvt->is_fork_master
+				&& (status == 401 || status == 407) && pvt->outbound_invite_auth_attempts < 3) {
+			struct sofia_peer *auth_peer = NULL;
+			const char *ch_user = "";
+			const char *ch_secret = "";
+			char www_creds[512] = "";
+			char proxy_creds[512] = "";
+			int have_www = 0, have_proxy = 0;
+
+			ast_mutex_lock(&pvt->lock);
+			pvt->outbound_invite_auth_attempts++;
+			if (pvt->peer) {
+				ao2_ref(pvt->peer, +1);
+				auth_peer = pvt->peer;
+			}
+			ast_mutex_unlock(&pvt->lock);
+			if (auth_peer) {
+				ast_mutex_lock(&auth_peer->lock);
+				ch_user = ast_strdupa(!ast_strlen_zero(auth_peer->defaultuser)
+					? auth_peer->defaultuser : auth_peer->name);
+				ch_secret = ast_strdupa(S_OR(auth_peer->secret, ""));
+				ast_mutex_unlock(&auth_peer->lock);
+				ao2_ref(auth_peer, -1);
+			}
+			/* A single response may carry BOTH a WWW-Authenticate (endpoint/registrar) AND a
+			 * Proxy-Authenticate (proxy) challenge — build a credential for EACH present one and feed
+			 * both to NUA in one nua_authenticate call (Codex refinement). */
+			if (!ast_strlen_zero(ch_secret)) {
+				if (sip->sip_www_authenticate && sofia_format_auth_creds(
+						sip->sip_www_authenticate, ch_user, ch_secret, www_creds, sizeof(www_creds)) == 0) {
+					have_www = 1;
+				}
+				if (sip->sip_proxy_authenticate && sofia_format_auth_creds(
+						sip->sip_proxy_authenticate, ch_user, ch_secret, proxy_creds, sizeof(proxy_creds)) == 0) {
+					have_proxy = 1;
+				}
+			}
+			if (have_www || have_proxy) {
+				/* runs on sofia_thread; no lock held — restart the INVITE with the digest(s) */
+				nua_authenticate(nh,
+					TAG_IF(have_www, NUTAG_AUTH(www_creds)),
+					TAG_IF(have_proxy, NUTAG_AUTH(proxy_creds)),
+					TAG_END());
+				ast_log(LOG_NOTICE,
+					"Sofia: outbound INVITE challenged (%d) — re-sending with %s%s%s credentials\n",
+					status, have_www ? "WWW" : "", (have_www && have_proxy) ? "+" : "",
+					have_proxy ? "Proxy" : "");
+				break;	/* NUA restarts the request; stop processing this challenge response */
+			}
+			ast_log(LOG_NOTICE,
+				"Sofia: outbound INVITE challenged (%d) but no usable cleartext credential — call will fail\n",
+				status);
+		}
 		/* post-T56 session timers (RFC 4028) (2026-04-27): capture negotiated
 		 * Session-Expires on every 200-OK (initial + refresh); R13.a sip show
 		 * channels display reads pvt->session_negotiated_expires at any
