@@ -8728,7 +8728,7 @@ static int sofia_send_digit_end(struct ast_channel *ast, char digit, unsigned in
 		if (pvt->nh) {
 			char info_body[64];
 			snprintf(info_body, sizeof(info_body),
-				"Signal=%c\r\nDuration=%d\r\n", digit, duration ? duration : 250);
+				"Signal=%c\r\nDuration=%u\r\n", digit, duration ? duration : 250);
 			nua_info(pvt->nh,
 				SIPTAG_CONTENT_TYPE_STR("application/dtmf-relay"),
 				SIPTAG_PAYLOAD_STR(info_body),
@@ -10429,17 +10429,38 @@ static int sofia_blacklist_check_sip(sip_t const *sip)
 	return 1;
 }
 
+/* R7-6 (3-way): parse a Contact URL port to a valid [0,65535], defaulting to 5060 (RFC 3261
+ * §19.1.2) on a NULL/empty/non-numeric/out-of-range value. strtol with a full-string endptr check
+ * so trailing garbage ("8080abc") falls to the default rather than being silently taken as a
+ * numeric prefix. Used at the contact-ACL gate, the stored c->port, AND the canonical contact URI
+ * below, so the URI ao2 key and c->port always carry the SAME normalized port. */
+static int sofia_contact_url_port(const char *url_port)
+{
+	char *end = NULL;
+	long p;
+
+	if (!url_port || !*url_port) {
+		return 5060;
+	}
+	p = strtol(url_port, &end, 10);
+	if (end == url_port || *end != '\0' || p < 0 || p > 65535) {
+		return 5060;
+	}
+	return (int)p;
+}
+
 static void sofia_contact_uri_from_url(char *buf, size_t len, const url_t *url)
 {
 	if (!url || !buf) {
 		buf[0] = '\0';
 		return;
 	}
-	snprintf(buf, len, "sip:%s%s%s:%s",
+	/* R7-6: normalize the port (clamp to [0,65535], default 5060) so the URI key matches c->port. */
+	snprintf(buf, len, "sip:%s%s%s:%d",
 		url->url_user ? url->url_user : "",
 		url->url_user ? "@" : "",
 		url->url_host ? url->url_host : "",
-		url->url_port ? url->url_port : "5060");
+		sofia_contact_url_port(url->url_port));
 }
 
 static int sofia_expire_contacts_cb(void *obj, void *arg, int flags)
@@ -10456,6 +10477,47 @@ static int sofia_expire_contacts_cb(void *obj, void *arg, int flags)
 	if (c->expires > 0 && c->expires < *now) {
 		ast_verbose("Sofia: Expiring contact %s\n", c->contact_uri);
 		return CMP_MATCH;
+	}
+	return 0;
+}
+
+/* R7-7 (3-way): the contact-ACL check for ONE Contact URL, factored out so the REGISTER handler can
+ * PREFLIGHT every Contact (validate ALL before binding ANY) instead of check-then-bind per Contact
+ * — the old single loop left earlier Contacts already linked when a LATER Contact tripped the
+ * fail-closed ACL (the caller then answers 403 for the whole REGISTER → partial-apply). Returns
+ * 0 = allowed, -1 = denied. No-op (allow) when no ACL is configured. Mirrors the R6 #2 fail-closed +
+ * IPv6-bracket logic verbatim; uri is for the log line only. */
+static int sofia_contact_acl_check(struct sofia_peer *peer, const url_t *url, const char *uri)
+{
+	struct ast_sockaddr contact_addr;
+	char addr_buf[128];
+	const char *chost;
+	int cport;
+
+	if (!sofia_cfg.contact_ha && !peer->contactha) {
+		return 0;
+	}
+	chost = url->url_host ? url->url_host : "0.0.0.0";
+	cport = sofia_contact_url_port(url->url_port);	/* R7-6: clamped [0,65535], default 5060 */
+	if (strchr(chost, ':')) {
+		snprintf(addr_buf, sizeof(addr_buf), "[%s]:%d", chost, cport);
+	} else {
+		snprintf(addr_buf, sizeof(addr_buf), "%s:%d", chost, cport);
+	}
+	if (ast_sockaddr_parse(&contact_addr, addr_buf, 0)) {
+		if ((sofia_cfg.contact_ha && ast_apply_ha(sofia_cfg.contact_ha, &contact_addr) != AST_SENSE_ALLOW) ||
+		    (peer->contactha && ast_apply_ha(peer->contactha, &contact_addr) != AST_SENSE_ALLOW)) {
+			ast_log(LOG_NOTICE, "Sofia: REGISTER from peer '%s' Contact %s rejected by contact-ACL\n",
+				peer->name, uri);
+			return -1;
+		}
+	} else {
+		/* R6 #2: FAIL CLOSED — ast_sockaddr_parse is numeric-only; a non-IP/malformed Contact host
+		 * with an ACL configured is rejected rather than DNS-resolved (no blocking lookup on the
+		 * single sofia_thread). Only fires when an ACL is set, so non-ACL peers are unaffected. */
+		ast_log(LOG_NOTICE, "Sofia: REGISTER from peer '%s' Contact %s has a non-IP host with contact-ACL configured — rejecting (fail-closed)\n",
+			peer->name, uri);
+		return -1;
 	}
 	return 0;
 }
@@ -10547,7 +10609,20 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				ast_verbose("Sofia: Unlinked contact %s\n", uri);
 		}
 	} else {
-		/* Registration / re-registration */
+		/* Registration / re-registration.
+		 * R7-7 (3-way): PREFLIGHT the contact-ACL for EVERY Contact before binding ANY, so a later
+		 * Contact that trips the fail-closed ACL never leaves earlier Contacts partially bound (the
+		 * caller then answers 403 for the whole REGISTER). The check is deterministic across both
+		 * loops — sip->sip_contact is the immutable parsed message and src is computed once at the
+		 * top — so the apply loop's all-pass behavior is byte-identical to the old single loop. */
+		for (m = sip->sip_contact; m; m = m->m_next) {
+			char uri[256];
+			sofia_contact_uri_from_url(uri, sizeof(uri), m->m_url);
+			if (sofia_contact_acl_check(peer, m->m_url, uri) < 0) {
+				return -1;
+			}
+		}
+		/* Apply loop — every Contact passed the ACL preflight above. */
 		for (m = sip->sip_contact; m; m = m->m_next) {
 			char uri[256];
 			struct sofia_contact *c;
@@ -10559,51 +10634,6 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 			 * new-contact branches store it on c->transport, and the last value seen
 			 * is snapshotted into peer->reg_transport after the loop. */
 			sofia_contact_transport_from_url(m->m_url, reg_transport, sizeof(reg_transport));
-
-			/* post-T56 contactpermit/contactdeny per-peer parity (2026-04-27):
-			 * apply BOTH sofia_cfg.contact_ha (global) AND peer->contactha
-			 * against the Contact: URL host:port. Short-circuit OR (either rejects
-			 * = DENY entire REGISTER per Contact). chan_sip parity at chan_sip.c:15043-15044
-			 * verbatim semantic. NULL ha chains pass-through (ast_apply_ha returns
-			 * AST_SENSE_ALLOW); peers without contactpermit/contactdeny configs behave
-			 * identically to today (Task 12 backwards-compat ABSOLUTE). */
-			if (sofia_cfg.contact_ha || peer->contactha) {
-				struct ast_sockaddr contact_addr;
-				char addr_buf[128];
-				const char *chost = m->m_url->url_host ? m->m_url->url_host : "0.0.0.0";
-				int cport = m->m_url->url_port ? atoi(m->m_url->url_port) : 5060;
-				/* R6 #2 (3-way consensus): bracket a numeric IPv6 literal so ast_sockaddr_parse
-				 * accepts it — its non-bracket split mis-parses a bare "2001:db8::1" (host="2001"
-				 * + parse fail), which would (a) wrongly fail-CLOSE a legit IPv6-registered peer
-				 * that has contactpermit= set, and (b) never actually enforce the ACL for IPv6.
-				 * With the bracket, IPv4 + numeric IPv6 ACLs are enforced; only true hostnames /
-				 * malformed hosts fall through to the fail-closed else below. */
-				if (strchr(chost, ':')) {
-					snprintf(addr_buf, sizeof(addr_buf), "[%s]:%d", chost, cport);
-				} else {
-					snprintf(addr_buf, sizeof(addr_buf), "%s:%d", chost, cport);
-				}
-				if (ast_sockaddr_parse(&contact_addr, addr_buf, 0)) {
-					if ((sofia_cfg.contact_ha && ast_apply_ha(sofia_cfg.contact_ha, &contact_addr) != AST_SENSE_ALLOW) ||
-					    (peer->contactha && ast_apply_ha(peer->contactha, &contact_addr) != AST_SENSE_ALLOW)) {
-						ast_log(LOG_NOTICE, "Sofia: REGISTER from peer '%s' Contact %s rejected by contact-ACL\n",
-							peer->name, uri);
-						return -1;
-					}
-				} else {
-					/* R6 #2 (3-way consensus): FAIL CLOSED. ast_sockaddr_parse is numeric-only,
-					 * so a non-IP / malformed Contact host previously SKIPPED the ACL entirely and
-					 * the binding was stored (fail-open). We deliberately do NOT DNS-resolve like
-					 * chan_sip: chan_sofia runs all signaling on the single sofia_thread, and a
-					 * blocking lookup against an attacker-controlled NS would stall ALL signaling
-					 * (amplifying DoS, violates the concurrency doctrine). This only fires when an
-					 * ACL is actually configured, so peers without contactpermit/deny are
-					 * unaffected. */
-					ast_log(LOG_NOTICE, "Sofia: REGISTER from peer '%s' Contact %s has a non-IP host with contact-ACL configured — rejecting (fail-closed)\n",
-						peer->name, uri);
-					return -1;
-				}
-			}
 
 			c = ao2_find(peer->contacts, uri, OBJ_POINTER);
 			if (c) {
@@ -10648,7 +10678,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				ast_copy_string(c->contact_uri, uri, sizeof(c->contact_uri));
 				if (m->m_url->url_host)
 					ast_copy_string(c->host, m->m_url->url_host, sizeof(c->host));
-				c->port = m->m_url->url_port ? atoi(m->m_url->url_port) : 5060;
+				c->port = sofia_contact_url_port(m->m_url->url_port);	/* R7-6: clamped [0,65535], default 5060 */
 				/* Round5 transport-route: store the transport resolved from the
 				 * Contact's ;transport= param (the old scheme-only derivation had a
 				 * dead "tcp" branch — url_scheme is only ever "sip"/"sips"). */
