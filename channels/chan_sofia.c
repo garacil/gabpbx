@@ -4225,6 +4225,8 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	struct ast_sockaddr orig_audio_remote;						/* (C) */
 	struct ast_sockaddr orig_video_remote;						/* (C) */
 	struct ast_sockaddr orig_udptl_peer;						/* (C) */
+	enum ast_t38_ec_modes orig_udptl_ec = UDPTL_ERROR_CORRECTION_NONE;		/* (C) 2c-3 */
+	unsigned int orig_udptl_far_datagram = 0;					/* (C) 2c-3 */
 	int had_vrtp = (pvt->vrtp != NULL);
 	int had_udptl = (pvt->udptl != NULL);
 	ast_sockaddr_setnull(&orig_audio_remote);
@@ -4236,6 +4238,11 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	}
 	if (had_udptl) {
 		ast_udptl_get_peer(pvt->udptl, &orig_udptl_peer);
+		/* R7 2c-3 (bucket C): snapshot the EFFECTIVE EC scheme + far_max_datagram so a rejected
+		 * re-INVITE restores a PRE-EXISTING udptl's config. The getter values are value-faithful
+		 * (post per-peer override + normalization), not raw-bit-exact for the -1/0 sentinel. */
+		orig_udptl_ec = ast_udptl_get_error_correction_scheme(pvt->udptl);
+		orig_udptl_far_datagram = ast_udptl_get_far_max_datagram(pvt->udptl);
 	}
 
 	/* R7 batch 2b (bucket A): the negotiated audio/video codec payload maps are built into
@@ -4257,6 +4264,20 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	 * channel. staged_chosen_audio_valid gates the deferred apply. */
 	format_t staged_chosen_audio = 0;
 	int staged_chosen_audio_valid = 0;
+
+	/* R7 batch 2c-3 (bucket D): the T.38 irreversible side-effects are STAGED here during the media
+	 * loop and fired in the commit phase (after every reject gate) so a rejected SDP never touches
+	 * the channel / T.38 state. The udptl INSTANCE is still created + configured in-loop (3b:
+	 * was_new-destroy-on-reject; a pre-existing udptl's peer/EC/far_datagram are snapshot-restored
+	 * above), but its fds[5] channel attach and the state-change/timer/withdraw/async-goto-to-fax
+	 * are all deferred. Advance (enter PEER_REINVITE) and withdraw (return to DISABLED) are mutually
+	 * exclusive. */
+	int t38_stage_fds5 = 0;			/* attach o->fds[5] = ast_udptl_fd(udptl) at commit (was_new only) */
+	int t38_stage_enter_reinvite = 0;	/* sofia_change_t38_state(PEER_REINVITE) + arm t38id at commit */
+	int t38_stage_withdraw = 0;		/* sofia_change_t38_state(DISABLED) + cancel t38id at commit */
+	/* The fax-redirect inputs (owner exten/context + ast_exists_extension) are evaluated at COMMIT
+	 * under the channel lock — only the advance intent is staged here (Codex: snapshot channel
+	 * fields at commit, not during the loop). */
 
 	for (media = sdp->sdp_media; media; media = media->m_next) {
 		if (media->m_type == sdp_media_audio && media->m_port != 0) {
@@ -4569,10 +4590,11 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 				 * hold pvt/channel locks or an owner ref (or have no owner), so `o`
 				 * stays alive; the direct fds[] write matches the driver's audio/video
 				 * idiom (no channel lock pushed, no lock-order hazard). */
-				struct ast_channel *o = pvt->owner;
-				if (o) {
-					o->fds[5] = ast_udptl_fd(pvt->udptl);
-				}
+				/* R7 2c-3 (bucket D): DEFER the fds[5] channel attach to the commit phase.
+				 * This runs ONLY inside the udptl create block, so it is a was_new-only
+				 * side-effect (a pre-existing udptl already had fds[5] wired at its first
+				 * create). On reject the was_new udptl is destroyed, so no fd is ever wired. */
+				t38_stage_fds5 = 1;
 			}
 
 			/* Set UDPTL peer address (mirrors chan_sip.c:10178
@@ -4701,44 +4723,14 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 			 * :24288 verbatim 5000ms). ao2_bump pvt for ref-transferred to
 			 * scheduler — abort callback drops the ref. */
 			if (pvt->t38_state == SOFIA_T38_DISABLED) {
-				sofia_change_t38_state(pvt, SOFIA_T38_PEER_REINVITE);
-				if (sofia_sched && pvt->t38id == -1) {
-					ao2_ref(pvt, +1);  /* held by scheduler entry */
-					pvt->t38id = ast_sched_thread_add(sofia_sched,
-						SOFIA_T38_ABORT_TIMEOUT_MS, sofia_t38_abort, pvt);
-					if (pvt->t38id < 0) {
-						pvt->t38id = -1;
-						ao2_ref(pvt, -1);  /* schedule failed; release ref */
-					}
-				}
-				/* post-T56 Task #8 T.38 fax UDPTL parity SS6 (2026-04-28):
-				 * when peer sends T.38 reINVITE AND peer has
-				 * faxdetect=t38 (or cng,t38), async-goto channel to "fax"
-				 * extension per chan_sip.c:10196 verbatim semantic. Dialplan
-				 * runs SendFAX/ReceiveFAX which negotiates T.38 mode via
-				 * setoption / control-frame chain (SS4 sofia_interpret_t38_
-				 * parameters dispatch). FAXEXTEN channel-var carries original
-				 * extension for return-on-fax-end. */
-				if (pvt->owner &&
-				    pvt->peer && (pvt->peer->faxdetect_mode & SOFIA_FAX_DETECT_T38)) {
-					struct ast_channel *chan = pvt->owner;
-					if (strcmp(chan->exten, "fax")) {
-						const char *target_context = S_OR(chan->macrocontext, chan->context);
-						if (ast_exists_extension(chan, target_context, "fax", 1,
-						    S_COR(chan->caller.id.number.valid, chan->caller.id.number.str, NULL))) {
-							ast_verbose(VERBOSE_PREFIX_2 "Sofia: redirecting '%s' to fax extension due to peer T.38 re-INVITE\n",
-								chan->name);
-							pbx_builtin_setvar_helper(chan, "FAXEXTEN", chan->exten);
-							if (ast_async_goto(chan, target_context, "fax", 1)) {
-								ast_log(LOG_NOTICE, "Sofia: T.38 reINVITE detected — failed async goto fax extension on '%s'\n",
-									chan->name);
-							}
-						} else {
-							ast_log(LOG_NOTICE, "Sofia: T.38 reINVITE detected but no fax extension on '%s'\n",
-								chan->name);
-						}
-					}
-				}
+				/* R7 2c-3 (bucket D): DEFER the state advance (sofia_change_t38_state queues a
+				 * REQUEST_NEGOTIATE frame to the channel), the 5s t38id abort timer, AND the fax
+				 * redirect to the commit phase. t38_state stays DISABLED through the loop, so the
+				 * post-loop withdraw check reads the PRE-parse state, and a rejected SDP fires NONE
+				 * of these (SS5/SS6 chan_sip.c:10194/10196 parity, now reject-safe). The whole fax
+				 * redirect (peer faxdetect gating + exten/ctx + ast_exists_extension) is evaluated
+				 * at commit under the channel lock, not here. */
+				t38_stage_enter_reinvite = 1;
 			}
 		}
 	}
@@ -4749,13 +4741,11 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	 * If no live UDPTL image leg was seen this parse but T.38 is in a peer-established
 	 * active state, disable it and cancel the pending re-INVITE timeout. */
 	if (!image_active_seen && pvt->t38_state >= SOFIA_T38_PEER_REINVITE) {
-		sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
-		if (pvt->t38id != -1 && sofia_sched) {
-			if (ast_sched_thread_del(sofia_sched, pvt->t38id) == 0) {
-				ao2_ref(pvt, -1);
-			}
-			pvt->t38id = -1;
-		}
+		/* R7 2c-3 (bucket D): DEFER the T.38 withdraw (state→DISABLED queues a frame to the
+		 * channel + cancels the t38id timer) to the commit phase, so a rejected SDP does not
+		 * disable an established fax. Mutually exclusive with t38_stage_enter_reinvite (advance
+		 * implies image_active_seen, which makes this !image_active_seen test false). */
+		t38_stage_withdraw = 1;
 	}
 
 	sdp_parser_free(parser);
@@ -4844,25 +4834,105 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	ast_rtp_codecs_payloads_clear(&staged_audio_codecs, NULL);
 	ast_rtp_codecs_payloads_clear(&staged_video_codecs, NULL);
 
-	/* R7 2c-1 (bucket D) COMMIT: apply the deferred audio channel native format. Only reached
-	 * after every reject gate passes, so a rejected SDP never reformats an established channel.
-	 * The ref+lock+revalidate dance is relocated verbatim from the audio block: channel locks
-	 * are recursive (re-INVITE/directmedia callers already hold channel+pvt locks → nest safely);
-	 * the 180/183/200/ACK callers pin pvt->owner with a ref → this fresh channel lock cannot race
-	 * the channel free. pvt->owner is re-snapshotted here (it may have changed since the loop). */
-	if (staged_chosen_audio_valid && pvt->owner) {
+	/* R7 2c-3 (bucket D) COMMIT — ONE consolidated channel ref+lock+revalidate dance applying the
+	 * deferred side-effects in the EXACT original temporal order (Codex re-review caught the R6 #3
+	 * full-temporal-order lesson): under the channel lock, audio native format (2c-1) → udptl
+	 * fds[5] attach → THEN the T.38 state-change (sofia_change_t38_state queues the REQUEST_NEGOTIATE
+	 * frame, which MUST come AFTER fds[5] so app_fax/res_fax sees the UDPTL fd) → arm/cancel the
+	 * t38id timer → snapshot the fax-redirect inputs from the locked channel; THEN release the
+	 * channel lock and run ast_exists_extension + FAXEXTEN setvar + ast_async_goto on the ref-pinned
+	 * owner (they take their own channel/pbx/contexts locking, so the channel lock must be dropped
+	 * first — Codex refinement 2). Only reached after every reject gate passes. Advance and withdraw
+	 * are mutually exclusive (advance implies image_active_seen, suppressing withdraw). fds[5] is
+	 * gated on t38_stage_fds5, set ONLY in the udptl create block (was_new) — a pre-existing udptl
+	 * already had fds[5] wired. sofia_change_t38_state under the held channel lock is recursive-safe
+	 * (ast_queue_frame re-locks). */
+	if (staged_chosen_audio_valid || t38_stage_fds5 || t38_stage_enter_reinvite || t38_stage_withdraw) {
 		struct ast_channel *o = pvt->owner;
 		if (o) {
+			char fax_context[AST_MAX_CONTEXT] = "";
+			char fax_exten[AST_MAX_EXTENSION] = "";
+			const char *fax_cid = NULL;	/* R7 2c-3 nit (Codex): ast_strdupa, no truncation */
+			int do_fax = 0;
 			ast_channel_ref(o);
 			ast_channel_lock(o);
 			if (pvt->owner == o) {
-				o->nativeformats =
-					(o->nativeformats & ~AST_FORMAT_AUDIO_MASK) | staged_chosen_audio;
-				ast_set_read_format(o, staged_chosen_audio);
-				ast_set_write_format(o, staged_chosen_audio);
+				if (staged_chosen_audio_valid) {
+					o->nativeformats =
+						(o->nativeformats & ~AST_FORMAT_AUDIO_MASK) | staged_chosen_audio;
+					ast_set_read_format(o, staged_chosen_audio);
+					ast_set_write_format(o, staged_chosen_audio);
+				}
+				if (t38_stage_fds5 && pvt->udptl) {
+					o->fds[5] = ast_udptl_fd(pvt->udptl);
+				}
+				if (t38_stage_enter_reinvite) {
+					/* frame AFTER the fds[5] attach above */
+					sofia_change_t38_state(pvt, SOFIA_T38_PEER_REINVITE);
+					if (sofia_sched && pvt->t38id == -1) {
+						ao2_ref(pvt, +1);  /* held by scheduler entry */
+						pvt->t38id = ast_sched_thread_add(sofia_sched,
+							SOFIA_T38_ABORT_TIMEOUT_MS, sofia_t38_abort, pvt);
+						if (pvt->t38id < 0) {
+							pvt->t38id = -1;
+							ao2_ref(pvt, -1);  /* schedule failed; release ref */
+						}
+					}
+					/* snapshot the fax-redirect inputs while locked (chan_sip.c:10196 parity:
+					 * peer faxdetect=t38 + a "fax" extension exists + not already at "fax") */
+					if (pvt->peer && (pvt->peer->faxdetect_mode & SOFIA_FAX_DETECT_T38)
+					    && strcmp(o->exten, "fax")) {
+						ast_copy_string(fax_context, S_OR(o->macrocontext, o->context), sizeof(fax_context));
+						ast_copy_string(fax_exten, o->exten, sizeof(fax_exten));
+						if (o->caller.id.number.valid && o->caller.id.number.str) {
+							/* ast_strdupa under the lock — stack-duped, valid until this
+							 * function returns; no truncation of a long caller ID (matches the
+							 * original direct-pointer pass to ast_exists_extension). */
+							fax_cid = ast_strdupa(o->caller.id.number.str);
+						}
+						do_fax = 1;
+					}
+				} else if (t38_stage_withdraw) {
+					sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
+					if (pvt->t38id != -1 && sofia_sched) {
+						if (ast_sched_thread_del(sofia_sched, pvt->t38id) == 0) {
+							ao2_ref(pvt, -1);
+						}
+						pvt->t38id = -1;
+					}
+				}
 			}
 			ast_channel_unlock(o);
+			/* dialplan ops AFTER the unlock, on the ref-pinned o (no raw pvt->owner re-read) */
+			if (do_fax) {
+				if (ast_exists_extension(o, fax_context, "fax", 1, fax_cid)) {
+					ast_verbose(VERBOSE_PREFIX_2 "Sofia: redirecting '%s' to fax extension due to peer T.38 re-INVITE\n",
+						o->name);
+					pbx_builtin_setvar_helper(o, "FAXEXTEN", fax_exten);
+					if (ast_async_goto(o, fax_context, "fax", 1)) {
+						ast_log(LOG_NOTICE, "Sofia: T.38 reINVITE detected — failed async goto fax extension on '%s'\n",
+							o->name);
+					}
+				} else {
+					ast_log(LOG_NOTICE, "Sofia: T.38 reINVITE detected but no fax extension on '%s'\n",
+						o->name);
+				}
+			}
 			ast_channel_unref(o);
+		} else if (t38_stage_withdraw) {
+			/* No owner: sofia_change_t38_state would NO-OP — it does `chan = pvt->owner; if
+			 * (!chan) return;` BEFORE writing pvt->t38_state (verified in source), so the original
+			 * left t38_state STALE at PEER_REINVITE on a no-owner withdraw. 3-way refine ("lo mejor
+			 * SIEMPRE"): set the state DIRECTLY to DISABLED so a withdrawn image leg never leaves
+			 * stale T.38 state (no frame is queued — there is no channel to notify). Then cancel a
+			 * pending t38id timer (scheduler-ref cleanup the original did regardless of owner). */
+			pvt->t38_state = SOFIA_T38_DISABLED;
+			if (pvt->t38id != -1 && sofia_sched) {
+				if (ast_sched_thread_del(sofia_sched, pvt->t38id) == 0) {
+					ao2_ref(pvt, -1);
+				}
+				pvt->t38id = -1;
+			}
 		}
 	}
 
@@ -4891,7 +4961,12 @@ sdp_reject:
 		ast_rtp_instance_set_remote_address(pvt->vrtp, &orig_video_remote);
 	}
 	if (had_udptl) {
+		/* R7 2c-3 (bucket C): restore a PRE-EXISTING udptl's peer + EC scheme + far_max_datagram
+		 * (a was_new udptl is destroyed below instead). The EC/datagram setters take the
+		 * value-faithful getter snapshots captured before the loop. */
 		ast_udptl_set_peer(pvt->udptl, &orig_udptl_peer);
+		ast_udptl_set_error_correction_scheme(pvt->udptl, orig_udptl_ec);
+		ast_udptl_set_far_max_datagram(pvt->udptl, orig_udptl_far_datagram);
 	}
 	/* R7 2b (bucket A): discard the staged codec maps — on a reject they were NEVER copied into
 	 * the live RTP instances (the commit copy is past this label), so there is nothing to restore;
@@ -4908,6 +4983,14 @@ sdp_reject:
 	if (!had_vrtp && pvt->vrtp) {
 		ast_rtp_instance_destroy(pvt->vrtp);
 		pvt->vrtp = NULL;
+	}
+	/* R7 2c-3 (bucket D): destroy a udptl LAZILY CREATED this parse (!had_udptl but now non-NULL).
+	 * The fds[5] channel attach was DEFERRED to commit, so on a reject it was never wired — destroy
+	 * + NULL is the complete cleanup (mirrors the vrtp/SRTP was_new rollback). Mutually exclusive
+	 * with the had_udptl peer/EC/datagram restore above (that runs only for a pre-existing udptl). */
+	if (!had_udptl && pvt->udptl) {
+		ast_udptl_destroy(pvt->udptl);
+		pvt->udptl = NULL;
 	}
 	return -1;
 }
