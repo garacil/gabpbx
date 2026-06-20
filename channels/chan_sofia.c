@@ -4898,6 +4898,17 @@ sdp_reject:
 	 * just free them. Clearing an empty/unbuilt map is a safe no-op. */
 	ast_rtp_codecs_payloads_clear(&staged_audio_codecs, NULL);
 	ast_rtp_codecs_payloads_clear(&staged_video_codecs, NULL);
+	/* R7 2c-2 (bucket D): if pvt->vrtp was LAZILY CREATED this parse (!had_vrtp but now non-NULL),
+	 * a rejected SDP must not leave a stray video RTP instance — destroy it (mirrors the SRTP
+	 * was_new rollback). Placed AFTER sofia_sdp_stage_rollback above so a was_new vsrtp is torn
+	 * down first (sofia_srtp_destroy frees only the srtp/crypto, never derefs pvt->vrtp; the staged
+	 * crypto is metadata, not a live session on vrtp). The m=video lazy create wires no channel fd,
+	 * so destroy + NULL is the complete cleanup. Mutually exclusive with the had_vrtp restore above
+	 * (that branch only runs for a PRE-existing vrtp). */
+	if (!had_vrtp && pvt->vrtp) {
+		ast_rtp_instance_destroy(pvt->vrtp);
+		pvt->vrtp = NULL;
+	}
 	return -1;
 }
 
