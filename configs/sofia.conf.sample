@@ -128,6 +128,23 @@ srvlookup=yes
 ;   cp cert.pem /etc/gabpbx/keys/cafile.pem
 ; T36: WebRTC media (DTLS-SRTP/ICE/BUNDLE) is Stage B — signaling-only here.
 ;
+; --- Connection keepalive (TCP) — optional ---
+; For connection-oriented transports, sofia-sip already keeps the OS socket alive with SO_KEEPALIVE
+; (~30s) by default, so a TCP/TLS/WS phone behind NAT keeps a live socket out of the box (this matches
+; chan_sip, which set SO_KEEPALIVE per session). To ALSO refresh the NAT mapping at the SIP layer,
+; enable a periodic CRLF keepalive on idle connections:
+;   tcp_keepalive  - seconds between CRLF keepalives on an idle connection (0 = off, the default).
+;                    Sends a double-CRLF ping (RFC 5626 §3.5.1) on idle TCP connections so the NAT
+;                    binding stays open and an inbound request still reaches the phone. TCP ONLY —
+;                    TLS/WS connections rely on the SO_KEEPALIVE socket option above. A common
+;                    NAT-friendly value is 30.
+;   tcp_pingpong   - seconds to wait for a pong after a keepalive ping before treating the connection
+;                    as dead and closing it (0 = off, the default). Requires tcp_keepalive (it is
+;                    ignored, with a warning, if keepalive is off). Use with care: an aggressive value
+;                    can drop a slow-but-alive connection.
+;tcp_keepalive = 0
+;tcp_pingpong = 0
+;
 ; --- WS+WSS deployment guidance (post-T56 Task #2 D-3 SS2 operator-honest expansion) ---
 ;
 ; (1) ORIGIN HEADER VALIDATION (RFC 7118 §4.1.4) — DELEGATED TO REVERSE-PROXY:

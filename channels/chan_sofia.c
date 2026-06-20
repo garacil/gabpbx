@@ -388,6 +388,8 @@ static struct {
 	char default_user[80];
 	char default_secret[80];
 	char realm[80];
+	int tcp_keepalive_ms;     /* feature #5: [general] tcp_keepalive (seconds in config, stored ms). 0 = OFF (default). Application-level CRLF keepalive (TPTAG_KEEPALIVE) on connection-oriented transports — a periodic CRLF on an idle connection holds the NAT binding. TCP-only (sofia-sip's TLS/WS vtables do not use this timer). Socket-level SO_KEEPALIVE is already on by default (sofia-sip ~30s). */
+	int tcp_pingpong_ms;      /* feature #5: [general] tcp_pingpong (seconds in config, stored ms). 0 = OFF (default). TPTAG_PINGPONG — if no pong arrives within this after a keepalive ping, the connection is treated as dead. Opt-in (an aggressive value can tear down a slow-but-alive connection). */
 	int allowguest;
 	int busy_on_active;
 	int max_contacts;
@@ -17204,6 +17206,13 @@ static void *sofia_thread_func(void *data)
 			wss_url[0] ? wss_url : "(none)",
 			needs_cert ? sofia_cfg.tlscertfile : "(none)");
 
+		/* feature #5: warn on a pingpong-without-keepalive misconfig — it is silently ignored (the gate
+		 * below only applies PINGPONG alongside KEEPALIVE) since a pong is only expected after a ping. */
+		if (sofia_cfg.tcp_pingpong_ms > 0 && sofia_cfg.tcp_keepalive_ms == 0) {
+			ast_log(LOG_WARNING, "Sofia: tcp_pingpong is set but tcp_keepalive is 0 — pingpong needs "
+				"keepalive to send the ping, so it is ignored. Set tcp_keepalive to enable both.\n");
+		}
+
 		sofia_nua = nua_create(sofia_root,
 			sofia_event_callback,
 			NULL,
@@ -17275,6 +17284,19 @@ static void *sofia_thread_func(void *data)
 			 * UDP/TCP transport level. tport_tag.h:319 verbatim. production
 			 * tos_sip=cs3 finally honored on next reload (REAL OPERATOR DRIVER). */
 			TAG_IF(sofia_cfg.tos_sip, TPTAG_TOS((int)sofia_cfg.tos_sip)),
+			/* feature #5: application-level connection keepalive. TPTAG_KEEPALIVE sends a periodic
+			 * CRLF on an idle connection-oriented transport to hold the NAT binding open (so an inbound
+			 * request still reaches a TCP-registered phone); TCP-only — sofia-sip's TLS/WS vtables do
+			 * not drive this timer. TPTAG_PINGPONG treats the connection as dead if no pong follows the
+			 * keepalive within the window. Both default OFF (opt-in via [general] tcp_keepalive /
+			 * tcp_pingpong, seconds). Socket-level SO_KEEPALIVE is already on by default (sofia-sip
+			 * ~30s) so chan_sip socket-keepalive parity is unchanged. */
+			TAG_IF(sofia_cfg.tcp_keepalive_ms > 0, TPTAG_KEEPALIVE((unsigned)sofia_cfg.tcp_keepalive_ms)),
+			/* pingpong is meaningless without keepalive (no ping -> no pong is ever expected), so it is
+			 * applied only alongside keepalive (Codex); a pingpong-without-keepalive config is warned
+			 * about at parse time. */
+			TAG_IF(sofia_cfg.tcp_keepalive_ms > 0 && sofia_cfg.tcp_pingpong_ms > 0,
+				TPTAG_PINGPONG((unsigned)sofia_cfg.tcp_pingpong_ms)),
 			/* post-T56 useragent [general] parity (2026-04-28): Pattern 16
 			 * sofia-sip-native 10th-instance DOUBLE-DIGIT MILESTONE —
 			 * SIPTAG_USER_AGENT_STR at nua_create installs User-Agent + Server
@@ -19281,6 +19303,36 @@ static void sofia_parse_register_line(const char *value)
 	}
 }
 
+/* feature #5: parse a SECONDS config value into milliseconds, overflow-safe (Codex). Returns 0 (OFF)
+ * on empty / non-numeric / <= 0; caps at 86400 s (1 day) so the * 1000 can never overflow int. Shared
+ * by the live parser and the reload-listener-change detector so both interpret the knob identically. */
+static int sofia_cfg_seconds_to_ms(const char *val)
+{
+	char *end;
+	long s;
+
+	if (ast_strlen_zero(val)) {
+		return 0;
+	}
+	/* strtol (not sscanf %d) so overflow is detected via errno BEFORE any cap and trailing garbage is
+	 * rejected via endptr (Codex). */
+	errno = 0;
+	s = strtol(val, &end, 10);
+	if (errno != 0 || end == val || s <= 0) {
+		return 0;
+	}
+	while (*end == ' ' || *end == '\t') {
+		end++;
+	}
+	if (*end != '\0') {
+		return 0;	/* trailing garbage (e.g. "30abc") -> OFF */
+	}
+	if (s > 86400) {
+		s = 86400;	/* cap at 1 day so s * 1000 cannot overflow int */
+	}
+	return (int)(s * 1000);
+}
+
 static void sofia_parse_general_config(struct ast_config *cfg)
 {
 	struct ast_variable *v;
@@ -19342,6 +19394,13 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			ast_copy_string(sofia_cfg.context, v->value, sizeof(sofia_cfg.context));
 		} else if (!strcasecmp(v->name, "realm")) {
 			ast_copy_string(sofia_cfg.realm, v->value, sizeof(sofia_cfg.realm));
+		} else if (!strcasecmp(v->name, "tcp_keepalive")) {
+			/* feature #5: CRLF keepalive interval in SECONDS (operator UX, chan_sip parity); stored as
+			 * ms for TPTAG_KEEPALIVE. Overflow-safe; 0/negative/non-numeric -> OFF. */
+			sofia_cfg.tcp_keepalive_ms = sofia_cfg_seconds_to_ms(v->value);
+		} else if (!strcasecmp(v->name, "tcp_pingpong")) {
+			/* feature #5: pong-timeout in SECONDS; stored ms for TPTAG_PINGPONG. 0 -> OFF. */
+			sofia_cfg.tcp_pingpong_ms = sofia_cfg_seconds_to_ms(v->value);
 		} else if (!strcasecmp(v->name, "useragent")) {
 			/* post-T56 useragent [general] parity (2026-04-28): operator override
 			 * of User-Agent header value. chan_sip parity chan_sip.c:29574-29575
@@ -20986,6 +21045,10 @@ static int sofia_apply_config(struct ast_config *cfg)
 	snprintf(sofia_cfg.useragent, sizeof(sofia_cfg.useragent), "%s %s",
 		DEFAULT_USERAGENT, ast_get_version());
 	sofia_cfg.allowguest = 1;
+	/* feature #5: connection keepalive OFF by default (opt-in). Reset here so a reload that removes
+	 * the knob reverts to OFF. Socket-level SO_KEEPALIVE remains on via sofia-sip's own default. */
+	sofia_cfg.tcp_keepalive_ms = 0;
+	sofia_cfg.tcp_pingpong_ms = 0;
 	sofia_cfg.busy_on_active = 0;
 	sofia_cfg.max_contacts = 6;
 	sofia_cfg.encryption = 0;
@@ -21723,6 +21786,8 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 		int t1min;
 		int timer_t1;
 		int timer_b;
+		int tcp_keepalive_ms;	/* feature #5: a change forces a listener recreate (TPTAG set at nua_create) */
+		int tcp_pingpong_ms;
 	} s;
 	int timert1_set = 0, timerb_set = 0;
 	struct ast_variable *v;
@@ -21749,6 +21814,8 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 	s.t1min = DEFAULT_T1MIN;
 	s.timer_t1 = 500;
 	s.timer_b = 32000;
+	s.tcp_keepalive_ms = 0;	/* feature #5: default OFF (matches the live-parser default) */
+	s.tcp_pingpong_ms = 0;
 
 	for (v = ast_variable_browse(cfg, "general"); v; v = v->next) {
 		if (!strcasecmp(v->name, "bindaddr")) {
@@ -21790,6 +21857,10 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 			s.tlsbindport = atoi(v->value);
 		} else if (!strcasecmp(v->name, "tlscertfile") || !strcasecmp(v->name, "tlscertdir")) {
 			ast_copy_string(s.tlscertfile, v->value, sizeof(s.tlscertfile));
+		} else if (!strcasecmp(v->name, "tcp_keepalive")) {
+			s.tcp_keepalive_ms = sofia_cfg_seconds_to_ms(v->value);
+		} else if (!strcasecmp(v->name, "tcp_pingpong")) {
+			s.tcp_pingpong_ms = sofia_cfg_seconds_to_ms(v->value);
 		} else if (!strcasecmp(v->name, "tlsverify") || !strcasecmp(v->name, "tlsverifyserver")) {
 			s.tlsverify = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "wsbindaddr")) {
@@ -21873,6 +21944,9 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 	SOFIA_LISTENER_CMP_INT(wsbindport, "wsbindport");
 	SOFIA_LISTENER_CMP_STR(wssbindaddr, "wssbindaddr");
 	SOFIA_LISTENER_CMP_INT(wssbindport, "wssbindport");
+	/* feature #5: the keepalive TPTAGs are set at nua_create, so a change needs the listeners recreated. */
+	SOFIA_LISTENER_CMP_INT(tcp_keepalive_ms, "tcp_keepalive");
+	SOFIA_LISTENER_CMP_INT(tcp_pingpong_ms, "tcp_pingpong");
 	/* scratch field names diverge here (s.timer_t1 vs sofia_cfg.default_timer_t1). */
 	if (sofia_cfg.default_timer_t1 != s.timer_t1) {
 		SOFIA_LISTENER_FLAG("timert1");
