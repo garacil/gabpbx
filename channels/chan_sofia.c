@@ -3618,6 +3618,24 @@ static int sofia_sdp_pt_in_use(const char *list, int pt)
 	return 0;
 }
 
+/* R7 C7: bounded SDP-fragment appender. sofia_generate_sdp builds the payload-type list, the rtpmap
+ * block, and the video equivalents in fixed stack buffers; the historical code used unbounded strcat
+ * (and strncat, which BOUNDS but silently TRUNCATES without telling the caller), so a pathological
+ * codec/cipher count could overrun a buffer or emit a half-built SDP while still returning non-NULL.
+ * This appends src to dst only if it fully fits (leaving room for the NUL) and returns -1 otherwise;
+ * callers OR the result into an `overflow` flag and, if set, sofia_generate_sdp returns NULL — every
+ * caller already treats a NULL/!sofia_generate_sdp return as "no SDP" (verified at all 6 call sites). */
+static int sofia_sdp_cat(char *dst, size_t dstsize, const char *src)
+{
+	size_t dlen = strlen(dst);
+	size_t slen = strlen(src);
+	if (dlen + slen + 1 > dstsize) {
+		return -1;
+	}
+	memcpy(dst + dlen, src, slen + 1);
+	return 0;
+}
+
 static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 {
 	struct ast_sockaddr rtp_addr;
@@ -3638,6 +3656,7 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 	int i;
 	format_t fmt;
 	format_t emitted = 0;
+	int overflow = 0;	/* R7 C7: set if any SDP fragment would overrun its fixed buffer */
 
 	if (!pvt || !pvt->rtp) {
 		return NULL;
@@ -3713,25 +3732,25 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 		if (fmt == AST_FORMAT_OPUS)
 			channels = 2;
 		if (!first)
-			strcat(payload_buf, " ");
+			overflow |= sofia_sdp_cat(payload_buf, sizeof(payload_buf), " ");
 		snprintf(tmp_buf, sizeof(tmp_buf), "%d", pt);
-		strcat(payload_buf, tmp_buf);
+		overflow |= sofia_sdp_cat(payload_buf, sizeof(payload_buf), tmp_buf);
 		first = 0;
 		if (channels)
 			snprintf(tmp_buf, sizeof(tmp_buf), "a=rtpmap:%d %s/%u/%d\r\n", pt, enc, rate, channels);
 		else
 			snprintf(tmp_buf, sizeof(tmp_buf), "a=rtpmap:%d %s/%u\r\n", pt, enc, rate);
-		strcat(rtpmap_buf, tmp_buf);
+		overflow |= sofia_sdp_cat(rtpmap_buf, sizeof(rtpmap_buf), tmp_buf);
 		/* fmtp for specific codecs */
 		if (fmt == AST_FORMAT_G729A) {
 			snprintf(tmp_buf, sizeof(tmp_buf), "a=fmtp:%d annexb=no\r\n", pt);
-			strcat(rtpmap_buf, tmp_buf);
+			overflow |= sofia_sdp_cat(rtpmap_buf, sizeof(rtpmap_buf), tmp_buf);
 		} else if (fmt == AST_FORMAT_OPUS) {
 			snprintf(tmp_buf, sizeof(tmp_buf), "a=fmtp:%d useinbandfec=1;usedtx=0\r\n", pt);
-			strcat(rtpmap_buf, tmp_buf);
+			overflow |= sofia_sdp_cat(rtpmap_buf, sizeof(rtpmap_buf), tmp_buf);
 		} else if (fmt == AST_FORMAT_ILBC) {
 			snprintf(tmp_buf, sizeof(tmp_buf), "a=fmtp:%d mode=20\r\n", pt);
-			strcat(rtpmap_buf, tmp_buf);
+			overflow |= sofia_sdp_cat(rtpmap_buf, sizeof(rtpmap_buf), tmp_buf);
 		}
 		emitted |= fmt;
 		/* post-T56 preferred_codec_only per-peer parity (2026-04-28): chan_sip parity at
@@ -3766,24 +3785,24 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 		if (fmt == AST_FORMAT_OPUS)
 			channels = 2;
 		if (!first)
-			strcat(payload_buf, " ");
+			overflow |= sofia_sdp_cat(payload_buf, sizeof(payload_buf), " ");
 		snprintf(tmp_buf, sizeof(tmp_buf), "%d", pt);
-		strcat(payload_buf, tmp_buf);
+		overflow |= sofia_sdp_cat(payload_buf, sizeof(payload_buf), tmp_buf);
 		first = 0;
 		if (channels)
 			snprintf(tmp_buf, sizeof(tmp_buf), "a=rtpmap:%d %s/%u/%d\r\n", pt, enc, rate, channels);
 		else
 			snprintf(tmp_buf, sizeof(tmp_buf), "a=rtpmap:%d %s/%u\r\n", pt, enc, rate);
-		strcat(rtpmap_buf, tmp_buf);
+		overflow |= sofia_sdp_cat(rtpmap_buf, sizeof(rtpmap_buf), tmp_buf);
 		if (fmt == AST_FORMAT_G729A) {
 			snprintf(tmp_buf, sizeof(tmp_buf), "a=fmtp:%d annexb=no\r\n", pt);
-			strcat(rtpmap_buf, tmp_buf);
+			overflow |= sofia_sdp_cat(rtpmap_buf, sizeof(rtpmap_buf), tmp_buf);
 		} else if (fmt == AST_FORMAT_OPUS) {
 			snprintf(tmp_buf, sizeof(tmp_buf), "a=fmtp:%d useinbandfec=1;usedtx=0\r\n", pt);
-			strcat(rtpmap_buf, tmp_buf);
+			overflow |= sofia_sdp_cat(rtpmap_buf, sizeof(rtpmap_buf), tmp_buf);
 		} else if (fmt == AST_FORMAT_ILBC) {
 			snprintf(tmp_buf, sizeof(tmp_buf), "a=fmtp:%d mode=20\r\n", pt);
-			strcat(rtpmap_buf, tmp_buf);
+			overflow |= sofia_sdp_cat(rtpmap_buf, sizeof(rtpmap_buf), tmp_buf);
 		}
 		emitted |= fmt;
 	}
@@ -3803,14 +3822,14 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 			}
 		}
 		if (!first) {
-			strcat(payload_buf, " ");
+			overflow |= sofia_sdp_cat(payload_buf, sizeof(payload_buf), " ");
 		}
 		snprintf(tmp_buf, sizeof(tmp_buf), "%d", te_pt);
-		strcat(payload_buf, tmp_buf);
+		overflow |= sofia_sdp_cat(payload_buf, sizeof(payload_buf), tmp_buf);
 		snprintf(tmp_buf, sizeof(tmp_buf), "a=rtpmap:%d telephone-event/8000\r\n", te_pt);
-		strcat(rtpmap_buf, tmp_buf);
+		overflow |= sofia_sdp_cat(rtpmap_buf, sizeof(rtpmap_buf), tmp_buf);
 		snprintf(tmp_buf, sizeof(tmp_buf), "a=fmtp:%d 0-16\r\n", te_pt);
-		strcat(rtpmap_buf, tmp_buf);
+		overflow |= sofia_sdp_cat(rtpmap_buf, sizeof(rtpmap_buf), tmp_buf);
 	}
 
 	/* T37: append local a=crypto for SDES-SRTP. sdp_crypto_attrib returns the
@@ -3818,7 +3837,7 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 	if (pvt->srtp && pvt->srtp->crypto) {
 		const char *a_crypto = sdp_crypto_attrib(pvt->srtp->crypto);
 		if (a_crypto) {
-			strncat(rtpmap_buf, a_crypto, sizeof(rtpmap_buf) - strlen(rtpmap_buf) - 1);
+			overflow |= sofia_sdp_cat(rtpmap_buf, sizeof(rtpmap_buf), a_crypto);
 		}
 	}
 
@@ -3847,7 +3866,7 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 		pvt->sess_id = (unsigned long)time(NULL);
 	}
 	pvt->sess_version++;
-	snprintf(buf, len,
+	if (snprintf(buf, len,
 		"v=0\r\n"
 		"o=- %lu %lu IN %s %s\r\n"
 		"s=GABpbx\r\n"
@@ -3859,7 +3878,9 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 		pvt->sess_id, pvt->sess_version,
 		sdp_family, host, sdp_family, host, port,
 		(pvt->srtp && pvt->srtp->crypto) ? "RTP/SAVP" : "RTP/AVP",
-		payload_buf, rtpmap_buf);
+		payload_buf, rtpmap_buf) >= (int)len) {	/* R7 C7: truncated audio SDP */
+		overflow = 1;
+	}
 
 	/* Append video block -- only when video capability present and vrtp allocated */
 	if (pvt->vrtp && (pvt->capability & AST_FORMAT_VIDEO_MASK)) {
@@ -3908,12 +3929,12 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 			enc = ast_rtp_lookup_mime_subtype2(1, fmt, 0);
 			rate = ast_rtp_lookup_sample_rate2(1, fmt);
 			if (!vfirst)
-				strcat(vpayload_buf, " ");
+				overflow |= sofia_sdp_cat(vpayload_buf, sizeof(vpayload_buf), " ");
 			snprintf(tmp_buf, sizeof(tmp_buf), "%d", pt);
-			strcat(vpayload_buf, tmp_buf);
+			overflow |= sofia_sdp_cat(vpayload_buf, sizeof(vpayload_buf), tmp_buf);
 			vfirst = 0;
 			snprintf(tmp_buf, sizeof(tmp_buf), "a=rtpmap:%d %s/%u\r\n", pt, enc, rate);
-			strcat(vrtpmap_buf, tmp_buf);
+			overflow |= sofia_sdp_cat(vrtpmap_buf, sizeof(vrtpmap_buf), tmp_buf);
 			emitted |= fmt;
 		}
 		for (fmt = 1; fmt; fmt <<= 1) {
@@ -3928,12 +3949,12 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 			enc = ast_rtp_lookup_mime_subtype2(1, fmt, 0);
 			rate = ast_rtp_lookup_sample_rate2(1, fmt);
 			if (!vfirst)
-				strcat(vpayload_buf, " ");
+				overflow |= sofia_sdp_cat(vpayload_buf, sizeof(vpayload_buf), " ");
 			snprintf(tmp_buf, sizeof(tmp_buf), "%d", pt);
-			strcat(vpayload_buf, tmp_buf);
+			overflow |= sofia_sdp_cat(vpayload_buf, sizeof(vpayload_buf), tmp_buf);
 			vfirst = 0;
 			snprintf(tmp_buf, sizeof(tmp_buf), "a=rtpmap:%d %s/%u\r\n", pt, enc, rate);
-			strcat(vrtpmap_buf, tmp_buf);
+			overflow |= sofia_sdp_cat(vrtpmap_buf, sizeof(vrtpmap_buf), tmp_buf);
 			emitted |= fmt;
 		}
 
@@ -3941,7 +3962,7 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 		if (pvt->vsrtp && pvt->vsrtp->crypto) {
 			const char *va_crypto = sdp_crypto_attrib(pvt->vsrtp->crypto);
 			if (va_crypto) {
-				strncat(vrtpmap_buf, va_crypto, sizeof(vrtpmap_buf) - strlen(vrtpmap_buf) - 1);
+				overflow |= sofia_sdp_cat(vrtpmap_buf, sizeof(vrtpmap_buf), va_crypto);
 			}
 		}
 
@@ -3956,14 +3977,16 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 			if (pvt->peer && pvt->peer->maxcallbitrate > 0) {
 				snprintf(bw_buf, sizeof(bw_buf), "b=CT:%d\r\n", pvt->peer->maxcallbitrate);
 			}
-			snprintf(buf + vlen, len - vlen,
+			if (snprintf(buf + vlen, len - vlen,
 				"m=video %d %s %s\r\n"
 				"%s"
 				"%s"
 				"a=sendrecv\r\n",
 				vport,
 				(pvt->vsrtp && pvt->vsrtp->crypto) ? "RTP/SAVP" : "RTP/AVP",
-				vpayload_buf, bw_buf, vrtpmap_buf);
+				vpayload_buf, bw_buf, vrtpmap_buf) >= (int)(len - vlen)) {	/* R7 C7: truncated video SDP */
+				overflow = 1;
+			}
 		}
 	}
 
@@ -4033,7 +4056,7 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 
 		/* Append m=image + a=T38Fax* attributes (5 mandatory). RFC 4566 §5.14:
 		 * m=image port udptl t38 — UDPTL transport per RFC 3362. */
-		snprintf(buf + t38vlen, len - t38vlen,
+		if (snprintf(buf + t38vlen, len - t38vlen,
 			"m=image %d udptl t38\r\n"
 			"a=T38FaxVersion:%u\r\n"
 			"a=T38MaxBitRate:%u\r\n"
@@ -4043,29 +4066,47 @@ static char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 			pvt->t38_our_parms.version,
 			max_bitrate,
 			rate_mgmt_str,
-			max_datagram);
+			max_datagram) >= (int)(len - t38vlen)) {	/* R7 C7: truncated T.38 SDP */
+			overflow = 1;
+		}
 
 		/* 3 optional bare-flag attributes (chan_sip.c:12422-12430 verbatim
 		 * conditional pattern — emit when our_parms bit is set). */
 		if (pvt->t38_our_parms.fill_bit_removal) {
 			int blen = strlen(buf);
-			snprintf(buf + blen, len - blen, "a=T38FaxFillBitRemoval\r\n");
+			if (snprintf(buf + blen, len - blen, "a=T38FaxFillBitRemoval\r\n") >= (int)(len - blen)) {
+				overflow = 1;
+			}
 		}
 		if (pvt->t38_our_parms.transcoding_mmr) {
 			int blen = strlen(buf);
-			snprintf(buf + blen, len - blen, "a=T38FaxTranscodingMMR\r\n");
+			if (snprintf(buf + blen, len - blen, "a=T38FaxTranscodingMMR\r\n") >= (int)(len - blen)) {
+				overflow = 1;
+			}
 		}
 		if (pvt->t38_our_parms.transcoding_jbig) {
 			int blen = strlen(buf);
-			snprintf(buf + blen, len - blen, "a=T38FaxTranscodingJBIG\r\n");
+			if (snprintf(buf + blen, len - blen, "a=T38FaxTranscodingJBIG\r\n") >= (int)(len - blen)) {
+				overflow = 1;
+			}
 		}
 
 		/* T38FaxUdpEC emitted only when EC scheme is FEC or Redundancy
 		 * (NONE = omit per chan_sip.c:12441 NONE-case-empty-block convention). */
 		if (udpec_str) {
 			int blen = strlen(buf);
-			snprintf(buf + blen, len - blen, "a=T38FaxUdpEC:%s\r\n", udpec_str);
+			if (snprintf(buf + blen, len - blen, "a=T38FaxUdpEC:%s\r\n", udpec_str) >= (int)(len - blen)) {
+				overflow = 1;
+			}
 		}
+	}
+
+	/* R7 C7: if any fragment would have overrun a build buffer or the final SDP truncated, fail the
+	 * whole SDP rather than emit a half-built body — every caller treats NULL as "no SDP". */
+	if (overflow) {
+		ast_log(LOG_WARNING, "Sofia: SDP for '%s' exceeded its build buffers (too many codecs/attributes) — emitting no SDP\n",
+			S_OR(pvt->callid, "<unknown>"));
+		return NULL;
 	}
 
 	return buf;
