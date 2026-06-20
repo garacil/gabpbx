@@ -19084,9 +19084,93 @@ static char *sofia_cli_show_registry(struct ast_cli_entry *e, int cmd, struct as
 	return CLI_SUCCESS;
 }
 
+/* Capability feature #3: `sip unregister <peer>` — force-expire a dynamic peer's INBOUND registration
+ * (chan_sip parity, chan_sip.c:19094) so the phone must re-register. DOCTRINE EXCEPTION (tenet 6 — the
+ * sofia_thread normally owns mutable registration state): this mutates it from the CLI thread, which is
+ * justified because (a) the writes are simple field assignments + ao2 (thread-safe) container ops, NOT
+ * nua_* calls or state-machine transitions; (b) peer->lock serializes against the sofia_thread expiry
+ * sweep / REGISTER apply (which mutate the SAME state the SAME way @10805-10835); (c) the
+ * AMI/devstate/hint side-effects are deferred to AFTER the unlock (R4 lesson); (d) a synchronous result
+ * is what an operator expects from a CLI command (vs an async dispatch-to-sofia_thread). It is a pure
+ * LOCAL state clear — no de-REGISTER is sent to the phone. In-RAM peers only: a realtime peer's binding
+ * lives in the DB (chan_sip's `sip unregister` likewise does not touch the DB). */
+static char *sofia_cli_unregister(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct sofia_peer *peer;
+	int was_registered = 0, had_contacts = 0, did_clear = 0;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "sip unregister";
+		e->usage =
+			"Usage: sip unregister <peer>\n"
+			"       Force-expire a SIP peer's inbound registration (the peer must re-register).\n"
+			"       Operates on in-RAM peers; a realtime peer's database binding is untouched.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return complete_sofia_peer(a->word, a->n, 0);
+	}
+
+	if (a->argc != 3) {
+		return CLI_SHOWUSAGE;
+	}
+
+	peer = sofia_find_peer(a->argv[2]);
+	if (!peer) {
+		ast_cli(a->fd, "Peer unknown: '%s'. Not unregistered.\n", a->argv[2]);
+		return CLI_SUCCESS;
+	}
+
+	ast_mutex_lock(&peer->lock);
+	/* Reject an OUTBOUND register => trunk: such a peer ALSO carries registered=1/reg_expiry for its
+	 * OWN upstream registration (set in the nua_r_register handler), so clearing it here would mark the
+	 * trunk down and zero its refresh. `sip unregister` is only for a dynamic peer's INBOUND binding
+	 * (Codex). Use `sip show registry` to inspect outbound trunk registrations. */
+	if (peer->is_register_line) {
+		ast_mutex_unlock(&peer->lock);
+		ast_cli(a->fd, "Peer '%s' is an outbound registration (register =>); "
+			"'sip unregister' applies to inbound peer registrations.\n", a->argv[2]);
+		ao2_ref(peer, -1);
+		return CLI_SUCCESS;
+	}
+	was_registered = peer->registered;
+	/* Clear if there is anything to clear — registered, OR stale contacts left when the flag is
+	 * already 0 (defensive: an inconsistent state still gets fully cleaned). */
+	had_contacts = ao2_container_count(peer->contacts) > 0;
+	did_clear = was_registered || had_contacts;
+	if (did_clear) {
+		/* Unconditional contacts clear — NOT sofia_expire_contacts_cb, which returns 0 when
+		 * ignore_regexpire is set and otherwise only matches already-expired contacts, so it would
+		 * leave the live bindings a force-unregister must remove. A NULL ao2 callback matches all. */
+		ao2_callback(peer->contacts, OBJ_UNLINK | OBJ_NODATA | OBJ_MULTIPLE, NULL, NULL);
+		peer->registered = 0;
+		memset(&peer->src_addr, 0, sizeof(peer->src_addr));
+		ast_copy_string(peer->reg_transport, "udp", sizeof(peer->reg_transport));
+		peer->expire = 0;
+		peer->reg_expiry = 0;
+	}
+	ast_mutex_unlock(&peer->lock);
+
+	if (did_clear) {
+		/* Fire the registration side-effects AFTER the unlock — the proven path the natural expiry
+		 * uses (regexten cleanup + AMI PeerStatus Unregistered + devstate/BLF). sip=NULL is safe: the
+		 * emit_unregister branch never dereferences it. */
+		struct sofia_register_update upd = { 0 };
+		upd.emit_unregister = 1;
+		upd.unregister_cause = "CLI";
+		sofia_emit_register_side_effects(peer, NULL, &upd);
+		ast_cli(a->fd, "Unregistered peer '%s'\n", a->argv[2]);
+	} else {
+		ast_cli(a->fd, "Peer '%s' not registered\n", a->argv[2]);
+	}
+	ao2_ref(peer, -1);
+	return CLI_SUCCESS;
+}
+
 static struct ast_cli_entry cli_sofia[] = {
 	AST_CLI_DEFINE(sofia_cli_show_peers, "List Sofia-SIP peers"),
 	AST_CLI_DEFINE(sofia_cli_show_registry, "List outbound SIP trunk registrations"),
+	AST_CLI_DEFINE(sofia_cli_unregister, "Force-expire a SIP peer's inbound registration"),
 	AST_CLI_DEFINE(sofia_cli_show_channels, "List active Sofia-SIP channels"),
 	AST_CLI_DEFINE(sofia_cli_show_peer, "Show detailed Sofia-SIP peer info"),
 	AST_CLI_DEFINE(sofia_cli_show_inuse, "Show SIP peer call usage counters"),

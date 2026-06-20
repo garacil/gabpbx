@@ -2541,6 +2541,13 @@ srvlookup=yes
 ;   Registered or Unregistered; the "(N attempts)" hint appears when an upstream keeps
 ;   rejecting the digest (verify the trunk secret). The same data is also available via
 ;   the AMI SofiaShowRegistry action.
+;
+; --- Forcing a re-registration: "sip unregister <peer>" (CLI) ---
+; Force-expires a DYNAMIC peer's INBOUND registration so the phone must register
+; again: clears its contact bindings, marks it unregistered and emits the AMI
+; "PeerStatus: Unregistered" event plus the device-state change (so BLF lamps update).
+; Operates on in-RAM peers only — a realtime peer's database binding is untouched — and
+; refuses to run on an outbound register => trunk (use sip show registry for those).
 
 ; ============================================
 ; Outbound trunk example
