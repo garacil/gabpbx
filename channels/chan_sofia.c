@@ -4238,6 +4238,19 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 		ast_udptl_get_peer(pvt->udptl, &orig_udptl_peer);
 	}
 
+	/* R7 batch 2b (bucket A): the negotiated audio/video codec payload maps are built into
+	 * these function-scope ast_rtp_codecs during the media loop, but the install into the live
+	 * pvt->rtp/vrtp (ast_rtp_codecs_payloads_copy) is DEFERRED to the commit phase after every
+	 * reject gate passes — so a rejected SDP never overwrites an established call's codec map.
+	 * Init here; destroy at the commit copy AND at sdp_reject (clearing an unused/empty map is a
+	 * safe no-op). staged_*_valid gates only the copy, not the clear. */
+	struct ast_rtp_codecs staged_audio_codecs;
+	struct ast_rtp_codecs staged_video_codecs;
+	int staged_audio_valid = 0;
+	int staged_video_valid = 0;
+	ast_rtp_codecs_payloads_clear(&staged_audio_codecs, NULL);
+	ast_rtp_codecs_payloads_clear(&staged_video_codecs, NULL);
+
 	for (media = sdp->sdp_media; media; media = media->m_next) {
 		if (media->m_type == sdp_media_audio && media->m_port != 0) {
 			sdp_attribute_t *a;
@@ -4306,35 +4319,38 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 			}
 
 			{
-				struct ast_rtp_codecs newaudiortp;
 				format_t local_cap = pvt->capability;
 				format_t offered = 0;
 				int noncodec = 0;
 				sdp_rtpmap_t *rm;
 				sdp_list_t *fmt;
 
-				ast_rtp_codecs_payloads_clear(&newaudiortp, NULL);
+				/* R7 2b: re-init the staged map at the start of EACH m=audio block so a
+				 * (rare) second m=audio line wins last — matching the original per-block
+				 * ast_rtp_codecs_payloads_clear semantics. The install into pvt->rtp is
+				 * deferred to the commit phase (bucket A). */
+				ast_rtp_codecs_payloads_clear(&staged_audio_codecs, NULL);
 
 				/* Step 1: register PTs from m= line */
 				for (fmt = media->m_format; fmt; fmt = fmt->l_next) {
 					int pt = atoi(fmt->l_text);
-					ast_rtp_codecs_payloads_set_m_type(&newaudiortp, NULL, pt);
+					ast_rtp_codecs_payloads_set_m_type(&staged_audio_codecs, NULL, pt);
 				}
 
 				/* Step 2: override with a=rtpmap entries (handles dynamic PTs) */
 				for (rm = media->m_rtpmaps; rm; rm = rm->rm_next) {
 					if (rm->rm_encoding) {
 						int rc = ast_rtp_codecs_payloads_set_rtpmap_type_rate(
-							&newaudiortp, NULL, rm->rm_pt, "audio",
+							&staged_audio_codecs, NULL, rm->rm_pt, "audio",
 							(char *)rm->rm_encoding, 0, rm->rm_rate);
 						if (rc) {
-							ast_rtp_codecs_payloads_unset(&newaudiortp, NULL, rm->rm_pt);
+							ast_rtp_codecs_payloads_unset(&staged_audio_codecs, NULL, rm->rm_pt);
 						}
 					}
 				}
 
 				/* Step 3: extract negotiated formats */
-				ast_rtp_codecs_payload_formats(&newaudiortp, &offered, &noncodec);
+				ast_rtp_codecs_payload_formats(&staged_audio_codecs, &offered, &noncodec);
 
 				/* Step 4: intersect with local capability.
 				 * Round3 #6 (Codex consensus): if audio was OFFERED but we share NO
@@ -4356,8 +4372,7 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 					}
 					if (!has_t38) {
 						ast_log(LOG_WARNING, "Sofia: no common audio codec with peer — rejecting (488 Not Acceptable Here)\n");
-						ast_rtp_codecs_payloads_clear(&newaudiortp, NULL);
-						goto sdp_reject;	/* R6 #3: label frees parser (still live here) + rollback + restore capability */
+						goto sdp_reject;	/* R7 2b: staged_audio_codecs is cleared once at the label; R6 #3: label frees parser (still live here) + rollback + restore capability */
 					}
 				}
 				/* R6 #3: narrow audio to the negotiated set, but PRESERVE this-SDP video.
@@ -4370,9 +4385,10 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 					pvt->capability = local_cap;
 				}
 
-				/* Step 5: install into RTP instance */
-				ast_rtp_codecs_payloads_copy(&newaudiortp,
-					ast_rtp_instance_get_codecs(pvt->rtp), pvt->rtp);
+				/* Step 5: R7 2b (bucket A) — codec map built; DEFER the install into
+				 * pvt->rtp to the commit phase (after every reject gate) so a rejected SDP
+				 * never overwrites the established codec map. */
+				staged_audio_valid = 1;
 
 				if (pvt->owner && (pvt->capability & AST_FORMAT_AUDIO_MASK)) {
 					format_t chosen = ast_codec_choose(&pvt->prefs,
@@ -4442,7 +4458,6 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 
 			if (pvt->vrtp) {
 				struct ast_sockaddr remote;
-				struct ast_rtp_codecs newvideortp;
 				format_t offered = 0;
 				int noncodec = 0;
 				sdp_rtpmap_t *rm;
@@ -4474,28 +4489,30 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 					ast_log(LOG_NOTICE, "Sofia: unparseable video media address '%s' in SDP — leaving video remote unchanged\n", addr);
 				}
 
-				ast_rtp_codecs_payloads_clear(&newvideortp, NULL);
+				ast_rtp_codecs_payloads_clear(&staged_video_codecs, NULL);
 
 				for (vfmt = media->m_format; vfmt; vfmt = vfmt->l_next) {
 					int pt = atoi(vfmt->l_text);
-					ast_rtp_codecs_payloads_set_m_type(&newvideortp, NULL, pt);
+					ast_rtp_codecs_payloads_set_m_type(&staged_video_codecs, NULL, pt);
 				}
 				for (rm = media->m_rtpmaps; rm; rm = rm->rm_next) {
 					if (rm->rm_encoding) {
 						int rc = ast_rtp_codecs_payloads_set_rtpmap_type_rate(
-							&newvideortp, NULL, rm->rm_pt, "video",
+							&staged_video_codecs, NULL, rm->rm_pt, "video",
 							(char *)rm->rm_encoding, 0, rm->rm_rate);
 						if (rc)
-							ast_rtp_codecs_payloads_unset(&newvideortp, NULL, rm->rm_pt);
+							ast_rtp_codecs_payloads_unset(&staged_video_codecs, NULL, rm->rm_pt);
 					}
 				}
 
-				ast_rtp_codecs_payload_formats(&newvideortp, &offered, &noncodec);
+				ast_rtp_codecs_payload_formats(&staged_video_codecs, &offered, &noncodec);
 				if (offered & AST_FORMAT_VIDEO_MASK) {
 					pvt->capability |= offered & AST_FORMAT_VIDEO_MASK;
 				}
-				ast_rtp_codecs_payloads_copy(&newvideortp,
-					ast_rtp_instance_get_codecs(pvt->vrtp), pvt->vrtp);
+				/* R7 2b (bucket A): video codec map built — DEFER the install into
+				 * pvt->vrtp to the commit phase. staged_video_valid implies pvt->vrtp
+				 * exists (this block is gated on it). */
+				staged_video_valid = 1;
 			}
 		} else if (media->m_type == sdp_media_image && media->m_port != 0) {
 			/* post-T56 Task #8 T.38 fax UDPTL parity SS3a (2026-04-28, SDP
@@ -4820,6 +4837,21 @@ static int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 		}
 	}
 
+	/* R7 2b (bucket A) COMMIT: every reject gate — including the SRTP commit above, the LAST
+	 * reject point — has passed. Install the staged codec maps into the live RTP instances now.
+	 * A rejected SDP returned via sdp_reject before reaching here, so it never overwrote them.
+	 * (C remote addresses use 2a snapshot-restore; D side-effects are deferred in 2c.) */
+	if (staged_audio_valid) {
+		ast_rtp_codecs_payloads_copy(&staged_audio_codecs,
+			ast_rtp_instance_get_codecs(pvt->rtp), pvt->rtp);
+	}
+	if (staged_video_valid && pvt->vrtp) {
+		ast_rtp_codecs_payloads_copy(&staged_video_codecs,
+			ast_rtp_instance_get_codecs(pvt->vrtp), pvt->vrtp);
+	}
+	ast_rtp_codecs_payloads_clear(&staged_audio_codecs, NULL);
+	ast_rtp_codecs_payloads_clear(&staged_video_codecs, NULL);
+
 	return 0;
 
 sdp_reject:
@@ -4847,6 +4879,11 @@ sdp_reject:
 	if (had_udptl) {
 		ast_udptl_set_peer(pvt->udptl, &orig_udptl_peer);
 	}
+	/* R7 2b (bucket A): discard the staged codec maps — on a reject they were NEVER copied into
+	 * the live RTP instances (the commit copy is past this label), so there is nothing to restore;
+	 * just free them. Clearing an empty/unbuilt map is a safe no-op. */
+	ast_rtp_codecs_payloads_clear(&staged_audio_codecs, NULL);
+	ast_rtp_codecs_payloads_clear(&staged_video_codecs, NULL);
 	return -1;
 }
 
