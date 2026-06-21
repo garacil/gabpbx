@@ -35,13 +35,12 @@
 #include "include/sofia_publish.h"
 
 #define SOFIA_PUBLISH_MAX_AUTH 3
-#define SOFIA_PUBLISH_SWEEP_MS 1000	/* the PUBLISH scheduler tick (next_send granularity) */
-#define SOFIA_PUBLISH_MIN_EXPIRES 30	/* floor: a TTL below this cannot be reliably refreshed by the 1Hz sweep (Codex) */
+#define SOFIA_PUBLISH_SWEEP_MS 1000	/* PUBLISH scheduler tick (next_send granularity) */
+#define SOFIA_PUBLISH_MIN_EXPIRES 30	/* floor: a sub-30s TTL cannot be refreshed by the 1Hz sweep */
 
-/* Constant sentinel hmagic for publication handles (like SOFIA_SIPNOTIFY_HMAGIC) — routes
- * the generic nua_r_method events to the publication handler in sofia_event_callback before
- * any pvt/peer dispatch. It is NOT a per-object discriminator (that is find_by_nh's job);
- * being a fixed address it can never be confused with a live pvt/peer/sub pointer. */
+/* Sentinel hmagic for publication handles - routes generic nua_r_method events to the
+ * publication handler before any pvt/peer dispatch. A fixed address, so never confusable
+ * with a live pvt/peer/sub pointer (per-object correlation is find_by_nh's job). */
 int sofia_publication_sentinel;	/* hmagic identity; HMAGIC macro in sofia_publish.h */
 
 struct sofia_publication {
@@ -77,13 +76,13 @@ static struct ao2_container *publications;	/* keyed by key; created in load_modu
 static su_timer_t *publication_refresh_timer;	/* recurring refresh sweep on sofia_thread */
 static void sofia_publication_teardown(struct sofia_publication *pub);	/* fwd: defined after create */
 static void sofia_publication_schedule(struct sofia_publication *pub, int base, int span);	/* fwd */
-
+/* ao2 hash: on the composite key string. */
 static int publication_hash_fn(const void *obj, int flags)
 {
 	const struct sofia_publication *p = obj;	/* full pub or {.key} shim */
 	return ast_str_hash(p->key);
 }
-
+/* ao2 cmp: exact match on the composite key. */
 static int publication_cmp_fn(void *obj, void *arg, int flags)
 {
 	struct sofia_publication *p = obj;
@@ -96,7 +95,7 @@ static void publication_destructor(void *obj)
 	/* No nua_* here — the handle is detached + destroyed on sofia_thread at teardown. */
 }
 
-/* Type-safe correlation of a publication handle -> its object (no hmagic; 3-way consensus). */
+/* Find a publication by its nua handle (linear scan); returns it with a +1 ref. */
 static struct sofia_publication *sofia_publication_find_by_nh(nua_handle_t *nh)
 {
 	struct ao2_iterator it;
@@ -117,11 +116,8 @@ static struct sofia_publication *sofia_publication_find_by_nh(nua_handle_t *nh)
 	return found;
 }
 
-/* Build the dialog-info+xml PUBLISH body. Dedicated (NOT a refactor of the NOTIFY builder, so the
- * live NOTIFY body stays byte-identical — 3-way consensus); reuses sofia_presence_state_map; XML-
- * escapes the operator-supplied exten + entity (injection safety — opencode); replicates the
- * offline-hint override for parity (for dialog-info this only reinforces "terminated" when idle and
- * all devices are offline — it matters most for the v2 PIDF body — but is kept for parity). */
+/* Build the dialog-info+xml PUBLISH body. XML-escapes the operator-supplied exten + entity
+ * (injection safety). Separate from the NOTIFY builder so that body stays byte-identical. */
 static void sofia_publication_build_body(struct ast_str **buf, struct sofia_publication *pub, int state)
 {
 	const char *statestring, *pidfstate, *pidfnote;
@@ -169,10 +165,9 @@ static void sofia_publication_build_body(struct ast_str **buf, struct sofia_publ
 	ast_str_append(buf, 0, "</dialog>\n</dialog-info>\n");
 }
 
-/* Send a PUBLISH for `pub` reflecting the CURRENT hint state (sofia_thread ONLY). removing=1 ->
- * Expires:0 unpublish. The state is fetched here (on sofia_thread) so callers never marshal it. Skips
- * if a PUBLISH is already in flight (the sweep retries on the next tick once next_send is still due —
- * this is the per-handle serialization that prevents two concurrent 200s racing the ETag). */
+/* Send a PUBLISH for `pub` reflecting the current hint state (sofia_thread ONLY). removing=1 ->
+ * Expires:0 unpublish. Skips if already in flight - the per-handle serialization that stops two
+ * concurrent 200s racing the ETag; the sweep retries on the next due tick. */
 static void sofia_publication_send(struct sofia_publication *pub, int removing)
 {
 	struct ast_str *body = NULL;
@@ -185,7 +180,7 @@ static void sofia_publication_send(struct sofia_publication *pub, int removing)
 
 	state = removing ? pub->laststate : ast_extension_state(NULL, pub->context, pub->exten);
 
-	/* Build the body FIRST (Codex): only after it succeeds do we consume next_send + advance version,
+	/* Build the body FIRST: only after it succeeds do we consume next_send + advance version,
 	 * so an OOM reschedules a retry instead of permanently unscheduling the publication. */
 	if (!removing) {
 		if (!(body = ast_str_create(256))) {
@@ -225,9 +220,9 @@ static void sofia_publication_schedule(struct sofia_publication *pub, int base, 
 	pub->next_send = time(NULL) + base + jitter;
 }
 
-/* nua_r_method response handler (sofia_thread). Applies the ETag/error matrix (opencode):
- * 200+ETag store; 200 no-ETag warn+clear; 401/407 reactive auth (bounded); 412 stale->re-init;
- * 423->Min-Expires+retry; other 4xx/5xx keep last good. Then re-fires a deferred (dirty) state. */
+/* nua_r_method response handler (sofia_thread). ETag/error matrix: 200+ETag store; 200 no-ETag
+ * warn+clear; 401/407 reactive auth (bounded); 412 stale->re-init; 423->Min-Expires+retry;
+ * other 4xx/5xx keep last good. */
 void sofia_publication_handle_response(int status, char const *phrase,
 		nua_handle_t *nh, sip_t const *sip)
 {
@@ -243,9 +238,8 @@ void sofia_publication_handle_response(int status, char const *phrase,
 	pub->last_status = status;	/* final status — recorded for `sip show publications` diagnostics */
 
 	if ((status == 401 || status == 407) && sip) {
-		/* reactive digest auth. sofia_format_auth_creds returns 0 on SUCCESS (Codex: the v1 check was
-		 * inverted). Build BOTH WWW + Proxy creds when present and pass both (one response may carry
-		 * both challenges) — Feature #1 pattern. */
+		/* Reactive digest auth. sofia_format_auth_creds returns 0 on SUCCESS. Build BOTH WWW + Proxy
+		 * creds when present and pass both (one response may carry both challenges). */
 		char www_creds[512], proxy_creds[512];
 		int have_www = 0, have_proxy = 0;
 
@@ -287,15 +281,14 @@ void sofia_publication_handle_response(int status, char const *phrase,
 				pub->key);
 			pub->etag[0] = '\0';
 		}
-		/* Honor a granted Expires, clamped before the unsigned->int cast can wrap (Codex). */
+		/* Honor a granted Expires, clamped before the unsigned->int cast can wrap. */
 		if (sip && sip->sip_expires && sip->sip_expires->ex_delta > 0
 			&& sip->sip_expires->ex_delta <= SOFIA_PUBLISH_MAX_EXPIRES) {
 			pub->expires = (int) sip->sip_expires->ex_delta;
 		}
-		/* Refresh BEFORE expiry, jittered DOWNWARD so it can never land at/after the TTL — for ANY
-		 * Expires including tiny ones (Codex): the margin scales with the TTL (never more than the TTL
-		 * itself), so next_send stays strictly below it. Skip if next_send was already set while this
-		 * PUBLISH was in flight (a state change came in) — let the sweep send the new state. */
+		/* Refresh BEFORE expiry, jittered DOWNWARD so next_send always lands strictly below the TTL
+		 * (margin scales with the TTL). Skip if next_send was already set while this PUBLISH was in
+		 * flight (a state change came in) - let the sweep send the new state. */
 		if (pub->next_send == 0 && !pub->terminated) {
 			int margin = pub->expires / 10;					/* ~10% headroom */
 			if (margin < 5) {
@@ -331,9 +324,8 @@ struct sofia_publication_dispatch {
 	struct sofia_publication *pub;	/* +1 ref TRANSFERRED — the cb drops it */
 };
 
-/* sofia_thread: marshaled target of the extension-state callback. Marks the pub due NOW so the sweep
- * re-PUBLISHes it with the current state (no per-change PUBLISH burst; serialized through next_send +
- * in_flight). The actual state is read at send time on sofia_thread. */
+/* sofia_thread: marshaled target of the extension-state callback. Marks the pub due NOW so the
+ * sweep re-PUBLISHes it (serialized through next_send + in_flight; state read at send time). */
 static void sofia_publication_dispatch_cb(void *arg)
 {
 	struct sofia_publication_dispatch *d = arg;
@@ -401,10 +393,9 @@ static void sofia_publish_server_hostport(char *host, size_t hlen, int *port)
 }
 
 /* Create a publication for a publish=yes peer + send the initial PUBLISH (sofia_thread). */
-/* Is this presentity entity already published? Entity de-dupe (opencode): the same bare extension in
- * two contexts maps to ONE ESC presentity (sip:exten@domain); two publications would clobber each
- * other's SIP-ETag and 412-storm indefinitely (RFC 3903 §4.1 — the ESC replaces on initial-without-
- * If-Match, as Kamailio's presence module does). First valid hint wins. */
+/* Is this presentity entity already published? The same bare extension in two contexts maps to
+ * ONE ESC presentity (sip:exten@domain); two publications would clobber each other's ETag and
+ * 412-storm (RFC 3903 4.1). First valid hint wins. */
 static int sofia_publication_entity_in_use(const char *entity)
 {
 	struct ao2_iterator it;
@@ -427,9 +418,8 @@ static int sofia_publication_entity_in_use(const char *entity)
 	return found;
 }
 
-/* Create + initial-publish ONE (exten, context) presentity. Requires a REAL hint (no auto-create in
- * the PUBLISH path — Codex). Key = peer|context|exten so distinct contexts are distinct internal
- * entries; a duplicate key OR a duplicate presentity entity is skipped (opencode 412-storm guard). */
+/* Create + initial-publish ONE (exten, context) presentity. Requires a REAL hint. Key =
+ * peer|context|exten; a duplicate key OR a duplicate presentity entity is skipped (412-storm guard). */
 static void sofia_publication_create_one(struct sofia_peer *peer, const char *exten,
 		const char *context, const char *domain, int create)
 {
@@ -446,9 +436,8 @@ static void sofia_publication_create_one(struct sofia_peer *peer, const char *ex
 			peer->name, exten, context);
 		return;
 	}
-	/* Key-find FIRST (Codex): an existing peer|context|exten is already published — keep it and UNMARK
-	 * it (so a reload mark-and-sweep does not remove it) — BEFORE the entity-dedup, which only matters
-	 * when we are about to create a genuinely new presentity. */
+	/* Key-find FIRST: an existing peer|context|exten is already published - keep it and UNMARK it
+	 * (survives the reload sweep) BEFORE the entity-dedup, which only matters for a genuinely new one. */
 	if (snprintf(tmp.key, sizeof(tmp.key), "%s|%s|%s", peer->name, context, exten) >= (int) sizeof(tmp.key)) {
 		ast_log(LOG_WARNING, "Sofia PUBLISH: composite key too long for peer '%s' %s@%s — skipped\n",
 			peer->name, exten, context);
@@ -460,9 +449,8 @@ static void sofia_publication_create_one(struct sofia_peer *peer, const char *ex
 		return;
 	}
 	if (!create) {
-		/* unmark-only reconcile pass: existing pubs are unmarked above; do NOT create a new pub yet — a
-		 * stale same-entity pub (about to be swept) would block it via the entity-dedup (Codex). The
-		 * create-missing pass runs AFTER the sweep. */
+		/* unmark-only reconcile pass: do NOT create yet - a stale same-entity pub (about to be swept)
+		 * would block it via the entity-dedup. The create-missing pass runs AFTER the sweep. */
 		return;
 	}
 	snprintf(entity, sizeof(entity), "sip:%s@%s", exten, domain);	/* BARE exten, never ext@ctx */
@@ -485,16 +473,11 @@ static void sofia_publication_create_one(struct sofia_peer *peer, const char *ex
 	pub->stateid = -1;
 	pub->etag[0] = '\0';
 
-	/* RFC 3903 §4: the PUBLISH Request-URI is the PRESENTITY. We build the R-URI (pub->target) with the
-	 * ESC's explicit SIP port — sip:exten@publish_domain:<ESC-port> — so the request goes to the ESC on
-	 * the FIRST send AND on every refresh. Real-Kamailio validation proved the alternatives fail: a Route
-	 * header (NUTAG_INITIAL_ROUTE / SIPTAG_ROUTE) routes only the first request, then sofia caches the
-	 * resolved R-URI as the dialog route (ds_route, nua_client.c:776) and strips the per-request Route, so
-	 * refreshes leaked to the DNS-default :5060. Putting the port in the R-URI keeps the dialog target on
-	 * the ESC throughout. To/From/body use the CLEAN presentity `entity` (no port); the ESC normalizes the
-	 * R-URI host (== MY_DOMAIN, port ignored) to the same presentity. NUTAG_DIALOG(0) additionally tells
-	 * sofia this generic method must not create/refresh dialog target state (Codex).
-	 * (3-way consensus + real-Kamailio validation; no Route header, no NUTAG_PROXY, no handle churn.) */
+	/* RFC 3903 4: the PUBLISH R-URI is the PRESENTITY. We put the ESC's explicit port in the R-URI
+	 * (sip:exten@publish_domain:<ESC-port>) so first send AND every refresh hit the ESC. A Route header
+	 * routes only the first request - sofia then caches the resolved R-URI (ds_route, nua_client.c:776)
+	 * and strips the per-request Route, leaking refreshes to the DNS-default :5060. To/From/body use the
+	 * clean presentity `entity` (no port); the ESC normalizes the R-URI host to the same presentity. */
 	{
 		char eschost[128];
 		int escport = 0;
@@ -535,8 +518,7 @@ static void sofia_publication_create_one(struct sofia_peer *peer, const char *ex
 		return;
 	}
 
-	/* Spread the initial PUBLISH across [0, min(Expires, 60)) seconds so 5-10k pubs at load do not
-	 * thunder-herd the ESC — the sweep fires it when due (#6). */
+	/* Spread the initial PUBLISH across [0, min(Expires, 60))s so a large fleet does not thunder-herd. */
 	sofia_publication_schedule(pub, 0, (pub->expires < 60 ? pub->expires : 60) ?: 1);
 
 	if (sofia_debug) {
@@ -546,9 +528,8 @@ static void sofia_publication_create_one(struct sofia_peer *peer, const char *ex
 	ao2_ref(pub, -1);		/* drop our local alloc ref (container + registration hold theirs) */
 }
 
-/* Create publications for a publish=yes peer. regexten may carry multiple extensions
- * (ext1&ext2@ctx&...) — one publication per extension (Codex); the peer name is used only when
- * regexten is empty. Per-token @context overrides the peer subscribecontext default. */
+/* Create publications for a publish=yes peer - one per regexten extension (ext1&ext2@ctx&...);
+ * the peer name is used only when regexten is empty. Per-token @context overrides subscribecontext. */
 static void sofia_publication_create_for_peer(struct sofia_peer *peer, int create)
 {
 	char multi[256], domain[128];
@@ -598,12 +579,9 @@ static void sofia_publication_create_for_peer(struct sofia_peer *peer, int creat
 	}
 }
 
-/* Detach + destroy one publication (sofia_thread). The Expires:0 unpublish is BEST-EFFORT only
- * (Codex): the message is queued on the handle and the handle is destroyed immediately after, and at
- * shutdown this runs after su_root_run() has returned — so the unpublish may not reach the wire. That
- * is acceptable: the central ESC expires the soft state by its TTL (the granted Expires) regardless.
- * A guaranteed wire-unpublish would require pumping the event loop until the final nua_r_method, which
- * is not worth blocking shutdown for. */
+/* Detach + destroy one publication (sofia_thread). The Expires:0 unpublish is BEST-EFFORT: the handle
+ * is destroyed right after queueing it (and at shutdown this runs after su_root_run() returns), so it
+ * may not reach the wire - acceptable, the ESC expires the soft state by its TTL regardless. */
 static void sofia_publication_teardown(struct sofia_publication *pub)
 {
 	if (!pub || pub->terminated) {
@@ -627,8 +605,8 @@ static void sofia_publication_teardown(struct sofia_publication *pub)
 	ao2_unlink(publications, pub);
 }
 
-/* Periodic refresh: re-PUBLISH each established publication with If-Match to keep the ESC binding
- * alive. Runs on sofia_thread via a su_timer (see load). Fires at ~90% of publish_expires. */
+/* Periodic scheduler tick (sofia_thread su_timer): PUBLISH each due, not-in-flight publication,
+ * capped per tick. The single funnel for initial spread, refresh, state-change and retry. */
 #define SOFIA_PUBLISH_SWEEP_CAP 200	/* max PUBLISHes emitted per ~1s tick (drains a 5-10k fleet smoothly) */
 static void sofia_publication_sweep(su_root_magic_t *magic, su_timer_t *t, su_timer_arg_t *arg)
 {
@@ -640,8 +618,7 @@ static void sofia_publication_sweep(su_root_magic_t *magic, su_timer_t *t, su_ti
 	if (!publications) {
 		return;
 	}
-	/* The ONE PUBLISH scheduler (sofia_thread): initial spread, refresh, state-change and retry all
-	 * flow through next_send, so a due + not-in-flight pub is published here, capped per tick. */
+	/* Each due, not-in-flight pub is published here, capped per tick. */
 	it = ao2_iterator_init(publications, 0);
 	while ((pub = ao2_iterator_next(&it))) {
 		if (!pub->terminated && !pub->in_flight && pub->next_send != 0 && pub->next_send <= now
@@ -654,10 +631,9 @@ static void sofia_publication_sweep(su_root_magic_t *magic, su_timer_t *t, su_ti
 	ao2_iterator_destroy(&it);
 }
 
-/* Reconcile the live publication set with the just-applied config on a `sip reload` (sofia_thread, at
- * the end of sofia_reload_worker — same thread that owns publications, so teardown is UAF-safe). Mirrors
- * the peer mark-and-sweep. `config_changed` = publish_server/domain/expires differs from before the
- * reload (the target/entity/TTL formula changed for every pub). 3-way consensus. */
+/* Reconcile the publication set with the just-applied config on `sip reload` (sofia_thread, which owns
+ * publications, so teardown is UAF-safe). config_changed = publish_server/domain/expires differs from
+ * before the reload (the target/entity/TTL formula changed for every pub). */
 void sofia_publications_reconcile(int config_changed)
 {
 	struct ao2_iterator it, pit;
@@ -668,8 +644,8 @@ void sofia_publications_reconcile(int config_changed)
 		return;
 	}
 
-	/* publish_server removed, or the ESC/domain/TTL changed -> tear the whole set down, then (unless the
-	 * feature is now off) rebuild from publish=yes peers in a single create pass. */
+	/* publish_server removed or ESC/domain/TTL changed -> tear the whole set down, then (unless the
+	 * feature is now off) rebuild from publish=yes peers. */
 	if (config_changed || ast_strlen_zero(sofia_cfg.publish_server)) {
 		it = ao2_iterator_init(publications, 0);
 		while ((pub = ao2_iterator_next(&it))) {
@@ -691,10 +667,9 @@ void sofia_publications_reconcile(int config_changed)
 		return;
 	}
 
-	/* Incremental — THREE passes so a stale same-entity pub never blocks its replacement (Codex):
-	 * (1) mark all + UNMARK every pub a publish=yes peer still maps to (no creation yet); (2) SWEEP the
-	 * still-marked stale pubs (peer gone / publish=no / key changed); (3) CREATE the missing pubs — now
-	 * the stale ones are gone, so the entity-dedup cannot wrongly block a new presentity. */
+	/* Incremental - THREE passes so a stale same-entity pub never blocks its replacement:
+	 * (1) mark all + UNMARK every pub a publish=yes peer still maps to; (2) SWEEP the still-marked stale
+	 * pubs; (3) CREATE the missing ones - by now the stale ones are gone, so entity-dedup cannot block. */
 	it = ao2_iterator_init(publications, 0);
 	while ((pub = ao2_iterator_next(&it))) {
 		pub->_reload_marked = 1;
@@ -730,11 +705,9 @@ void sofia_publications_reconcile(int config_changed)
 	ao2_iterator_destroy(&pit);
 }
 
-/* Off-thread `sip show publications` reads the sofia_thread-owned publication set via a SYNCHRONOUS
- * snapshot (3-way + Codex safety refinement): a builder is dispatched onto sofia_thread (the single
- * owner), formats all rows into a ref-counted ast_str, and signals; the CLI thread waits (bounded) then
- * prints. AO2 protects object lifetime but NOT coherent reads of etag/next_send/in_flight/last_status, so
- * we never read those from the CLI thread. */
+/* `sip show publications` snapshot request. The CLI thread dispatches a builder onto sofia_thread (the
+ * single owner of the pub set) and waits on this cond; ao2 protects object lifetime but NOT coherent
+ * reads of etag/next_send/in_flight/last_status, so those are only ever read on sofia_thread. */
 struct sofia_pubsnapshot_req {
 	ast_mutex_t mutex;
 	ast_cond_t cond;
@@ -750,7 +723,7 @@ static void sofia_pubsnapshot_req_destructor(void *obj)
 	ast_cond_destroy(&req->cond);
 	ast_free(req->out);
 }
-
+/* Format a pub next-send time for the CLI table (in-flight / - / due / Ns). */
 static const char *sofia_pub_nextsend_str(struct sofia_publication *pub, time_t now, char *buf, size_t len)
 {
 	if (pub->in_flight) {
@@ -774,8 +747,7 @@ static void sofia_pubsnapshot_build(void *data)
 	time_t now = time(NULL);
 	int count = 0;
 
-	/* LastState = what we last PUBLISHed; Current = what the hint is NOW (Codex: the key ops diagnostic
-	 * is "is the published state stale vs the live hint state?"). */
+	/* LastState = what we last PUBLISHed; Current = the live hint state now (is the publish stale?). */
 	ast_str_set(&req->out, 0, "%-16.16s  %-26.26s  %-11.11s  %-11.11s  %-4s  %-7s  %-9s  %-6s  %s\n",
 		"Peer", "Presentity", "LastState", "Current", "ETag", "Expires", "NextSend", "Last", "Target");
 	if (publications) {
@@ -817,7 +789,7 @@ static void sofia_pubsnapshot_build(void *data)
 	ast_mutex_unlock(&req->mutex);
 	ao2_ref(req, -1);	/* drop the builder's ref */
 }
-
+/* CLI `sip show publications` - dispatches the snapshot builder to sofia_thread and prints it. */
 char *sofia_cli_show_publications(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
 	struct sofia_pubsnapshot_req *req;
@@ -880,13 +852,13 @@ char *sofia_cli_show_publications(struct ast_cli_entry *e, int cmd, struct ast_c
 
 
 /* ---- lifecycle (called from chan_sofia.c) — hand-written to preserve the original behavior ---- */
-
+/* Allocate the publications container. Returns 0 on success. */
 int sofia_publications_init(void)
 {
 	publications = ao2_container_alloc(MAX_PUBLICATION_BUCKETS, publication_hash_fn, publication_cmp_fn);
 	return publications ? 0 : -1;
 }
-
+/* Release the publications container. */
 void sofia_publications_destroy(void)
 {
 	if (publications) {
@@ -894,7 +866,7 @@ void sofia_publications_destroy(void)
 		publications = NULL;
 	}
 }
-
+/* Create publications for all publish=yes peers and start the refresh sweep timer (sofia_thread). */
 void sofia_publications_start(void)
 {
 	struct ao2_iterator pit;
@@ -920,7 +892,7 @@ void sofia_publications_start(void)
 			"be sent or refreshed\n");
 	}
 }
-
+/* Stop the sweep timer and tear down every publication (sofia_thread). */
 void sofia_publications_stop(void)
 {
 	if (publication_refresh_timer) {

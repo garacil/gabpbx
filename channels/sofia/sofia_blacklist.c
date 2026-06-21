@@ -28,7 +28,7 @@
 #define SOFIA_BLACKLIST_BUCKETS 1024
 #define SOFIA_BLACKLIST_MAX_DEFAULT 1024
 #define SOFIA_BLACKLIST_COUNT_DEFAULT 5
-#define SOFIA_BLACKLIST_TTL_DEFAULT 600   /* seconds of inactivity after which a blacklisted IP's counter decays (0 = never) */
+#define SOFIA_BLACKLIST_TTL_DEFAULT 600   /* seconds of inactivity after which the counter decays (0 = never) */
 
 struct sofia_blacklist_entry {
 	char ip[80];
@@ -42,14 +42,14 @@ static int sofia_blacklist_max = SOFIA_BLACKLIST_MAX_DEFAULT;
 static int sofia_blacklist_count = SOFIA_BLACKLIST_COUNT_DEFAULT;
 static int sofia_blacklist_ttl = SOFIA_BLACKLIST_TTL_DEFAULT;
 AST_MUTEX_DEFINE_STATIC(sofia_blacklist_lock);
-
+/* ao2 hash: case-insensitive on the IP string. */
 static int sofia_blacklist_hash_fn(const void *obj, int flags)
 {
 	const struct sofia_blacklist_entry *entry = obj;
 
 	return ast_str_case_hash(entry->ip);
 }
-
+/* ao2 cmp: match by IP, case-insensitive. */
 static int sofia_blacklist_cmp_fn(void *obj, void *arg, int flags)
 {
 	struct sofia_blacklist_entry *entry = obj;
@@ -57,7 +57,7 @@ static int sofia_blacklist_cmp_fn(void *obj, void *arg, int flags)
 
 	return !strcasecmp(entry->ip, match->ip) ? (CMP_MATCH | CMP_STOP) : 0;
 }
-
+/* Stringify a sockaddr IP (no port) into buf. Returns -1 if addr/buf is unusable. */
 static int sofia_blacklist_ip_from_addr(const struct ast_sockaddr *addr, char *buf, size_t len)
 {
 	const char *ip;
@@ -74,7 +74,7 @@ static int sofia_blacklist_ip_from_addr(const struct ast_sockaddr *addr, char *b
 	ast_copy_string(buf, ip, len);
 	return 0;
 }
-
+/* Resolve the source IP of a SIP message into buf. */
 static int sofia_blacklist_ip_from_sip(sip_t const *sip, char *buf, size_t len)
 {
 	struct ast_sockaddr src;
@@ -83,7 +83,7 @@ static int sofia_blacklist_ip_from_sip(sip_t const *sip, char *buf, size_t len)
 	sofia_get_source_addr(sip, &src);
 	return sofia_blacklist_ip_from_addr(&src, buf, len);
 }
-
+/* Normalize a CLI-supplied IP string (parse+restringify, else copy verbatim). */
 static int sofia_blacklist_ip_from_text(const char *text, char *buf, size_t len)
 {
 	struct ast_sockaddr addr;
@@ -101,7 +101,7 @@ static int sofia_blacklist_ip_from_text(const char *text, char *buf, size_t len)
 	ast_copy_string(buf, text, len);
 	return 0;
 }
-
+/* Record (add=1) and/or test an IP. Returns 1 once it reaches the block threshold (held under sofia_blacklist_lock). */
 static int sofia_blacklist_check_ip(const char *ip, int add, const char *reason)
 {
 	struct sofia_blacklist_entry key;
@@ -120,17 +120,9 @@ static int sofia_blacklist_check_ip(const char *ip, int add, const char *reason)
 	entry = ao2_find(sofia_blacklist, &key, OBJ_POINTER);
 	if (!entry && add) {
 		if (ao2_container_count(sofia_blacklist) >= sofia_blacklist_max) {
-			/* LRU eviction — find the entry with the oldest last_seen
-			 * and remove it to make room for the new offender.  Without
-			 * this, the historical "Sofia blacklist FULL" rejection meant
-			 * any attacker rotating IPs beyond the cap (default 1024)
-			 * would escape blacklisting entirely, converting a working
-			 * defence into a "first 1024 wins" race that the attacker
-			 * always wins.  The walk is O(N) bounded by sofia_blacklist_
-			 * max and only fires on overflow, so per-INVITE/REGISTER cost
-			 * stays at the normal ao2_find.  Held under sofia_blacklist_
-			 * lock so the iterator + the eviction + the new alloc + link
-			 * are atomic against concurrent blacklist mutations. */
+			/* At cap: evict the oldest-last_seen entry so an attacker rotating IPs past
+			 * the cap cannot escape blacklisting (the old "FULL" reject was "first N wins").
+			 * O(N) walk, fires only on overflow. */
 			struct sofia_blacklist_entry *oldest = NULL;
 			struct sofia_blacklist_entry *cand;
 			struct ao2_iterator i = ao2_iterator_init(sofia_blacklist, 0);
@@ -155,8 +147,7 @@ static int sofia_blacklist_check_ip(const char *ip, int add, const char *reason)
 				ao2_unlink(sofia_blacklist, oldest);
 				ao2_ref(oldest, -1);
 			} else {
-				/* Should not happen — container_count >= max but iterator
-				 * found nothing.  Bail honestly. */
+				/* count >= max but the walk found nothing - bail honestly. */
 				ast_log(LOG_ERROR,
 					"Sofia blacklist at cap (%d) but LRU walk found "
 					"nothing to evict — refusing new entry for %s\n",
@@ -177,15 +168,10 @@ static int sofia_blacklist_check_ip(const char *ip, int add, const char *reason)
 		ao2_link(sofia_blacklist, entry);
 	}
 	if (entry) {
-		/* Decay-on-inactivity (fail2ban model): an offender whose last counted
-		 * failure is older than the TTL is forgiven — reset its counter and start a
-		 * fresh window. Without this an IP that once tripped the threshold stayed
-		 * blocked until module reload, so a transient burst (a handset with a stale
-		 * password later fixed, or a shared NAT) was punished permanently. Once an
-		 * IP is blocked its requests are dropped at the gate (the add=0 check path)
-		 * WITHOUT calling add, so last_seen freezes and the ban auto-expires TTL
-		 * after the last counted failure; a still-active attacker must then
-		 * re-accumulate sofia_blacklist_count failures to be re-blocked. */
+		/* Decay-on-inactivity (fail2ban model): if the last counted failure is older
+		 * than the TTL, forgive - reset the counter and start a fresh window. A blocked
+		 * IP is dropped at the gate (add=0) so last_seen freezes and the ban auto-expires
+		 * TTL after the last failure; a live attacker must re-accumulate the threshold. */
 		if (sofia_blacklist_ttl > 0 && entry->last_seen > 0
 				&& (now - entry->last_seen) > sofia_blacklist_ttl) {
 			entry->counter = 0;
@@ -207,7 +193,7 @@ static int sofia_blacklist_check_ip(const char *ip, int add, const char *reason)
 
 	return blocked;
 }
-
+/* Count a failure for the source IP of sip. Returns 1 if it is now blocked. */
 int sofia_blacklist_add_sip(sip_t const *sip, const char *reason)
 {
 	char ip[80];
@@ -218,7 +204,7 @@ int sofia_blacklist_add_sip(sip_t const *sip, const char *reason)
 
 	return sofia_blacklist_check_ip(ip, 1, reason);
 }
-
+/* Test-only (no count) whether the source IP of sip is currently blocked. */
 int sofia_blacklist_check_sip(sip_t const *sip)
 {
 	char ip[80];
@@ -233,7 +219,7 @@ int sofia_blacklist_check_sip(sip_t const *sip)
 
 	return 1;
 }
-
+/* CLI `sip show blacklist`. */
 char *sofia_cli_show_blacklist(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
 #define BLACKLIST_FORMAT "%-39s %-11s %-19s %-19s\n"
@@ -258,10 +244,9 @@ char *sofia_cli_show_blacklist(struct ast_cli_entry *e, int cmd, struct ast_cli_
 	}
 
 	ast_cli(a->fd, BLACKLIST_FORMAT, "IP", "Counter", "First seen", "Last seen");
-	/* Round4 C3 (Codex consensus): accumulate the rows into a heap buffer UNDER the
-	 * lock, then emit them with a single ast_cli AFTER releasing it — the auth-failure
-	 * path on sofia_thread also takes sofia_blacklist_lock, so a blocking CLI write
-	 * held across the iteration stalls signaling. */
+	/* Build all rows into a heap buffer UNDER the lock, then emit with one ast_cli AFTER
+	 * releasing it: the auth-failure path on sofia_thread also takes this lock, so a CLI
+	 * write held across the iteration would stall signaling. */
 	struct ast_str *bl_buf = ast_str_create(2048);
 	ast_mutex_lock(&sofia_blacklist_lock);
 	iter = ao2_iterator_init(sofia_blacklist, 0);
@@ -300,7 +285,7 @@ char *sofia_cli_show_blacklist(struct ast_cli_entry *e, int cmd, struct ast_cli_
 	return CLI_SUCCESS;
 #undef BLACKLIST_FORMAT
 }
-
+/* CLI `sip blacklist search <IP>`. */
 char *sofia_cli_blacklist_search(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
 	struct sofia_blacklist_entry key;
@@ -340,7 +325,7 @@ char *sofia_cli_blacklist_search(struct ast_cli_entry *e, int cmd, struct ast_cl
 
 	return CLI_SUCCESS;
 }
-
+/* CLI `sip blacklist delete <IP>`. */
 char *sofia_cli_blacklist_delete(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
 	struct sofia_blacklist_entry key;
@@ -379,7 +364,7 @@ char *sofia_cli_blacklist_delete(struct ast_cli_entry *e, int cmd, struct ast_cl
 
 	return CLI_SUCCESS;
 }
-
+/* ao2 callback: counts and unlinks every entry. */
 static int sofia_blacklist_clear_cb(void *obj, void *arg, int flags)
 {
 	int *count = arg;
@@ -387,7 +372,7 @@ static int sofia_blacklist_clear_cb(void *obj, void *arg, int flags)
 	(*count)++;
 	return CMP_MATCH;
 }
-
+/* CLI `sip blacklist clear`. */
 char *sofia_cli_blacklist_clear(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
 	int deleted = 0;
@@ -418,14 +403,14 @@ char *sofia_cli_blacklist_clear(struct ast_cli_entry *e, int cmd, struct ast_cli
 	return CLI_SUCCESS;
 }
 
-
+/* Allocate the blacklist container. Returns 0 on success. */
 int sofia_blacklist_init(void)
 {
 	sofia_blacklist = ao2_container_alloc(SOFIA_BLACKLIST_BUCKETS,
 		sofia_blacklist_hash_fn, sofia_blacklist_cmp_fn);
 	return sofia_blacklist ? 0 : -1;
 }
-
+/* Release the blacklist container. */
 void sofia_blacklist_destroy(void)
 {
 	if (sofia_blacklist) {
