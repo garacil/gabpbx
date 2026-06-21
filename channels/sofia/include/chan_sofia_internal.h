@@ -22,6 +22,7 @@
 #define CHAN_SOFIA_INTERNAL_H
 
 #include "gabpbx/channel.h"	/* AST_MAX_CONTEXT / AST_MAX_EXTENSION */
+#include "gabpbx/pbx.h"		/* enum ast_extension_states */
 #include "gabpbx/acl.h"		/* struct ast_ha */
 #include "gabpbx/frame.h"	/* struct ast_codec_pref */
 #include "gabpbx/netsock2.h"	/* struct ast_sockaddr */
@@ -177,6 +178,51 @@ int sofia_debug_match(const char *peer_name, const char *src_ip);
 int sofia_reload_request_sync(char *errmsg, size_t errmsglen, int timeout_ms);
 void sofia_peer_drain_mwi(struct sofia_peer *peer);
 void sofia_emit_register_side_effects(struct sofia_peer *peer, sip_t const *sip, const struct sofia_register_update *update);
+
+#define SOFIA_PRESENCE_DEFAULT_EXPIRY 3600	/* used when the SUBSCRIBE omits Expires */
+
+enum sofia_sub_format {
+	SOFIA_SUB_DIALOG_INFO = 0,	/* application/dialog-info+xml (BLF) */
+	SOFIA_SUB_PIDF,			/* application/pidf+xml */
+	SOFIA_SUB_XPIDF,		/* application/xpidf+xml (Polycom/MSN) */
+	SOFIA_SUB_CPIM_PIDF,		/* application/cpim-pidf+xml */
+};
+
+struct sofia_presence_sub {
+	char subkey[200];			/* "peername|exten|context" — container key */
+	nua_handle_t *nh;			/* subscription dialog handle (NOT bound as hmagic;
+						 * correlated via sofia_presence_find_by_nh) */
+	char exten[AST_MAX_EXTENSION];		/* watched extension (To user) */
+	char context[AST_MAX_CONTEXT];		/* hint lookup context */
+	char entity[256];			/* watched resource URI: sip:exten@domain */
+	char peername[80];			/* subscriber peer name (From user) for AMI */
+	char watcher_addr[64];			/* subscriber source addr for AMI */
+	char nat_proxy[128];			/* NUTAG_PROXY target for NAT watchers — routes NOTIFY to
+						 * the public source not the private Contact (else 408s).
+						 * Empty for non-NAT peers. */
+	char event[16];				/* "dialog" or "presence" (NOTIFY Event hdr) */
+	enum sofia_sub_format format;		/* negotiated body type */
+	int stateid;				/* ast_extension_state_add_destroy id (-1 = none) */
+	int laststate;				/* last AST_EXTENSION_* pushed */
+	uint32_t version;			/* monotonic dialog-info version= counter */
+	int expires;				/* granted subscription lifetime (seconds) */
+	time_t expires_at;			/* absolute expiry, for Subscription-State expires= */
+	int terminated;				/* set on sofia_thread at teardown (idempotency) */
+};
+
+extern struct ao2_container *presence_subs;
+void presence_sub_destructor(void *obj);
+void sofia_presence_emit_notify(struct sofia_presence_sub *sub, int state, int terminate);
+void sofia_presence_teardown(struct sofia_presence_sub *sub, int send_terminated);
+int sofia_presence_state_cb(char *context, char *exten, enum ast_extension_states state, void *data);
+void sofia_presence_sub_destroy_cb(int id, void *data);
+struct sofia_presence_sub *sofia_presence_find_by_nh(nua_handle_t *nh);
+const char *sofia_presence_mime(enum sofia_sub_format f);
+int sofia_substate_terminated(tagi_t tags[]);
+int sofia_presence_init(void);
+void sofia_presence_destroy(void);
+void sofia_presence_start(void);
+void sofia_presence_stop(void);
 
 /* Per-peer reachability state (qualify). */
 enum sofia_peer_status {
