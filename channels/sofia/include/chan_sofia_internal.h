@@ -155,6 +155,10 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len);
 int sofia_sdp_extract_hold(sip_t const *sip, su_home_t *home);
 
 struct sofia_peer *sofia_find_peer(const char *name);
+struct sofia_peer *sofia_find_peer_cached(const char *name);	/* cache-only: no realtime fallback */
+/* Normalize peer/[general] outboundproxy into a "sip:HOST[:PORT];lr" Route; buf empty if none.
+ * Caller MUST hold peer->lock. Shared by REGISTER + the outbound MWI SUBSCRIBE (sofia_subscribe.c). */
+void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len);
 /* Remove the per-token PRIORITY_HINT extensions for a regexten spec (ext1[@ctx]&ext2...). Splits like
  * the hint creator so multi-token hints are fully reclaimed; registrar matches the creator. */
 void sofia_remove_peer_hints(const char *regexten, const char *subscribecontext, const char *registrar);
@@ -165,6 +169,18 @@ const char *sofia_uri_format_host(const char *host, char *out_buf, size_t out_le
 void sofia_uri_append_transport(char *url, size_t len, const char *transport);
 void sofia_qualify_peer(struct sofia_peer *peer);
 #define SOFIA_SIPNOTIFY_HMAGIC ((nua_hmagic_t *)&sofia_sipnotify_sentinel)
+
+/*! \brief Outbound MWI SUBSCRIBE (a watcher), in sofia_subscribe.c. The sofia_mwisub object +
+ * the SOFIA_MWISUB_HMAGIC sentinel are private to that .c. ALL nua_* run on sofia_thread. */
+int sofia_subscribe_init(void);			/* alloc the container (load_module) */
+void sofia_subscribe_stop(void);		/* tear down every watcher's handle (Sofia thread, before nua_destroy) */
+void sofia_subscribe_destroy(void);		/* drop the container only (after the Sofia thread has stopped) */
+void sofia_subscribe_start(void);		/* startup sweep: start a watcher per mwi_subscribe= static-host peer (Sofia thread) */
+void sofia_subscribe_reconcile(void);		/* sip reload: add/remove watchers to match the new config (Sofia thread) */
+void sofia_subscribe_on_registered(struct sofia_peer *peer);	/* outbound REGISTER 200 -> start the peer's watcher */
+int sofia_subscribe_on_subscribe_response(nua_handle_t *nh, sip_t const *sip, int status);	/* nua_r_subscribe; 1 = consumed */
+int sofia_subscribe_on_notify(nua_handle_t *nh, nua_t *nua, sip_t const *sip);	/* nua_i_notify; 1 = consumed (200-OK'd) */
+void sofia_subscribe_on_peer_gone(const char *peername);	/* peer removed/pruned -> tear down its watcher (Sofia thread) */
 
 struct sipqualifypeer_data {
 	struct sofia_peer *peer;	/* +1 ref TRANSFERRED to callback (caller doesn't drop) */
@@ -394,6 +410,7 @@ struct sofia_peer {
 		AST_STRING_FIELD(cid_tag);    /* per-peer CID tag (chan_sip parity); overrides sofia-sip auto-generated From-tag at sofia_build_from when set. */
 		AST_STRING_FIELD(forceddiversion);  /* per-trunk DID forced into the outbound Diversion header (RFC 5806) on a forwarded call, so the carrier gets a trunk-owned number it can validate. Empty = disabled (legacy data-driven Diversion preserved). Read by sofia_add_diversion under peer->lock. */
 		AST_STRING_FIELD(message_context);  /* per-peer override of [general] message_context for inbound out-of-dialog MESSAGE; empty inherits */
+		AST_STRING_FIELD(mwi_subscribe);    /* outbound MWI watcher: <localmailbox>[@context]; chan_sofia SUBSCRIBEs this peer (trunk) for Event: message-summary and injects the received MWI into the LOCAL ast_event MWI cache. Empty = off. DISTINCT from the subscribemwi inbound bool. */
 		AST_STRING_FIELD(nonce);
 		AST_STRING_FIELD(outboundproxy);	/* per-peer outbound proxy override; empty = inherit sofia_cfg.outboundproxy or no Route */
 		AST_STRING_FIELD(srtpcipher);		/* comma-separated SRTP suite preference; empty = inherit sofia_cfg.default_srtpcipher or sdp_crypto.c default AES_CM_128_HMAC_SHA1_80 */

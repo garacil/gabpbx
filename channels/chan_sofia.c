@@ -172,6 +172,7 @@
 #include "sofia/include/sofia_t38.h"
 #include "sofia/include/sofia_message.h"
 #include "sofia/include/sofia_transfer.h"
+#include "sofia/include/sofia_subscribe.h"
 
 #include <sofia-sip/nua.h>
 #include <sofia-sip/su.h>
@@ -1655,7 +1656,7 @@ static struct sofia_pvt *sofia_pvt_alloc(void)
 /* Forward declarations (definitions live further down). */
 int sofia_dispatch_to_root_thread(void (*callback)(void *), void *data);
 static void transmit_mwi_notify_for_peer(struct sofia_peer *peer);
-static void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len);
+void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len);
 /* sofia_resolve_ourip mirrors ast_sip_ouraddrfor (kernel routing + externaddr remap). */
 static void sofia_resolve_ourip(struct sofia_pvt *pvt, const struct ast_sockaddr *target);
 static void sofia_build_from(struct sofia_pvt *pvt, char *buf, size_t len);
@@ -1860,6 +1861,16 @@ void sofia_peer_drain_mwi(struct sofia_peer *peer)
 	}
 }
 
+/* sofia_thread trampoline (F1a): tear down a removed peer's outbound MWI watcher, then free the heap
+ * name. Dispatched from sofia_peer_destructor so the teardown runs on the thread that owns mwisubs. */
+static void sofia_subscribe_peer_gone_cb(void *data)
+{
+	char *name = data;
+
+	sofia_subscribe_on_peer_gone(name);
+	ast_free(name);
+}
+
 static void sofia_peer_destructor(void *obj)
 {
 	struct sofia_peer *peer = obj;
@@ -1896,6 +1907,20 @@ static void sofia_peer_destructor(void *obj)
 			mb->event_sub = ast_event_unsubscribe(mb->event_sub);
 		}
 		ast_free(mb);
+	}
+
+	/* F1a: tear down this peer's OUTBOUND MWI watcher (sofia_subscribe.c) on sofia_thread so it
+	 * neither leaks nor blocks a same-named re-create (e.g. after `sip prune realtime`). strdup the
+	 * name because the peer is being freed; the trampoline frees it. */
+	{
+		char *gone_name = ast_strdup(peer->name);
+
+		if (gone_name && sofia_dispatch_to_root_thread(sofia_subscribe_peer_gone_cb, gone_name) < 0) {
+			/* Same convention as the inbound-MWI dispatch above: log + accept the deferral. */
+			ast_log(LOG_NOTICE, "Sofia MWI-SUBSCRIBE: peer %s destructor — sofia_thread dispatch "
+				"failed; watcher teardown deferred to next reload/restart\n", peer->name);
+			ast_free(gone_name);
+		}
 	}
 
 	/* Destroy the MWI subscription on sofia_thread; nua_handle_bind(nh, NULL)
@@ -2080,6 +2105,7 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	/* ""/0 so a removed per-peer key reverts on reload (inherit-at-use-time). */
 	ast_string_field_set(peer, forceddiversion, "");
 	ast_string_field_set(peer, message_context, "");
+	ast_string_field_set(peer, mwi_subscribe, "");
 	ast_string_field_set(peer, callbackextension, "");
 	ast_string_field_set(peer, accountcode, "");
 	ast_string_field_set(peer, cid_name, "");
@@ -2350,6 +2376,10 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 		} else if (!strcasecmp(v->name, "message_context")) {
 			/* Per-peer override for inbound out-of-dialog MESSAGE dialplan dispatch. */
 			ast_string_field_set(peer, message_context, v->value);
+		} else if (!strcasecmp(v->name, "mwi_subscribe")) {
+			/* Outbound MWI watcher: <localmailbox>[@context]. SUBSCRIBE this trunk for
+			 * Event: message-summary and inject the result into the local MWI cache. */
+			ast_string_field_set(peer, mwi_subscribe, v->value);
 		} else if (!strcasecmp(v->name, "callerid")) {
 			ast_string_field_set(peer, callerid, v->value);
 		} else if (!strcasecmp(v->name, "regexten")) {
@@ -2882,6 +2912,20 @@ struct sofia_peer *sofia_find_peer(const char *name)
 
 	ao2_unlock(peers);
 	return found;
+}
+
+/* Cache-only peer lookup: ao2_find on the in-memory container ONLY, never the realtime DB fallback that
+ * sofia_find_peer() takes on a miss. Required where a realtime reload would be WRONG — e.g. the MWI
+ * watcher peer-gone guard (sofia_subscribe_on_peer_gone), which must NOT resurrect a peer that
+ * `sip prune realtime` just unlinked (that only unlinks the cache; the DB row survives). +1 ref or NULL. */
+struct sofia_peer *sofia_find_peer_cached(const char *name)
+{
+	struct sofia_peer_key key = { .name = name };
+
+	if (ast_strlen_zero(name) || !peers) {
+		return NULL;
+	}
+	return ao2_find(peers, &key, OBJ_POINTER);
 }
 
 /* chan_sip parity: IP-based fallback peer match.
@@ -8320,7 +8364,7 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
  * "sip:HOST[:PORT];lr" Route URI; buf empty if no proxy applies. Accepts bare host /
  * host:port / full sip:URI. Caller MUST hold peer->lock (reload writer may free the
  * stringfield pool even with a ref held; sofia_do_register is load-time exempt). */
-static void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len)
+void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len)
 {
 	const char *spec;
 	int has_scheme;
@@ -8976,6 +9020,13 @@ static void sofia_process_notify(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 {
 	if (sofia_debug)
 		ast_verbose("Sofia: Received NOTIFY\n");
+
+	/* Outbound MWI SUBSCRIBE (a watcher): a message-summary NOTIFY on one of OUR SUBSCRIBE
+	 * dialogs. Checked FIRST (before the transfer hook and presence/MWI dispatch). The check
+	 * is pvt-free — it only reads nua_handle_magic — and 200-OKs internally when it consumes. */
+	if (sofia_subscribe_on_notify(nh, nua, sip)) {
+		return;
+	}
 
 	/* refer-event NOTIFY (outbound transfer progress). The event callback does NOT pin
 	 * pvt for nua_i_notify (op is the raw hmagic), so re-validate/pin by the handle magic.
@@ -10104,6 +10155,10 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 								syslabel, sysname,
 								SENTINEL);
 						}
+						/* Outbound MWI SUBSCRIBE (a watcher): now that this trunk is
+						 * registered, start (idempotently) its message-summary watcher
+						 * if mwi_subscribe is configured. No-op otherwise. */
+						sofia_subscribe_on_registered(peer);
 					}
 				}
 			} else if (status == 401 || status == 407) {
@@ -10679,6 +10734,10 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		sofia_message_reap_outbound(nh, status);
 		break;
 	case nua_r_subscribe:
+		/* Outbound MWI SUBSCRIBE (a watcher) response — reactive digest auth + status handling.
+		 * Returns 1 (break) when nh is one of our MWISUB handles. */
+		if (sofia_subscribe_on_subscribe_response(nh, sip, status))
+			break;
 		if (sofia_debug)
 			ast_verbose("Sofia: SUBSCRIBE response %d %s\n", status, phrase);
 		break;
@@ -10959,12 +11018,21 @@ static void *sofia_thread_func(void *data)
 	 * sofia_publications_reconcile (no restart needed for PUBLISH config). */
 	sofia_publications_start();
 
+	/* Outbound MWI SUBSCRIBE (a watcher) STARTUP pass on sofia_thread: subscribe each
+	 * mwi_subscribe= static-host peer for Event: message-summary. register=> trunks also
+	 * (re)start via sofia_subscribe_on_registered after their REGISTER 200. A later
+	 * `sip reload` reconciles via sofia_subscribe_reconcile. */
+	sofia_subscribe_start();
+
 	su_root_run(sofia_root);
 
 	sofia_presence_stop();
 
 	/* Outbound PUBLISH teardown (sofia_thread, after the loop ends). */
 	sofia_publications_stop();
+
+	/* Outbound MWI SUBSCRIBE watcher teardown (sofia_thread, before nua_destroy). */
+	sofia_subscribe_stop();
 
 	/* Ownership-correct teardown — su_root_destroy MUST run on the creating thread
 	 * (sofia-sip asserts; cross-thread aborts). unload_module signals us via
@@ -12073,6 +12141,10 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "message_context")) {
 			/* Per-peer override for inbound out-of-dialog MESSAGE dialplan dispatch. */
 			ast_string_field_set(peer, message_context, v->value);
+		} else if (!strcasecmp(v->name, "mwi_subscribe")) {
+			/* Outbound MWI watcher: <localmailbox>[@context]. SUBSCRIBE this trunk for
+			 * Event: message-summary and inject the result into the local MWI cache. */
+			ast_string_field_set(peer, mwi_subscribe, v->value);
 		} else if (!strcasecmp(v->name, "type")) {
 			if (!strcasecmp(v->value, "friend")) {
 				peer->type = SOFIA_TYPE_FRIEND;
@@ -13503,6 +13575,9 @@ static void sofia_reload_worker(void *data)
 			/* a format change must full-rebuild: RFC 3903 keys ESC state by Event package + ETag, so
 			 * we teardown the old (old Event + old ETag) and re-PUBLISH fresh with no If-Match. */
 			|| pub_format_was != sofia_cfg.publish_format);
+
+		/* Outbound MWI-SUBSCRIBE reconcile: add/remove watchers to match the new config. */
+		sofia_subscribe_reconcile();
 	}
 
 	ast_config_destroy(cfg);
@@ -13576,6 +13651,13 @@ static int load_module(void)
 	/* outbound PUBLISH (RFC 3903): one publication per publish=yes peer. */
 	if (sofia_publications_init()) {
 		ast_log(LOG_ERROR, "Unable to create Sofia publications container\n");
+		rc = AST_MODULE_LOAD_FAILURE;
+		goto err_cleanup;
+	}
+
+	/* outbound MWI SUBSCRIBE (a watcher): one subscription per mwi_subscribe= peer. */
+	if (sofia_subscribe_init()) {
+		ast_log(LOG_ERROR, "Unable to create Sofia MWI-subscribe container\n");
 		rc = AST_MODULE_LOAD_FAILURE;
 		goto err_cleanup;
 	}
@@ -13716,6 +13798,7 @@ err_cleanup:
 	sofia_blacklist_destroy();
 	sofia_presence_destroy();
 	sofia_publications_destroy();
+	sofia_subscribe_destroy();
 	if (dialogs) {
 		ao2_ref(dialogs, -1);
 		dialogs = NULL;
@@ -13807,6 +13890,7 @@ static int unload_module(void)
 	sofia_blacklist_destroy();
 	sofia_presence_destroy();
 	sofia_publications_destroy();
+	sofia_subscribe_destroy();
 
 	return 0;
 }
