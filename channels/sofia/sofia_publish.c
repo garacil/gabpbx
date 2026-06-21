@@ -58,6 +58,7 @@ struct sofia_publication {
 	int stateid;				/* ast_extension_state_add_destroy id (-1 = none) */
 	int laststate;				/* last AST_EXTENSION_* published */
 	uint32_t version;			/* dialog-info version= counter */
+	enum sofia_sub_format format;		/* body format: DIALOG_INFO (default) or PIDF ([general] publish_format) */
 	int expires;				/* configured PUBLISH Expires (seconds) */
 	unsigned in_flight:1;			/* a nua_method PUBLISH awaits its nua_r_method */
 	time_t next_send;			/* when the sweep should (re)PUBLISH this pub; 0 = not scheduled.
@@ -116,53 +117,20 @@ static struct sofia_publication *sofia_publication_find_by_nh(nua_handle_t *nh)
 	return found;
 }
 
-/* Build the dialog-info+xml PUBLISH body. XML-escapes the operator-supplied exten + entity
- * (injection safety). Separate from the NOTIFY builder so that body stays byte-identical. */
+/* SIP Event package for a publication's body format: RFC 4235 dialog-info -> "dialog";
+ * RFC 3856 presence (PIDF) -> "presence". RFC 3903 §4.1/§6: the body's content-type must match the
+ * Event package, or the ESC rejects it. */
+static const char *sofia_publication_event(enum sofia_sub_format f)
+{
+	return (f == SOFIA_SUB_DIALOG_INFO) ? "dialog" : "presence";
+}
+
+/* Build the PUBLISH body via the SHARED presence/dialog-info builder (one source of truth with the
+ * NOTIFY path). pub->format selects dialog-info (default) or PIDF. XML-escaping is done inside. */
 static void sofia_publication_build_body(struct ast_str **buf, struct sofia_publication *pub, int state)
 {
-	const char *statestring, *pidfstate, *pidfnote;
-	int local_state;
-	char hint[AST_MAX_EXTENSION];
-	char exten_esc[AST_MAX_EXTENSION * 6];		/* *6: ast_xml_escape worst-case expansion */
-	char entity_esc[sizeof(pub->entity) * 6];
-
-	sofia_presence_state_map(state, &statestring, &pidfstate, &pidfnote, &local_state);
-
-	if (local_state == 0 && ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, pub->context, pub->exten)) {
-		char *h = hint, *one;
-		int total = 0, unavail = 0;
-		while ((one = strsep(&h, "&"))) {
-			total++;
-			if (ast_device_state(one) == AST_DEVICE_UNAVAILABLE) {
-				unavail++;
-			}
-		}
-		if (total > 0 && total == unavail) {
-			statestring = "terminated";	/* all devices offline -> no active dialog */
-		}
-	}
-
-	ast_xml_escape(pub->exten, exten_esc, sizeof(exten_esc));
-	ast_xml_escape(pub->entity, entity_esc, sizeof(entity_esc));
-
-	ast_str_set(buf, 0, "%s", "<?xml version=\"1.0\"?>\n");
-	ast_str_append(buf, 0,
-		"<dialog-info xmlns=\"urn:ietf:params:xml:ns:dialog-info\" "
-		"version=\"%u\" state=\"full\" entity=\"%s\">\n",
-		pub->version, entity_esc);
-	if (state & AST_EXTENSION_RINGING) {
-		ast_str_append(buf, 0, "<dialog id=\"%s\" direction=\"recipient\">\n", exten_esc);
-	} else {
-		ast_str_append(buf, 0, "<dialog id=\"%s\">\n", exten_esc);
-	}
-	ast_str_append(buf, 0, "<state>%s</state>\n", statestring);
-	if (state == AST_EXTENSION_ONHOLD) {
-		ast_str_append(buf, 0,
-			"<local>\n<target uri=\"%s\">\n"
-			"<param pname=\"+sip.rendering\" pvalue=\"no\"/>\n"
-			"</target>\n</local>\n", entity_esc);
-	}
-	ast_str_append(buf, 0, "</dialog>\n</dialog-info>\n");
+	sofia_presence_build_body_ex(buf, pub->exten, pub->context, pub->entity, pub->version,
+		pub->format, state);
 }
 
 /* Send a PUBLISH for `pub` reflecting the current hint state (sofia_thread ONLY). removing=1 ->
@@ -201,8 +169,8 @@ static void sofia_publication_send(struct sofia_publication *pub, int removing)
 	nua_method(pub->nh,
 		NUTAG_METHOD("PUBLISH"),
 		NUTAG_DIALOG(0),	/* generic method, not a dialog: do not create/refresh dialog target state */
-		SIPTAG_EVENT_STR("dialog"),
-		TAG_IF(!removing, SIPTAG_CONTENT_TYPE_STR("application/dialog-info+xml")),
+		SIPTAG_EVENT_STR(sofia_publication_event(pub->format)),
+		TAG_IF(!removing, SIPTAG_CONTENT_TYPE_STR(sofia_presence_mime(pub->format))),
 		TAG_IF(!removing && body != NULL, SIPTAG_PAYLOAD_STR(body ? ast_str_buffer(body) : "")),
 		TAG_IF(!ast_strlen_zero(pub->etag), SIPTAG_IF_MATCH_STR(pub->etag)),
 		SIPTAG_EXPIRES_STR(expires_str),
@@ -472,6 +440,7 @@ static void sofia_publication_create_one(struct sofia_peer *peer, const char *ex
 	}
 	pub->stateid = -1;
 	pub->etag[0] = '\0';
+	pub->format = sofia_cfg.publish_format;	/* dialog-info (default) or PIDF, per [general] publish_format */
 
 	/* RFC 3903 4: the PUBLISH R-URI is the PRESENTITY. We put the ESC's explicit port in the R-URI
 	 * (sip:exten@publish_domain:<ESC-port>) so first send AND every refresh hit the ESC. A Route header
@@ -555,7 +524,10 @@ static void sofia_publication_create_for_peer(struct sofia_peer *peer, int creat
 		return;
 	}
 
-	ast_copy_string(multi, S_OR(peer->regexten, peer->name), sizeof(multi));
+	/* What to publish: explicit publish_exten overrides; else the regexten hint(s); else the peer name.
+	 * Same ext1&ext2@ctx&... grammar either way. publish_exten lets the operator publish a different
+	 * presentity than the dialplan regexten (which also CREATES the hint). */
+	ast_copy_string(multi, S_OR(peer->publish_exten, S_OR(peer->regexten, peer->name)), sizeof(multi));
 	stringp = multi;
 	while ((tok = strsep(&stringp, "&"))) {
 		char *ctx = strchr(tok, '@');
@@ -596,7 +568,7 @@ static void sofia_publication_teardown(struct sofia_publication *pub)
 		if (!ast_strlen_zero(pub->etag)) {
 			nua_method(pub->nh, NUTAG_METHOD("PUBLISH"),
 				NUTAG_DIALOG(0),
-				SIPTAG_EVENT_STR("dialog"),
+				SIPTAG_EVENT_STR(sofia_publication_event(pub->format)),
 				SIPTAG_IF_MATCH_STR(pub->etag), SIPTAG_EXPIRES_STR("0"), TAG_END());
 		}
 		nua_handle_destroy(pub->nh);
@@ -892,7 +864,15 @@ void sofia_publications_start(void)
 			"be sent or refreshed\n");
 	}
 }
-/* Stop the sweep timer and tear down every publication (sofia_thread). */
+/* Stop the sweep timer and tear down every publication (sofia_thread). Each teardown best-effort sends
+ * an Expires:0 unpublish (sofia_publication_teardown), but note the KNOWN, BOUNDED, RFC-COMPLIANT limit
+ * (3-way reviewed; operator chose "document, not engineer around it"): on `systemctl stop` chan_sofia's
+ * unload_module returns -1 (no runtime unload), so this teardown path does NOT run before SIGKILL; and
+ * on a load-failure path nua_shutdown() has already set nua_shutdown_started=1, so nua_signal() rejects
+ * the Expires:0 nua_method (silently dropped). Either way the ESC clears the stale state on its own when
+ * the soft-state TTL lapses (RFC 3903 §3: PUBLISH is soft-state; §4.5 Expires:0 is for IMMEDIATE removal,
+ * not mandated on EPA shutdown). Worst-case staleness at the ESC = publish_expires (default 3600s) after
+ * chan_sofia disappears — tolerable for federation; for wallboards set a low publish_expires. */
 void sofia_publications_stop(void)
 {
 	if (publication_refresh_timer) {

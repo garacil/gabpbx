@@ -120,22 +120,25 @@ const char *sofia_presence_mime(enum sofia_sub_format f)
 	return "application/dialog-info+xml";
 }
 
-/* Build the NOTIFY body for sub->format (chan_sip parity) + the "all hinted
- * devices unavailable => offline" override. exten is XML-escaped. */
-static void sofia_presence_build_body(struct ast_str **buf, const struct sofia_presence_sub *sub, int state)
+/* Field-based body builder — the SINGLE source of truth for the dialog-info / PIDF / XPIDF / CPIM
+ * presence XML, shared by the presence NOTIFY (sofia_presence_build_body wrapper below) AND the
+ * outbound PUBLISH (sofia_publish.c). exten + entity are XML-escaped here. Plus the "all hinted
+ * devices unavailable => offline" override (chan_sip parity). */
+void sofia_presence_build_body_ex(struct ast_str **buf, const char *exten, const char *context,
+		const char *entity, uint32_t version, enum sofia_sub_format format, int state)
 {
 	const char *statestring, *pidfstate, *pidfnote;
 	int local_state;
 	char hint[AST_MAX_EXTENSION];
 	char exten_esc[AST_MAX_EXTENSION * 6];		/* *6: ast_xml_escape worst-case (&quot;) expansion */
-	char entity_esc[sizeof(sub->entity) * 6];
+	char entity_esc[256 * 6];			/* entity is a URI (<=256); *6 worst-case escape */
 
 	sofia_presence_state_map(state, &statestring, &pidfstate, &pidfnote, &local_state);
 
 	/* If every hinted device is unregistered, override "open" to offline (chan_sip
 	 * parity). Only runs when local_state is open — the override can never flip an
 	 * in-use/closed state, so the global hint rdlock + device scan stays off that path. */
-	if (local_state == 0 && ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, sub->context, sub->exten)) {
+	if (local_state == 0 && ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, context, exten)) {
 		char *h = hint, *one;
 		int total = 0, unavail = 0;
 		while ((one = strsep(&h, "&"))) {
@@ -146,16 +149,20 @@ static void sofia_presence_build_body(struct ast_str **buf, const struct sofia_p
 		}
 		if (total > 0 && total == unavail) {
 			local_state = 2;	/* closed */
+			/* Redundant today (local_state==0 here implies state_map already set statestring
+			 * "terminated" for NOT_INUSE/default) — kept explicit so dialog-info stays "terminated"
+			 * on all-offline even if the state_map table changes. */
+			statestring = "terminated";
 			pidfstate = "away";
 			pidfnote = "Not online";
 		}
 	}
 
-	ast_xml_escape(sub->exten, exten_esc, sizeof(exten_esc));
+	ast_xml_escape(exten, exten_esc, sizeof(exten_esc));
 	/* entity comes from the remote To header — escape before it enters XML. */
-	ast_xml_escape(sub->entity, entity_esc, sizeof(entity_esc));
+	ast_xml_escape(entity, entity_esc, sizeof(entity_esc));
 
-	switch (sub->format) {
+	switch (format) {
 	case SOFIA_SUB_XPIDF:
 	case SOFIA_SUB_CPIM_PIDF:
 		ast_str_append(buf, 0,
@@ -201,7 +208,7 @@ static void sofia_presence_build_body(struct ast_str **buf, const struct sofia_p
 		ast_str_append(buf, 0,
 			"<dialog-info xmlns=\"urn:ietf:params:xml:ns:dialog-info\" "
 			"version=\"%u\" state=\"full\" entity=\"%s\">\n",
-			sub->version, entity_esc);
+			version, entity_esc);
 		if (state & AST_EXTENSION_RINGING) {
 			ast_str_append(buf, 0, "<dialog id=\"%s\" direction=\"recipient\">\n", exten_esc);
 		} else {
@@ -217,6 +224,13 @@ static void sofia_presence_build_body(struct ast_str **buf, const struct sofia_p
 		ast_str_append(buf, 0, "</dialog>\n</dialog-info>\n");
 		break;
 	}
+}
+
+/* NOTIFY body wrapper — output byte-identical to before (delegates to the shared builder). */
+static void sofia_presence_build_body(struct ast_str **buf, const struct sofia_presence_sub *sub, int state)
+{
+	sofia_presence_build_body_ex(buf, sub->exten, sub->context, sub->entity, sub->version,
+		sub->format, state);
 }
 
 /* Emit one NOTIFY for sub at the given state, plus the detailed AMI event.

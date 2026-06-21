@@ -400,18 +400,19 @@ srvlookup=yes
 ;
 ; --- Outbound PUBLISH (RFC 3903) — publish dialog/BLF state to a CENTRAL presence server ---
 ; chan_sofia can act as an Event Publication Agent (EPA): for each peer with `publish=yes`, it sends a
-; SIP PUBLISH (application/dialog-info+xml) carrying that peer's hint state to a central Event State
+; SIP PUBLISH (application/dialog-info+xml by default, or PIDF — see publish_format) carrying that peer's hint state to a central Event State
 ; Compositor (ESC) such as Kamailio's presence module — so the ESC can NOTIFY watchers across a cluster
 ; or federation. chan_sip never had this (SURPASS). The feature is OFF until `publish_server` is set,
 ; and validated end-to-end against a real Kamailio ESC.
 ;
 ; The peer's published presentity is sip:<exten>@<publish_domain>, where <exten> is the peer's
-; `regexten` (or its name) and the state comes from the peer's `subscribecontext` dialplan hint — so a
-; published peer needs `regexten` + `subscribecontext` + a real hint (no auto-create).
+; `publish_exten` (if set) else `regexten` (or its name), and the state comes from the peer's
+; `subscribecontext` dialplan hint — so a published peer needs that exten + `subscribecontext` + a real
+; hint (no auto-create).
 ;
 ; A `sip reload` reconciles publications live: it adds peers that gained publish=yes, removes (with an
 ; Expires:0 unpublish to the server) peers that dropped it, and rebuilds when publish_server/domain/
-; expires change — no restart needed. (Only a listener change, e.g. bindport/TLS, is restart-required.)
+; expires/format change — no restart needed. (Only a listener change, e.g. bindport/TLS, is restart-required.)
 ;
 ;publish_server   = sip:presence.example.com:60000  ; central ESC host[:port]. Empty = feature OFF. The
 ;                                                    ; ESC's SIP port is used in the PUBLISH Request-URI,
@@ -424,10 +425,24 @@ srvlookup=yes
 ;                                                    ; and chan_sofia retries with the returned Min-Expires.
 ;publish_username = pbxpublisher                     ; digest credentials, only if the ESC challenges the
 ;publish_password = s3cr3t                           ; PUBLISH with 401/407 (trusted-IP ESCs need neither).
+;publish_format   = dialog-info                      ; PUBLISH body: dialog-info (RFC 4235, default — call
+;                                                    ; state early/confirmed/terminated, Event: dialog) or
+;                                                    ; pidf (RFC 3863 presence open/closed/busy, Event:
+;                                                    ; presence, application/pidf+xml). Global; the ESC must
+;                                                    ; support the chosen event package. Changing it on
+;                                                    ; reload full-rebuilds publications (new Event + ETag).
 ;
 ; Then opt a peer in (in its [peer] section): publish = yes
-; v1 publishes application/dialog-info+xml only. Initial sends are jittered and refreshes/state-changes
-; are serialized per presentity, so a 5000-10000 peer fleet does not thundering-herd the ESC.
+; Optionally override WHAT that peer publishes with publish_exten (per-peer; <exten>[@context]) — useful
+; to publish a different presentity than the dialplan regexten. The target exten must have a hint. Empty =
+; use regexten/name. (Multi-exten "a&b" parses but, like regexten, the per-token hint lookup is a known
+; limitation — use one publish_exten exten per intended presentity.)
+; Initial sends are jittered and refreshes/state-changes are serialized per presentity, so a 5000-10000
+; peer fleet does not thundering-herd the ESC.
+;
+; KNOWN LIMIT (RFC-compliant, bounded): on a hard stop chan_sofia may not send the Expires:0 unpublish, so
+; the ESC clears stale state only when the soft-state TTL lapses (RFC 3903 §3). Worst case = publish_expires
+; of staleness after the PBX disappears; for live wallboards set a lower publish_expires.
 
 ;
 ; --- gruu (RFC 5626 instance advertisement on outbound REGISTER — per-peer) ---

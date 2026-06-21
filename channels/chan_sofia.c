@@ -2299,6 +2299,9 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			ast_string_field_set(peer, callerid, v->value);
 		} else if (!strcasecmp(v->name, "regexten")) {
 			ast_string_field_set(peer, regexten, v->value);
+		} else if (!strcasecmp(v->name, "publish_exten")) {
+			/* Outbound PUBLISH: explicit exten(s) to publish (overrides regexten/name as the source). */
+			ast_string_field_set(peer, publish_exten, v->value);
 		} else if (!strcasecmp(v->name, "callbackextension")) {
 			ast_string_field_set(peer, callbackextension, v->value);
 		} else if (!strcasecmp(v->name, "setvar")) {
@@ -11318,6 +11321,17 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			ast_copy_string(sofia_cfg.publish_username, v->value, sizeof(sofia_cfg.publish_username));
 		} else if (!strcasecmp(v->name, "publish_password")) {
 			ast_copy_string(sofia_cfg.publish_password, v->value, sizeof(sofia_cfg.publish_password));
+		} else if (!strcasecmp(v->name, "publish_format")) {
+			/* Outbound PUBLISH body format: dialog-info (RFC 4235, default) or pidf (RFC 3863 presence). */
+			if (!strcasecmp(v->value, "pidf")) {
+				sofia_cfg.publish_format = SOFIA_SUB_PIDF;
+			} else if (!strcasecmp(v->value, "dialog-info") || !strcasecmp(v->value, "dialog")) {
+				sofia_cfg.publish_format = SOFIA_SUB_DIALOG_INFO;
+			} else {
+				ast_log(LOG_WARNING, "Sofia: invalid publish_format '%s' (use dialog-info|pidf); keeping dialog-info\n",
+					v->value);
+				sofia_cfg.publish_format = SOFIA_SUB_DIALOG_INFO;
+			}
 		} else if (!strcasecmp(v->name, "wsbindaddr")) {
 			ast_copy_string(sofia_cfg.wsbindaddr, v->value, sizeof(sofia_cfg.wsbindaddr));
 		} else if (!strcasecmp(v->name, "wsbindport")) {
@@ -11951,6 +11965,7 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		ast_string_field_set(peer, fromdomain, "");
 		ast_string_field_set(peer, callerid, "");
 		ast_string_field_set(peer, regexten, "");
+		ast_string_field_set(peer, publish_exten, "");
 		/* Free prior chanvars before re-parsing (mirrors the string-field reset). */
 		if (peer->chanvars) {
 			ast_variables_destroy(peer->chanvars);
@@ -12017,6 +12032,9 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			ast_string_field_set(peer, callerid, v->value);
 		} else if (!strcasecmp(v->name, "regexten")) {
 			ast_string_field_set(peer, regexten, v->value);
+		} else if (!strcasecmp(v->name, "publish_exten")) {
+			/* Outbound PUBLISH: explicit exten(s) to publish (overrides regexten/name as the source). */
+			ast_string_field_set(peer, publish_exten, v->value);
 		} else if (!strcasecmp(v->name, "callbackextension")) {
 			ast_string_field_set(peer, callbackextension, v->value);
 		} else if (!strcasecmp(v->name, "setvar")) {
@@ -12516,6 +12534,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.publish_domain[0] = '\0';
 	sofia_cfg.publish_username[0] = '\0';
 	sofia_cfg.publish_password[0] = '\0';
+	sofia_cfg.publish_format = SOFIA_SUB_DIALOG_INFO;
 	sofia_cfg.busy_on_active = 0;
 	sofia_cfg.max_contacts = 6;
 	sofia_cfg.encryption = 0;
@@ -13406,6 +13425,7 @@ static void sofia_reload_worker(void *data)
 		char pub_server_was[sizeof(sofia_cfg.publish_server)];
 		char pub_domain_was[sizeof(sofia_cfg.publish_domain)];
 		int pub_expires_was = sofia_cfg.publish_expires;
+		enum sofia_sub_format pub_format_was = sofia_cfg.publish_format;
 		ast_copy_string(pub_server_was, sofia_cfg.publish_server, sizeof(pub_server_was));
 		ast_copy_string(pub_domain_was, sofia_cfg.publish_domain, sizeof(pub_domain_was));
 
@@ -13425,7 +13445,10 @@ static void sofia_reload_worker(void *data)
 		sofia_publications_reconcile(
 			strcmp(pub_server_was, sofia_cfg.publish_server) != 0
 			|| strcmp(pub_domain_was, sofia_cfg.publish_domain) != 0
-			|| pub_expires_was != sofia_cfg.publish_expires);
+			|| pub_expires_was != sofia_cfg.publish_expires
+			/* a format change must full-rebuild: RFC 3903 keys ESC state by Event package + ETag, so
+			 * we teardown the old (old Event + old ETag) and re-PUBLISH fresh with no If-Match. */
+			|| pub_format_was != sofia_cfg.publish_format);
 	}
 
 	ast_config_destroy(cfg);

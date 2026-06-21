@@ -235,6 +235,10 @@ int sofia_presence_state_cb(char *context, char *exten, enum ast_extension_state
 void sofia_presence_sub_destroy_cb(int id, void *data);
 struct sofia_presence_sub *sofia_presence_find_by_nh(nua_handle_t *nh);
 const char *sofia_presence_mime(enum sofia_sub_format f);
+/* Shared presence/dialog-info body builder (one source of truth) used by the presence NOTIFY and the
+ * outbound PUBLISH (sofia_publish.c). exten + entity are XML-escaped inside. */
+void sofia_presence_build_body_ex(struct ast_str **buf, const char *exten, const char *context,
+		const char *entity, uint32_t version, enum sofia_sub_format format, int state);
 int sofia_substate_terminated(tagi_t tags[]);
 int sofia_presence_init(void);
 void sofia_presence_destroy(void);
@@ -376,6 +380,7 @@ struct sofia_peer {
 		AST_STRING_FIELD(fromuser);
 		AST_STRING_FIELD(fromdomain);
 		AST_STRING_FIELD(regexten);
+		AST_STRING_FIELD(publish_exten);	/* outbound PUBLISH: explicit exten(s) to publish (ext1&ext2@ctx&...); overrides regexten/name as the publish source. Empty = use regexten/name. */
 		AST_STRING_FIELD(callbackextension);	/* when registering AS a client to an upstream provider, user-portion of our Contact URI telling upstream which local extension to call back; wired via NUTAG_M_USERNAME at the 3 nua_register sites. Empty = no callback (chan_sip parity). */
 		AST_STRING_FIELD(subscribecontext);	/* SUBSCRIBE-method dispatch context override (chan_sip parity); inherits default_subscribecontext when empty. LIMITATION: per-peer dialplan dispatch not yet wired (MWI uses peer->mailboxes; unknown events auto-202). */
 		AST_STRING_FIELD(accountcode);	/* CDR billing-tag propagated to channel->accountcode at sofia_new (chan_sip parity); truncated to AST_MAX_ACCOUNT_CODE=20 at CDR-write. Per-peer only (no [general] default). */
@@ -667,6 +672,7 @@ struct sofia_config {
 	char publish_domain[128];  /* entity-URI domain for the published PIDF/dialog-info; empty -> derived from publish_server host */
 	char publish_username[80]; /* digest credentials for the central server (401/407) */
 	char publish_password[80];
+	enum sofia_sub_format publish_format; /* outbound PUBLISH body: SOFIA_SUB_DIALOG_INFO (default) or SOFIA_SUB_PIDF; [general] publish_format=dialog-info|pidf */
 	char wsbindaddr[64];
 	int  wsbindport;         /* 0 = disabled; common: 5066 */
 	char wssbindaddr[64];
