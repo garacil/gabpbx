@@ -49,6 +49,108 @@ extern nua_t *sofia_nua;
 extern su_root_t *sofia_root;
 extern int sofia_debug;
 
+/* ===== Peer/config model constants, enums, display helpers (shared with split modules) ===== */
+
+#define SOFIA_PROG_INBAND_NEVER 0
+#define SOFIA_PROG_INBAND_NO    1
+#define SOFIA_PROG_INBAND_YES   2
+#define SOFIA_FAX_DETECT_NONE   0
+#define SOFIA_FAX_DETECT_CNG    1
+#define SOFIA_FAX_DETECT_T38    2
+#define SOFIA_FAX_DETECT_BOTH   3
+#define SOFIA_T38_DISABLED          0
+#define SOFIA_T38_LOCAL_REINVITE    1
+#define SOFIA_T38_PEER_REINVITE     2
+#define SOFIA_T38_ENABLED           3
+#define SOFIA_T38_EC_NONE           0
+#define SOFIA_T38_EC_FEC            1
+#define SOFIA_T38_EC_REDUNDANCY     2
+#define SOFIA_OVERLAP_NO        0
+#define SOFIA_OVERLAP_YES       1
+#define SOFIA_OVERLAP_DTMF      2
+#define SOFIA_TYPE_PEER    (1 << 0)
+#define SOFIA_TYPE_USER    (1 << 1)
+#define SOFIA_TYPE_FRIEND  (SOFIA_TYPE_PEER | SOFIA_TYPE_USER)
+#define SOFIA_DTMF_RFC2833 0
+#define SOFIA_DTMF_INBAND  1
+#define SOFIA_DTMF_INFO    2
+#define SOFIA_DTMF_AUTO    3
+#define SOFIA_INSECURE_PORT    (1 << 0)
+#define SOFIA_INSECURE_INVITE  (1 << 1)
+#define SOFIA_TRANSPORT_UDP 1
+#define SOFIA_TRANSPORT_TCP 2
+#define SOFIA_TRANSPORT_TLS 4
+#define SOFIA_TRANSPORT_WS  8
+#define SOFIA_TRANSPORT_WSS 16
+#define SOFIA_NAT_FORCE_RPORT (1 << 0)
+#define SOFIA_NAT_COMEDIA     (1 << 1)
+#define SOFIA_AUTH_ALG_BOTH   0   /* offer MD5 + SHA-256 (default) */
+#define SOFIA_AUTH_ALG_MD5    1   /* offer MD5 only */
+#define SOFIA_AUTH_ALG_SHA256 2   /* offer SHA-256 only */
+
+enum sofia_session_timer_mode {
+	SESSION_TIMERS_OFF       = 0, /* unset / inherit from [general] */
+	SESSION_TIMERS_ACCEPT    = 1, /* honor inbound peer Session-Expires; no initiate */
+	SESSION_TIMERS_ORIGINATE = 2, /* originate outbound Session-Expires + honor inbound */
+	SESSION_TIMERS_REFUSE    = 3, /* Round3 T2 (my#3): disables OUR origination only —
+	                               * NUTAG_SESSION_TIMER(0) tells sofia-sip not to run a
+	                               * refresher, it does NOT 422-refuse a peer-offered
+	                               * Session-Expires (sofia-sip still accepts inbound
+	                               * timers). Effectively equivalent-to-ACCEPT inbound. */
+};
+
+enum sofia_session_refresher {
+	SESSION_REFRESHER_AUTO = 0, /* sofia-sip nua_any_refresher; negotiation decides */
+	SESSION_REFRESHER_UAC  = 1, /* we refresh; chan_sip stimer.st_ref UAC parity */
+	SESSION_REFRESHER_UAS  = 2, /* peer refreshes; chan_sip stimer.st_ref UAS parity */
+};
+
+enum sofia_transfer_mode {
+	TRANSFER_OPENFORALL = 0, /* allow all SIP REFER transfers; chan_sip parity */
+	TRANSFER_CLOSED     = 1, /* reject all SIP REFER with 603 Declined (policy) */
+};
+
+static inline const char *sofia_transfer_mode_str(int mode)
+{
+	return (mode == TRANSFER_CLOSED) ? "closed" : "open";
+}
+
+static inline const char *sofia_allowoverlap_str(int mode)
+{
+	switch (mode) {
+	case SOFIA_OVERLAP_YES:  return "Yes";
+	case SOFIA_OVERLAP_DTMF: return "DTMF";
+	default:                 return "No";
+	}
+}
+
+/* Per-registration contact (one peer can hold several). */
+struct sofia_contact {
+	char contact_uri[256];
+	char host[64];
+	int port;
+	char transport[8];
+	char user_agent[64];
+	time_t expires;
+	struct ast_sockaddr src_addr;
+	int active_calls;          /* count of active calls on this contact */
+};
+
+extern char sofia_sipnotify_sentinel;
+
+struct sofia_peer *sofia_find_peer(const char *name);
+struct sofia_contact *sofia_peer_first_contact(struct sofia_peer *peer);
+const char *sofia_uri_format_host(const char *host, char *out_buf, size_t out_len);
+void sofia_uri_append_transport(char *url, size_t len, const char *transport);
+void sofia_qualify_peer(struct sofia_peer *peer);
+#define SOFIA_SIPNOTIFY_HMAGIC ((nua_hmagic_t *)&sofia_sipnotify_sentinel)
+
+struct sipqualifypeer_data {
+	struct sofia_peer *peer;	/* +1 ref TRANSFERRED to callback (caller doesn't drop) */
+	int clear_pending;		/* Round5 #1: 1 = timer dispatch owns peer->qualify_pending (callback clears it); 0 = AMI manual qualify (leaves the timer gate alone) */
+};
+void sipqualifypeer_callback(void *data);
+
 /* Per-peer reachability state (qualify). */
 enum sofia_peer_status {
 	PEER_UNREACHABLE = -1,
