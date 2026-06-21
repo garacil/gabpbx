@@ -255,7 +255,6 @@ int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_contr
 /* T.38 reINVITE 5s-timeout callback (one-shot; drops the ao2 ref taken at
  * ast_sched_thread_add). The 488 is a nua_* call, so it is marshaled to
  * sofia_thread with a FRESH +1 ref; the state change stays on the sched thread. */
-int sofia_dispatch_to_root_thread(void (*callback)(void *), void *data);
 static void sofia_t38_respond_488_root(void *data)
 {
 	struct sofia_pvt *pvt = data;
