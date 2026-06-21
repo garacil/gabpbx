@@ -2,7 +2,45 @@
 
 ## Unreleased
 
-`chan_sofia` scaling and call-forwarding work, building on the 1.0 correctness base.
+_No changes yet._
+
+## 1.1
+
+`chan_sofia` matures into a more capable SIP driver, building on the 1.0 correctness
+base: a modular source layout, new SIP capabilities, and continued performance,
+forwarding and reliability work.
+
+### Modular source layout
+
+- **The driver is now a core plus cohesive subsystem modules.** `channels/chan_sofia.c`
+  keeps the channel technology vtable, event dispatch, authentication, and the call /
+  register / configuration core; the subsystems that form clean functional boundaries
+  move into `channels/sofia/`: `sofia_sdp.c` (SDP offer/answer), `sofia_t38.c` (T.38
+  fax), `sofia_presence.c` (presence/BLF), `sofia_publish.c` (outbound PUBLISH),
+  `sofia_ami.c` (AMI actions), `sofia_cli.c` (CLI commands) and `sofia_blacklist.c`,
+  alongside the existing `sdp_crypto.c` / `srtp.c`. It is still one loadable module
+  (`chan_sofia.so`), the core is ~44% smaller, and the change is **behavior-identical** —
+  every extraction was wire-validated and lock-checked.
+
+### New SIP capabilities
+
+- **Presence / BLF.** Inbound `SUBSCRIBE` → `NOTIFY` for `dialog-info+xml`, `pidf+xml`
+  and `xpidf+xml`, so busy-lamp-field and presence watchers light up. Governed by the
+  existing `allowsubscribe` / `subscribecontext` gates.
+- **Outbound PUBLISH (RFC 3903).** Publishes local extension/dialog state to a central
+  state server (`publish_server`, with reload reconciliation and `sip show publications`).
+- **Outbound REGISTER authentication.** chan_sofia now answers a `401`/`407` challenge
+  when registering to an upstream trunk.
+- **Connection keepalive.** `tcp_keepalive` / `tcp_pingpong` keep TCP/TLS connections to
+  carriers and NAT'd endpoints alive.
+- **Instance advertisement on outbound REGISTER** (`gruu`) — adds `+sip.instance` to the
+  outbound Contact.
+- **TLS hardening** (`tlsverify`, default off) — peer-certificate verification policy for
+  TLS transports.
+- **Digest algorithm offer** (`auth_algorithms = both | md5 | sha256`) — controls which
+  algorithm the `WWW-Authenticate` challenge offers, with anti-downgrade enforcement.
+- **CLI additions:** `sip show registry`, `sip unregister`, `sip show publications`, plus
+  peer-name tab completion on `sip show peer`.
 
 ### Performance & scaling
 
@@ -25,6 +63,15 @@
   validate the diversion against a number it provisions for the trunk. Emitted only
   when the channel carries a redirect marker; empty (default) keeps the legacy
   data-driven behavior.
+
+### Reliability
+
+- **Continued concurrency and memory-safety hardening** across the registration, media,
+  presence and teardown paths, extending the 1.0 correctness work. A re-INVITE that is
+  rejected now leaves the live call fully unchanged (validate-then-commit SDP handling);
+  REGISTER side effects run outside the peer lock; and the SUBSCRIBE/NOTIFY, fork and
+  qualify paths were swept for use-after-free and lock-order issues — each fix verified
+  under a thread-debug build with `core show locks`.
 
 ## 1.0
 
