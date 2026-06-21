@@ -151,6 +151,33 @@ struct sipqualifypeer_data {
 };
 void sipqualifypeer_callback(void *data);
 
+struct sofia_register_update {
+	int was_registered;
+	int now_registered;
+	int contacts_before;
+	int contacts_after;
+	int contacts_added;
+	int contacts_refreshed;
+	int contacts_removed;
+	int contacts_moved;
+	int wildcard_removed;
+	/* Accumulated under peer->lock; consumed by sofia_emit_register_side_effects
+	 * AFTER unlock (moves the AMI / devstate emissions out from under peer->lock).
+	 * emit_unregister is mutually exclusive with the registered tail. */
+	int emit_unregister;
+	const char *unregister_cause;	/* string literal: "Wildcard" / "Expired" / "CLI" (sip unregister) */
+	char changed_uri[256];
+	struct ast_sockaddr old_src;
+	struct ast_sockaddr new_src;
+	struct ast_sockaddr changed_old_src;
+};
+
+extern char sofia_debug_filter[64];
+int sofia_debug_match(const char *peer_name, const char *src_ip);
+int sofia_reload_request_sync(char *errmsg, size_t errmsglen, int timeout_ms);
+void sofia_peer_drain_mwi(struct sofia_peer *peer);
+void sofia_emit_register_side_effects(struct sofia_peer *peer, sip_t const *sip, const struct sofia_register_update *update);
+
 /* Per-peer reachability state (qualify). */
 enum sofia_peer_status {
 	PEER_UNREACHABLE = -1,
@@ -159,9 +186,14 @@ enum sofia_peer_status {
 	PEER_LAGGED      = 2,
 };
 
-/* Per-peer MWI mailbox list head. struct sofia_mailbox itself stays in chan_sofia.c;
- * the head only needs the node forward-declared (it stores pointers). */
-struct sofia_mailbox;
+/* Per-peer MWI mailbox node + list head (sip show peer walks the list). */
+struct ast_event_sub;
+struct sofia_mailbox {
+	char mailbox[80];
+	char context[80];
+	struct ast_event_sub *event_sub;	/* AST_EVENT_MWI subscription per mailbox */
+	AST_LIST_ENTRY(sofia_mailbox) list;
+};
 AST_LIST_HEAD_NOLOCK(sofia_mailbox_list, sofia_mailbox);
 
 /* The peer/trunk object — the central chan_sofia data structure, shared with split modules. */
