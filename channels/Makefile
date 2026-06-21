@@ -111,7 +111,7 @@ chan_usbradio.so: _ASTCFLAGS+=-DNDEBUG
 chan_sofia.o: _ASTCFLAGS+=-I/usr/local/include/sofia-sip-1.13
 chan_sofia.so: LIBS+=-L/usr/local/lib -lsofia-sip-ua
 $(if $(filter chan_sofia,$(EMBEDDED_MODS)),modules.link,chan_sofia.so): $(subst .c,.o,$(wildcard sofia/*.c))
-$(subst .c,.o,$(wildcard sofia/*.c)): _ASTCFLAGS+=$(call MOD_ASTCFLAGS,chan_sofia)
+$(subst .c,.o,$(wildcard sofia/*.c)): _ASTCFLAGS+=$(call MOD_ASTCFLAGS,chan_sofia) -I/usr/local/include/sofia-sip-1.13
 
 h323/Makefile.ast:
 	$(CMD_PREFIX) $(MAKE) -C h323 Makefile.ast
