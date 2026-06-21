@@ -170,6 +170,7 @@
 #include "sofia/include/sofia_presence.h"
 #include "sofia/include/sofia_sdp.h"
 #include "sofia/include/sofia_t38.h"
+#include "sofia/include/sofia_message.h"
 
 #include <sofia-sip/nua.h>
 #include <sofia-sip/su.h>
@@ -189,7 +190,6 @@
 #include <sofia-sip/tport_tag.h>	/* TPTAG_TOS for SIP-listener-side TOS */
 
 #define SOFIA_CONFIG "sofia.conf"
-#define SOFIA_CHANNEL_TYPE "SIP"
 
 #define DEFAULT_CONTEXT "default"
 #define DEFAULT_BINDADDR "0.0.0.0"
@@ -614,7 +614,7 @@ static inline int sofia_user_looks_like_phone(const char *s)
 	return 1;
 }
 
-static void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
+void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
 		char *out_url, size_t out_len)
 {
 	const char *target_host = peer->host;
@@ -2072,6 +2072,7 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	peer->qualify = 0;
 	/* ""/0 so a removed per-peer key reverts on reload (inherit-at-use-time). */
 	ast_string_field_set(peer, forceddiversion, "");
+	ast_string_field_set(peer, message_context, "");
 	ast_string_field_set(peer, callbackextension, "");
 	ast_string_field_set(peer, accountcode, "");
 	ast_string_field_set(peer, cid_name, "");
@@ -2284,6 +2285,9 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 		} else if (!strcasecmp(v->name, "forceddiversion")) {
 			/* Per-trunk redirecting DID forced into the outbound Diversion header. */
 			ast_string_field_set(peer, forceddiversion, v->value);
+		} else if (!strcasecmp(v->name, "message_context")) {
+			/* Per-peer override for inbound out-of-dialog MESSAGE dialplan dispatch. */
+			ast_string_field_set(peer, message_context, v->value);
 		} else if (!strcasecmp(v->name, "callerid")) {
 			ast_string_field_set(peer, callerid, v->value);
 		} else if (!strcasecmp(v->name, "regexten")) {
@@ -5379,6 +5383,8 @@ static int func_sofia_sippeer(struct ast_channel *chan, const char *cmd,
 		ast_copy_string(buf, peer->fromdomain, len);
 	} else if (!strcasecmp(colname, "forceddiversion")) {
 		ast_copy_string(buf, peer->forceddiversion, len);
+	} else if (!strcasecmp(colname, "message_context")) {
+		ast_copy_string(buf, peer->message_context, len);
 	} else if (!strcasecmp(colname, "accountcode")) {
 		ast_copy_string(buf, peer->accountcode, len);
 	} else if (!strcasecmp(colname, "fullcontact")) {
@@ -7308,84 +7314,6 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		}
 		sofia_emit_register_side_effects(peer, sip, &reg_update);
 		ao2_ref(peer, -1);
-}
-
-/* Inbound MESSAGE handler (chan_sip parity). In-dialog (op->owner): queue AST_FRAME_TEXT
- * + 202. Out-of-dialog: 405. */
-static void sofia_process_message(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
-		sip_t const *sip, tagi_t tags[])
-{
-	char buf[1400];
-	const char *body = NULL;
-	char *bufp;
-	struct ast_frame f;
-
-	/* text/plain only, case-insensitive full-match (RFC 3261 §7.3.1; c_type has no ;params). */
-	if (!sip || !sip->sip_content_type || !sip->sip_content_type->c_type
-			|| strcasecmp(sip->sip_content_type->c_type, "text/plain")) {
-		nua_respond(nh, 415, "Unsupported Media Type",
-			NUTAG_WITH_THIS(nua), TAG_END());
-		return;
-	}
-
-	if (sip->sip_payload && sip->sip_payload->pl_data) {
-		body = sip->sip_payload->pl_data;
-	}
-	if (!body) {
-		nua_respond(nh, 500, "Internal Server Error",
-			NUTAG_WITH_THIS(nua), TAG_END());
-		return;
-	}
-	/* Bound the copy by pl_len: payload may hold embedded NULs and isn't NUL-terminated. */
-	{
-		size_t n = sip->sip_payload->pl_len;
-		if (n >= sizeof(buf)) {
-			n = sizeof(buf) - 1;
-		}
-		memcpy(buf, body, n);
-		buf[n] = '\0';
-	}
-
-	/* Trailing-LF strip (chan_sip parity). */
-	bufp = buf + strlen(buf);
-	while (bufp > buf && bufp[-1] == '\n') {
-		*--bufp = '\0';
-	}
-
-	/* Safety: op is pinned by the teardown-race guard, but op->owner is nulled under
-	 * op->lock by sofia_hangup. Snapshot+ref the owner under op->lock, then queue the
-	 * frame outside the lock (it takes the channel lock — order channel->pvt). */
-	if (op) {
-		struct ast_channel *owner;
-		ast_mutex_lock(&op->lock);
-		owner = op->owner;
-		if (owner) {
-			ast_channel_ref(owner);
-		}
-		ast_mutex_unlock(&op->lock);
-		if (owner) {
-			if (sofia_debug) {
-				ast_verbose("Sofia: in-call MESSAGE received: '%s'\n", buf);
-			}
-			/* AST_FRAME_TEXT queue (chan_sip parity) */
-			memset(&f, 0, sizeof(f));
-			f.frametype = AST_FRAME_TEXT;
-			f.subclass.integer = 0;
-			f.offset = 0;
-			f.data.ptr = buf;
-			f.datalen = strlen(buf) + 1;
-			ast_queue_frame(owner, &f);
-			ast_channel_unref(owner);
-			nua_respond(nh, 202, "Accepted", NUTAG_WITH_THIS(nua), TAG_END());
-			return;
-		}
-	}
-
-	/* Out-of-dialog: 405 + LOG_WARNING (chan_sip parity). */
-	ast_log(LOG_WARNING, "Sofia: out-of-dialog MESSAGE dropped (no active call). "
-		"Content-Type: %s, Body: '%s'\n",
-		sip->sip_content_type->c_type, buf);
-	nua_respond(nh, 405, "Method Not Allowed", NUTAG_WITH_THIS(nua), TAG_END());
 }
 
 /* Resolve the source IP+port presented to `target` for outbound INVITE From/Contact/SDP
@@ -10656,6 +10584,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	case nua_r_message:
 		if (sofia_debug)
 			ast_verbose("Sofia: MESSAGE response %d %s\n", status, phrase);
+		sofia_message_reap_outbound(nh, status);
 		break;
 	case nua_r_subscribe:
 		if (sofia_debug)
@@ -11468,6 +11397,9 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			/* Default subscribecontext inherited by sofia_peer_alloc. KNOWN LIMITATION: per-site
 			 * override at sofia_process_subscribe deferred (no SUBSCRIBE dialplan dispatch yet). */
 			ast_copy_string(sofia_cfg.default_subscribecontext, v->value, sizeof(sofia_cfg.default_subscribecontext));
+		} else if (!strcasecmp(v->name, "message_context")) {
+			/* [general] default context for inbound out-of-dialog MESSAGE -> dialplan; empty = SIP SIMPLE messaging OFF. */
+			ast_copy_string(sofia_cfg.message_context, v->value, sizeof(sofia_cfg.message_context));
 		} else if (!strcasecmp(v->name, "maxexpiry") || !strcasecmp(v->name, "maxexpirey")) {
 			/* Registration TTL bound + 423 Interval Too Brief; typo-tolerant dual-spelling. */
 			sofia_cfg.max_expiry = atoi(v->value);
@@ -12024,6 +11956,9 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			/* CLI-forward compliance: per-trunk redirecting DID forced into the
 			 * outbound Diversion header on forwarded calls. See sofia_add_diversion. */
 			ast_string_field_set(peer, forceddiversion, v->value);
+		} else if (!strcasecmp(v->name, "message_context")) {
+			/* Per-peer override for inbound out-of-dialog MESSAGE dialplan dispatch. */
+			ast_string_field_set(peer, message_context, v->value);
 		} else if (!strcasecmp(v->name, "type")) {
 			if (!strcasecmp(v->value, "friend")) {
 				peer->type = SOFIA_TYPE_FRIEND;
@@ -12565,6 +12500,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.regcontext[0] = '\0';
 	sofia_cfg.regextenonqualify = 0;
 	sofia_cfg.default_subscribecontext[0] = '\0';
+	sofia_cfg.message_context[0] = '\0';   /* SIP SIMPLE messaging OFF by default (opt-in). */
 	/* registration TTL bounds + 423 Interval Too Brief (60/3600/120). */
 	sofia_cfg.min_expiry     = DEFAULT_MIN_EXPIRY;
 	sofia_cfg.max_expiry     = DEFAULT_MAX_EXPIRY;
@@ -13576,6 +13512,12 @@ static int load_module(void)
 	ast_register_application_xml(app_dtmfmode, sofia_app_dtmfmode);
 	ast_register_application_xml(app_sipaddheader, sofia_app_addheader);
 	ast_register_application_xml(app_sipremoveheader, sofia_app_removeheader);
+	ast_register_application(app_sofiasendmessage, sofia_app_sendmessage,
+		"Send an out-of-dialog SIP MESSAGE (SIP SIMPLE)",
+		"SofiaSendMessage(<peer-or-uri>,<body>[,<from>])\n"
+		"  Sends a SIP SIMPLE instant message out of dialog via chan_sofia.\n"
+		"  <peer-or-uri>: a configured peer name, or a sip:/sips: URI.\n"
+		"  <from>: optional From URI; defaults to the peer identity.\n");
 
 	/* Dialplan functions: SIP_HEADER / CHECKSIPDOMAIN / SIPPEER / SIPCHANINFO. */
 	ast_custom_function_register(&sofia_sip_header_function);
@@ -13593,6 +13535,7 @@ static int load_module(void)
 		EVENT_FLAG_SYSTEM | EVENT_FLAG_REPORTING, manager_sofia_show_registry);
 	ast_manager_register_xml("SIPnotify",
 		EVENT_FLAG_SYSTEM, manager_sofia_notify);
+	ast_manager_register_xml("SofiaMessageSend", EVENT_FLAG_SYSTEM, manager_sofia_messagesend);
 
 	ast_cli_register_multiple(cli_sofia, ARRAY_LEN(cli_sofia));
 
@@ -13675,6 +13618,8 @@ static int unload_module(void)
 	ast_unregister_application(app_dtmfmode);
 	ast_unregister_application(app_sipaddheader);
 	ast_unregister_application(app_sipremoveheader);
+	ast_unregister_application(app_sofiasendmessage);
+	ast_manager_unregister("SofiaMessageSend");
 	/* The unregisters below are defensive (the body returns -1 before they run at runtime). */
 	ast_custom_function_unregister(&sofia_sip_header_function);
 	ast_custom_function_unregister(&sofia_check_sipdomain_function);

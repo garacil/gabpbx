@@ -47,6 +47,7 @@ void sofia_split_hostport_from_uri(const char *hostport, char *host, size_t host
 void sofia_presence_state_map(int state, const char **statestring, const char **pidfstate, const char **pidfnote, int *local_state);
 
 /* Globals defined in chan_sofia.c, shared with the split modules. */
+#define SOFIA_CHANNEL_TYPE "SIP"
 extern struct ao2_container *peers;
 extern nua_t *sofia_nua;
 extern su_root_t *sofia_root;
@@ -154,6 +155,8 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len);
 int sofia_sdp_extract_hold(sip_t const *sip, su_home_t *home);
 
 struct sofia_peer *sofia_find_peer(const char *name);
+void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
+		char *out_url, size_t out_len);
 struct sofia_contact *sofia_peer_first_contact(struct sofia_peer *peer);
 const char *sofia_uri_format_host(const char *host, char *out_buf, size_t out_len);
 void sofia_uri_append_transport(char *url, size_t len, const char *transport);
@@ -380,6 +383,7 @@ struct sofia_peer {
 		AST_STRING_FIELD(cid_num);    /* per-peer CID number (chan_sip parity); fallback at sofia_resolve_identity when channel connected.id.number is empty (dialplan CALLERID() overrides). */
 		AST_STRING_FIELD(cid_tag);    /* per-peer CID tag (chan_sip parity); overrides sofia-sip auto-generated From-tag at sofia_build_from when set. */
 		AST_STRING_FIELD(forceddiversion);  /* per-trunk DID forced into the outbound Diversion header (RFC 5806) on a forwarded call, so the carrier gets a trunk-owned number it can validate. Empty = disabled (legacy data-driven Diversion preserved). Read by sofia_add_diversion under peer->lock. */
+		AST_STRING_FIELD(message_context);  /* per-peer override of [general] message_context for inbound out-of-dialog MESSAGE; empty inherits */
 		AST_STRING_FIELD(nonce);
 		AST_STRING_FIELD(outboundproxy);	/* per-peer outbound proxy override; empty = inherit sofia_cfg.outboundproxy or no Route */
 		AST_STRING_FIELD(srtpcipher);		/* comma-separated SRTP suite preference; empty = inherit sofia_cfg.default_srtpcipher or sdp_crypto.c default AES_CM_128_HMAC_SHA1_80 */
@@ -605,6 +609,7 @@ struct sofia_config {
 	int regextenonqualify;             /* couple regexten add/remove to qualify state transitions; default 0 (FALSE) */
 	/* default routing context for SUBSCRIBE dispatch, inherited by peers. EFFECT-PENDING: MWI handler uses peer->mailboxes, unknown events auto-202 (no dialplan dispatch yet). */
 	char default_subscribecontext[AST_MAX_CONTEXT];
+	char message_context[AST_MAX_CONTEXT];  /* [general] default context for out-of-dialog inbound MESSAGE -> dialplan; empty = SIP SIMPLE messaging OFF */
 	/* registration TTL bounds ([general]-only); typo-tolerant Xexpiry/Xexpirey parse for chan_sip migration. */
 	int min_expiry;     /* default 60s — under this rejects 423 Interval Too Brief + Min-Expires (RFC 3261 §10.2.8) */
 	int max_expiry;     /* default 3600s — over this silently caps */
