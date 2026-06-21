@@ -243,6 +243,109 @@ struct sofia_mailbox {
 AST_LIST_HEAD_NOLOCK(sofia_mailbox_list, sofia_mailbox);
 
 /* The peer/trunk object — the central chan_sofia data structure, shared with split modules. */
+#define SOFIA_FORK_ID_LEN 40
+
+/* Heavy call/dialog-media types embedded as pointers in struct sofia_pvt — forward-declared
+ * (their full definitions live in chan_sofia.c / their owning subsystems). */
+struct ast_dsp;
+struct ast_rtp_instance;
+struct ast_udptl;
+struct sofia_fork;
+struct sofia_srtp;
+
+enum sofia_dialog_state {
+	SOFIA_DIALOG_STATE_DOWN,
+	SOFIA_DIALOG_STATE_TRYING,
+	SOFIA_DIALOG_STATE_RINGING,
+	SOFIA_DIALOG_STATE_UP,
+};
+
+/* The per-call/dialog object — the central media/signaling state. Shared so the SDP, T.38, register
+ * and CLI(show channels) modules can reference it. */
+struct sofia_pvt {
+	AST_DECLARE_STRING_FIELDS(
+		AST_STRING_FIELD(callid);
+		AST_STRING_FIELD(exten);
+		AST_STRING_FIELD(context);
+		AST_STRING_FIELD(subscribecontext);	/* per-call cache of peer->subscribecontext for in-dialog SUBSCRIBE routing */
+		AST_STRING_FIELD(accountcode);	/* per-call cache of peer->accountcode for CDR billing-tag — NOT pvt->username (auth-identity, wrong semantic) */
+		AST_STRING_FIELD(username);
+		AST_STRING_FIELD(peername);
+		AST_STRING_FIELD(peersecret);
+		AST_STRING_FIELD(fromdomain);
+		AST_STRING_FIELD(fromuser);
+		AST_STRING_FIELD(uri);
+		AST_STRING_FIELD(ruri);
+		AST_STRING_FIELD(cid_num);   /* inbound caller-id num; from sip_from, overwritten by PAI/RPID when peer->trustrpid */
+		AST_STRING_FIELD(cid_name);  /* inbound caller-id name; same chain as cid_num */
+	);
+	enum sofia_dialog_state state;
+	int dtmfmode;
+	int alreadygone;
+	int owner_busy;
+	struct ast_channel *owner;
+	struct sofia_peer *peer;
+	nua_handle_t *nh;
+	su_home_t *home;
+	int cseq;
+	struct ast_rtp_instance *rtp;
+	struct ast_rtp_instance *vrtp;
+	format_t capability;
+	struct ast_codec_pref prefs;
+	int lastinvite;
+	ast_mutex_t lock;
+	/* Fork fields — NULL/single for the normal (non-forked) call path */
+	struct sofia_fork *fork;         /* shared fork object, NULL = no forking */
+	int is_fork_master;              /* 1 = this pvt owns the ast_channel in a fork */
+	int is_fork_child;               /* 1 = this pvt is a fork child leg */
+	char fork_branch_id[SOFIA_FORK_ID_LEN];
+	struct sofia_contact *active_contact;  /* contact this call is on (holds ao2 ref) */
+	struct ast_sockaddr redirip;     /* directmedia: peer's RTP target; zero = relay through PBX */
+	int reinvite_pending;            /* directmedia re-INVITE in flight; gates response handler */
+	int outbound_invite_auth_attempts; /* 401/407 answered on this outbound INVITE; bounded vs bad-creds loop */
+	unsigned long sess_id;           /* SDP o= session-id, set ONCE per dialog (RFC 4566 §5.2 / RFC 3264 §8: constant across offers/answers) */
+	unsigned long sess_version;      /* SDP o= session-version, bumped per generated SDP */
+	int hold_state;                  /* 1 = peer holding us (a=sendonly/inactive) */
+	struct sofia_srtp *srtp;         /* audio SDES-SRTP context (NULL = plain RTP); freed in destructor */
+	struct sofia_srtp *vsrtp;        /* video SDES-SRTP context; freed in destructor */
+	struct ast_variable *initreq_headers; /* inbound INVITE headers for ${SIP_HEADER()}; freed in destructor */
+	struct ast_sockaddr last_src_addr; /* INVITE transport-source for ${SIPCHANINFO(peerip|recvip)} */
+	struct ast_sockaddr ourip; /* kernel-routed source IP for outbound From/Contact + SDP c= (sofia_resolve_ourip) */
+	int callingpres; /* AST_PRES_* mask; inherits peer->callingpres */
+	int outgoing; /* 1=outbound dial, 0=inbound INVITE; drives RPID ;party=calling/called */
+	int call_inc_done; /* this pvt incremented peer->inUse — idempotency guard for DEC sites */
+	int ring_inc_done; /* this pvt incremented peer->inRinging — idempotency guard */
+	struct ast_dsp *dsp; /* set by sofia_enable_dsp_detect for inband/auto DTMF or fax-CNG; freed in destructor */
+
+	/* T.38 fax UDPTL state. udptl: per-dialog session, lazily allocated on first
+	 * T.38 reINVITE, destroyed in the destructor. t38_state: 4-state machine.
+	 * t38id: sofia_t38_abort sched ID (-1 = none); without it a peer that never
+	 * acks the 200 OK leaves us stuck in PEER_REINVITE. t38_max_ifp: far-end
+	 * advertised — LOAD-BEARING (peer max_ifp==0 forces T38_DISABLED). t38_our/
+	 * their_parms: zero-init, filled during negotiation. */
+	struct ast_udptl *udptl;
+	int t38_state;
+	int t38id;
+	unsigned int t38_max_ifp;
+	int t38_maxdatagram;
+	int t38_ec_mode;
+	int t38pt_usertpsource;
+	struct ast_control_t38_parameters t38_our_parms;
+	struct ast_control_t38_parameters t38_their_parms;
+	/* RFC 4028 session-timer refresh tracking (sip show channels + AMI
+	 * SessionTimerRefresh); populated at refresh-fire. zero = none yet. */
+	int session_negotiated_expires; /* negotiated Session-Expires (s); 0 = no timer */
+	time_t session_last_refresh_at; /* most recent refresh; 0 = never */
+	int allowtransfer; /* per-call REFER policy; inherits peer->allowtransfer; gated at sofia_process_refer */
+	/* Blind/attended-transfer BYE deferral (RFC 5589 §6.1): we must not race the
+	 * transferer's UA BYE with our own nua_bye, or sofia-sip drops the pending
+	 * terminal NOTIFY and the transfer never completes. When set, sofia_hangup
+	 * skips its nua_bye; a sched timer (defer_bye_sched_id) BYEs after
+	 * SOFIA_DEFER_BYE_TIMEOUT_MS for UAs that don't auto-BYE. Incoming BYE cancels it. */
+	int defer_bye;
+	int defer_bye_sched_id;
+};
+
 struct sofia_peer {
 	AST_DECLARE_STRING_FIELDS(
 		AST_STRING_FIELD(name);
