@@ -148,6 +148,7 @@ extern struct ast_sched_thread *sofia_sched;
 int sofia_should_use_externaddr(const struct ast_sockaddr *peer_addr);
 void sofia_change_t38_state(struct sofia_pvt *pvt, int new_state);
 int sofia_t38_abort(const void *data);
+int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_control_t38_parameters *parameters);
 int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip);
 char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len);
 int sofia_sdp_extract_hold(sip_t const *sip, su_home_t *home);
