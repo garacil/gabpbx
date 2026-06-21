@@ -171,6 +171,7 @@
 #include "sofia/include/sofia_sdp.h"
 #include "sofia/include/sofia_t38.h"
 #include "sofia/include/sofia_message.h"
+#include "sofia/include/sofia_transfer.h"
 
 #include <sofia-sip/nua.h>
 #include <sofia-sip/su.h>
@@ -1120,7 +1121,7 @@ static struct ast_channel_tech sofia_tech = {
 	.fixup = sofia_fixup,
 	.setoption = NULL,
 	.queryoption = sofia_queryoption,
-	.transfer = NULL,
+	.transfer = sofia_transfer,
 	.write_video = sofia_write_video,
 	.write_text = NULL,
 	.bridged_channel = NULL,
@@ -1522,6 +1523,12 @@ static void sofia_nh_destroy_cleanup(void *arg);
 static void sofia_pvt_destructor(void *obj)
 {
 	struct sofia_pvt *pvt = obj;
+
+	/* Safety net: a pending outbound REFER must be failed + its timer freed before the
+	 * pvt is released. In practice refer_pending is already 0 here (an armed timer holds
+	 * a +1 pvt ref, so the destructor cannot run while a transfer is in flight), but the
+	 * hook is idempotent and a no-op when nothing is pending. */
+	sofia_transfer_cleanup(pvt);
 
 	sofia_pvt_clear_active_contact(pvt);
 
@@ -3765,6 +3772,11 @@ static int sofia_hangup(struct ast_channel *ast)
 	if (!pvt) {
 		return -1;
 	}
+
+	/* Fail a pending outbound REFER + disarm its timer so Transfer() never blocks past
+	 * teardown (queues AST_CONTROL_TRANSFER=FAILED if pending). Off-thread-safe (it
+	 * marshals the su_timer ops onto sofia_thread). No-op if no transfer is pending. */
+	sofia_transfer_cleanup(pvt);
 
 	/* Channel-hangup counter DEC. Decrements peer->inUse if this pvt incremented it
 	 * (call_inc_done flag-gated for multi-site safety with the BYE handlers +
@@ -8897,11 +8909,33 @@ static void sofia_process_subscribe(nua_t *nua, nua_handle_t *nh, struct sofia_p
 	sofia_subscribe_reject_reap(nh);
 }
 
+/* Forward-decl the pvt validator (defined below near sofia_event_callback) so the NOTIFY
+ * refer hook can re-validate/pin pvt by handle magic. */
+static struct sofia_pvt *sofia_pvt_ref_if_linked(nua_hmagic_t *hmagic);
+
 static void sofia_process_notify(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
 		sip_t const *sip, tagi_t tags[])
 {
 	if (sofia_debug)
 		ast_verbose("Sofia: Received NOTIFY\n");
+
+	/* refer-event NOTIFY (outbound transfer progress). The event callback does NOT pin
+	 * pvt for nua_i_notify (op is the raw hmagic), so re-validate/pin by the handle magic.
+	 * If sofia_transfer_on_notify consumes it, still 200-OK and return — do not fall
+	 * through to presence/MWI handling. */
+	{
+		struct sofia_pvt *rp = sofia_pvt_ref_if_linked(nh ? nua_handle_magic(nh) : NULL);
+		int consumed = 0;
+		if (rp) {
+			consumed = sofia_transfer_on_notify(rp, sip);
+			ao2_ref(rp, -1);
+		}
+		if (consumed) {
+			nua_respond(nh, SIP_200_OK, TAG_END());
+			return;
+		}
+	}
+
 	nua_respond(nh, SIP_200_OK, TAG_END());
 }
 
@@ -10606,6 +10640,16 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	case nua_r_refer:
 		if (sofia_debug)
 			ast_verbose("Sofia: REFER response %d %s\n", status, phrase);
+		/* The REFER request's own response. The event callback does NOT pin pvt for
+		 * nua_r_refer, so re-validate/pin by the handle magic ourselves. >=300 fails
+		 * the pending outbound transfer (sofia_transfer_on_refer_response). */
+		{
+			struct sofia_pvt *rp = sofia_pvt_ref_if_linked(nh ? nua_handle_magic(nh) : NULL);
+			if (rp) {
+				sofia_transfer_on_refer_response(rp, status);
+				ao2_ref(rp, -1);
+			}
+		}
 		break;
 	case nua_r_info:
 		if (sofia_debug)
@@ -13518,6 +13562,12 @@ static int load_module(void)
 		"  Sends a SIP SIMPLE instant message out of dialog via chan_sofia.\n"
 		"  <peer-or-uri>: a configured peer name, or a sip:/sips: URI.\n"
 		"  <from>: optional From URI; defaults to the peer identity.\n");
+	ast_register_application(app_sofiatransfer, sofia_app_transfer,
+		"Transfer a call via SIP REFER",
+		"SofiaTransfer(<refer-to>[,<replaces>])\n"
+		"  Sends an outbound SIP REFER (blind, or attended when <replaces> is given).\n"
+		"  <refer-to>: a configured peer name, a sip:/sips: URI, or a bare extension.\n"
+		"  <replaces>: optional dialog for an attended transfer (\"callid;to-tag=X;from-tag=Y\").\n");
 
 	/* Dialplan functions: SIP_HEADER / CHECKSIPDOMAIN / SIPPEER / SIPCHANINFO. */
 	ast_custom_function_register(&sofia_sip_header_function);
@@ -13619,6 +13669,7 @@ static int unload_module(void)
 	ast_unregister_application(app_sipaddheader);
 	ast_unregister_application(app_sipremoveheader);
 	ast_unregister_application(app_sofiasendmessage);
+	ast_unregister_application(app_sofiatransfer);
 	ast_manager_unregister("SofiaMessageSend");
 	/* The unregisters below are defensive (the body returns -1 before they run at runtime). */
 	ast_custom_function_unregister(&sofia_sip_header_function);

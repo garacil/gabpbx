@@ -365,6 +365,16 @@ srvlookup=yes
 ;
 ;default_allowtransfer = yes    ; yes = allow REFER (chan_sip default); no = reject 603 Declined (policy)
 ;allowtransfer         = yes    ; bare key alias accepted in [general] (chan_sip MOH-style leniency)
+;
+; allowtransfer gates INBOUND REFER only. chan_sofia can also ORIGINATE a REFER to
+; push a connected call away (outbound transfer), from the dialplan:
+;   SofiaTransfer(<peer-or-uri>[,<replaces>])   ; blind, or attended when <replaces> is given
+;       <replaces> = "callid;to-tag=X;from-tag=Y" (percent-encoded into Refer-To)
+;   Transfer(<dest>)                            ; the standard blind-transfer app (needs app_transfer);
+;                                               ; chan_sofia's .transfer callback emits the REFER
+; Outbound REFER is your own dialplan's decision, so it is NOT gated by allowtransfer.
+; The transfer result returns to the dialplan via the refer NOTIFY (sipfrag 2xx = success),
+; with a 30s backstop so Transfer() never blocks forever. One outbound REFER per dialog at a time.
 
 ;
 ; --- allowsubscribe (post-T56 chan_sip parity, drop-in SUBSCRIBE policy) ---

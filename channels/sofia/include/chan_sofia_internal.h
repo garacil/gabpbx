@@ -304,6 +304,8 @@ struct sofia_pvt {
 	struct sofia_peer *peer;
 	nua_handle_t *nh;
 	su_home_t *home;
+	int refer_pending;            /* 1 = an outbound REFER is in flight on this dialog (Transfer() is blocked waiting for AST_CONTROL_TRANSFER) */
+	su_timer_t *refer_timer;      /* outbound-REFER timeout; fires AST_TRANSFER_FAILED so Transfer() never blocks forever (sofia_thread-only) */
 	int cseq;
 	struct ast_rtp_instance *rtp;
 	struct ast_rtp_instance *vrtp;
