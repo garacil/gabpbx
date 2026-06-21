@@ -433,10 +433,10 @@ srvlookup=yes
 ;                                                    ; reload full-rebuilds publications (new Event + ETag).
 ;
 ; Then opt a peer in (in its [peer] section): publish = yes
-; Optionally override WHAT that peer publishes with publish_exten (per-peer; <exten>[@context]) — useful
-; to publish a different presentity than the dialplan regexten. The target exten must have a hint. Empty =
-; use regexten/name. (Multi-exten "a&b" parses but, like regexten, the per-token hint lookup is a known
-; limitation — use one publish_exten exten per intended presentity.)
+; Optionally override WHAT that peer publishes with publish_exten (per-peer; ext1[@ctx]&ext2[@ctx]...) —
+; useful to publish a different presentity than the dialplan regexten. Each token must have a hint; the
+; multi-token "a&b" form is supported (regexten now creates one BLF hint per token, so both BLF and
+; PUBLISH cover every token). Empty = use regexten/name.
 ; Initial sends are jittered and refreshes/state-changes are serialized per presentity, so a 5000-10000
 ; peer fleet does not thundering-herd the ESC.
 ;
@@ -882,12 +882,10 @@ srvlookup=yes
 ; emits no AMI signal at hint creation. NMS systems gain real-time visibility
 ; into hint lifecycle.
 ;
-; KNOWN LIMITATION (Pattern 12 honest-disclosure): no hint removal counterpart.
-; chan_sip relies on ast_context cleanup at module unload; chan_sofia is
-; non-unloadable per T40 (sofia-sip same-thread-as-create assert), so dynamic
-; hints persist for the chan_sofia module lifetime. Operator restart for hint
-; cleanup. This mirrors prior task patterns (cleanup_stale_contexts T40 +
-; subscribecontext pivot-deferral + register-TTL Option A dual-scope).
+; HINT REMOVAL: each per-token hint IS removed (symmetric with creation) when the peer drops regexten/
+; subscribecontext or disappears on `sip reload` (re-parse + sweep) and on realtime prune/unregister.
+; The only uncovered case is module UNLOAD — chan_sofia is non-unloadable per T40 (sofia-sip
+; same-thread-as-create assert), so there is no unload-time cleanup; that path never runs in practice.
 ;
 ; To use: configure both regexten + subscribecontext on the peer (in [peer]
 ; section or sippeers realtime row); hints auto-install at peer load.

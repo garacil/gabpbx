@@ -2205,36 +2205,91 @@ static int sofia_check_register_expiry(nua_t *nua, nua_handle_t *nh,
 	return 0;
 }
 
-/* Install a PRIORITY_HINT extension (regexten + subscribecontext) tracking peer
- * presence via DEVICE_STATE("SIP/<name>"). source only picks the registrar string.
- * LIMITATION: no removal — hints persist for the module lifetime. */
+/* Remove the per-token PRIORITY_HINT extensions for a regexten spec ("ext1[@ctx]&ext2[@ctx]...").
+ * Splits exactly like sofia_create_peer_hint (default context = subscribecontext, per-token @context
+ * override) so MULTI-token hints are fully reclaimed (a verbatim remove of "a&b" would orphan the
+ * per-token hints). registrar must match the creator ("sofia_config_peer" static / "realtime_peer"
+ * realtime). Exported for the realtime CLI prune path (sofia_cli.c). Does NOT create contexts. */
+void sofia_remove_peer_hints(const char *regexten, const char *subscribecontext, const char *registrar)
+{
+	char multi[256];
+	char *stringp, *ext, *ctx;
+
+	if (ast_strlen_zero(regexten) || ast_strlen_zero(subscribecontext)) {
+		return;
+	}
+	ast_copy_string(multi, regexten, sizeof(multi));
+	stringp = multi;
+	while ((ext = strsep(&stringp, "&"))) {
+		const char *ctxname = subscribecontext;
+
+		if (ast_strlen_zero(ext)) {
+			continue;
+		}
+		if ((ctx = strchr(ext, '@'))) {
+			*ctx++ = '\0';
+			if (ast_strlen_zero(ext) || ast_strlen_zero(ctx)) {
+				continue;
+			}
+			ctxname = ctx;
+		}
+		ast_context_remove_extension(ctxname, ext, PRIORITY_HINT, registrar);
+	}
+}
+
+/* Install a PRIORITY_HINT extension per regexten token (ext1[@ctx]&ext2[@ctx]...) tracking peer
+ * presence via DEVICE_STATE("SIP/<name>"). Splits on '&' with optional per-token @context (default
+ * subscribecontext) — same grammar as the regcontext routing + outbound PUBLISH, so BLF, REGISTER
+ * routing and PUBLISH agree on the token set. source only picks the registrar string. Removal is the
+ * symmetric sofia_remove_peer_hints() (called from reload/sweep/realtime-prune). */
 static void sofia_create_peer_hint(struct sofia_peer *peer, const char *source)
 {
-	struct ast_context *hintcontext;
+	char multi[256];
+	char *stringp, *ext, *ctx;
 	char hintsip[AST_MAX_EXTENSION + 5];
 	const char *registrar;
 
 	if (!peer || ast_strlen_zero(peer->subscribecontext) || ast_strlen_zero(peer->regexten)) {
 		return; /* both fields required */
 	}
-	hintcontext = ast_context_find_or_create(NULL, NULL, peer->subscribecontext, "chan_sofia");
-	if (!hintcontext) {
-		ast_log(LOG_WARNING, "Sofia: failed to find_or_create hint context '%s' for peer '%s'\n",
-			peer->subscribecontext, peer->name);
-		return;
-	}
 	snprintf(hintsip, sizeof(hintsip), "SIP/%s", peer->name);
 	registrar = (source && !strcmp(source, "realtime")) ? "realtime_peer" : "sofia_config_peer";
-	ast_add_extension2(hintcontext, 0, peer->regexten, PRIORITY_HINT, NULL, NULL,
-		hintsip, NULL, NULL, registrar);
-	manager_event(EVENT_FLAG_SYSTEM, "HintCreated",
-		"Peer: SIP/%s\r\n"
-		"Extension: %s\r\n"
-		"Context: %s\r\n"
-		"HintDevice: %s\r\n"
-		"Source: %s\r\n",
-		peer->name, peer->regexten, peer->subscribecontext, hintsip,
-		source ? source : "unknown");
+
+	ast_copy_string(multi, peer->regexten, sizeof(multi));
+	stringp = multi;
+	while ((ext = strsep(&stringp, "&"))) {
+		const char *ctxname = peer->subscribecontext;
+		struct ast_context *hintcontext;
+
+		if (ast_strlen_zero(ext)) {
+			continue;
+		}
+		if ((ctx = strchr(ext, '@'))) {
+			*ctx++ = '\0';
+			if (ast_strlen_zero(ext) || ast_strlen_zero(ctx)) {
+				ast_log(LOG_WARNING, "Sofia: peer '%s' regexten token has an empty exten/context — skipped\n",
+					peer->name);
+				continue;
+			}
+			ctxname = ctx;
+		}
+		hintcontext = ast_context_find_or_create(NULL, NULL, ctxname, "chan_sofia");
+		if (!hintcontext) {
+			ast_log(LOG_WARNING, "Sofia: failed to find_or_create hint context '%s' for peer '%s'\n",
+				ctxname, peer->name);
+			continue;
+		}
+		ast_add_extension2(hintcontext, 0, ext, PRIORITY_HINT, NULL, NULL,
+			hintsip, NULL, NULL, registrar);
+		manager_event(EVENT_FLAG_SYSTEM, "HintCreated",
+			"Peer: SIP/%s\r\n"
+			"Extension: %s\r\n"
+			"Context: %s\r\n"
+			"HintDevice: %s\r\n"
+			"Source: %s\r\n",
+			peer->name, ext, ctxname, hintsip,
+			source ? source : "unknown");
+	}
 }
 
 /* Parse one ast_variable chain into peer fields. overlay=1 (sipregs pass) skips the
@@ -11924,10 +11979,10 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		 * the OLD subscribecontext/regexten are stable to snapshot unlocked. */
 		if (!ast_strlen_zero(peer->subscribecontext) && !ast_strlen_zero(peer->regexten)) {
 			char old_subctx[AST_MAX_CONTEXT];
-			char old_regexten[AST_MAX_EXTENSION];
+			char old_regexten[256];	/* a multi-token regexten SPEC, not one exten — match the 256 the splitter uses */
 			ast_copy_string(old_subctx, peer->subscribecontext, sizeof(old_subctx));
 			ast_copy_string(old_regexten, peer->regexten, sizeof(old_regexten));
-			ast_context_remove_extension(old_subctx, old_regexten, PRIORITY_HINT, "sofia_config_peer");
+			sofia_remove_peer_hints(old_regexten, old_subctx, "sofia_config_peer");
 		}
 		ast_mutex_lock(&peer->lock);
 		locked = 1;
@@ -13243,8 +13298,7 @@ static int sofia_peer_sweep_cb(void *obj, void *arg, int flags)
 	sofia_peer_drain_mwi(peer);
 	/* Drop our own dialplan hint (registrar matches sofia_create_peer_hint). */
 	if (!ast_strlen_zero(peer->subscribecontext) && !ast_strlen_zero(peer->regexten)) {
-		ast_context_remove_extension(peer->subscribecontext,
-			peer->regexten, PRIORITY_HINT, "sofia_config_peer");
+		sofia_remove_peer_hints(peer->regexten, peer->subscribecontext, "sofia_config_peer");
 	}
 	/* Release dnsmgr + drop its +1 ref FIRST, else the destructor never runs (its ref pins
 	 * refcount >= 1 after ao2_unlink). ast_dnsmgr_release is synchronous (waits for in-flight

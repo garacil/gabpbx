@@ -155,6 +155,9 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len);
 int sofia_sdp_extract_hold(sip_t const *sip, su_home_t *home);
 
 struct sofia_peer *sofia_find_peer(const char *name);
+/* Remove the per-token PRIORITY_HINT extensions for a regexten spec (ext1[@ctx]&ext2...). Splits like
+ * the hint creator so multi-token hints are fully reclaimed; registrar matches the creator. */
+void sofia_remove_peer_hints(const char *regexten, const char *subscribecontext, const char *registrar);
 void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
 		char *out_url, size_t out_len);
 struct sofia_contact *sofia_peer_first_contact(struct sofia_peer *peer);

@@ -1039,13 +1039,13 @@ char *sofia_cli_prune_realtime(struct ast_cli_entry *e, int cmd, struct ast_cli_
 				{
 					/* Snapshot stringfields under pi->lock (leaf) — racing the reload worker's
 					 * stringfield-pool free. */
-					char l_sub[AST_MAX_CONTEXT], l_rex[AST_MAX_EXTENSION];
+					char l_sub[AST_MAX_CONTEXT], l_rex[256];	/* l_rex = multi-token regexten SPEC -> 256 (splitter), not one exten */
 					ast_mutex_lock(&pi->lock);
 					ast_copy_string(l_sub, pi->subscribecontext, sizeof(l_sub));
 					ast_copy_string(l_rex, pi->regexten, sizeof(l_rex));
 					ast_mutex_unlock(&pi->lock);
 					if (!ast_strlen_zero(l_sub) && !ast_strlen_zero(l_rex)) {
-						ast_context_remove_extension(l_sub, l_rex, PRIORITY_HINT, "realtime_peer");
+						sofia_remove_peer_hints(l_rex, l_sub, "realtime_peer");
 					}
 				}
 				/* Drain MWI before the final unref so the destructor's drain can't resurrect the
@@ -1080,13 +1080,13 @@ char *sofia_cli_prune_realtime(struct ast_cli_entry *e, int cmd, struct ast_cli_
 					 * (see multi-prune branch). */
 					{
 						/* Snapshot under peer->lock (leaf) — racing the reload stringfield-pool free. */
-						char l_sub[AST_MAX_CONTEXT], l_rex[AST_MAX_EXTENSION];
+						char l_sub[AST_MAX_CONTEXT], l_rex[256];	/* l_rex = multi-token regexten SPEC -> 256 (splitter), not one exten */
 						ast_mutex_lock(&peer->lock);
 						ast_copy_string(l_sub, peer->subscribecontext, sizeof(l_sub));
 						ast_copy_string(l_rex, peer->regexten, sizeof(l_rex));
 						ast_mutex_unlock(&peer->lock);
 						if (!ast_strlen_zero(l_sub) && !ast_strlen_zero(l_rex)) {
-							ast_context_remove_extension(l_sub, l_rex, PRIORITY_HINT, "realtime_peer");
+							sofia_remove_peer_hints(l_rex, l_sub, "realtime_peer");
 						}
 					}
 					/* Drain MWI subscriptions before the final unref (see the multi-prune branch). */
