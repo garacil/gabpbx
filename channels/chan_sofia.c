@@ -12463,10 +12463,12 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			if (sofia_cfg.mwi_expiry < 1) {
 				sofia_cfg.mwi_expiry = 3600;
 			}
-		} else if (!strcasecmp(v->name, "externaddr") || !strcasecmp(v->name, "externhost")) {
-			/* Accept both keys. ast_sockaddr_parse detects the value type: a literal IP stores as
-			 * static externaddr (no refresh); else treat as hostname (resolve + arm externexpire
-			 * for lazy-refresh), so a hostname in externaddr= still works. */
+		} else if (!strcasecmp(v->name, "externaddr") || !strcasecmp(v->name, "externip")
+				|| !strcasecmp(v->name, "externhost")) {
+			/* Accept all three keys (externip is the chan_sip name, alias of externaddr).
+			 * ast_sockaddr_parse detects the value type: a literal IP stores as static externaddr
+			 * (no refresh); else treat as hostname (resolve + arm externexpire for lazy-refresh), so a
+			 * hostname in externaddr=/externip= still works. */
 			struct ast_sockaddr probe;
 			int is_explicit_host = !strcasecmp(v->name, "externhost");
 			int parses_as_ip = ast_sockaddr_parse(&probe, v->value, PARSE_PORT_FORBID);
@@ -12496,6 +12498,21 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			sofia_cfg.externtcpport = atoi(v->value);
 		} else if (!strcasecmp(v->name, "externtlsport")) {
 			sofia_cfg.externtlsport = atoi(v->value);
+		} else if (!strcasecmp(v->name, "media_address")) {
+			/* media_address (chan_sip parity): advertise this address in the SDP c=/o= instead of the
+			 * kernel-routed source (the RTP still binds bindaddr — advertise-only). Validate as an IP and
+			 * store ADDRESS-ONLY (a stray port would emit a malformed "c=IN IP4 host:port"); reject + warn
+			 * + leave off on an invalid value, like chan_sip's PARSE_ADDR. */
+			struct ast_sockaddr ma;
+			if (ast_sockaddr_parse(&ma, v->value, PARSE_PORT_IGNORE)) {
+				/* stringify_addr_remote (NOT _host) gives the SDP-form address: an IPv6 stays UNbracketed
+				 * (c=IN IP6 2001:db8::1), where stringify_host would emit the invalid [2001:db8::1]. */
+				ast_copy_string(sofia_cfg.media_address, ast_sockaddr_stringify_addr_remote(&ma),
+					sizeof(sofia_cfg.media_address));
+			} else {
+				ast_log(LOG_WARNING, "Sofia: ignoring media_address='%s' (not a valid IP address)\n",
+					v->value);
+			}
 		} else if (!strcasecmp(v->name, "localnet")) {
 			ast_copy_string(sofia_cfg.localnet, v->value, sizeof(sofia_cfg.localnet));
 			{
@@ -13373,6 +13390,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.externexpire = 0;
 	sofia_cfg.externrefresh = 10;
 	sofia_cfg.localnet[0] = '\0';
+	sofia_cfg.media_address[0] = '\0';
 	/* rtp-timeout bundle: default 0 (disabled); sofia_rtp_init wires set_*timeout when non-zero. */
 	sofia_cfg.default_rtptimeout = 0;
 	sofia_cfg.default_rtpholdtimeout = 0;

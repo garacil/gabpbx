@@ -112,7 +112,7 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 
 	/* SDP c= host chain, lowest-to-highest priority (later clauses override):
 	 * (1) local RTP addr above, (2) pvt->ourip (outbound kernel-routed source),
-	 * (3) externaddr, (4) directmedia redirip. Inbound: ourip zero → falls to (1). */
+	 * (3) externaddr, (4) media_address, (5) directmedia redirip. Inbound: ourip zero → falls to (1). */
 	if (pvt && !ast_sockaddr_isnull(&pvt->ourip)) {
 		ast_copy_string(host, ast_sockaddr_stringify_host(&pvt->ourip), sizeof(host));
 	}
@@ -122,6 +122,14 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 			&& sofia_should_use_externaddr(&pvt->peer->src_addr)
 			&& !ast_strlen_zero(sofia_cfg.externaddr)) {
 		ast_copy_string(host, sofia_cfg.externaddr, sizeof(host));
+	}
+
+	/* media_address (chan_sip parity, get_our_media_address): a global media-interface address advertised
+	 * in the SDP c=/o= INSTEAD of the kernel-routed source. A deliberate operator override that wins over
+	 * both ourip and the externaddr NAT remap (chan_sip checks it FIRST); only directmedia redirip below
+	 * still wins. Advertise-only — the RTP socket still binds bindaddr. Empty = off (no change). */
+	if (!ast_strlen_zero(sofia_cfg.media_address)) {
+		ast_copy_string(host, sofia_cfg.media_address, sizeof(host));
 	}
 
 	/* Direct media: redirect c=/port to the bridged peer's RTP target (set by

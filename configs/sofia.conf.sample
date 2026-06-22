@@ -275,6 +275,7 @@ srvlookup=yes
 ; externaddr = static IP). Backwards-compat: externaddr=hostname auto-detected
 ; + routed to externhost path (lenient parser; existing operator scripts unchanged).
 ;externaddr=203.0.113.1
+;externip=203.0.113.1          ; chan_sip alias of externaddr (literal external IP) — drop-in parity
 ;externhost=mypbx.dyndns.net   ; DDNS WAN hostname; chan_sofia re-resolves periodically per externrefresh
 ;externrefresh=10              ; DNS-refresh interval in seconds (default 10; chan_sip parity)
 ;externtcpport=5060            ; external TCP port for outbound headers (default 5060; 0 = use externaddr port)
@@ -285,6 +286,13 @@ srvlookup=yes
 ; Repeat the directive for multiple ranges (CIDR notation).
 ;localnet=192.168.0.0/24
 ;localnet=10.0.0.0/8
+;
+; media_address (chan_sip parity): a global media-interface address advertised in the SDP c=/o= lines
+; (audio, video and T.38) INSTEAD of the kernel-routed source — for multi-homed hosts where media must
+; leave a different interface/IP than signaling. It is ADVERTISE-ONLY: the RTP sockets still bind
+; bindaddr; only the address offered to the far end changes. It WINS over externaddr/externip (a
+; deliberate operator override); directmedia still redirects to the bridged peer. Empty = off.
+;media_address=198.51.100.20
 
 ;
 ; Default qualify settings for all peers

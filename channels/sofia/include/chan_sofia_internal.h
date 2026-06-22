@@ -688,6 +688,7 @@ struct sofia_config {
 	int externtcpport;        /* External TCP port for outbound headers; default 5060 (int for atoi simplicity) */
 	int externtlsport;        /* External TLS port; default 5061 */
 	char localnet[128];
+	char media_address[128];  /* media_address (chan_sip parity): a global media-interface address advertised in the SDP c=/o= INSTEAD of the kernel-routed source. Advertise-only (RTP still binds bindaddr); wins over externaddr, but directmedia redirip still overrides. Empty = off. */
 		struct ast_ha *localha;
 	int udpport;
 	/* T36: optional TLS / WS / WSS listeners */
