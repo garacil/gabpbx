@@ -4761,6 +4761,204 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	}
 }
 
+/* Handle an inbound in-dialog UPDATE (RFC 3311) — media renegotiation / hold / session-timer refresh
+ * with NO dialog-state transition. Mirrors sofia_process_reinvite's validate-then-commit SDP path
+ * (R7 doctrine: a rejected offer must not mutate live media), with two UPDATE-specific differences:
+ * (1) RFC 3311 §5.2 / RFC 3261 §14.2 glare — if we already have an offer in flight (reinvite_pending),
+ *     reject the incoming offer with 491 Request Pending;
+ * (2) RFC 3311 §5.1 — a no-SDP UPDATE is a target-refresh, answered with a 200 OK carrying NO body.
+ * The 200 carries a GRUU-aware target-refresh Contact (reuses sofia_build_contact / Phase 2b). UPDATE is
+ * NUTAG_APPL_METHOD'd, so the stack hands it here instead of auto-answering (chan_sofia owns SDP). */
+static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
+		nua_handle_t *nh, sip_t const *sip)
+{
+	char sdp_buf[2048];
+	struct ast_channel *owner = NULL;
+	char own_name[80] = "";
+	char own_uniqueid[150] = "";
+	int old_hold = 0, new_hold = 0, trans = 0;
+	int has_offer = (sip && sip->sip_payload && sip->sip_payload->pl_data);
+	int sdp_ok = 0;
+	int st_refresh = 0;
+	int st_refresh_seconds = 0;
+	const char *st_refresher_str = NULL;
+
+	/* Session-Expires on an inbound UPDATE = uas-side refresh fire (RFC 4028 allows UPDATE refresh). */
+	if (sip && sip->sip_session_expires) {
+		st_refresh = 1;
+		st_refresh_seconds = sip->sip_session_expires->x_delta;
+		st_refresher_str = sip->sip_session_expires->x_refresher; /* NULL if absent */
+	}
+
+	if (!pvt) {
+		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, TAG_END());
+		return;
+	}
+
+	ast_mutex_lock(&pvt->lock);
+	/* (1) Glare: an offer WE sent is still awaiting its answer — RFC 3311 §5.2 / RFC 3261 §14.2. */
+	if (has_offer && pvt->reinvite_pending) {
+		ast_mutex_unlock(&pvt->lock);
+		nua_respond(nh, SIP_491_REQUEST_PENDING, NUTAG_WITH_THIS(nua), TAG_END());
+		return;
+	}
+	/* (1b) Early-dialog SDP UPDATE: v1 has no early-media O/A tracking, so reject an offer before the
+	 * dialog is confirmed — RFC 3311 §5.2 received-offer overlap = 500 + Retry-After (1s, in 0–10s).
+	 * A no-SDP early UPDATE is a pure target-refresh and continues to a 200 below. */
+	if (has_offer && pvt->state != SOFIA_DIALOG_STATE_UP) {
+		ast_mutex_unlock(&pvt->lock);
+		nua_respond(nh, 500, "Overlapping Offer/Answer",
+			NUTAG_WITH_THIS(nua),
+			SIPTAG_RETRY_AFTER_STR("1"),
+			TAG_END());
+		return;
+	}
+	/* Re-acquire owner in canonical channel->pvt order (sofia_process_reinvite idiom). */
+	for (;;) {
+		owner = pvt->owner;
+		if (!owner) {
+			break;
+		}
+		ast_channel_ref(owner);
+		ast_mutex_unlock(&pvt->lock);
+		ast_channel_lock(owner);
+		ast_mutex_lock(&pvt->lock);
+		if (pvt->owner == owner) {
+			break;
+		}
+		ast_channel_unlock(owner);
+		ast_channel_unref(owner);
+		owner = NULL;
+	}
+	if (has_offer) {
+		old_hold = pvt->hold_state;
+		new_hold = sofia_sdp_extract_hold(sip, pvt->home);
+		trans = (old_hold != new_hold);
+		/* Preflight (R7): we can only answer if media exists (sofia_generate_sdp needs pvt->rtp);
+		 * check BEFORE sofia_parse_sdp, which commits. */
+		if (!pvt->rtp) {
+			ast_mutex_unlock(&pvt->lock);
+			if (owner) {
+				ast_channel_unlock(owner);
+				ast_channel_unref(owner);
+			}
+			nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, TAG_END());
+			return;
+		}
+		if (sofia_parse_sdp(pvt, sip) < 0) {
+			/* Unacceptable offer — reject 488, leave the live call untouched (RFC 3261 §14). */
+			ast_mutex_unlock(&pvt->lock);
+			if (owner) {
+				ast_channel_unlock(owner);
+				ast_channel_unref(owner);
+			}
+			ast_log(LOG_NOTICE, "Sofia: in-dialog UPDATE rejected — SDP not acceptable on '%s'\n",
+				pvt->callid ? pvt->callid : "(no-callid)");
+			nua_respond(nh, SIP_488_NOT_ACCEPTABLE, NUTAG_WITH_THIS(nua), TAG_END());
+			return;
+		}
+		/* Offer accepted — commit the deferred hold state + MOH (same as re-INVITE). */
+		pvt->hold_state = new_hold;
+		if (trans && pvt->peer && sofia_cfg.notifyhold) {
+			ast_atomic_fetchadd_int(&pvt->peer->onHold, new_hold ? +1 : -1);
+		}
+		if (trans && owner) {
+			if (new_hold) {
+				const char *suggest = (pvt->peer && !ast_strlen_zero(pvt->peer->mohsuggest))
+					? pvt->peer->mohsuggest : NULL;
+				ast_queue_control_data(owner, AST_CONTROL_HOLD,
+					S_OR(suggest, NULL), suggest ? strlen(suggest) + 1 : 0);
+			} else {
+				ast_queue_control(owner, AST_CONTROL_UNHOLD);
+			}
+		}
+		sdp_ok = (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf)) != NULL);
+	}
+	ast_mutex_unlock(&pvt->lock);
+
+	char contact_buf[1024];	/* GRUU-aware target-refresh Contact (RFC 3311 §5.1) */
+	contact_buf[0] = '\0';
+	if (pvt->peer) {
+		ast_mutex_lock(&pvt->peer->lock);
+	}
+	if (owner) {
+		ast_copy_string(own_name, owner->name, sizeof(own_name));
+		ast_copy_string(own_uniqueid, owner->uniqueid, sizeof(own_uniqueid));
+		sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
+		ast_channel_unlock(owner);
+	} else {
+		sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
+	}
+	if (pvt->peer) {
+		ast_mutex_unlock(&pvt->peer->lock);
+	}
+
+	/* Reflect the peer's session-timer policy on the 2xx (RFC 4028 — UPDATE is a valid refresh method),
+	 * mirroring sofia_answer; otherwise sofia-sip would stamp its default 1800/120 handle prefs. */
+	int st_seconds, st_min_se, st_refresher;
+	sofia_session_timer_values(pvt->peer, 0 /* inbound */, &st_seconds, &st_min_se, &st_refresher);
+
+	if (has_offer) {
+		if (sdp_ok) {
+			nua_respond(nh, SIP_200_OK,
+				NUTAG_WITH_THIS(nua),
+				TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
+				TAG_IF(st_seconds >= 0, NUTAG_SESSION_TIMER(st_seconds)),
+				TAG_IF(st_min_se > 0, NUTAG_MIN_SE(st_min_se)),
+				TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
+				SIPTAG_CONTENT_TYPE_STR("application/sdp"),
+				SIPTAG_PAYLOAD_STR(sdp_buf),
+				TAG_END());
+		} else {
+			nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, TAG_END());
+		}
+	} else {
+		/* (2) RFC 3311 §5.1: a no-SDP UPDATE is a target-refresh — 200 OK with NO body. */
+		nua_respond(nh, SIP_200_OK,
+			NUTAG_WITH_THIS(nua),
+			TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
+			TAG_IF(st_seconds >= 0, NUTAG_SESSION_TIMER(st_seconds)),
+			TAG_IF(st_min_se > 0, NUTAG_MIN_SE(st_min_se)),
+			TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
+			TAG_END());
+	}
+
+	if (trans) {
+		ast_verbose("Sofia: in-dialog UPDATE on '%s' - hold=%d\n",
+			pvt->callid ? pvt->callid : "(no-callid)", new_hold);
+		if (owner) {
+			manager_event(EVENT_FLAG_CALL, "Hold",
+				"Status: %s\r\n"
+				"Channel: %s\r\n"
+				"Uniqueid: %s\r\n",
+				new_hold ? "On" : "Off", own_name, own_uniqueid);
+		}
+	}
+
+	/* SessionTimerRefresh AMI for a uas-side refresh fire via UPDATE (mirrors the re-INVITE path).
+	 * Gated on a 2xx: a non-2xx UPDATE leaves session parameters unchanged (RFC 3311 §5.3), so an
+	 * offer that failed to answer (500) must NOT bump the negotiated session timer. */
+	if (st_refresh && (!has_offer || sdp_ok)) {
+		ast_mutex_lock(&pvt->lock);
+		pvt->session_negotiated_expires = st_refresh_seconds;
+		pvt->session_last_refresh_at = time(NULL);
+		ast_mutex_unlock(&pvt->lock);
+		manager_event(EVENT_FLAG_CALL, "SessionTimerRefresh",
+			"Channel: %s\r\n"
+			"Uniqueid: %s\r\n"
+			"Peer: Sofia/%s\r\n"
+			"SessionExpires: %d\r\n"
+			"Refresher: %s\r\n"
+			"Direction: uas\r\n",
+			own_name, own_uniqueid, pvt->peername, st_refresh_seconds,
+			st_refresher_str ? st_refresher_str : "auto");
+	}
+
+	if (owner) {
+		ast_channel_unref(owner);
+	}
+}
+
 static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
 		sip_t const *sip, tagi_t tags[])
 {
@@ -5222,7 +5420,7 @@ static void sofia_process_options(nua_t *nua, nua_handle_t *nh, struct sofia_pvt
 {
 	nua_respond(nh, SIP_200_OK,
 		SIPTAG_ALLOW_STR("INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER, "
-				"SUBSCRIBE, NOTIFY, REFER, MESSAGE, INFO, PRACK"),	/* no PUBLISH (we 405 it) */
+				"SUBSCRIBE, NOTIFY, REFER, MESSAGE, INFO, PRACK, UPDATE"),	/* no PUBLISH (we 405 it) */
 		SIPTAG_ACCEPT_STR("application/sdp"),
 		TAG_END());
 }
@@ -10034,6 +10232,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 
 	switch (event) {
 	case nua_i_invite:
+	case nua_i_update:
 	case nua_i_bye:
 	case nua_i_cancel:
 	case nua_i_options:
@@ -10061,6 +10260,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	 * function-exit drop. */
 	switch (event) {
 	case nua_i_invite:
+	case nua_i_update:
 	case nua_i_refer:
 	case nua_i_info:
 	case nua_i_ack:
@@ -10091,6 +10291,17 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				NUTAG_WITH_THIS(nua), TAG_END());
 		} else {
 			sofia_process_invite(nua, nh, pvt, sip, tags);
+		}
+		break;
+	case nua_i_update:
+		/* In-dialog UPDATE (RFC 3311) — media renegotiation / hold / session-timer refresh.
+		 * UPDATE is always in-dialog; pvt NULL = the dialog is gone -> 481. APPL_METHOD'd so the
+		 * stack delivers it here (with MEDIA_ENABLE 0 / no soa it would otherwise mis-answer). */
+		if (pvt) {
+			sofia_process_update(pvt, nua, nh, sip);
+		} else {
+			nua_respond(nh, 481, "Call/Transaction Does Not Exist",
+				NUTAG_WITH_THIS(nua), TAG_END());
 		}
 		break;
 	case nua_i_bye:
@@ -10974,7 +11185,7 @@ static void *sofia_thread_func(void *data)
 			TAG_IF(needs_cert && sofia_cfg.tls_verify_depth > 0,
 				TPTAG_TLS_VERIFY_DEPTH((unsigned)sofia_cfg.tls_verify_depth)),
 			NUTAG_MEDIA_ENABLE(0),
-			NUTAG_ALLOW("INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, REFER, MESSAGE, INFO, PRACK"),
+			NUTAG_ALLOW("INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, REFER, MESSAGE, INFO, PRACK, UPDATE"),
 			NUTAG_APPL_METHOD("REGISTER"),
 			NUTAG_ALLOW_EVENTS("presence"),
 			NUTAG_ALLOW_EVENTS("dialog"),
@@ -11016,7 +11227,7 @@ static void *sofia_thread_func(void *data)
 
 	nua_set_params(sofia_nua,
 		NUTAG_ENABLEMESSAGE(1),
-		NUTAG_ALLOW("INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, REFER, MESSAGE, INFO, PRACK"),
+		NUTAG_ALLOW("INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, REFER, MESSAGE, INFO, PRACK, UPDATE"),
 		TAG_END());
 
 	/* Add methods to appl_method one at a time */
@@ -11026,6 +11237,9 @@ static void *sofia_thread_func(void *data)
 	 * inbound PUBLISH (405/501) rather than a stub leaking a 200 OK + un-reaped handle. */
 	nua_set_params(sofia_nua, NUTAG_APPL_METHOD("NOTIFY"), TAG_END());
 	nua_set_params(sofia_nua, NUTAG_APPL_METHOD("INFO"), TAG_END());
+	/* UPDATE (RFC 3311): APPL_METHOD so the stack delivers nua_i_update to us. With MEDIA_ENABLE(0)
+	 * (no soa) the stack cannot run the UPDATE offer/answer, so chan_sofia owns the SDP (sofia_process_update). */
+	nua_set_params(sofia_nua, NUTAG_APPL_METHOD("UPDATE"), TAG_END());
 	nua_set_params(sofia_nua, NUTAG_APPL_METHOD("REFER"), TAG_END());
 
 	/* Allow event packages one at a time */
