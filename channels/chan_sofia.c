@@ -11518,6 +11518,145 @@ static char *sofia_cli_show_channels(struct ast_cli_entry *e, int cmd, struct as
 	return CLI_SUCCESS;
 }
 
+/* `sip show channel <call-id-prefix>` — detailed state for ONE active channel (chan_sip parity).
+ * Prefix-match the Call-ID, snapshot all fields under pvt->lock, emit after the lock drops. */
+static char *sofia_cli_show_channel(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct sofia_pvt *pvt;
+	struct ao2_iterator i;
+	char callid[256] = "", peer[256] = "", user[256] = "", fromu[256] = "", fromd[256] = "", ruri[256] = "";
+	int st = -1, outgoing = 0, has_rtp = 0, has_vrtp = 0, t38 = 0, hold = 0, has_srtp = 0, sess_exp = 0, found = 0;
+	const char *state_str;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "sip show channel";
+		e->usage = "Usage: sip show channel <call-id-prefix>\n"
+			   "       Show detailed state for one active Sofia-SIP channel (Call-ID prefix match).\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;	/* Call-IDs are dynamic — no completion in v1 */
+	}
+	if (a->argc != 4) {
+		return CLI_SHOWUSAGE;
+	}
+	if (!dialogs) {
+		ast_cli(a->fd, "No active channels.\n");
+		return CLI_SUCCESS;
+	}
+	i = ao2_iterator_init(dialogs, 0);
+	while (!found && (pvt = ao2_iterator_next(&i))) {
+		ast_mutex_lock(&pvt->lock);
+		if (!ast_strlen_zero(pvt->callid)
+				&& !strncasecmp(pvt->callid, a->argv[3], strlen(a->argv[3]))) {
+			ast_copy_string(callid, S_OR(pvt->callid, ""), sizeof(callid));
+			ast_copy_string(peer, S_OR(pvt->peername, ""), sizeof(peer));
+			ast_copy_string(user, S_OR(pvt->username, ""), sizeof(user));
+			ast_copy_string(fromu, S_OR(pvt->fromuser, ""), sizeof(fromu));
+			ast_copy_string(fromd, S_OR(pvt->fromdomain, ""), sizeof(fromd));
+			ast_copy_string(ruri, S_OR(pvt->ruri, ""), sizeof(ruri));
+			st = pvt->state;
+			outgoing = pvt->outgoing;
+			has_rtp = !!pvt->rtp;
+			has_vrtp = !!pvt->vrtp;
+			has_srtp = !!pvt->srtp;
+			t38 = pvt->t38_state;
+			hold = pvt->hold_state;
+			sess_exp = pvt->session_negotiated_expires;
+			found = 1;
+		}
+		ast_mutex_unlock(&pvt->lock);
+		ao2_ref(pvt, -1);
+	}
+	ao2_iterator_destroy(&i);
+
+	if (!found) {
+		ast_cli(a->fd, "No active channel with Call-ID prefix '%s'.\n", a->argv[3]);
+		return CLI_SUCCESS;
+	}
+	switch (st) {
+	case SOFIA_DIALOG_STATE_DOWN: state_str = "Down"; break;
+	case SOFIA_DIALOG_STATE_TRYING: state_str = "Trying"; break;
+	case SOFIA_DIALOG_STATE_RINGING: state_str = "Ringing"; break;
+	case SOFIA_DIALOG_STATE_UP: state_str = "Up"; break;
+	default: state_str = "Unknown"; break;
+	}
+	ast_cli(a->fd, "  Call-ID       : %s\n", callid);
+	ast_cli(a->fd, "  Peer          : %s\n", peer);
+	ast_cli(a->fd, "  Username      : %s\n", user);
+	ast_cli(a->fd, "  From          : %s@%s\n", fromu, fromd);
+	ast_cli(a->fd, "  Request-URI   : %s\n", ruri);
+	ast_cli(a->fd, "  State         : %s\n", state_str);
+	ast_cli(a->fd, "  Direction     : %s\n", outgoing ? "outbound" : "inbound");
+	ast_cli(a->fd, "  Audio RTP     : %s\n", has_rtp ? "yes" : "no");
+	ast_cli(a->fd, "  Video RTP     : %s\n", has_vrtp ? "yes" : "no");
+	ast_cli(a->fd, "  SRTP          : %s\n", has_srtp ? "yes" : "no");
+	ast_cli(a->fd, "  On hold       : %s\n", hold ? "yes" : "no");
+	ast_cli(a->fd, "  T.38 state    : %d\n", t38);
+	if (sess_exp > 0) {
+		ast_cli(a->fd, "  Session-Timer : %ds\n", sess_exp);
+	}
+	return CLI_SUCCESS;
+}
+
+/* `sip show channelstats` — per-channel audio RTP stats (chan_sip parity). The dialog iterator holds a
+ * +1 ref on each pvt while reading, so the pvt stays alive; pvt->rtp is only destroyed/replaced under
+ * pvt->lock (fork-winner promotion) or freed in the pvt destructor, so reading it here under pvt->lock is
+ * safe; ast_rtp_instance_get_stats is called under pvt->lock with lock order pvt->rtp, matching
+ * the read path channel->pvt->rtp. Fork children are skipped, as in show channels. */
+static char *sofia_cli_show_channelstats(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct sofia_pvt *pvt;
+	struct ao2_iterator i;
+	int count = 0;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "sip show channelstats";
+		e->usage = "Usage: sip show channelstats\n"
+			   "       Per-channel audio RTP statistics (tx/rx packets, loss, jitter).\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+	if (a->argc != 3) {
+		return CLI_SHOWUSAGE;
+	}
+	ast_cli(a->fd, "%-40s %-16s %8s %8s %8s %8s %10s\n",
+		"Call-ID", "Peer", "TxPkt", "RxPkt", "TxLost", "RxLost", "RxJitter");
+	if (!dialogs) {
+		return CLI_SUCCESS;
+	}
+	i = ao2_iterator_init(dialogs, 0);
+	while ((pvt = ao2_iterator_next(&i))) {
+		char callid[256] = "", peer[256] = "";
+		struct ast_rtp_instance_stats stats;
+		int have = 0;
+
+		if (pvt->is_fork_child) {
+			ao2_ref(pvt, -1);
+			continue;
+		}
+		ast_mutex_lock(&pvt->lock);
+		ast_copy_string(callid, S_OR(pvt->callid, ""), sizeof(callid));
+		ast_copy_string(peer, S_OR(pvt->peername, ""), sizeof(peer));
+		if (pvt->rtp && ast_rtp_instance_get_stats(pvt->rtp, &stats, AST_RTP_INSTANCE_STAT_ALL) == 0) {
+			have = 1;
+		}
+		ast_mutex_unlock(&pvt->lock);
+		if (have) {
+			ast_cli(a->fd, "%-40s %-16s %8u %8u %8u %8u %10.3f\n",
+				callid, peer, stats.txcount, stats.rxcount, stats.txploss, stats.rxploss,
+				stats.rxjitter);
+			count++;
+		}
+		ao2_ref(pvt, -1);
+	}
+	ao2_iterator_destroy(&i);
+	ast_cli(a->fd, "%d channel%s with RTP\n", count, count != 1 ? "s" : "");
+	return CLI_SUCCESS;
+}
+
 
 /* Peer-dump helpers: append into *out (assembled under peer->lock, emitted once after
  * the lock drops). All call sites live in sofia_cli_show_peer. */
@@ -11573,7 +11712,11 @@ static struct ast_cli_entry cli_sofia[] = {
 	AST_CLI_DEFINE(sofia_cli_show_registry, "List outbound SIP trunk registrations"),
 	AST_CLI_DEFINE(sofia_cli_show_publications, "List outbound PUBLISH presentities"),
 	AST_CLI_DEFINE(sofia_cli_unregister, "Force-expire a SIP peer's inbound registration"),
+	AST_CLI_DEFINE(sofia_cli_qualify_peer, "Send an on-demand OPTIONS qualify to a peer"),
+	AST_CLI_DEFINE(sofia_cli_notify, "Send a sip_notify.conf NOTIFY to peers"),
 	AST_CLI_DEFINE(sofia_cli_show_channels, "List active Sofia-SIP channels"),
+	AST_CLI_DEFINE(sofia_cli_show_channel, "Show one Sofia-SIP channel in detail"),
+	AST_CLI_DEFINE(sofia_cli_show_channelstats, "Per-channel RTP statistics"),
 	AST_CLI_DEFINE(sofia_cli_show_peer, "Show detailed Sofia-SIP peer info"),
 	AST_CLI_DEFINE(sofia_cli_show_inuse, "Show SIP peer call usage counters"),
 	AST_CLI_DEFINE(sofia_cli_show_settings, "Show Sofia-SIP global settings"),
@@ -14075,6 +14218,31 @@ void sipqualifypeer_callback(void *data)
 		}
 		ast_free(d);
 	}
+}
+
+/* Manual (AMI/CLI) on-demand qualify: alloc a dispatch + hand it to sofia_thread (where nua_options
+ * runs). ALWAYS consumes the caller's peer +1 ref — transferred to the callback on success (return 0),
+ * dropped on failure (return -1). clear_pending=0 so a manual qualify never touches the timer's
+ * qualify_pending gate. Shared by manager_sofia_qualify_peer + the `sip qualify peer` CLI. */
+int sofia_qualify_peer_async(struct sofia_peer *peer)
+{
+	struct sipqualifypeer_data *d;
+
+	if (!peer) {
+		return -1;
+	}
+	if (!(d = ast_calloc(1, sizeof(*d)))) {
+		ao2_ref(peer, -1);
+		return -1;
+	}
+	d->peer = peer;		/* TRANSFER the caller's +1 ref */
+	d->clear_pending = 0;
+	if (sofia_dispatch_to_root_thread(sipqualifypeer_callback, d) < 0) {
+		ao2_ref(peer, -1);
+		ast_free(d);
+		return -1;
+	}
+	return 0;
 }
 
 

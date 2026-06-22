@@ -198,6 +198,7 @@ struct sipqualifypeer_data {
 	int clear_pending;		/* 1 = timer dispatch owns peer->qualify_pending (callback clears it); 0 = AMI manual qualify (leaves the timer gate alone) */
 };
 void sipqualifypeer_callback(void *data);
+int sofia_qualify_peer_async(struct sofia_peer *peer);	/* manual qualify: consumes the peer ref; 0 ok, -1 fail */
 
 struct sofia_register_update {
 	int was_registered;

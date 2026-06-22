@@ -22,5 +22,6 @@ char *sofia_cli_reload(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 char *sofia_cli_prune_realtime(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 char *sofia_cli_show_registry(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 char *sofia_cli_unregister(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+char *sofia_cli_qualify_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 
 #endif /* CHAN_SOFIA_CLI_H */

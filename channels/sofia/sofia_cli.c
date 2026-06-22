@@ -1211,6 +1211,42 @@ char *sofia_cli_show_registry(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 	return CLI_SUCCESS;
 }
 
+/* `sip qualify peer <peer> [load]` — on-demand OPTIONS qualify (chan_sip parity). Async: the result
+ * lands via the normal qualify path (sip show peers / PeerStatus AMI). [load] is a chan_sip-compat
+ * no-op (sofia_find_peer already realtime-loads on a cache miss). */
+char *sofia_cli_qualify_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct sofia_peer *peer;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "sip qualify peer";
+		e->usage =
+			"Usage: sip qualify peer <peer> [load]\n"
+			"       Send an on-demand OPTIONS qualify to a SIP peer. The result is asynchronous —\n"
+			"       watch 'sip show peers' or the PeerStatus AMI event. 'load' is accepted for\n"
+			"       chan_sip compatibility (realtime peers load automatically).\n";
+		return NULL;
+	case CLI_GENERATE:
+		return (a->pos == 3) ? complete_sofia_peer(a->word, a->n, 0) : NULL;
+	}
+
+	if (a->argc != 4 && a->argc != 5) {
+		return CLI_SHOWUSAGE;
+	}
+	peer = sofia_find_peer(a->argv[3]);
+	if (!peer) {
+		ast_cli(a->fd, "Peer unknown: '%s'.\n", a->argv[3]);
+		return CLI_SUCCESS;
+	}
+	if (sofia_qualify_peer_async(peer) < 0) {	/* consumes the peer ref */
+		ast_cli(a->fd, "Failed to dispatch qualify for '%s'.\n", a->argv[3]);
+		return CLI_SUCCESS;
+	}
+	ast_cli(a->fd, "Qualify Peer '%s' triggered (asynchronous).\n", a->argv[3]);
+	return CLI_SUCCESS;
+}
+
 char *sofia_cli_unregister(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
 	struct sofia_peer *peer;

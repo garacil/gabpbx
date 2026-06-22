@@ -16,6 +16,7 @@
 #include "gabpbx/astobj2.h"
 #include "gabpbx/manager.h"
 #include "gabpbx/cli.h"
+#include "gabpbx/config.h"	/* sip_notify.conf parse for the `sip notify` CLI */
 #include "gabpbx/lock.h"
 #include "gabpbx/utils.h"
 #include "gabpbx/strings.h"
@@ -484,7 +485,6 @@ int manager_sofia_qualify_peer(struct mansession *s, const struct message *m)
 {
 	const char *peername = astman_get_header(m, "Peer");
 	struct sofia_peer *peer;
-	struct sipqualifypeer_data *dispatch;
 
 	if (ast_strlen_zero(peername)) {
 		astman_send_error(s, m, "Peer: <name> missing.");
@@ -495,16 +495,7 @@ int manager_sofia_qualify_peer(struct mansession *s, const struct message *m)
 		astman_send_error(s, m, "Peer not found");
 		return 0;
 	}
-	dispatch = ast_calloc(1, sizeof(*dispatch));
-	if (!dispatch) {
-		ao2_ref(peer, -1);
-		astman_send_error(s, m, "Memory allocation failed");
-		return 0;
-	}
-	dispatch->peer = peer;	/* TRANSFER the +1 ref to the callback */
-	if (sofia_dispatch_to_root_thread(sipqualifypeer_callback, dispatch) < 0) {
-		ao2_ref(peer, -1);
-		ast_free(dispatch);
+	if (sofia_qualify_peer_async(peer) < 0) {	/* consumes the peer ref (transfer/drop) */
 		astman_send_error(s, m, "Failed to dispatch qualify");
 		return 0;
 	}
@@ -625,6 +616,31 @@ static void sipnotify_data_free(struct sipnotify_data *d)
 	ast_free(d);
 }
 
+/* Append one extra NOTIFY header to a sipnotify_data (heap-grown). Both name+value are dup'd; the entry
+ * is COUNTED only when both dups succeed (the callback formats "%s: %s", so a NULL would deref). Shared
+ * by the AMI + CLI notify builders. */
+static void sipnotify_add_header(struct sipnotify_data *d, const char *name, const char *value)
+{
+	struct sipnotify_header *resized;
+	char *hn, *hv;
+
+	resized = ast_realloc(d->headers, (d->header_count + 1) * sizeof(*d->headers));
+	if (!resized) {
+		return;
+	}
+	d->headers = resized;
+	hn = ast_strdup(name);
+	hv = ast_strdup(value);
+	if (hn && hv) {
+		d->headers[d->header_count].name = hn;
+		d->headers[d->header_count].value = hv;
+		d->header_count++;
+	} else {
+		ast_free(hn);
+		ast_free(hv);
+	}
+}
+
 /* Runs on sofia_thread via sofia_dispatch_to_root_thread. Builds the
  * extra-headers buffer, creates an out-of-dialog nua_handle to the target,
  * dispatches the NOTIFY, then frees all dispatch resources. */
@@ -676,6 +692,41 @@ static void sipnotify_callback(void *data)
 	sipnotify_data_free(d);
 }
 /* AMI SIPnotify entry: resolve the target URI, build the dispatch, and hand it to sofia_thread. */
+/* Resolve a peer's out-of-dialog NOTIFY target URI (registered contact preferred, constructed fallback
+ * for a never-registered peer) and hand back a +1 ref to the chosen contact (or NULL). Shared by the AMI
+ * (manager_sofia_notify) and the CLI (sofia_cli_notify) notify paths. */
+static void sipnotify_resolve_target(struct sofia_peer *peer, struct sofia_contact **out_contact,
+	char *target_uri, size_t len)
+{
+	struct sofia_contact *contact = sofia_peer_first_contact(peer);
+
+	if (contact && !ast_strlen_zero(contact->contact_uri)) {
+		char c_transport[8];
+		ast_copy_string(target_uri, contact->contact_uri, len);
+		ao2_lock(contact);
+		ast_copy_string(c_transport, contact->transport, sizeof(c_transport));
+		ao2_unlock(contact);
+		sofia_uri_append_transport(target_uri, len, c_transport);
+	} else {
+		char hbuf[80];
+		char l_defaultuser[256], l_name[256], l_host[256];
+		int l_port;
+
+		ast_mutex_lock(&peer->lock);
+		ast_copy_string(l_defaultuser, peer->defaultuser, sizeof(l_defaultuser));
+		ast_copy_string(l_name, peer->name, sizeof(l_name));
+		ast_copy_string(l_host, peer->host, sizeof(l_host));
+		l_port = peer->port;
+		ast_mutex_unlock(&peer->lock);
+
+		snprintf(target_uri, len, "sip:%s@%s:%d",
+			!ast_strlen_zero(l_defaultuser) ? l_defaultuser : l_name,
+			sofia_uri_format_host(!ast_strlen_zero(l_host) ? l_host : "unknown", hbuf, sizeof(hbuf)),
+			l_port ? l_port : 5060);
+	}
+	*out_contact = contact;
+}
+
 int manager_sofia_notify(struct mansession *s, const struct message *m)
 {
 	const char *channelname = astman_get_header(m, "Channel");
@@ -702,38 +753,8 @@ int manager_sofia_notify(struct mansession *s, const struct message *m)
 		return 0;
 	}
 
-	/* Target URI: registered contact preferred; constructed fallback for never-registered. */
-	contact = sofia_peer_first_contact(peer);
-	if (contact && !ast_strlen_zero(contact->contact_uri)) {
-		char c_transport[8];
-		ast_copy_string(target_uri, contact->contact_uri, sizeof(target_uri));
-		/* contact_uri is the transport-less stable key - route over the registered transport. */
-		ao2_lock(contact);
-		ast_copy_string(c_transport, contact->transport, sizeof(c_transport));
-		ao2_unlock(contact);
-		sofia_uri_append_transport(target_uri, sizeof(target_uri), c_transport);
-	} else {
-		/* Fallback URI; sofia_uri_format_host bracket-wraps a bare IPv6 host. */
-		char hbuf[80];
-		/* reload-UAF fix: defaultuser/name/host are unbounded stringfields the reload writer frees
-		 * under peer->lock on grow - snapshot them (and port) under the lock, then build from locals. */
-		char l_defaultuser[256], l_name[256], l_host[256];
-		int l_port;
-
-		ast_mutex_lock(&peer->lock);
-		ast_copy_string(l_defaultuser, peer->defaultuser, sizeof(l_defaultuser));
-		ast_copy_string(l_name, peer->name, sizeof(l_name));
-		ast_copy_string(l_host, peer->host, sizeof(l_host));
-		l_port = peer->port;
-		ast_mutex_unlock(&peer->lock);
-
-		snprintf(target_uri, sizeof(target_uri), "sip:%s@%s:%d",
-			!ast_strlen_zero(l_defaultuser) ? l_defaultuser : l_name,
-			sofia_uri_format_host(
-				!ast_strlen_zero(l_host) ? l_host : "unknown",
-				hbuf, sizeof(hbuf)),
-			l_port ? l_port : 5060);
-	}
+	/* Target URI + contact ref (registered contact preferred; constructed fallback). */
+	sipnotify_resolve_target(peer, &contact, target_uri, sizeof(target_uri));
 
 	dispatch = ast_calloc(1, sizeof(*dispatch));
 	if (!dispatch) {
@@ -758,24 +779,7 @@ int manager_sofia_notify(struct mansession *s, const struct message *m)
 			ast_free(dispatch->content);
 			dispatch->content = ast_strdup(v->value);
 		} else {
-			struct sipnotify_header *resized;
-			resized = ast_realloc(dispatch->headers,
-				(dispatch->header_count + 1) * sizeof(*dispatch->headers));
-			if (resized) {
-				char *hn = ast_strdup(v->name);
-				char *hv = ast_strdup(v->value);
-				dispatch->headers = resized;
-				/* Only COUNT the header when BOTH strdups succeed - the callback formats
-				 * "%s: %s" over name/value, so a NULL would deref. On partial failure, free + skip. */
-				if (hn && hv) {
-					dispatch->headers[dispatch->header_count].name = hn;
-					dispatch->headers[dispatch->header_count].value = hv;
-					dispatch->header_count++;
-				} else {
-					ast_free(hn);
-					ast_free(hv);
-				}
-			}
+			sipnotify_add_header(dispatch, v->name, v->value);
 		}
 	}
 	ast_variables_destroy(vars);
@@ -797,4 +801,120 @@ int manager_sofia_notify(struct mansession *s, const struct message *m)
 
 	astman_send_ack(s, m, "Notify Sent");
 	return 0;
+}
+
+/* `sip notify <type> <peer> [<peer>...]` — send a named NOTIFY (from sip_notify.conf) to peers, e.g.
+ * `sip notify check-sync 100` to reboot a phone (chan_sip parity). Reuses the one-shot SIPnotify core
+ * (sipnotify_resolve_target + the SOFIA_SIPNOTIFY_HMAGIC sipnotify_callback). sip_notify.conf is
+ * lazy-loaded per invocation (no cached global). A type's KEY=VALUE lines become SIP headers; Event and
+ * Content are special (Content lines CRLF-join into the body); Content-Length is ignored (computed); a
+ * default Subscription-State: terminated is added if the type omits it. */
+char *sofia_cli_notify(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct ast_config *cfg;
+	struct ast_flags cfg_flags = { 0 };
+	struct ast_variable *v;
+	int i, sent = 0;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "sip notify";
+		e->usage =
+			"Usage: sip notify <type> <peer> [<peer>...]\n"
+			"       Send a NOTIFY of the named type (a sip_notify.conf section) to one or more peers,\n"
+			"       e.g. 'sip notify check-sync 100' to reboot a phone. The section's lines become SIP\n"
+			"       headers (Event/Content are special; a Subscription-State: terminated default is added).\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;	/* types live in a config file; peer/type completion is a v2 polish */
+	}
+	if (a->argc < 4) {
+		return CLI_SHOWUSAGE;
+	}
+	cfg = ast_config_load("sip_notify.conf", cfg_flags);
+	if (!cfg || cfg == CONFIG_STATUS_FILEINVALID || cfg == CONFIG_STATUS_FILEMISSING) {
+		ast_cli(a->fd, "sip_notify.conf not found or invalid.\n");
+		return CLI_SUCCESS;
+	}
+	if (!ast_variable_browse(cfg, a->argv[2])) {
+		ast_cli(a->fd, "Notify type '%s' not found in sip_notify.conf.\n", a->argv[2]);
+		ast_config_destroy(cfg);
+		return CLI_SUCCESS;
+	}
+
+	for (i = 3; i < a->argc; i++) {
+		struct sofia_peer *peer = sofia_find_peer(a->argv[i]);
+		struct sofia_contact *contact = NULL;
+		struct sipnotify_data *d;
+		char target_uri[512];
+		int have_substate = 0;
+
+		if (!peer) {
+			ast_cli(a->fd, "  %s: peer not found\n", a->argv[i]);
+			continue;
+		}
+		sipnotify_resolve_target(peer, &contact, target_uri, sizeof(target_uri));
+		if (!(d = ast_calloc(1, sizeof(*d)))) {
+			if (contact) {
+				ao2_ref(contact, -1);
+			}
+			ao2_ref(peer, -1);
+			continue;
+		}
+		d->peer = peer;		/* TRANSFER +1 ref */
+		d->contact = contact;	/* TRANSFER +1 ref (may be NULL) */
+		d->target_uri = ast_strdup(target_uri);
+
+		for (v = ast_variable_browse(cfg, a->argv[2]); v; v = v->next) {
+			/* chan_sip parity: each value is semicolon-unescaped before use (e.g.
+			 * Event=>check-sync\;reboot=true must send "check-sync;reboot=true"). */
+			char buf[1024];
+
+			ast_copy_string(buf, v->value, sizeof(buf));
+			ast_unescape_semicolon(buf);
+			if (!strcasecmp(v->name, "Event")) {
+				ast_free(d->event);
+				d->event = ast_strdup(buf);
+			} else if (!strcasecmp(v->name, "Content")) {
+				/* Join Content lines with a CRLF BETWEEN them (chan_sip semantics) — NOT a trailing
+				 * CRLF per line; a final empty Content=> is how the conf adds a trailing blank line. */
+				char *joined = NULL;
+				if (ast_strlen_zero(d->content)) {
+					d->content = ast_strdup(buf);
+				} else if (ast_asprintf(&joined, "%s\r\n%s", d->content, buf) >= 0) {
+					ast_free(d->content);
+					d->content = joined;
+				}
+			} else if (!strcasecmp(v->name, "Content-Length")) {
+				ast_log(LOG_NOTICE, "sip notify: ignoring Content-Length in type '%s' (computed)\n",
+					a->argv[2]);
+			} else {
+				if (!strcasecmp(v->name, "Subscription-State")) {
+					have_substate = 1;
+				}
+				sipnotify_add_header(d, v->name, buf);
+			}
+		}
+		/* chan_sip CLI behavior: a NOTIFY out-of-dialog carries Subscription-State: terminated unless
+		 * the type set one explicitly. */
+		if (!have_substate) {
+			sipnotify_add_header(d, "Subscription-State", "terminated");
+		}
+		if (!d->event) {
+			d->event = ast_strdup("check-sync");
+		}
+		if (!d->content) {
+			d->content = ast_strdup("");
+		}
+		if (sofia_dispatch_to_root_thread(sipnotify_callback, d) < 0) {
+			sipnotify_data_free(d);
+			ast_cli(a->fd, "  %s: dispatch failed\n", a->argv[i]);
+		} else {
+			ast_cli(a->fd, "  %s: NOTIFY '%s' sent\n", a->argv[i], a->argv[2]);
+			sent++;
+		}
+	}
+	ast_config_destroy(cfg);
+	ast_cli(a->fd, "%d NOTIFY message%s sent\n", sent, sent != 1 ? "s" : "");
+	return CLI_SUCCESS;
 }
