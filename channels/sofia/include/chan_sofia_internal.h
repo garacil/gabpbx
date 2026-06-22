@@ -164,7 +164,8 @@ void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len);
  * the hint creator so multi-token hints are fully reclaimed; registrar matches the creator. */
 void sofia_remove_peer_hints(const char *regexten, const char *subscribecontext, const char *registrar);
 /* GRUU (RFC 5627/5626), sofia_gruu.c: advertise +sip.instance + consume the registrar's pub/temp-gruu. */
-void sofia_build_instance_feature(const struct sofia_peer *peer, char *buf, size_t len);
+void sofia_build_instance_feature(const struct sofia_peer *peer, char *buf, size_t len, int with_reg_id);
+void sofia_outbound_consume(struct sofia_peer *peer, sip_t const *sip, int keepalive_ms);	/* RFC 5626 REGISTER-2xx inspect */
 void sofia_gruu_consume(struct sofia_peer *peer, sip_t const *sip);
 void sofia_service_route_store(struct sofia_peer *peer, sip_t const *sip);	/* Service-Route RFC 3608, sofia_route.c */
 int sofia_route_serialize(sip_route_t const *list, char *buf, size_t len);	/* Path/Service-Route hop list -> Route value; 0 ok, -1 overflow */
@@ -467,6 +468,10 @@ struct sofia_peer {
 	int use_service_route;          /* Service-Route (RFC 3608): when 1, ingest the registrar's Service-Route from the REGISTER 200 and pre-load it on outbound INVITEs to that domain. Default 0 (opt-in; applying it diverts outbound routing). */
 	int path_support;               /* Path (RFC 3327): when 1, as the registrar for this dynamic peer, accept + store the Path from its REGISTER and pre-load it as a Route on requests to its contacts. Default 0 (opt-in; accepting Path is a trust decision, RFC 3327 §7). */
 	int rel100;                     /* 100rel/PRACK (RFC 3262): when 1, send NON-183 provisionals (180 Ringing etc.) to this peer RELIABLY (Require: 100rel + RSeq, await PRACK) via NUTAG_EARLY_MEDIA on the inbound handle. The 183 early-media is already reliable when the caller advertises 100rel. Default 0 (opt-in; some UACs mishandle a reliable 180). */
+	int sip_outbound;               /* RFC 5626 SIP Outbound (register=> trunks): when 1, the outbound REGISTER advertises Supported: outbound,path + carries a stable +sip.instance and reg-id=1 on the Contact, so the registrar/edge proxy maintains the client-initiated flow. Manual signals (no native outbound engine). Default 0 (opt-in). */
+	int sip_outbound_active;        /* RFC 5626 runtime: set when the REGISTER 2xx confirmed outbound (Require: outbound). Informational (shown in sip show peer); not config. */
+	int flow_timer;                 /* RFC 5626 Flow-Timer (seconds) learned from the REGISTER 2xx (§4.4); 0 = none advertised. Informational. */
+	int reg_handle_dirty;           /* set when a reload toggled gruu/sip_outbound: the surviving REGISTER handle carries merged Supported/M_FEATURES prefs that can only be dropped by rebuilding peer->nh, done on the next refresh. */
 	/* Buggy-CISCO MWI fix (chan_sip parity): when set, the Voice-Message: NOTIFY
 	 * body line OMITS the trailing " (0/0)" suffix (some SIP stacks reject it).
 	 * Per-peer only (no [general] default); default 0 = standard RFC 3842. */

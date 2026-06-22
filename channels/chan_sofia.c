@@ -2086,6 +2086,9 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	peer->use_service_route = 0;	/* Service-Route (RFC 3608): opt-in (applying it diverts outbound routing) */
 	peer->path_support = 0;		/* Path (RFC 3327): opt-in (accepting Path is a trust decision) */
 	peer->rel100 = 0;		/* 100rel/PRACK (RFC 3262): reliable non-183 provisionals, opt-in */
+	peer->sip_outbound = 0;		/* RFC 5626 SIP Outbound: opt-in (advertise outbound + reg-id) */
+	peer->sip_outbound_active = 0;	/* runtime: set from the REGISTER 2xx Require: outbound */
+	peer->flow_timer = 0;		/* runtime: Flow-Timer learned from the REGISTER 2xx */
 	peer->buggymwi = 0;
 	peer->lockuseragent = 0;
 	ast_string_field_set(peer, lockuseragent_prefixes, "");
@@ -2733,6 +2736,8 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			}
 		} else if (!strcasecmp(v->name, "rel100")) {
 			peer->rel100 = ast_true(v->value);	/* RFC 3262: reliable non-183 provisionals (opt-in) */
+		} else if (!strcasecmp(v->name, "sip_outbound")) {
+			peer->sip_outbound = ast_true(v->value);	/* RFC 5626: advertise outbound + reg-id on REGISTER (opt-in) */
 		} else if (!strcasecmp(v->name, "publish")) {
 			/* outbound PUBLISH (RFC 3903): opt hint state into central publication. */
 			peer->publish = ast_true(v->value);
@@ -10517,6 +10522,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				 * carrying a Contact — so a 2xx with no Service-Route reliably clears the stored
 				 * route. Self-no-ops when peer is NULL or service_route=no. */
 				sofia_service_route_store(peer, sip);
+				/* RFC 5626 SIP Outbound: record Require: outbound confirmation + Flow-Timer from the
+				 * 2xx (no-op unless sip_outbound=yes). Global tcp_keepalive feeds the keepalive warn. */
+				sofia_outbound_consume(peer, sip, sofia_cfg.tcp_keepalive_ms);
 			} else if (status == 401 || status == 407) {
 			if (peer) {
 				char www_creds[512] = "";
@@ -10562,7 +10570,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				char instance_feature_reg[120];
 				snprintf(mf_str_reg, sizeof(mf_str_reg), "%d", peer->maxforwards);
 				/* GRUU: keep the +sip.instance advertisement on the re-REGISTER too. */
-				sofia_build_instance_feature(peer, instance_feature_reg, sizeof(instance_feature_reg));
+				sofia_build_instance_feature(peer, instance_feature_reg, sizeof(instance_feature_reg), peer->sip_outbound);
 				/* callbackextension (chan_sip parity): override the Contact username. */
 				nua_register(peer->nh,
 					NUTAG_URL(uri),
@@ -10572,7 +10580,8 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					SIPTAG_MAX_FORWARDS_STR(mf_str_reg),
 					TAG_IF(!ast_strlen_zero(peer->callbackextension),
 						NUTAG_M_USERNAME(peer->callbackextension)),
-					TAG_IF(peer->gruu, NUTAG_M_FEATURES(instance_feature_reg)),
+					TAG_IF(peer->gruu || peer->sip_outbound, NUTAG_M_FEATURES(instance_feature_reg)),
+					TAG_IF(peer->sip_outbound, NUTAG_SUPPORTED("outbound, path")),	/* RFC 5626 §4.2.1 */
 					TAG_END());
 
 				peer->reg_attempts++;
@@ -12382,6 +12391,9 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 	 * re-linking a surviving peer each reload would duplicate the node + leak a ref). */
 	int new_alloc = 0;
 	int locked = 0;
+	/* RFC 5626/5627: snapshot gruu/sip_outbound BEFORE the reload reset (sofia_peer_set_defaults zeroes
+	 * them) so the tail can tell whether a toggle needs the REGISTER handle rebuilt. */
+	int old_gruu = 0, old_sip_outbound = 0;
 	/* Per-peer header= counter for the unique __SIPADDHEADERpre%2d= var name. */
 	int headercount = 0;
 
@@ -12460,6 +12472,10 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			ast_variables_destroy(peer->chanvars);
 			peer->chanvars = NULL;
 		}
+		/* Snapshot the OLD advertisement knobs before the reset zeroes them; the tail compares the final
+		 * parsed values to decide whether the REGISTER handle must be rebuilt (RFC 5626/5627). */
+		old_gruu = peer->gruu;
+		old_sip_outbound = peer->sip_outbound;
 		/* Re-apply the COMPLETE default set so a REMOVED per-peer key reverts to its [general]
 		 * default rather than keeping the prior value (else a stale md5secret authenticates the
 		 * OLD password, a removed insecure=invite keeps auth off -> toll-fraud). Under the held
@@ -12859,6 +12875,8 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			}
 		} else if (!strcasecmp(v->name, "rel100")) {
 			peer->rel100 = ast_true(v->value);	/* RFC 3262: reliable non-183 provisionals (opt-in) */
+		} else if (!strcasecmp(v->name, "sip_outbound")) {
+			peer->sip_outbound = ast_true(v->value);	/* RFC 5626: advertise outbound + reg-id on REGISTER (opt-in) */
 		} else if (!strcasecmp(v->name, "publish")) {
 			/* outbound PUBLISH (RFC 3903); mirrors the realtime branch. */
 			peer->publish = ast_true(v->value);
@@ -12943,6 +12961,20 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 	if (locked) {
 		if (!peer->lockuseragent) {
 			peer->locked_user_agent[0] = '\0';
+		}
+		/* RFC 5626/5627: a reload that toggled gruu/sip_outbound left the surviving peer->nh advertising
+		 * the OLD set (NUTAG_SUPPORTED only merges on a handle) — mark it for rebuild on the next refresh.
+		 * And drop runtime advertisement state when the knob ended up off (line removed or set no). */
+		if (peer->nh && (old_gruu != peer->gruu || old_sip_outbound != peer->sip_outbound)) {
+			peer->reg_handle_dirty = 1;
+		}
+		if (!peer->gruu) {
+			ast_string_field_set(peer, pub_gruu, "");
+			ast_string_field_set(peer, temp_gruu, "");
+		}
+		if (!peer->sip_outbound) {
+			peer->sip_outbound_active = 0;
+			peer->flow_timer = 0;
 		}
 		ast_mutex_unlock(&peer->lock);
 	}
@@ -13300,6 +13332,8 @@ static int sofia_load_config(int reload)
 	return rc;
 }
 
+static void sofia_peer_recreate_register_handle(struct sofia_peer *peer);	/* defined below sofia_reg_thread_func */
+
 static void *sofia_reg_thread_func(void *data)
 {
 	while (sofia_nua) {
@@ -13340,7 +13374,14 @@ static void *sofia_reg_thread_func(void *data)
 				char instance_feature_rereg[120];
 				snprintf(mf_str_reregister, sizeof(mf_str_reregister), "%d", peer->maxforwards);
 				/* GRUU Phase 1: re-advertise +sip.instance. */
-				sofia_build_instance_feature(peer, instance_feature_rereg, sizeof(instance_feature_rereg));
+				sofia_build_instance_feature(peer, instance_feature_rereg, sizeof(instance_feature_rereg), peer->sip_outbound);
+				/* A reload that toggled gruu/sip_outbound left stale merged Supported/M_FEATURES on
+				 * peer->nh (NUTAG_SUPPORTED only merges); rebuild the handle with the CURRENT tags before
+				 * this refresh so a disabled knob stops advertising (RFC 5626/5627). */
+				if (peer->reg_handle_dirty) {
+					sofia_peer_recreate_register_handle(peer);
+					peer->reg_handle_dirty = 0;
+				}
 				/* callbackextension: NUTAG_M_USERNAME override (as at initial register). */
 				nua_register(peer->nh,
 					NUTAG_URL(uri),
@@ -13348,7 +13389,8 @@ static void *sofia_reg_thread_func(void *data)
 					SIPTAG_MAX_FORWARDS_STR(mf_str_reregister),
 					TAG_IF(!ast_strlen_zero(peer->callbackextension),
 						NUTAG_M_USERNAME(peer->callbackextension)),
-					TAG_IF(peer->gruu, NUTAG_M_FEATURES(instance_feature_rereg)),
+					TAG_IF(peer->gruu || peer->sip_outbound, NUTAG_M_FEATURES(instance_feature_rereg)),
+					TAG_IF(peer->sip_outbound, NUTAG_SUPPORTED("outbound, path")),	/* RFC 5626 §4.2.1 */
 					TAG_END());
 				peer->reg_expiry = now + 60;
 			}
@@ -13358,6 +13400,38 @@ static void *sofia_reg_thread_func(void *data)
 		ao2_iterator_destroy(&i);
 	}
 	return NULL;
+}
+
+/* Build/rebuild a peer's outbound-REGISTER handle (peer->nh) from its CURRENT config: detach + destroy
+ * any prior handle (so a late 401/200 can't re-enter the register state machine against the stale
+ * handle) and create a fresh one carrying the current GRUU/SIP-Outbound advertisement tags. Used at load
+ * (sofia_do_register) and when a reload toggled gruu/sip_outbound (reg_handle_dirty) — NUTAG_SUPPORTED
+ * merges on a handle, so a stale outbound/gruu advertisement can only be dropped by recreating peer->nh.
+ * Reads peer fields the caller already serializes; runs on the load/reg thread (nua_handle posts to
+ * sofia_thread). */
+static void sofia_peer_recreate_register_handle(struct sofia_peer *peer)
+{
+	char uri[256], route_buf[256], hbuf[80], instance_feature[120];
+
+	snprintf(uri, sizeof(uri), "sip:%s@%s:%d", peer->defaultuser,
+		sofia_uri_format_host(peer->host, hbuf, sizeof(hbuf)), peer->port);
+	sofia_format_outboundproxy(peer, route_buf, sizeof(route_buf));
+	sofia_build_instance_feature(peer, instance_feature, sizeof(instance_feature), peer->sip_outbound);
+
+	if (peer->nh) {
+		nua_handle_t *old_rnh = peer->nh;
+		peer->nh = NULL;
+		nua_handle_bind(old_rnh, NULL);
+		nua_handle_destroy(old_rnh);
+	}
+	peer->nh = nua_handle(sofia_nua, peer,
+		NUTAG_URL(uri),
+		SIPTAG_TO_STR(uri),
+		TAG_IF(route_buf[0], NUTAG_INITIAL_ROUTE_STR(route_buf)),
+		TAG_IF(peer->gruu || peer->sip_outbound, NUTAG_M_FEATURES(instance_feature)),
+		TAG_IF(peer->sip_outbound, NUTAG_SUPPORTED("outbound, path")),	/* RFC 5626 §4.2.1 */
+		TAG_IF(peer->gruu, NUTAG_SUPPORTED("gruu")),	/* RFC 5627 §4.1 */
+		TAG_END());
 }
 
 static void sofia_do_register(void)
@@ -13372,7 +13446,6 @@ static void sofia_do_register(void)
 			if (!ast_strlen_zero(peer->secret) &&
 			    !ast_strlen_zero(peer->host) &&
 			    strcasecmp(peer->host, "dynamic") != 0) {
-				char route_buf[256];
 				char hbuf[80];	/* bracket-wrap IPv6 host */
 
 				snprintf(uri, sizeof(uri), "sip:%s@%s:%d",
@@ -13380,32 +13453,14 @@ static void sofia_do_register(void)
 					sofia_uri_format_host(peer->host, hbuf, sizeof(hbuf)),
 					peer->port);
 
-				/* Outbound REGISTER Route from peer/[general] outboundproxy; sticky-on-handle. */
-				sofia_format_outboundproxy(peer, route_buf, sizeof(route_buf));
+				/* Detach+destroy any stale handle and create a fresh one carrying the current
+				 * GRUU/SIP-Outbound advertisement tags — single source of truth for the tag set,
+				 * shared with the reload-dirty rebuild path. */
+				sofia_peer_recreate_register_handle(peer);
 
-				if (peer->nh) {
-					/* Detach hmagic before destroying the previous handle: a late 401/200 on
-					 * the old peer->nh would otherwise re-enter the register state machine
-					 * against a stale handle. bind(NULL) makes it inert so the `if (hmagic)`
-					 * gates short-circuit. */
-					nua_handle_t *old_rnh = peer->nh;
-					peer->nh = NULL;
-					nua_handle_bind(old_rnh, NULL);
-					nua_handle_destroy(old_rnh);
-				}
-
-				/* GRUU Phase 1 (gruu=yes): advertise a stable +sip.instance on the Contact so a
-				 * GRUU-capable registrar can mint a pub-gruu. Advertisement only. */
+				/* The same +sip.instance/reg-id advertisement also rides the REGISTER request below. */
 				char instance_feature[120];
-				sofia_build_instance_feature(peer, instance_feature, sizeof(instance_feature));
-
-				peer->nh = nua_handle(sofia_nua, peer,
-					NUTAG_URL(uri),
-					SIPTAG_TO_STR(uri),
-					TAG_IF(route_buf[0], NUTAG_INITIAL_ROUTE_STR(route_buf)),
-					TAG_IF(peer->gruu, NUTAG_M_FEATURES(instance_feature)),
-					TAG_IF(peer->gruu, NUTAG_SUPPORTED("gruu")),	/* RFC 5627 §4.1 */
-					TAG_END());
+				sofia_build_instance_feature(peer, instance_feature, sizeof(instance_feature), peer->sip_outbound);
 
 				/* RFC 3261 §20.22 outbound REGISTER. */
 				char mf_str_initreg[8];
@@ -13417,13 +13472,12 @@ static void sofia_do_register(void)
 					SIPTAG_MAX_FORWARDS_STR(mf_str_initreg),
 					TAG_IF(!ast_strlen_zero(peer->callbackextension),
 						NUTAG_M_USERNAME(peer->callbackextension)),
-					TAG_IF(peer->gruu, NUTAG_M_FEATURES(instance_feature)),
+					TAG_IF(peer->gruu || peer->sip_outbound, NUTAG_M_FEATURES(instance_feature)),
+					TAG_IF(peer->sip_outbound, NUTAG_SUPPORTED("outbound, path")),	/* RFC 5626 §4.2.1 */
 					TAG_END());
 
 				if (sofia_debug) {
-					ast_verbose("Sofia: Registering %s%s%s\n", uri,
-						route_buf[0] ? " via " : "",
-						route_buf[0] ? route_buf : "");
+					ast_verbose("Sofia: Registering %s\n", uri);
 				}
 			}
 		}

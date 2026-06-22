@@ -524,6 +524,28 @@ srvlookup=yes
 ;   rel100=yes
 
 ;
+; --- sip_outbound (RFC 5626 SIP Outbound — per-peer, on register=> trunks) ---
+; When this peer registers OUTBOUND to an upstream registrar (a non-dynamic host + secret), sip_outbound=yes
+; makes the REGISTER advertise "Supported: outbound, path" and carry a stable "+sip.instance" (a UUID URN
+; derived from the server EID + peer name, persistent across restarts) plus "reg-id=1" on the Contact —
+; so a SIP-Outbound-capable registrar/edge proxy keeps the client-initiated flow and routes inbound calls
+; back over it (RFC 5626 §4.2.1). This uses manual signalling, NOT the sofia-sip outbound engine (no
+; STUN/OPTIONS probing). The keep-alive that holds the flow open is the connection-oriented CRLF ping —
+; configure tcp_keepalive (and tcp_pingpong) for TCP/TLS trunks; a warning is logged if the registrar
+; confirms outbound (Require: outbound in the 200) but no keep-alive is set or it is slower than the
+; registrar's Flow-Timer. The runtime state (confirmed + Flow-Timer) is shown in `sip show peer`. Shares
+; the +sip.instance with gruu=yes; default off (opt-in). UDP STUN keep-alive and multi-flow are a
+; documented follow-on.
+;
+;   [mytrunk]
+;   type=peer
+;   host=sip.example.com
+;   defaultuser=...
+;   secret=...
+;   sip_outbound=yes
+;   tcp_keepalive=30   ; if the trunk is TCP/TLS
+
+;
 ; --- regexten + regextenonqualify (post-T56 chan_sip parity, drop-in registration-coupled dialplan) ---
 ; Auto-add a dialplan extension when a peer registers; auto-remove when the peer
 ; unregisters or (optionally) when qualify reports the peer unreachable. Common

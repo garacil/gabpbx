@@ -28,17 +28,24 @@
 #include "gabpbx/logger.h"
 
 #include <sofia-sip/sip.h>
+#include <sofia-sip/sip_header.h>	/* sip_has_feature */
+
+#include <ctype.h>	/* isdigit (Flow-Timer parse) */
+#include <stdlib.h>	/* atoi */
 
 #include "include/chan_sofia_internal.h"
 
-/* GRUU (gruu=yes): build the +sip.instance Contact param for a peer's REGISTER (RFC 5626 §4.1).
- * URN = stable UUID from server EID + peer name. Emitted via NUTAG_M_FEATURES (NOT NUTAG_INSTANCE,
- * which spins up the outbound engine). buf="" when gruu off, so callers use TAG_IF(peer->gruu, ...). */
-void sofia_build_instance_feature(const struct sofia_peer *peer, char *buf, size_t len)
+/* Build the +sip.instance Contact param for a peer's REGISTER (RFC 5626 §4.1). URN = stable UUID from
+ * server EID + peer name. Emitted via NUTAG_M_FEATURES (NOT NUTAG_INSTANCE, which spins up the outbound
+ * engine). Needed for BOTH GRUU (gruu=yes, RFC 5627) and SIP Outbound (sip_outbound=yes, RFC 5626), so
+ * the gate is gruu||sip_outbound; buf="" otherwise (callers gate with TAG_IF(gruu||sip_outbound, ...)).
+ * with_reg_id appends ";reg-id=1" (RFC 5626 §4.2.1, fixed single-flow value) after the instance; pass 0
+ * to keep the GRUU-only string byte-identical. */
+void sofia_build_instance_feature(const struct sofia_peer *peer, char *buf, size_t len, int with_reg_id)
 {
 	char seed[128], hash[33], eidstr[32] = "";
 
-	if (!peer->gruu) {
+	if (!peer->gruu && !peer->sip_outbound) {
 		buf[0] = '\0';
 		return;
 	}
@@ -47,6 +54,10 @@ void sofia_build_instance_feature(const struct sofia_peer *peer, char *buf, size
 	ast_md5_hash(hash, seed);	/* 32 hex chars formatted as a UUID below */
 	snprintf(buf, len, "+sip.instance=\"<urn:uuid:%.8s-%.4s-%.4s-%.4s-%.12s>\"",
 		hash, hash + 8, hash + 12, hash + 16, hash + 20);
+	if (with_reg_id) {
+		size_t n = strlen(buf);
+		snprintf(buf + n, len - n, ";reg-id=1");	/* RFC 5626 §4.2.1: single stable flow */
+	}
 }
 
 /* Strip one surrounding DQUOTE layer (RFC 5627 returns pub-gruu/temp-gruu as quoted param values).
@@ -95,7 +106,7 @@ void sofia_gruu_consume(struct sofia_peer *peer, sip_t const *sip)
 	if (!peer || !peer->gruu || !sip || !sip->sip_contact) {
 		return;
 	}
-	sofia_build_instance_feature(peer, ours, sizeof(ours));	/* +sip.instance="<urn:uuid:...>" */
+	sofia_build_instance_feature(peer, ours, sizeof(ours), 0);	/* +sip.instance="<urn:uuid:...>" — match on instance only, no reg-id */
 	our_val = strchr(ours, '=');	/* compare the value part incl quotes */
 	if (!our_val) {
 		return;
@@ -168,4 +179,48 @@ int sofia_gruu_dialog_contact(const struct sofia_peer *peer, char *buf, size_t l
 	}
 	snprintf(buf, len, "<%s>", peer->pub_gruu);
 	return 1;
+}
+
+/* RFC 5626 SIP Outbound (sip_outbound=yes): on a REGISTER 2xx, record whether the registrar CONFIRMED
+ * outbound (Require: outbound, §4.2) and learn any Flow-Timer (§4.4, seconds). sofia has no typed
+ * Flow-Timer header in this fork, so it is read by name from sip_unknown. Both are informational (shown
+ * in `sip show peer`); our CRLF keep-alive is the GLOBAL tcp_keepalive, passed in as keepalive_ms so this
+ * module needs no config global. Warns if an active flow has keepalive off or slower than the
+ * registrar's Flow-Timer. Runs on sofia_thread from the nua_r_register 2xx handler. */
+void sofia_outbound_consume(struct sofia_peer *peer, sip_t const *sip, int keepalive_ms)
+{
+	sip_unknown_t const *u;
+	int active, ft = 0;
+
+	if (!peer || !peer->sip_outbound || !sip) {
+		return;
+	}
+	active = (sip->sip_require && sip_has_feature(sip->sip_require, "outbound"));
+	for (u = sip->sip_unknown; u; u = u->un_next) {
+		if (u->un_name && !strcasecmp(u->un_name, "Flow-Timer") && !ast_strlen_zero(u->un_value)
+				&& isdigit((unsigned char)u->un_value[0])) {
+			/* §10 ABNF: Flow-Timer = 1*DIGIT seconds. Strict all-digits (reject "90junk") + cap at one
+			 * day so the ft*1000 keepalive comparison below can never overflow. */
+			char *end;
+			long v = strtol(u->un_value, &end, 10);
+			if (*end == '\0' && v > 0 && v <= 86400) {
+				ft = (int)v;
+			}
+			break;
+		}
+	}
+
+	ast_mutex_lock(&peer->lock);
+	peer->sip_outbound_active = active;
+	peer->flow_timer = ft;
+	ast_mutex_unlock(&peer->lock);
+
+	if (active && keepalive_ms == 0) {
+		ast_log(LOG_WARNING, "Sofia: peer '%s' registered with outbound active but tcp_keepalive is off "
+			"\xe2\x80\x94 the client-initiated flow may be dropped (RFC 5626 \xc2\xa7" "4.4)\n", peer->name);
+	} else if (active && ft > 0 && keepalive_ms > ft * 1000) {
+		ast_log(LOG_WARNING, "Sofia: peer '%s' outbound Flow-Timer is %ds but tcp_keepalive is %dms "
+			"\xe2\x80\x94 keep-alive too slow, the flow may be dropped (RFC 5626 \xc2\xa7" "4.4)\n",
+			peer->name, ft, keepalive_ms);
+	}
 }

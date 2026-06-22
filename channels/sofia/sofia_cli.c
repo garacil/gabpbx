@@ -547,6 +547,15 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 	if (peer->rel100) {
 		sofia_cli_peer_line(&buf, "100rel", "reliable provisionals (PRACK)");
 	}
+	/* SIP Outbound (RFC 5626): opt-in advertisement + the registrar's runtime confirmation/Flow-Timer. */
+	if (peer->sip_outbound) {
+		char ft[32] = "";
+		if (peer->flow_timer > 0) {
+			snprintf(ft, sizeof(ft), ", Flow-Timer %ds", peer->flow_timer);
+		}
+		sofia_cli_peer_line(&buf, "SIP Outbound", "advertised (reg-id=1, +sip.instance); registrar %s%s",
+			peer->sip_outbound_active ? "confirmed (Require: outbound)" : "not confirmed", ft);
+	}
 	/* setvar + header display (chan_sip parity): header= entries carry the
 	 * __SIPADDHEADERpre%2d= prefix. */
 	if (peer->chanvars) {
