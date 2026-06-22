@@ -2080,6 +2080,7 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	peer->publish = 0;	/* outbound PUBLISH opt-in */
 	peer->gruu = 0;		/* GRUU opt-in */
 	peer->use_gruu_contact = 1;	/* GRUU Phase 2b: use a learned pub-gruu as the dialog Contact (default yes; gated by gruu) */
+	peer->use_service_route = 0;	/* Service-Route (RFC 3608): opt-in (applying it diverts outbound routing) */
 	peer->buggymwi = 0;
 	peer->lockuseragent = 0;
 	ast_string_field_set(peer, lockuseragent_prefixes, "");
@@ -2715,6 +2716,11 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			}
 		} else if (!strcasecmp(v->name, "use_gruu_contact")) {
 			peer->use_gruu_contact = ast_true(v->value);	/* Phase 2b interop kill-switch */
+		} else if (!strcasecmp(v->name, "service_route")) {
+			peer->use_service_route = ast_true(v->value);	/* RFC 3608: pre-load the registrar's Service-Route on outbound INVITEs (opt-in) */
+			if (!peer->use_service_route) {	/* knob turned off -> drop any learned route (no stale routing) */
+				ast_string_field_set(peer, service_route, "");
+			}
 		} else if (!strcasecmp(v->name, "publish")) {
 			/* outbound PUBLISH (RFC 3903): opt hint state into central publication. */
 			peer->publish = ast_true(v->value);
@@ -4505,11 +4511,19 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 		{
 			char url[256];
 			char route_buf[256];
+			char sr_buf[1024] = "";	/* RFC 3608 Service-Route (opt-in), pre-loaded after outboundproxy */
 
 			sofia_resolve_peer_target(peer, exten, url, sizeof(url));
 			/* Outbound Route from outboundproxy; sticky-on-handle via
 			 * NUTAG_INITIAL_ROUTE_STR. */
 			sofia_format_outboundproxy(peer, route_buf, sizeof(route_buf));
+			/* Service-Route (RFC 3608 §6.1): snapshot under peer->lock (still held here) and apply it
+			 * as a SECOND Route after outboundproxy on the INVITE handle below. Gated on the LIVE knob
+			 * + an active registration (§6.1: a learned route is only valid while registered), so a
+			 * disabled knob never sends a stale route; empty otherwise. */
+			if (peer->use_service_route && peer->registered) {
+				ast_copy_string(sr_buf, peer->service_route, sizeof(sr_buf));
+			}
 			/* Resolve our source IP toward this peer (for SDP + From/Contact). */
 			{
 				struct ast_sockaddr target;
@@ -4547,6 +4561,7 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 					NUTAG_URL(url),
 					SIPTAG_TO_STR(url),
 					TAG_IF(route_buf[0], NUTAG_INITIAL_ROUTE_STR(route_buf)),
+					TAG_IF(sr_buf[0], NUTAG_INITIAL_ROUTE_STR(sr_buf)),	/* RFC 3608 Service-Route, after outboundproxy */
 					TAG_IF(proxy_url[0], NUTAG_PROXY(proxy_url)),
 					TAG_IF(peer_gruu, NUTAG_SUPPORTED("gruu")),	/* RFC 5627 §4.4 */
 					TAG_END());
@@ -10401,6 +10416,10 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 						sofia_gruu_consume(peer, sip);
 					}
 				}
+				/* Service-Route (RFC 3608 §6.1): keyed to the LATEST 2xx REGISTER, not only a 200
+				 * carrying a Contact — so a 2xx with no Service-Route reliably clears the stored
+				 * route. Self-no-ops when peer is NULL or service_route=no. */
+				sofia_service_route_store(peer, sip);
 			} else if (status == 401 || status == 407) {
 			if (peer) {
 				char www_creds[512] = "";
@@ -12728,6 +12747,11 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			}
 		} else if (!strcasecmp(v->name, "use_gruu_contact")) {
 			peer->use_gruu_contact = ast_true(v->value);	/* Phase 2b interop kill-switch */
+		} else if (!strcasecmp(v->name, "service_route")) {
+			peer->use_service_route = ast_true(v->value);	/* RFC 3608: pre-load the registrar's Service-Route on outbound INVITEs (opt-in) */
+			if (!peer->use_service_route) {	/* knob turned off -> drop any learned route (no stale routing) */
+				ast_string_field_set(peer, service_route, "");
+			}
 		} else if (!strcasecmp(v->name, "publish")) {
 			/* outbound PUBLISH (RFC 3903); mirrors the realtime branch. */
 			peer->publish = ast_true(v->value);

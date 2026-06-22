@@ -165,6 +165,7 @@ void sofia_remove_peer_hints(const char *regexten, const char *subscribecontext,
 /* GRUU (RFC 5627/5626), sofia_gruu.c: advertise +sip.instance + consume the registrar's pub/temp-gruu. */
 void sofia_build_instance_feature(const struct sofia_peer *peer, char *buf, size_t len);
 void sofia_gruu_consume(struct sofia_peer *peer, sip_t const *sip);
+void sofia_service_route_store(struct sofia_peer *peer, sip_t const *sip);	/* Service-Route RFC 3608, sofia_route.c */
 int sofia_gruu_dialog_contact(const struct sofia_peer *peer, char *buf, size_t len);	/* Phase 2b: GRUU as the dialog Contact */
 void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
 		char *out_url, size_t out_len);
@@ -406,6 +407,7 @@ struct sofia_peer {
 		AST_STRING_FIELD(publish_exten);	/* outbound PUBLISH: explicit exten(s) to publish (ext1&ext2@ctx&...); overrides regexten/name as the publish source. Empty = use regexten/name. */
 		AST_STRING_FIELD(pub_gruu);	/* GRUU Phase 2: public GRUU minted by the registrar for this peer's +sip.instance (RFC 5627 §5.2), learned from the REGISTER 200 Contact. Opaque URI. Empty = none/not-registered. */
 		AST_STRING_FIELD(temp_gruu);	/* GRUU Phase 2: temporary GRUU (rotates per refresh). Opaque URI. Empty = none. */
+		AST_STRING_FIELD(service_route);	/* Service-Route (RFC 3608) learned from the REGISTER 200 (service_route=yes), as a ready "<uri;lr>,..." Route value pre-loaded on outbound INVITEs to the registrar domain. Empty = none. */
 		AST_STRING_FIELD(callbackextension);	/* when registering AS a client to an upstream provider, user-portion of our Contact URI telling upstream which local extension to call back; wired via NUTAG_M_USERNAME at the 3 nua_register sites. Empty = no callback (chan_sip parity). */
 		AST_STRING_FIELD(subscribecontext);	/* SUBSCRIBE-method dispatch context override (chan_sip parity); inherits default_subscribecontext when empty. LIMITATION: per-peer dialplan dispatch not yet wired (MWI uses peer->mailboxes; unknown events auto-202). */
 		AST_STRING_FIELD(accountcode);	/* CDR billing-tag propagated to channel->accountcode at sofia_new (chan_sip parity); truncated to AST_MAX_ACCOUNT_CODE=20 at CDR-write. Per-peer only (no [general] default). */
@@ -457,6 +459,7 @@ struct sofia_peer {
 	int publish;                    /* outbound PUBLISH (RFC 3903): when 1 and [general] publish_server is set, chan_sofia PUBLISHes this peer's hint (regexten/subscribecontext) dialog-info state to the central server. Default 0. */
 	int gruu;                       /* GRUU/RFC 5626: when 1, the outbound REGISTER advertises a stable +sip.instance (urn:uuid from EID+name) so a GRUU-capable registrar can mint a pub-gruu. Default 0 (opt-in). */
 	int use_gruu_contact;           /* GRUU Phase 2b (RFC 5627 §4.4): when 1 (default) AND gruu=yes AND a pub-gruu was learned, use it as the outbound dialog Contact. Interop kill-switch: set no to keep advertising/learning but not use it as Contact. Default 1. */
+	int use_service_route;          /* Service-Route (RFC 3608): when 1, ingest the registrar's Service-Route from the REGISTER 200 and pre-load it on outbound INVITEs to that domain. Default 0 (opt-in; applying it diverts outbound routing). */
 	/* Buggy-CISCO MWI fix (chan_sip parity): when set, the Voice-Message: NOTIFY
 	 * body line OMITS the trailing " (0/0)" suffix (some SIP stacks reject it).
 	 * Per-peer only (no [general] default); default 0 = standard RFC 3842. */

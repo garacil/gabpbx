@@ -538,6 +538,11 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 			sofia_cli_peer_line(&buf, "Temp-GRUU", "%s", peer->temp_gruu);
 		}
 	}
+	/* Service-Route (RFC 3608): opt-in + any route learned from the registrar's REGISTER 200. */
+	if (peer->use_service_route) {
+		sofia_cli_peer_line(&buf, "Service-Route", "%s",
+			!ast_strlen_zero(peer->service_route) ? peer->service_route : "(enabled, none learned)");
+	}
 	/* setvar + header display (chan_sip parity): header= entries carry the
 	 * __SIPADDHEADERpre%2d= prefix. */
 	if (peer->chanvars) {

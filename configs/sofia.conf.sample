@@ -475,6 +475,22 @@ srvlookup=yes
 ;   use_gruu_contact=yes
 
 ;
+; --- service_route (RFC 3608 Service-Route — per-peer, outbound REGISTER trunks) ---
+; When this server registers to an upstream registrar (a register=> trunk) that returns a Service-Route
+; header in the REGISTER 200, `service_route=yes` ingests it and pre-loads it as a Route on outbound
+; INVITEs through that peer, so calls traverse the registrar's service proxy chain (Kamailio/IMS-style
+; deployments). The learned route is shown in `sip show peer` and cleared when the registrar stops
+; returning it or on de-registration. Default off (opt-in: applying a Service-Route diverts outbound
+; routing; only enable it when you know your upstream uses Service-Route). v1 applies it to outbound
+; INVITEs only (the registrar's domain); PUBLISH/SUBSCRIBE are a documented follow-on.
+;
+;   [mytrunk]
+;   type=peer
+;   host=registrar.example.com
+;   secret=...
+;   service_route=yes
+
+;
 ; --- regexten + regextenonqualify (post-T56 chan_sip parity, drop-in registration-coupled dialplan) ---
 ; Auto-add a dialplan extension when a peer registers; auto-remove when the peer
 ; unregisters or (optionally) when qualify reports the peer unreachable. Common
