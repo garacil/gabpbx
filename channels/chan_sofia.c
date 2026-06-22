@@ -2079,6 +2079,7 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	peer->allowsubscribe = sofia_cfg.default_allowsubscribe;
 	peer->publish = 0;	/* outbound PUBLISH opt-in */
 	peer->gruu = 0;		/* GRUU opt-in */
+	peer->use_gruu_contact = 1;	/* GRUU Phase 2b: use a learned pub-gruu as the dialog Contact (default yes; gated by gruu) */
 	peer->buggymwi = 0;
 	peer->lockuseragent = 0;
 	ast_string_field_set(peer, lockuseragent_prefixes, "");
@@ -2712,6 +2713,8 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 				ast_string_field_set(peer, pub_gruu, "");
 				ast_string_field_set(peer, temp_gruu, "");
 			}
+		} else if (!strcasecmp(v->name, "use_gruu_contact")) {
+			peer->use_gruu_contact = ast_true(v->value);	/* Phase 2b interop kill-switch */
 		} else if (!strcasecmp(v->name, "publish")) {
 			/* outbound PUBLISH (RFC 3903): opt hint state into central publication. */
 			peer->publish = ast_true(v->value);
@@ -3120,8 +3123,9 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 {
 	char sdp_buf[2048];
 	char mf_str[8];	/* RFC 3261 §20.22 Max-Forwards */
-	int mf = (pvt && pvt->peer) ? pvt->peer->maxforwards : sofia_cfg.default_max_forwards;
-	snprintf(mf_str, sizeof(mf_str), "%d", mf);
+	char gruu_contact[1024] = "";	/* sized for an opaque GRUU (RFC 5627) */
+	int have_gruu = 0;
+	int mf = sofia_cfg.default_max_forwards;
 
 	if (!pvt || !pvt->nh || !sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf))) {
 		/* Nothing sent — release the reinvite gate (pre-set by the directmedia
@@ -3131,11 +3135,23 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 		}
 		return;
 	}
+	/* GRUU Phase 2b: a re-INVITE is a target-refresh request (RFC 5627 §4.4 / RFC 3261 §12.2) so it
+	 * carries the GRUU Contact too. Snapshot maxforwards + the GRUU Contact under peer->lock (order is
+	 * pvt->peer; canonical), then RELEASE before nua_invite — never hold peer->lock across the stack. */
+	if (pvt->peer) {
+		ast_mutex_lock(&pvt->peer->lock);
+		mf = pvt->peer->maxforwards;
+		have_gruu = sofia_gruu_dialog_contact(pvt->peer, gruu_contact, sizeof(gruu_contact));
+		ast_mutex_unlock(&pvt->peer->lock);
+	}
+	snprintf(mf_str, sizeof(mf_str), "%d", mf);
+
 	pvt->reinvite_pending = 1;
 	nua_invite(pvt->nh,
 		SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 		SIPTAG_PAYLOAD_STR(sdp_buf),
 		SIPTAG_MAX_FORWARDS_STR(mf_str),
+		TAG_IF(have_gruu, SIPTAG_CONTACT_STR(gruu_contact)),
 		TAG_END());
 	ast_verbose("Sofia: directmedia re-INVITE sent on '%s' -> %s:%d\n",
 		pvt->callid ? pvt->callid : "(no-callid)",
@@ -3542,6 +3558,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 					child->nh = nua_handle(sofia_nua, child,
 						NUTAG_URL(ruri),
 						SIPTAG_TO_STR(ruri),
+						TAG_IF(child->peer && child->peer->gruu, NUTAG_SUPPORTED("gruu")),	/* RFC 5627 §4.4 */
 						TAG_END());
 				}
 
@@ -3587,7 +3604,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 					}
 					if (crypto_ok) {
 						char from_buf[256];
-						char contact_buf[256];
+						char contact_buf[1024];	/* sized for an opaque GRUU Contact (RFC 5627), not just sip:user@host */
 						char rpid_buf[512];
 						char diversion_buf[512];
 						/* reload-UAF: the identity builders read freeable peer
@@ -3759,7 +3776,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 	{
 		/* sofia-sip auto-emits the From-tag; we provide the URI without ;tag=. */
 		char from_buf[256];
-		char contact_buf[256];
+		char contact_buf[1024];	/* sized for an opaque GRUU Contact (RFC 5627), not just sip:user@host */
 		char rpid_buf[512];
 		char diversion_buf[512];
 		/* reload-UAF: the identity builders read freeable peer stringfields freed
@@ -3976,7 +3993,7 @@ static int sofia_answer(struct ast_channel *ast)
 		 * multihomed wildcard bind, sofia's auto-Contact would pick one interface for
 		 * every dialog → a leg on another interface gets an unroutable Contact and the
 		 * dialog never completes. RFC 3261 §12.1.1/§8.1.1.8. */
-		char contact_buf[256];
+		char contact_buf[1024];	/* sized for an opaque GRUU Contact (RFC 5627), not just sip:user@host */
 		/* reload-UAF: hold peer->lock across sofia_build_contact (reads freeable
 		 * fromuser); pure formatting on the answer thread. */
 		if (pvt->peer) ast_mutex_lock(&pvt->peer->lock);
@@ -4140,7 +4157,7 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 	{
 		/* Contact from pvt->ourip; see sofia_answer. reload-UAF: hold peer->lock
 		 * across sofia_build_contact (reads freeable fromuser). */
-		char contact_buf[256];
+		char contact_buf[1024];	/* sized for an opaque GRUU Contact (RFC 5627), not just sip:user@host */
 		if (pvt->peer) ast_mutex_lock(&pvt->peer->lock);
 		sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
 		if (pvt->peer) ast_mutex_unlock(&pvt->peer->lock);
@@ -4191,7 +4208,7 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 			char sdp_buf[2048];
 			/* Contact from pvt->ourip (see sofia_answer); reload-UAF: hold peer->lock
 			 * across sofia_build_contact (reads freeable fromuser). */
-			char contact_buf[256];
+			char contact_buf[1024];	/* sized for an opaque GRUU Contact (RFC 5627), not just sip:user@host */
 			if (pvt->peer) ast_mutex_lock(&pvt->peer->lock);
 			sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
 			if (pvt->peer) ast_mutex_unlock(&pvt->peer->lock);
@@ -4481,6 +4498,9 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 		ast_string_field_set(pvt, subscribecontext, peer->subscribecontext);
 		ast_string_field_set(pvt, accountcode, peer->accountcode); /* → chan->accountcode via sofia_new */
 		ao2_ref(peer, +1); pvt->peer = peer;
+		/* GRUU Phase 2b co-req: snapshot gruu under peer->lock; used for NUTAG_SUPPORTED("gruu") on
+		 * the call handle below (RFC 5627 §4.4: advertise Supported: gruu in requests we generate). */
+		int peer_gruu = peer->gruu;
 
 		{
 			char url[256];
@@ -4528,6 +4548,7 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 					SIPTAG_TO_STR(url),
 					TAG_IF(route_buf[0], NUTAG_INITIAL_ROUTE_STR(route_buf)),
 					TAG_IF(proxy_url[0], NUTAG_PROXY(proxy_url)),
+					TAG_IF(peer_gruu, NUTAG_SUPPORTED("gruu")),	/* RFC 5627 §4.4 */
 					TAG_END());
 			}
 		}
@@ -4663,8 +4684,13 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	}
 	sdp_ok = (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf)) != NULL);
 	ast_mutex_unlock(&pvt->lock);
-	char contact_buf[256];
+	char contact_buf[1024];	/* sized for an opaque GRUU Contact (RFC 5627), not just sip:user@host */
 	contact_buf[0] = '\0';
+	/* GRUU Phase 2b + reload-UAF: hold peer->lock across sofia_build_contact (reads the pub_gruu /
+	 * fromuser stringfields). Order is channel->peer here (pvt->lock already released above). */
+	if (pvt->peer) {
+		ast_mutex_lock(&pvt->peer->lock);
+	}
 	if (owner) {
 		/* Snapshot identity + build Contact while owner is STILL LOCKED, so the
 		 * connected.id read + AMI events can't race a post-unlock rename/hangup. */
@@ -4675,6 +4701,9 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	} else {
 		/* No owner: Contact uses the peer fallback (no owner deref). */
 		sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
+	}
+	if (pvt->peer) {
+		ast_mutex_unlock(&pvt->peer->lock);
 	}
 
 	if (sdp_ok) {
@@ -4903,6 +4932,12 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			ast_string_field_set(pvt, accountcode, caller_peer->accountcode); /* → chan->accountcode via sofia_new */
 			ao2_ref(caller_peer, +1); pvt->peer = caller_peer;
 			ao2_ref(caller_peer, -1);
+			/* GRUU Phase 2b co-req (RFC 5627 §4.4): advertise Supported: gruu on the responses we
+			 * generate to this inbound INVITE from a GRUU peer. gruu is an int (benign lock-free read);
+			 * nua adds the handle Supported pref to responses that lack one. */
+			if (pvt->peer && pvt->peer->gruu) {
+				nua_set_hparams(nh, NUTAG_SUPPORTED("gruu"), TAG_END());
+			}
 		}
 	}
 
@@ -7556,6 +7591,12 @@ static void sofia_build_contact(struct sofia_pvt *pvt, char *buf, size_t len)
 		return;
 	}
 	buf[0] = '\0';
+
+	/* GRUU Phase 2b: if this peer has a usable learned pub-gruu, use it verbatim as the dialog
+	 * Contact (RFC 5627 §4.4) and skip the legacy <sip:user@ourip> build. Caller holds peer->lock. */
+	if (pvt && pvt->peer && sofia_gruu_dialog_contact(pvt->peer, buf, len)) {
+		return;
+	}
 
 	if (pvt && pvt->owner
 			&& pvt->owner->connected.id.number.valid
@@ -12471,6 +12512,8 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 				ast_string_field_set(peer, pub_gruu, "");
 				ast_string_field_set(peer, temp_gruu, "");
 			}
+		} else if (!strcasecmp(v->name, "use_gruu_contact")) {
+			peer->use_gruu_contact = ast_true(v->value);	/* Phase 2b interop kill-switch */
 		} else if (!strcasecmp(v->name, "publish")) {
 			/* outbound PUBLISH (RFC 3903); mirrors the realtime branch. */
 			peer->publish = ast_true(v->value);

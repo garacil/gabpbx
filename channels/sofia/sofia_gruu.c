@@ -144,3 +144,28 @@ void sofia_gruu_consume(struct sofia_peer *peer, sip_t const *sip)
 			peer->name, pub_buf);
 	}
 }
+
+/* GRUU Phase 2b: if this peer has a usable learned public GRUU, write it as the dialog Contact
+ * "<pub-gruu>" (RFC 5627 §4.4 — so the far end routes target-refresh/in-dialog requests back to THIS
+ * instance via the registrar) and return 1; else return 0 and the caller keeps the legacy Contact.
+ * Gated on an ACTIVE registration (§4.4 MUST have one; §4.4 MUST NOT reuse a lapsed GRUU) and the
+ * per-peer use_gruu_contact opt-out. The pub-gruu is opaque, so it is wrapped verbatim in angle
+ * brackets (its ;gr= stays a URI param, not a Contact header param). Caller MUST hold peer->lock. */
+int sofia_gruu_dialog_contact(const struct sofia_peer *peer, char *buf, size_t len)
+{
+	if (!buf || len < 1) {
+		return 0;
+	}
+	if (!peer || !peer->gruu || !peer->use_gruu_contact || !peer->registered
+			|| ast_strlen_zero(peer->pub_gruu)) {
+		return 0;
+	}
+	/* The pub-gruu is an opaque URI of unbounded length (RFC 5627 §4.4); if it would not fit the
+	 * caller's Contact buffer with the angle brackets + NUL, fall back to the legacy Contact rather
+	 * than emit a TRUNCATED (malformed) one. */
+	if (strlen(peer->pub_gruu) + 3 > len) {
+		return 0;
+	}
+	snprintf(buf, len, "<%s>", peer->pub_gruu);
+	return 1;
+}

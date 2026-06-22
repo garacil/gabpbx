@@ -457,8 +457,14 @@ srvlookup=yes
 ; registrar mints a GRUU. When a GRUU-capable registrar returns a pub-gruu (and rotating temp-gruu) for
 ; our instance in the REGISTER 200 OK Contact (RFC 5627 5.2), chan_sofia learns + stores them (shown in
 ; `sip show peer` as Pub-GRUU / Temp-GRUU); they are opaque and cleared when the registration goes
-; inactive. NOT enabled: reg-id / the RFC 5626 outbound flow, validation/keepalive OPTIONS, and USING a
-; learned pub-gruu as the outgoing-call Contact (the planned next phase). Default off; opt-in per peer.
+; inactive. With use_gruu_contact=yes (the default), chan_sofia then USES that learned pub-gruu as the
+; Contact of outbound calls + re-INVITEs through this peer (RFC 5627 4.4), so the far end can route
+; in-dialog/target-refresh requests back to THIS instance via the registrar; call requests + responses
+; on the peer also advertise Supported: gruu. NOT enabled: reg-id / the RFC 5626 outbound flow,
+; validation/keepalive OPTIONS. Default off; opt-in per peer.
+;
+; use_gruu_contact = yes  (default) — interop kill-switch: set no to keep advertising/learning the GRUU
+;   but NOT use it as the dialog Contact (falls back to sip:user@our-ip). Only meaningful with gruu=yes.
 ;
 ;   [mytrunk]
 ;   type=peer
@@ -466,6 +472,7 @@ srvlookup=yes
 ;   defaultuser=...
 ;   secret=...
 ;   gruu=yes
+;   use_gruu_contact=yes
 
 ;
 ; --- regexten + regextenonqualify (post-T56 chan_sip parity, drop-in registration-coupled dialplan) ---

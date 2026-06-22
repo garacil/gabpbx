@@ -165,6 +165,7 @@ void sofia_remove_peer_hints(const char *regexten, const char *subscribecontext,
 /* GRUU (RFC 5627/5626), sofia_gruu.c: advertise +sip.instance + consume the registrar's pub/temp-gruu. */
 void sofia_build_instance_feature(const struct sofia_peer *peer, char *buf, size_t len);
 void sofia_gruu_consume(struct sofia_peer *peer, sip_t const *sip);
+int sofia_gruu_dialog_contact(const struct sofia_peer *peer, char *buf, size_t len);	/* Phase 2b: GRUU as the dialog Contact */
 void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
 		char *out_url, size_t out_len);
 struct sofia_contact *sofia_peer_first_contact(struct sofia_peer *peer);
@@ -455,6 +456,7 @@ struct sofia_peer {
 	int allowsubscribe;             /* 0=block / 1=allow SUBSCRIBE (chan_sip parity); gated at sofia_process_mwi_subscribe (per-peer) + sofia_process_subscribe entry (global). Default inherited from default_allowsubscribe (1). */
 	int publish;                    /* outbound PUBLISH (RFC 3903): when 1 and [general] publish_server is set, chan_sofia PUBLISHes this peer's hint (regexten/subscribecontext) dialog-info state to the central server. Default 0. */
 	int gruu;                       /* GRUU/RFC 5626: when 1, the outbound REGISTER advertises a stable +sip.instance (urn:uuid from EID+name) so a GRUU-capable registrar can mint a pub-gruu. Default 0 (opt-in). */
+	int use_gruu_contact;           /* GRUU Phase 2b (RFC 5627 §4.4): when 1 (default) AND gruu=yes AND a pub-gruu was learned, use it as the outbound dialog Contact. Interop kill-switch: set no to keep advertising/learning but not use it as Contact. Default 1. */
 	/* Buggy-CISCO MWI fix (chan_sip parity): when set, the Voice-Message: NOTIFY
 	 * body line OMITS the trailing " (0/0)" suffix (some SIP stacks reject it).
 	 * Per-peer only (no [general] default); default 0 = standard RFC 3842. */
