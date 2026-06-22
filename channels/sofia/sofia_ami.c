@@ -671,12 +671,18 @@ static void sipnotify_callback(void *data)
 	}
 
 	/* Bind the SIPnotify sentinel hmagic so sofia_event_callback can destroy this app-owned one-shot
-	 * handle on the final nua_r_notify (sofia-sip does NOT auto-reap it). Destroying it here, right
-	 * after nua_notify, would drop the queued NOTIFY before it hits the wire - so the destroy is
-	 * deferred to the transaction final response. */
+	 * handle on the final response (sofia-sip does NOT auto-reap it). Destroying it here, right after
+	 * the send, would drop the queued NOTIFY before it hits the wire - so the destroy is deferred to the
+	 * transaction final response (nua_r_method). */
 	nh = nua_handle(sofia_nua, SOFIA_SIPNOTIFY_HMAGIC, NUTAG_URL(d->target_uri), TAG_END());
 	if (nh) {
-		nua_notify(nh,
+		/* nua_method NOTIFY — NOT nua_notify: this sofia-sip fork compiles out the notifier client
+		 * methods (nua_notify_client_methods all NULL, the NUTAG_NEWSUB usage path is #if 0), so an
+		 * out-of-dialog nua_notify is rejected LOCALLY with 481 and never reaches the wire. The generic
+		 * method path sends the NOTIFY on the wire (same mechanism as outbound PUBLISH); the response
+		 * arrives as nua_r_method, reaped by the SOFIA_SIPNOTIFY_HMAGIC one-shot reap. */
+		nua_method(nh,
+			NUTAG_METHOD("NOTIFY"),
 			SIPTAG_EVENT_STR(d->event),
 			TAG_IF(header_buf, SIPTAG_HEADER_STR(header_buf ? ast_str_buffer(header_buf) : "")),
 			TAG_IF(!ast_strlen_zero(d->content), SIPTAG_PAYLOAD_STR(d->content)),

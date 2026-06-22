@@ -1701,8 +1701,14 @@ static int sofia_change_redirecting_info(struct sofia_pvt *pvt, struct ast_chann
 /* MWI re-NOTIFY cross-thread dispatch carrier: mwi_event_cb fires on the event-bus
  * thread, nua_notify must run on sofia_thread. The peer +1 ref is TRANSFERRED
  * (event_cb takes, dispatch carries, callback drops). */
+/* fwd: defined later (chan_sofia.c) — referenced by mwi_notify_callback + the register paths above
+ * their definitions. */
+static void transmit_unsolicited_mwi_for_peer(struct sofia_peer *peer);
+static void sofia_register_initial_mwi(struct sofia_peer *peer);
+
 struct mwi_dispatch_data {
 	struct sofia_peer *peer;	/* +1 ref TRANSFERRED — callback drops */
+	int unsolicited;		/* 0 = solicited re-NOTIFY on the active sub; 1 = unsolicited push */
 };
 
 /* Free the carrier; safe on any thread (ao2 unref + ast_free, no nua ops). */
@@ -1726,7 +1732,11 @@ static void mwi_notify_callback(void *arg)
 		return;
 	}
 	if (d->peer) {
-		transmit_mwi_notify_for_peer(d->peer);
+		if (d->unsolicited) {
+			transmit_unsolicited_mwi_for_peer(d->peer);
+		} else {
+			transmit_mwi_notify_for_peer(d->peer);
+		}
 	}
 	mwi_dispatch_data_free(d);
 }
@@ -1765,17 +1775,24 @@ static void mwi_event_cb(const struct ast_event *event, void *userdata)
 {
 	struct sofia_peer *peer = userdata;
 	struct mwi_dispatch_data *d;
+	int unsolicited = 0;
 
 	if (!event || !peer) {
 		return;
 	}
 
 	if (!peer->mwi_subscription_handle) {
-		if (sofia_debug) {
-			ast_debug(2, "Sofia MWI: peer %s event ignored (no active subscriber)\n",
-				peer->name);
+		/* No active inbound subscription. Push an UNSOLICITED NOTIFY only when subscribemwi=no AND the
+		 * peer is registered (chan_sip parity); the sofia_thread callback re-checks registered under
+		 * peer->lock. Otherwise there is nothing to do (solicited-only or no contact). */
+		if (peer->subscribemwi != 0 || !peer->registered) {
+			if (sofia_debug) {
+				ast_debug(2, "Sofia MWI: peer %s event ignored "
+					"(no subscriber; unsolicited off or not registered)\n", peer->name);
+			}
+			return;
 		}
-		return;
+		unsolicited = 1;
 	}
 
 	d = ast_calloc(1, sizeof(*d));
@@ -1787,6 +1804,7 @@ static void mwi_event_cb(const struct ast_event *event, void *userdata)
 	/* TRANSFER ref: take +1 here, dispatch carries, callback drops. */
 	ao2_ref(peer, +1);
 	d->peer = peer;
+	d->unsolicited = unsolicited;
 
 	if (sofia_dispatch_to_root_thread(mwi_notify_callback, d) < 0) {
 		ast_log(LOG_WARNING,
@@ -2571,17 +2589,10 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 				peer->amaflags = format;
 			}
 		} else if (!strcasecmp(v->name, "subscribemwi")) {
-			/* Parse-compat only — chan_sofia is SUBSCRIBE-only MWI (no unsolicited
-			 * NOTIFY); behaves as subscribemwi=yes regardless. =no emits a LOG_NOTICE. */
+			/* chan_sip parity: subscribemwi=yes => SUBSCRIBE-only (MWI only on an active
+			 * subscription dialog); subscribemwi=no (default) => also PUSH unsolicited MWI NOTIFY to
+			 * a registered peer that has a mailbox= but does not subscribe. */
 			peer->subscribemwi = ast_true(v->value);
-			if (!peer->subscribemwi) {
-				ast_log(LOG_NOTICE,
-					"Sofia: peer '%s' subscribemwi=no — chan_sofia is SUBSCRIBE-only MWI "
-					"(Pattern 12 17th-instance chan_sofia-architectural-divergence); "
-					"unsolicited MWI NOTIFY not implemented; behavior matches chan_sip "
-					"subscribemwi=yes regardless of this setting\n",
-					peer->name);
-			}
 		} else if (!strcasecmp(v->name, "preferred_codec_only")) {
 			peer->preferred_codec_only = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "ignoresdpversion")) {
@@ -7731,6 +7742,9 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			sofia_log_register_outcome("OK", peer->name, sip);
 		}
 		sofia_emit_register_side_effects(peer, sip, &reg_update);
+		/* Initial unsolicited MWI (chan_sip parity): a (re)registered peer with a mailbox= +
+		 * subscribemwi=no gets its current MWI pushed now, without subscribing. */
+		sofia_register_initial_mwi(peer);
 		ao2_ref(peer, -1);
 		return;
 	}
@@ -7830,6 +7844,8 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			sofia_log_register_outcome("OK", peer->name, sip);
 		}
 		sofia_emit_register_side_effects(peer, sip, &reg_update);
+		/* Initial unsolicited MWI after an AUTHENTICATED register (the other 200 path is no-auth). */
+		sofia_register_initial_mwi(peer);
 		ao2_ref(peer, -1);
 }
 
@@ -8809,84 +8825,183 @@ void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len)
 /* Build + send one RFC 3842 MWI NOTIFY (aggregated inbox counts) to a peer's active
  * subscriber. Runs on sofia_thread. Caller owns a peer ref; takes peer->lock
  * internally (caller must NOT hold it) and releases before nua_notify. */
-static void transmit_mwi_notify_for_peer(struct sofia_peer *peer)
+/* Build the RFC 3842 simple-message-summary body for a peer's mailboxes. Snapshots the mailbox specs +
+ * fromdomain/buggymwi under peer->lock, then counts OFF the lock (ast_app_inboxcount2 does unbounded
+ * backend I/O — IMAP/ODBC/dir-scan). Returns a new ast_str (NULL on failure); new_out and old_out get
+ * the totals for logging. Caller must NOT hold peer->lock. Shared by the solicited + unsolicited NOTIFY. */
+static struct ast_str *sofia_build_mwi_body(struct sofia_peer *peer, int *new_out, int *old_out)
 {
 	struct sofia_mailbox *mb;
 	struct ast_str *body;
-	int total_new = 0, total_old = 0, total_urgent = 0;
+	int total_new = 0, total_old = 0;
 	const char *vmexten;
+	char mboxes[32][160];
+	char l_fromdomain[256];
+	int nmb = 0, i, l_buggymwi;
+
+	if (!peer) {
+		return NULL;
+	}
+	ast_mutex_lock(&peer->lock);
+	AST_LIST_TRAVERSE(&peer->mailboxes, mb, list) {
+		if (nmb >= (int) ARRAY_LEN(mboxes)) {
+			break;
+		}
+		snprintf(mboxes[nmb], sizeof(mboxes[nmb]), "%s@%s", mb->mailbox, mb->context);
+		nmb++;
+	}
+	/* Snapshot the unbounded stringfield + the flag into locals (the reload writer can free/rewrite
+	 * peer->fromdomain under the lock; never deref it after unlock). */
+	ast_copy_string(l_fromdomain,
+		!ast_strlen_zero(peer->fromdomain) ? peer->fromdomain : S_OR(sofia_cfg.realm, "gabpbx"),
+		sizeof(l_fromdomain));
+	l_buggymwi = peer->buggymwi;
+	ast_mutex_unlock(&peer->lock);
+
+	for (i = 0; i < nmb; i++) {
+		int new_msgs = 0, old_msgs = 0, urgent_msgs = 0;
+		if (ast_app_inboxcount2(mboxes[i], &urgent_msgs, &new_msgs, &old_msgs) == 0) {
+			total_new += new_msgs;
+			total_old += old_msgs;
+		}
+	}
+
+	if (!(body = ast_str_create(256))) {
+		ast_log(LOG_WARNING, "Sofia MWI: ast_str_create failed for peer %s\n", peer->name);
+		return NULL;
+	}
+	vmexten = !ast_strlen_zero(sofia_cfg.vmexten) ? sofia_cfg.vmexten : "asterisk";
+	/* RFC 3842 body (chan_sip parity). */
+	ast_str_append(&body, 0, "Messages-Waiting: %s\r\n", total_new ? "yes" : "no");
+	ast_str_append(&body, 0, "Message-Account: sip:%s@%s\r\n", vmexten, l_fromdomain);
+	/* buggymwi=yes omits the "(0/0)" suffix some stacks reject (default = RFC 3842). */
+	ast_str_append(&body, 0, "Voice-Message: %d/%d%s\r\n", total_new, total_old, l_buggymwi ? "" : " (0/0)");
+
+	if (new_out) {
+		*new_out = total_new;
+	}
+	if (old_out) {
+		*old_out = total_old;
+	}
+	return body;
+}
+
+/* SOLICITED MWI re-NOTIFY: emit on the peer's active inbound-SUBSCRIBE dialog handle. No-op without an
+ * active subscription. sofia_thread only. */
+static void transmit_mwi_notify_for_peer(struct sofia_peer *peer)
+{
+	struct ast_str *body;
 	const char *notifymime;
-	const char *fromdomain;
+	int total_new = 0, total_old = 0;
 	nua_handle_t *nh;
 
 	if (!peer) {
 		return;
 	}
-
 	ast_mutex_lock(&peer->lock);
 	nh = peer->mwi_subscription_handle;
+	ast_mutex_unlock(&peer->lock);
 	if (!nh) {
-		ast_mutex_unlock(&peer->lock);
 		return;
 	}
-	/* Snapshot mailbox specs under peer->lock, then count OUTSIDE the lock:
-	 * ast_app_inboxcount2 does unbounded backend I/O (IMAP/ODBC/dir-scan). */
-	{
-		char mboxes[32][160];
-		int nmb = 0, i;
-		AST_LIST_TRAVERSE(&peer->mailboxes, mb, list) {
-			if (nmb >= (int) ARRAY_LEN(mboxes)) {
-				break;
-			}
-			snprintf(mboxes[nmb], sizeof(mboxes[nmb]), "%s@%s", mb->mailbox, mb->context);
-			nmb++;
-		}
-		/* fromdomain aliases peer->fromdomain's pool, used after unlock — safe:
-		 * all callers run on sofia_thread, serialised vs the reload writer. */
-		fromdomain = !ast_strlen_zero(peer->fromdomain) ? peer->fromdomain : sofia_cfg.realm;
-		ast_mutex_unlock(&peer->lock);
-
-		for (i = 0; i < nmb; i++) {
-			int new_msgs = 0, old_msgs = 0, urgent_msgs = 0;
-			if (ast_app_inboxcount2(mboxes[i], &urgent_msgs, &new_msgs, &old_msgs) == 0) {
-				total_new    += new_msgs;
-				total_old    += old_msgs;
-				total_urgent += urgent_msgs;
-			}
-		}
-	}
-
-	body = ast_str_create(256);
-	if (!body) {
-		ast_log(LOG_WARNING, "Sofia MWI: ast_str_create failed for peer %s\n", peer->name);
+	if (!(body = sofia_build_mwi_body(peer, &total_new, &total_old))) {
 		return;
 	}
-
-	vmexten    = !ast_strlen_zero(sofia_cfg.vmexten) ? sofia_cfg.vmexten : "asterisk";
 	notifymime = !ast_strlen_zero(sofia_cfg.notifymime) ? sofia_cfg.notifymime
 		: "application/simple-message-summary";
-
-	/* RFC 3842 body (chan_sip parity). */
-	ast_str_append(&body, 0, "Messages-Waiting: %s\r\n",
-		total_new ? "yes" : "no");
-	ast_str_append(&body, 0, "Message-Account: sip:%s@%s\r\n",
-		vmexten, fromdomain);
-	/* buggymwi=yes omits the "(0/0)" suffix some stacks reject (default = RFC 3842). */
-	ast_str_append(&body, 0, "Voice-Message: %d/%d%s\r\n",
-		total_new, total_old, peer->buggymwi ? "" : " (0/0)");
-
 	nua_notify(nh,
 		SIPTAG_EVENT_STR("message-summary"),
 		SIPTAG_CONTENT_TYPE_STR(notifymime),
 		SIPTAG_PAYLOAD_STR(ast_str_buffer(body)),
 		TAG_END());
-
 	if (sofia_debug) {
-		ast_verbose("Sofia MWI: NOTIFY emitted for peer '%s' (new=%d old=%d urgent=%d)\n",
-			peer->name, total_new, total_old, total_urgent);
+		ast_verbose("Sofia MWI: solicited NOTIFY for peer '%s' (new=%d old=%d)\n",
+			peer->name, total_new, total_old);
+	}
+	ast_free(body);
+}
+
+/* UNSOLICITED MWI NOTIFY (RFC 3842, chan_sip subscribemwi=no parity): push message-summary to a
+ * registered peer that has NOT subscribed, via a one-shot out-of-dialog handle to its registered
+ * contact. Sent with nua_method NOTIFY (NOT nua_notify): this sofia-sip fork compiles out the notifier
+ * client methods and the NUTAG_NEWSUB usage path is #if 0, so an out-of-dialog nua_notify is rejected
+ * locally with 481; the generic-method path delivers it. Subscription-State: active is set explicitly.
+ * The handle carries SOFIA_SIPNOTIFY_HMAGIC so the one-shot reap destroys it on the final nua_r_method
+ * response. sofia_thread only. */
+static void transmit_unsolicited_mwi_for_peer(struct sofia_peer *peer)
+{
+	struct ast_str *body;
+	const char *notifymime;
+	char target[300];
+	char defaultuser[256];
+	int registered, total_new = 0, total_old = 0;
+	nua_handle_t *nh;
+
+	if (!peer) {
+		return;
+	}
+	ast_mutex_lock(&peer->lock);
+	registered = peer->registered;
+	ast_copy_string(defaultuser,
+		!ast_strlen_zero(peer->defaultuser) ? peer->defaultuser : peer->name, sizeof(defaultuser));
+	ast_mutex_unlock(&peer->lock);
+	if (!registered) {
+		return;		/* no registered contact to push to */
 	}
 
+	sofia_resolve_peer_target(peer, defaultuser, target, sizeof(target));
+	if (ast_strlen_zero(target)) {
+		return;
+	}
+	if (!(body = sofia_build_mwi_body(peer, &total_new, &total_old))) {
+		return;
+	}
+	notifymime = !ast_strlen_zero(sofia_cfg.notifymime) ? sofia_cfg.notifymime
+		: "application/simple-message-summary";
+
+	nh = nua_handle(sofia_nua, SOFIA_SIPNOTIFY_HMAGIC, NUTAG_URL(target), TAG_END());
+	if (nh) {
+		/* nua_method NOTIFY — NOT nua_notify. This sofia-sip fork compiles out the notifier client
+		 * methods (nua_notify_client_methods are all NULL) and the NUTAG_NEWSUB usage-creation path is
+		 * #if 0, so an out-of-dialog nua_notify is rejected LOCALLY with 481 and never reaches the wire.
+		 * The generic-method path sends the NOTIFY on the wire (the same mechanism outbound PUBLISH uses);
+		 * the response arrives as nua_r_method, reaped by the SOFIA_SIPNOTIFY_HMAGIC one-shot reap. */
+		nua_method(nh,
+			NUTAG_METHOD("NOTIFY"),
+			SIPTAG_EVENT_STR("message-summary"),
+			SIPTAG_SUBSCRIPTION_STATE_STR("active"),
+			SIPTAG_CONTENT_TYPE_STR(notifymime),
+			SIPTAG_PAYLOAD_STR(ast_str_buffer(body)),
+			TAG_END());
+		if (sofia_debug) {
+			ast_verbose("Sofia MWI: unsolicited NOTIFY for peer '%s' -> %s (new=%d old=%d)\n",
+				peer->name, target, total_new, total_old);
+		}
+	}
 	ast_free(body);
+}
+
+/* On a successful REGISTER, push the initial unsolicited MWI for a peer that has a mailbox= and
+ * subscribemwi=no (chan_sip parity). Called from BOTH register-200 paths (no-auth + authenticated) on
+ * sofia_thread, after the 200 OK + side-effects. No-op for solicited-only (subscribemwi=yes) or
+ * mailbox-less peers; transmit_unsolicited re-checks registered under peer->lock. */
+static void sofia_register_initial_mwi(struct sofia_peer *peer)
+{
+	int want_mwi;
+
+	if (!peer) {
+		return;
+	}
+	ast_mutex_lock(&peer->lock);
+	/* Skip the unsolicited push when the phone has an ACTIVE inbound MWI subscription — it already gets
+	 * solicited NOTIFYs on that dialog; pushing here too would double-notify a subscribed phone on every
+	 * re-REGISTER. (The mwi_event_cb change path already gates on this.) */
+	want_mwi = (peer->subscribemwi == 0 && !AST_LIST_EMPTY(&peer->mailboxes)
+		&& !peer->mwi_subscription_handle);
+	ast_mutex_unlock(&peer->lock);
+	if (want_mwi) {
+		transmit_unsolicited_mwi_for_peer(peer);
+	}
 }
 
 /* Reap a SUBSCRIBE server handle on a NON-ACCEPTED path (final reject OR 401
@@ -10349,12 +10464,14 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	struct sofia_pvt *dialog_pvt = NULL;
 	const char *event_name = nua_event_name(event);
 
-	/* AMI SIPnotify one-shot handle (sentinel hmagic): destroy the app-owned
-	 * out-of-dialog NOTIFY handle on its final response (sofia-sip never auto-reaps it).
-	 * Handled before the blacklist/teardown-guard switches so the dispatch never sees
-	 * the sentinel. nua_handle_destroy is legal — same-thread rule. */
+	/* SIPnotify / unsolicited-MWI one-shot handle (sentinel hmagic): destroy the app-owned
+	 * out-of-dialog NOTIFY handle on its final response (sofia-sip never auto-reaps it). The NOTIFY is
+	 * sent via nua_method (this fork rejects an out-of-dialog nua_notify locally with 481), so the final
+	 * response arrives as nua_r_method; nua_r_notify is kept for safety. Handled before the
+	 * blacklist/teardown-guard switches so the dispatch never sees the sentinel. nua_handle_destroy is
+	 * legal — same-thread rule. */
 	if (hmagic == SOFIA_SIPNOTIFY_HMAGIC) {
-		if (event == nua_r_notify && status >= 200) {
+		if ((event == nua_r_method || event == nua_r_notify) && status >= 200) {
 			if (sofia_debug) {
 				ast_verbose("Sofia SIPnotify: NOTIFY final response %d %s — destroying one-shot handle\n",
 					status, phrase);
@@ -12944,17 +13061,8 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 				peer->amaflags = format;
 			}
 		} else if (!strcasecmp(v->name, "subscribemwi")) {
-			/* chan_sofia is SUBSCRIBE-only by design: subscribemwi=yes is a drop-in,
-			 * subscribemwi=no emits an honest NOTICE. KNOWN LIMITATION: no unsolicited MWI NOTIFY. */
+			/* chan_sip parity: yes => SUBSCRIBE-only; no (default) => also push unsolicited MWI. */
 			peer->subscribemwi = ast_true(v->value);
-			if (!peer->subscribemwi) {
-				ast_log(LOG_NOTICE,
-					"Sofia: peer '%s' subscribemwi=no — chan_sofia is SUBSCRIBE-only MWI "
-					"(Pattern 12 17th-instance chan_sofia-architectural-divergence); "
-					"unsolicited MWI NOTIFY not implemented; behavior matches chan_sip "
-					"subscribemwi=yes regardless of this setting\n",
-					peer->name);
-			}
 		} else if (!strcasecmp(v->name, "preferred_codec_only")) {
 			peer->preferred_codec_only = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "ignoresdpversion")) {

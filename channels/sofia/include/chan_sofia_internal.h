@@ -541,10 +541,9 @@ struct sofia_peer {
 	 * at sofia_new, only when non-zero (else channel-core default; chan_sip parity).
 	 * Default 0. Per-peer only. */
 	int amaflags;
-	/* MWI subscription-model gate (chan_sip parity). PARSE-COMPAT-ONLY: chan_sofia
-	 * is SUBSCRIBE-only by design and does NOT emit unsolicited MWI NOTIFY, so
-	 * subscribemwi=yes matches behavior while =no is parse-clean (LIMITATION noted
-	 * in sample.conf). Default 0. */
+	/* MWI subscription-model gate (chan_sip parity). 0 = no (default) = UNSOLICITED MWI: push a
+	 * message-summary NOTIFY to the registered contact on REGISTER + on mailbox change, no SUBSCRIBE
+	 * needed. 1 = yes = SUBSCRIBE-only (MWI only on an active inbound MWI subscription). Default 0. */
 	int subscribemwi;
 	/* flag to treat every inbound SDP as new, ignoring the o-line session-version
 	 * (chan_sip parity). PARSE-COMPAT-ONLY: chan_sofia has no session-version tracking
