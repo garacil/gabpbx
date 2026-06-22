@@ -118,9 +118,17 @@ srvlookup=yes
 ; tls_ciphers      = ECDHE+AESGCM:!aNULL:!MD5  ; OpenSSL cipher list (unset = sofia default
 ;                                              ; "!eNULL:!aNULL:!EXP:!LOW:!MD5:ALL:@STRENGTH").
 ; tls_verify_depth = 3                         ; max peer cert-chain depth (unset/0 = sofia default 2).
+; tlsverifyclient  = yes                       ; mutual TLS (mTLS): also verify the CLIENT cert on the
+;                                              ; INBOUND TLS listener. ORed with tlsverify's outbound
+;                                              ; server-cert check into ONE policy (both set -> verify
+;                                              ; both directions). Default no. A client without a
+;                                              ; CA-trusted cert then fails the TLS handshake before any
+;                                              ; SIP. Uses the same CA material as tlsverify (tlscertfile).
+;                                              ; Per-subject pinning (an allowlist) is a documented v2
+;                                              ; follow-up (TPTAG_TLS_VERIFY_SUBJECTS).
 ; NOTE: these harden the TLS listener ONLY — the WSS listener builds its own SSL_CTX (which already
-; disables SSLv2/SSLv3/TLSv1) and ignores these knobs. Changing any of tlsverify / tls_min_version /
-; tls_ciphers / tls_verify_depth needs `systemctl restart gabpbx` (a `sip reload` refuses with
+; disables SSLv2/SSLv3/TLSv1) and ignores these knobs. Changing any of tlsverify / tlsverifyclient /
+; tls_min_version / tls_ciphers / tls_verify_depth needs `systemctl restart gabpbx` (a `sip reload` refuses with
 ; "listener config changed").
 ;
 ; ws-binding for browser SIP UAs (no TLS)

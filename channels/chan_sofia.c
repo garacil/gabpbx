@@ -11285,6 +11285,13 @@ static void *sofia_thread_func(void *data)
 				"keepalive to send the ping, so it is ignored. Set tcp_keepalive to enable both.\n");
 		}
 
+		/* mTLS: combine the per-direction verify flags into ONE policy bitmask — SUBJECTS_OUT for
+		 * outbound server-cert checks (tlsverify), SUBJECTS_IN for inbound client-cert checks
+		 * (tlsverifyclient); both -> SUBJECTS_ALL; 0 -> no verification (sofia default). TLS listener
+		 * only (WSS builds its own SSL_CTX). */
+		unsigned tls_verify_policy = (sofia_cfg.tlsverify ? TPTLS_VERIFY_SUBJECTS_OUT : 0)
+			| (sofia_cfg.tlsverifyclient ? TPTLS_VERIFY_SUBJECTS_IN : 0);
+
 		sofia_nua = nua_create(sofia_root,
 			sofia_event_callback,
 			NULL,
@@ -11296,10 +11303,14 @@ static void *sofia_thread_func(void *data)
 				NUTAG_CERTIFICATE_DIR(sofia_cfg.tlscertfile)),
 			/* Opt-in peer-cert verification (default OFF = sofia-sip TPTLS_VERIFY_NONE).
 			 * tlsverify=yes verifies the outbound server cert chain+subject+date against
-			 * tlscertfile — closes the accept-any-cert MITM hole on outbound TLS/WSS. */
-			TAG_IF(needs_cert && sofia_cfg.tlsverify,
-				TPTAG_TLS_VERIFY_POLICY(TPTLS_VERIFY_SUBJECTS_OUT)),
-			TAG_IF(needs_cert && sofia_cfg.tlsverify,
+			 * tlscertfile — closes the accept-any-cert MITM hole on the outbound TLS transport
+			 * (WSS builds its own SSL_CTX and is not governed by these TPTAG_TLS_* knobs). */
+			/* Combined TLS verify policy: tlsverify -> verify the SERVER cert (outbound,
+			 * SUBJECTS_OUT); tlsverifyclient -> verify the CLIENT cert (inbound mTLS, SUBJECTS_IN);
+			 * both -> SUBJECTS_ALL. One bitmask (the flags ORed in tls_verify_policy above). */
+			TAG_IF(needs_cert && tls_verify_policy,
+				TPTAG_TLS_VERIFY_POLICY(tls_verify_policy)),
+			TAG_IF(needs_cert && tls_verify_policy,
 				TPTAG_TLS_VERIFY_DATE(1)),
 			/* TLS-listener hardening (opt-in; TLS listener only — WSS builds its own
 			 * SSL_CTX). Each applied only when set, so an unset knob keeps the default. */
@@ -11778,6 +11789,9 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			/* Opt-in TLS peer-cert verification (default OFF): validate the server cert chain +
 			 * subject against the configured CA material (tlscertfile dir). */
 			sofia_cfg.tlsverify = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "tlsverifyclient")) {
+			/* mutual TLS: verify the CLIENT cert on the inbound TLS listener (opt-in). */
+			sofia_cfg.tlsverifyclient = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "tls_ciphers")) {
 			/* OpenSSL cipher list for the TLS listener (TPTAG_TLS_CIPHERS). */
 			ast_copy_string(sofia_cfg.tls_ciphers, v->value, sizeof(sofia_cfg.tls_ciphers));
@@ -13593,6 +13607,7 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 		char wssbindaddr[64];
 		int wssbindport;
 		int tlsverify;
+		int tlsverifyclient;	/* mTLS toggle; a change forces a listener recreate */
 		char tls_ciphers[256];	/* a change forces a listener recreate (TLS ctx built at listener create) */
 		char tls_min_version[8];
 		int tls_verify_depth;
@@ -13622,6 +13637,7 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 	s.wssbindaddr[0] = '\0';
 	s.wssbindport = 0;
 	s.tlsverify = 0;
+	s.tlsverifyclient = 0;
 	s.tls_ciphers[0] = '\0';
 	s.tls_min_version[0] = '\0';
 	s.tls_verify_depth = 0;
@@ -13675,6 +13691,8 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 			s.tcp_pingpong_ms = sofia_cfg_seconds_to_ms(v->value);
 		} else if (!strcasecmp(v->name, "tlsverify") || !strcasecmp(v->name, "tlsverifyserver")) {
 			s.tlsverify = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "tlsverifyclient")) {
+			s.tlsverifyclient = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "tls_ciphers")) {
 			ast_copy_string(s.tls_ciphers, v->value, sizeof(s.tls_ciphers));
 		} else if (!strcasecmp(v->name, "tls_min_version")) {
@@ -13772,6 +13790,9 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 	}
 	if (!!sofia_cfg.tlsverify != !!s.tlsverify) {
 		SOFIA_LISTENER_FLAG("tlsverify");
+	}
+	if (!!sofia_cfg.tlsverifyclient != !!s.tlsverifyclient) {
+		SOFIA_LISTENER_FLAG("tlsverifyclient");
 	}
 	/* Compare tls_min_version as a STRING (its mask 0 for "1.3" collides with unset). */
 	SOFIA_LISTENER_CMP_STR(tls_ciphers, "tls_ciphers");

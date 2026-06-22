@@ -693,8 +693,13 @@ struct sofia_config {
 	char tlsbindaddr[64];
 	int  tlsbindport;        /* 0 = disabled; common: 5061 */
 	char tlscertfile[256];   /* directory containing agent.pem (combined cert+key) */
-	int  tlsverify;          /* verify the peer cert chain on TLS/WSS (default 0
-	                          * = OFF, sofia-sip default; opt-in, requires a CA bundle). */
+	int  tlsverify;          /* verify the peer (server) cert chain on the TLS transport (default 0
+	                          * = OFF, sofia-sip default; opt-in, requires a CA bundle). WSS builds
+	                          * its own SSL_CTX and is NOT governed by this. */
+	int  tlsverifyclient;    /* mutual TLS: verify the CLIENT cert on the INBOUND TLS listener
+	                          * (TPTLS_VERIFY_SUBJECTS_IN, ORed with tlsverify's OUT into one policy).
+	                          * Default 0 (opt-in; a client without a CA-trusted cert then fails the
+	                          * handshake before SIP). WSS excluded (own SSL_CTX). */
 	/* feature #6: TLS hardening knobs for the TLS listener (opt-in; empty/0 = sofia-sip default, no
 	 * behavior change). These map to TPTAG_TLS_* at nua_create. They affect the TLS listener ONLY —
 	 * the WSS listener builds its own SSL_CTX (tport_type_ws.c tport_wss_create_ssl_ctx) and ignores
