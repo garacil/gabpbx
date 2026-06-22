@@ -807,8 +807,11 @@ static int sofia_fork_cancel_loser_cb(void *obj, void *arg, int flags)
 static int sofia_fork_cancel_all_cb(void *obj, void *arg, int flags)
 {
 	struct sofia_pvt *child = obj;
+	const char *reason = arg;	/* Q.850 Reason from the master hangup (RFC 3326), or NULL */
 	if (child->nh) {
-		nua_cancel(child->nh, TAG_END());
+		nua_cancel(child->nh,
+			TAG_IF(!ast_strlen_zero(reason), SIPTAG_REASON_STR(reason)),
+			TAG_END());
 	}
 	ao2_unlink(dialogs, child);
 	return CMP_MATCH;
@@ -3897,10 +3900,16 @@ static int sofia_write_video(struct ast_channel *ast, struct ast_frame *frame)
 static int sofia_hangup(struct ast_channel *ast)
 {
 	struct sofia_pvt *pvt = ast->tech_pvt;
+	char reason_buf[160] = "";
+	/* Q.850 Reason header (RFC 3326) for the BYE/CANCEL we send — built once from the channel's
+	 * final hangup cause (set by the core before sofia_hangup). Gated by [general] use_q850_reason. */
+	int have_reason;
 
 	if (!pvt) {
 		return -1;
 	}
+	have_reason = (sofia_cfg.use_q850_reason
+		&& sofia_reason_build(ast->hangupcause, reason_buf, sizeof(reason_buf)));
 
 	/* Fail a pending outbound REFER + disarm its timer so Transfer() never blocks past
 	 * teardown (queues AST_CONTROL_TRANSFER=FAILED if pending). Off-thread-safe (it
@@ -3933,7 +3942,7 @@ static int sofia_hangup(struct ast_channel *ast)
 
 		if (!picked) {
 			ao2_callback(fork->children, OBJ_UNLINK | OBJ_MULTIPLE | OBJ_NODATA,
-				sofia_fork_cancel_all_cb, NULL);
+				sofia_fork_cancel_all_cb, have_reason ? reason_buf : NULL);
 			ast_verbose("Sofia: Fork master hangup — cancelled all children (%s)\n",
 				fork->fork_id);
 		}
@@ -3963,9 +3972,12 @@ static int sofia_hangup(struct ast_channel *ast)
 			int use_target = sofia_pvt_build_nat_target_url(pvt, target_url, sizeof(target_url));
 			nua_bye(pvt->nh,
 				TAG_IF(use_target, NUTAG_PROXY(target_url)),
+				TAG_IF(have_reason, SIPTAG_REASON_STR(reason_buf)),	/* RFC 3326 Q.850 */
 				TAG_END());
 		} else {
-			nua_cancel(pvt->nh, TAG_END());
+			nua_cancel(pvt->nh,
+				TAG_IF(have_reason, SIPTAG_REASON_STR(reason_buf)),	/* RFC 3326 Q.850 */
+				TAG_END());
 		}
 	}
 
@@ -5392,6 +5404,9 @@ static void sofia_process_bye(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op
 	}
 
 	if (op) {
+		/* Q.850 Reason (RFC 3326): map a received Reason: Q.850;cause=N to the AST hangup cause so
+		 * the CDR reflects the real reason. 0 (none/off) keeps the channel's existing cause. */
+		int q850 = (sofia_cfg.use_q850_reason && sip) ? sofia_reason_parse_cause(sip->sip_reason) : 0;
 		/* TOCTOU/UAF: snapshot+ref op->owner under op->lock, queue outside it
 		 * (ast_queue_hangup locks the channel → holding op->lock would invert). */
 		struct ast_channel *owner;
@@ -5402,7 +5417,11 @@ static void sofia_process_bye(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op
 		}
 		ast_mutex_unlock(&op->lock);
 		if (owner) {
-			ast_queue_hangup(owner);
+			if (q850) {
+				ast_queue_hangup_with_cause(owner, q850);
+			} else {
+				ast_queue_hangup(owner);
+			}
 			ast_channel_unref(owner);
 		}
 	}
@@ -5414,6 +5433,8 @@ static void sofia_process_cancel(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	nua_respond(nh, SIP_200_OK, TAG_END());
 
 	if (op) {
+		/* Q.850 Reason (RFC 3326): use a received cause as the hangup cause, else NORMAL_CLEARING. */
+		int q850 = (sofia_cfg.use_q850_reason && sip) ? sofia_reason_parse_cause(sip->sip_reason) : 0;
 		/* TOCTOU/UAF fix: snapshot+ref op->owner under op->lock, queue outside it
 		 * (see sofia_process_bye). */
 		struct ast_channel *owner;
@@ -5424,7 +5445,7 @@ static void sofia_process_cancel(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		}
 		ast_mutex_unlock(&op->lock);
 		if (owner) {
-			ast_queue_hangup_with_cause(owner, AST_CAUSE_NORMAL_CLEARING);
+			ast_queue_hangup_with_cause(owner, q850 ? q850 : AST_CAUSE_NORMAL_CLEARING);
 			ast_channel_unref(owner);
 		}
 	}
@@ -11977,6 +11998,9 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "notifyhold")) {
 			/* Gates the peer->onHold counter update. */
 			sofia_cfg.notifyhold = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "use_q850_reason")) {
+			/* Q.850 Reason header (RFC 3326) on BYE/CANCEL, both directions. */
+			sofia_cfg.use_q850_reason = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "notifyringing")) {
 			/* PARSE-COMPAT-ONLY: effect deferred until presence/dialog-info NOTIFY lands. */
 			sofia_cfg.notifyringing = ast_true(v->value);
@@ -13017,6 +13041,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.shrinkcallerid = 1;
 	/* gates the peer->onHold counter update; AMI Hold emission is unconditional. */
 	sofia_cfg.notifyhold = 0;
+	sofia_cfg.use_q850_reason = 0;	/* RFC 3326 Q.850 Reason on BYE/CANCEL; opt-in (chan_sip parity) */
 	/* PARSE-COMPAT-ONLY — effect deferred until presence/dialog-info NOTIFY lands. */
 	sofia_cfg.notifyringing = 1;
 	/* Security hardening: peer-build appends static IPs as deny rules to contact_ha. */

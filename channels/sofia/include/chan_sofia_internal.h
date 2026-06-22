@@ -166,6 +166,8 @@ void sofia_remove_peer_hints(const char *regexten, const char *subscribecontext,
 void sofia_build_instance_feature(const struct sofia_peer *peer, char *buf, size_t len);
 void sofia_gruu_consume(struct sofia_peer *peer, sip_t const *sip);
 void sofia_service_route_store(struct sofia_peer *peer, sip_t const *sip);	/* Service-Route RFC 3608, sofia_route.c */
+int sofia_reason_build(int hangupcause, char *buf, size_t len);	/* Q.850 Reason RFC 3326, sofia_reason.c */
+int sofia_reason_parse_cause(sip_reason_t const *reason);
 int sofia_gruu_dialog_contact(const struct sofia_peer *peer, char *buf, size_t len);	/* Phase 2b: GRUU as the dialog Contact */
 void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
 		char *out_url, size_t out_len);
@@ -725,6 +727,7 @@ struct sofia_config {
 	int legacy_useroption_parsing; /* PARSE-COMPAT-ONLY (sofia-sip has no post-parse URI semicolon-strip hook); default 0. chan_sofia URI parsing already RFC 3261-compliant. */
 	int shrinkcallerid;        /* 1 = strip leading '+'/parens from CID phone numbers (ast_is_shrinkable_phonenumber); default 1 (chan_sip). Non-phone CIDs unaffected. */
 	int notifyhold;            /* 1 = gate peer->onHold counter tracking on this flag; default 0 (chan_sip). AMI Hold remains unconditional. */
+	int use_q850_reason;       /* Q.850 Reason header (RFC 3326): when 1, stamp/parse Reason: Q.850;cause=N on BYE/CANCEL. Default 0 (chan_sip parity, opt-in). */
 	int notifyringing;         /* PARSE-COMPAT-ONLY (early-vs-confirmed presence gate; dialog-info NOTIFY infra deferred); default 1 (chan_sip) */
 	int dynamic_exclude_static; /* 1 = append static-peer addrs to contact_ha as DENY so dynamic peers can't claim static names by Contact-IP spoofing. Default 0. */
 	int autocreatepeer;        /* PARSE-COMPAT-ONLY: chan_sofia refuses to auto-create unknown peers (stronger via alwaysauthreject default). Default 0 (chan_sip). */
