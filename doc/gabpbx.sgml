@@ -415,22 +415,22 @@
  <refsect1>
   <title>BUGS</title>
   <para>
-  Bug reports and feature requests may be filed at https://issues.gabpbx.org
+  Bug reports and feature requests may be filed at https://github.com/garacil/gabpbx/issues
   </para>
  </refsect1>
  <refsect1>
   <title>SEE ALSO</title>
   <para>
-   http://www.gabpbx.org - The GABpbx Home Page
+   https://github.com/garacil/gabpbx - The GABpbx Home Page
   </para>
   <para>
-   http://www.gabpbxdocs.org - The GABpbx Documentation Project
+   https://github.com/garacil/gabpbx/wiki - The GABpbx Documentation Project
   </para>
   <para>
-   http://wiki.gabpbx.org - The GABpbx Wiki
+   https://github.com/garacil/gabpbx/wiki - The GABpbx Wiki
   </para>
   <para>
-   http://www.digium.com/ - GABpbx is sponsored by Digium
+   http://www.digium.com/ - derived from Asterisk (originally sponsored by Digium)
   </para>
  </refsect1>
  <refsect1>

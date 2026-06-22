@@ -88,7 +88,7 @@ Example:
  Recorded by:
  Allison Smith (http://www.theivrvoice.com)
  
- Financial Contributions by: Digium, Inc. (http://www.digium.com)
+ Originally derived from the Asterisk project.
  bash-3.2#
 
 5) Create a file called "LICENSE" and include the license text (listed
@@ -107,7 +107,7 @@ import to UTF-8 format.
 7) Use "tar" to create a single file of your sounds and the three text
 files.
 
-8) Create an account on http://issues.gabpbx.org/ if you do not
+8) Create an account on https://github.com/garacil/gabpbx/issues/ if you do not
 already have one, and submit the file via that interface.  In order to
 eliminate confusion, you should also complete the license agreement on
 that system, which is an electronic license agreement.  You will
