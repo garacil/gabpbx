@@ -138,6 +138,7 @@ struct sofia_contact {
 	time_t expires;
 	struct ast_sockaddr src_addr;
 	int active_calls;          /* count of active calls on this contact */
+	char path[1024];           /* Path (RFC 3327) the device registered through, as a ready "<uri;lr>,..." Route value pre-loaded on requests we send to this contact. Empty = none. */
 };
 
 extern char sofia_sipnotify_sentinel;
@@ -166,6 +167,8 @@ void sofia_remove_peer_hints(const char *regexten, const char *subscribecontext,
 void sofia_build_instance_feature(const struct sofia_peer *peer, char *buf, size_t len);
 void sofia_gruu_consume(struct sofia_peer *peer, sip_t const *sip);
 void sofia_service_route_store(struct sofia_peer *peer, sip_t const *sip);	/* Service-Route RFC 3608, sofia_route.c */
+int sofia_route_serialize(sip_route_t const *list, char *buf, size_t len);	/* Path/Service-Route hop list -> Route value; 0 ok, -1 overflow */
+void sofia_peer_clear_contact_paths(struct sofia_peer *peer);	/* blank RFC 3327 Path on all contacts (path=no) */
 int sofia_reason_build(int hangupcause, char *buf, size_t len);	/* Q.850 Reason RFC 3326, sofia_reason.c */
 int sofia_reason_parse_cause(sip_reason_t const *reason);
 int sofia_gruu_dialog_contact(const struct sofia_peer *peer, char *buf, size_t len);	/* Phase 2b: GRUU as the dialog Contact */
@@ -462,6 +465,7 @@ struct sofia_peer {
 	int gruu;                       /* GRUU/RFC 5626: when 1, the outbound REGISTER advertises a stable +sip.instance (urn:uuid from EID+name) so a GRUU-capable registrar can mint a pub-gruu. Default 0 (opt-in). */
 	int use_gruu_contact;           /* GRUU Phase 2b (RFC 5627 §4.4): when 1 (default) AND gruu=yes AND a pub-gruu was learned, use it as the outbound dialog Contact. Interop kill-switch: set no to keep advertising/learning but not use it as Contact. Default 1. */
 	int use_service_route;          /* Service-Route (RFC 3608): when 1, ingest the registrar's Service-Route from the REGISTER 200 and pre-load it on outbound INVITEs to that domain. Default 0 (opt-in; applying it diverts outbound routing). */
+	int path_support;               /* Path (RFC 3327): when 1, as the registrar for this dynamic peer, accept + store the Path from its REGISTER and pre-load it as a Route on requests to its contacts. Default 0 (opt-in; accepting Path is a trust decision, RFC 3327 §7). */
 	/* Buggy-CISCO MWI fix (chan_sip parity): when set, the Voice-Message: NOTIFY
 	 * body line OMITS the trailing " (0/0)" suffix (some SIP stacks reject it).
 	 * Per-peer only (no [general] default); default 0 = standard RFC 3842. */

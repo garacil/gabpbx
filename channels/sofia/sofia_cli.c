@@ -631,11 +631,13 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 			/* Snapshot the mutable contact fields under the contact lock (a REGISTER
 			 * refresh rewrites them). Lock order: peer->lock (held) -> contact lock. */
 			char ua_buf[256];
+			char c_path[1024];
 			ao2_lock(c);
 			ttl = (long)(c->expires - now);
 			ast_copy_string(src_buf, !ast_sockaddr_isnull(&c->src_addr) ?
 				ast_sockaddr_stringify(&c->src_addr) : "(unknown)", sizeof(src_buf));
 			ast_copy_string(ua_buf, c->user_agent[0] ? c->user_agent : "(none)", sizeof(ua_buf));
+			ast_copy_string(c_path, c->path, sizeof(c_path));
 			active_calls = c->active_calls;
 			ao2_unlock(c);
 			src = src_buf;
@@ -653,6 +655,9 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 			sofia_cli_peer_subline(&buf, "TTL", "%s", ttl_buf);
 			sofia_cli_peer_subline(&buf, "Source", "%s", src);
 			sofia_cli_peer_subline(&buf, "User-Agent", "%s", ua_buf);
+			if (!ast_strlen_zero(c_path)) {
+				sofia_cli_peer_subline(&buf, "Path", "%s", c_path);	/* RFC 3327 */
+			}
 			ao2_ref(c, -1);
 		}
 		ao2_iterator_destroy(&ci);

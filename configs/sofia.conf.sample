@@ -491,6 +491,23 @@ srvlookup=yes
 ;   service_route=yes
 
 ;
+; --- path (RFC 3327 Path — per-peer, dynamic peers behind an edge proxy/SBC) ---
+; When a dynamic peer registers THROUGH an edge proxy/SBC that inserts a Path header, path=yes makes
+; this server (as the registrar) accept + store that Path with the contact and pre-load it as a Route on
+; requests it sends TO that device (INVITEs incl. forked multi-contact), so they traverse the edge proxy
+; back to the NATed device (RFC 3327 §5.4). The Path is echoed in the REGISTER 200; if a Path is present
+; but the device did NOT advertise Supported: path, the REGISTER is rejected 420 Bad Extension (RFC 3327
+; §5.3 — an intermediary inserted Path without UA support). Default off (opt-in: accepting Path is a
+; trust decision, RFC 3327 §7). v1 applies it to outbound INVITEs; NOTIFY/OPTIONS/MESSAGE are a
+; documented follow-on (NAT-proxy/Route interaction).
+;
+;   [myphone]
+;   type=friend
+;   host=dynamic
+;   secret=...
+;   path=yes
+
+;
 ; --- regexten + regextenonqualify (post-T56 chan_sip parity, drop-in registration-coupled dialplan) ---
 ; Auto-add a dialplan extension when a peer registers; auto-remove when the peer
 ; unregisters or (optionally) when qualify reports the peer unreachable. Common

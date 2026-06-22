@@ -2084,6 +2084,7 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	peer->gruu = 0;		/* GRUU opt-in */
 	peer->use_gruu_contact = 1;	/* GRUU Phase 2b: use a learned pub-gruu as the dialog Contact (default yes; gated by gruu) */
 	peer->use_service_route = 0;	/* Service-Route (RFC 3608): opt-in (applying it diverts outbound routing) */
+	peer->path_support = 0;		/* Path (RFC 3327): opt-in (accepting Path is a trust decision) */
 	peer->buggymwi = 0;
 	peer->lockuseragent = 0;
 	ast_string_field_set(peer, lockuseragent_prefixes, "");
@@ -2723,6 +2724,11 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			peer->use_service_route = ast_true(v->value);	/* RFC 3608: pre-load the registrar's Service-Route on outbound INVITEs (opt-in) */
 			if (!peer->use_service_route) {	/* knob turned off -> drop any learned route (no stale routing) */
 				ast_string_field_set(peer, service_route, "");
+			}
+		} else if (!strcasecmp(v->name, "path")) {
+			peer->path_support = ast_true(v->value);	/* RFC 3327: accept + use the device's Path (opt-in) */
+			if (!peer->path_support) {	/* drop stored Paths so a re-enable can't resurrect a stale route */
+				sofia_peer_clear_contact_paths(peer);
 			}
 		} else if (!strcasecmp(v->name, "publish")) {
 			/* outbound PUBLISH (RFC 3903): opt hint state into central publication. */
@@ -3544,6 +3550,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				 * header builders below) so forked INVITEs carry the real caller. */
 				child->callingpres = pvt->callingpres;
 				ast_sockaddr_copy(&child->ourip, &pvt->ourip);
+				char child_path[1024] = "";	/* RFC 3327 Path of THIS contact, pre-loaded as Route on its forked INVITE */
 
 				/* Build RURI for this contact. c->host may be unbracketed IPv6 —
 				 * the helper wraps it (RFC 3261 §19.1.2). */
@@ -3557,6 +3564,9 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 					 * refresh-mutable field). */
 					ao2_lock(c);
 					ast_copy_string(c_transport, c->transport, sizeof(c_transport));
+					if (child->peer && child->peer->path_support) {
+						ast_copy_string(child_path, c->path, sizeof(child_path));	/* RFC 3327 */
+					}
 					ao2_unlock(c);
 					sofia_uri_append_transport(ruri, sizeof(ruri), c_transport);
 				}
@@ -3567,6 +3577,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 					child->nh = nua_handle(sofia_nua, child,
 						NUTAG_URL(ruri),
 						SIPTAG_TO_STR(ruri),
+						TAG_IF(child_path[0], NUTAG_INITIAL_ROUTE_STR(child_path)),	/* RFC 3327 Path as Route */
 						TAG_IF(child->peer && child->peer->gruu, NUTAG_SUPPORTED("gruu")),	/* RFC 5627 §4.4 */
 						TAG_END());
 				}
@@ -4524,6 +4535,9 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 			char url[256];
 			char route_buf[256];
 			char sr_buf[1024] = "";	/* RFC 3608 Service-Route (opt-in), pre-loaded after outboundproxy */
+			char path_buf[1024] = "";	/* RFC 3327 Path of the registered contact (opt-in), pre-loaded as Route */
+			struct ast_sockaddr sel_src;	/* the selected binding's src_addr — picks WHICH contact's Path */
+			int sel_ok = 0;
 
 			sofia_resolve_peer_target(peer, exten, url, sizeof(url));
 			/* Outbound Route from outboundproxy; sticky-on-handle via
@@ -4541,6 +4555,8 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 				struct ast_sockaddr target;
 				if (peer->registered && !ast_sockaddr_isnull(&peer->src_addr)) {
 					target = peer->src_addr;
+					sel_src = peer->src_addr;	/* the binding the RURI routes to -> its Path below */
+					sel_ok = 1;
 				} else {
 					char target_url[128];
 					snprintf(target_url, sizeof(target_url), "%s:%d",
@@ -4552,6 +4568,18 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 				 * kernel route; reads no freeable field — target is a local copy). */
 				ast_mutex_unlock(&peer->lock);
 				sofia_resolve_ourip(pvt, &target);
+			}
+			/* Path (RFC 3327, path=yes): pre-load THIS registered contact's stored Path as a Route so
+			 * the INVITE traverses the edge proxy back to the device. Done after the peer->lock release
+			 * to avoid nesting the contacts-container lock under peer->lock. */
+			if (peer->path_support && sel_ok) {
+				struct sofia_contact *fc = sofia_peer_find_contact_by_addr(peer, &sel_src);
+				if (fc) {
+					ao2_lock(fc);
+					ast_copy_string(path_buf, fc->path, sizeof(path_buf));
+					ao2_unlock(fc);
+					ao2_ref(fc, -1);
+				}
 			}
 			ast_string_field_set(pvt, ruri, url);
 			if (sofia_debug) {
@@ -4574,6 +4602,7 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 					SIPTAG_TO_STR(url),
 					TAG_IF(route_buf[0], NUTAG_INITIAL_ROUTE_STR(route_buf)),
 					TAG_IF(sr_buf[0], NUTAG_INITIAL_ROUTE_STR(sr_buf)),	/* RFC 3608 Service-Route, after outboundproxy */
+					TAG_IF(path_buf[0], NUTAG_INITIAL_ROUTE_STR(path_buf)),	/* RFC 3327 Path of the registered contact */
 					TAG_IF(proxy_url[0], NUTAG_PROXY(proxy_url)),
 					TAG_IF(peer_gruu, NUTAG_SUPPORTED("gruu")),	/* RFC 5627 §4.4 */
 					TAG_END());
@@ -6008,6 +6037,16 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 	struct ast_sockaddr src;
 	sip_contact_t *m;
 	char reg_transport[8] = "udp";	/* last contact's transport → peer->reg_transport */
+	/* Path (RFC 3327, path=yes): serialize the device's Path ONCE before any contact mutation; on
+	 * overflow reject the whole REGISTER (-1 -> 500) rather than store a binding without its route
+	 * vector. Empty unless path=yes and a Path is present — stored on every binding below. */
+	char pathstr[1024] = "";
+	/* Only on a real (re)binding (expires > 0): an UNREGISTER (expires == 0) removes the contacts, so
+	 * never serialize/reject a Path on it — you must always be able to de-register. */
+	if (peer->path_support && expires > 0 && sip->sip_path
+			&& sofia_route_serialize(sip->sip_path, pathstr, sizeof(pathstr)) != 0) {
+		return -4;	/* Path too long to store -> reject the REGISTER (500); see sofia_process_register */
+	}
 
 	/* "Contact: *" is valid only as the sole Contact with Expires:0 (RFC 3261
 	 * §10.2.2 bulk unregister); else malformed → -2 (400). */
@@ -6118,6 +6157,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				if (sip->sip_user_agent && sip->sip_user_agent->g_string)
 					ast_copy_string(c->user_agent, sip->sip_user_agent->g_string,
 						sizeof(c->user_agent));
+				ast_copy_string(c->path, pathstr, sizeof(c->path));	/* RFC 3327 Path (empty if none/off) */
 				ao2_unlock(c);
 				ao2_ref(c, -1);
 				if (sofia_debug)
@@ -6141,6 +6181,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 						sizeof(c->user_agent));
 				c->expires = now + expires;
 				memcpy(&c->src_addr, &src, sizeof(src));
+				ast_copy_string(c->path, pathstr, sizeof(c->path));	/* RFC 3327 Path (empty if none/off) */
 				ao2_lock(peer->contacts);
 				/* Link FIRST, evict oldest AFTER, so an OOM never drops an existing
 				 * binding (NULL = OOM: undo accounting, return -3/500). */
@@ -7534,6 +7575,19 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		}
 	}
 
+	/* Path (RFC 3327 §5.3): a path=yes peer whose REGISTER carries a Path but did NOT advertise
+	 * Supported: path means an intermediary inserted the Path without UA support -> reject with 420
+	 * Bad Extension + Unsupported: path (RFC 3327 §7 interception-risk posture). Gated on path=yes. */
+	if (peer->path_support && sip->sip_path && !sip_has_feature(sip->sip_supported, "path")) {
+		sofia_log_register_outcome("REJECT (Path without Supported)", peer->name, sip);
+		nua_respond(nh, 420, "Bad Extension",
+			NUTAG_WITH_THIS(nua),
+			SIPTAG_UNSUPPORTED_STR("path"),
+			TAG_END());
+		ao2_ref(peer, -1);
+		return;
+	}
+
 	/* No credential at all (neither secret nor md5secret) -> accept without auth.
 	 * md5secret IS a credential, so a md5secret-only peer MUST take the auth path below. */
 	if (ast_strlen_zero(peer->secret) && ast_strlen_zero(peer->md5secret)) {
@@ -7564,6 +7618,11 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		ast_mutex_lock(&peer->lock);
 		int rc = sofia_update_peer_contacts(peer, sip, expires, &reg_update);
 		ast_mutex_unlock(&peer->lock);
+		if (rc == -4) {	/* Path serialization overflow -> reject; never bind without the route vector (RFC 3327). */
+			nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
+			ao2_ref(peer, -1);
+			return;
+		}
 		if (rc == -2) {
 			/* Wildcard "Contact: *" with non-zero Expires -> 400 (no-secret path). */
 			sofia_log_register_outcome("REJECT (bad wildcard contact)", peer->name, sip);
@@ -7600,6 +7659,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		nua_respond(nh, SIP_200_OK,
 			SIPTAG_CONTACT(sip->sip_contact),
 			SIPTAG_EXPIRES_STR(granted_exp),
+			TAG_IF(peer->path_support && sip->sip_path, SIPTAG_PATH(sip->sip_path)),	/* RFC 3327 §5.3 echo */
 			NUTAG_WITH_THIS(nua),
 			TAG_END());
 		sofia_verbose_register_update(peer, &reg_update);
@@ -7655,6 +7715,11 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			ast_mutex_lock(&peer->lock);
 			int rc = sofia_update_peer_contacts(peer, sip, expires, &reg_update);
 			ast_mutex_unlock(&peer->lock);
+			if (rc == -4) {	/* Path serialization overflow -> reject; never bind without the route vector (RFC 3327). */
+				nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
+				ao2_ref(peer, -1);
+				return;
+			}
 			if (rc == -2) {
 				/* Wildcard "Contact: *" with non-zero Expires -> 400. */
 				sofia_log_register_outcome("REJECT (bad wildcard contact)", peer->name, sip);
@@ -7693,6 +7758,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		nua_respond(nh, SIP_200_OK,
 			SIPTAG_CONTACT(sip->sip_contact),
 			SIPTAG_EXPIRES_STR(granted_exp),
+			TAG_IF(peer->path_support && sip->sip_path, SIPTAG_PATH(sip->sip_path)),	/* RFC 3327 §5.3 echo */
 			NUTAG_WITH_THIS(nua),
 			TAG_END());
 		sofia_verbose_register_update(peer, &reg_update);
@@ -12775,6 +12841,11 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			peer->use_service_route = ast_true(v->value);	/* RFC 3608: pre-load the registrar's Service-Route on outbound INVITEs (opt-in) */
 			if (!peer->use_service_route) {	/* knob turned off -> drop any learned route (no stale routing) */
 				ast_string_field_set(peer, service_route, "");
+			}
+		} else if (!strcasecmp(v->name, "path")) {
+			peer->path_support = ast_true(v->value);	/* RFC 3327: accept + use the device's Path (opt-in) */
+			if (!peer->path_support) {	/* drop stored Paths so a re-enable can't resurrect a stale route */
+				sofia_peer_clear_contact_paths(peer);
 			}
 		} else if (!strcasecmp(v->name, "publish")) {
 			/* outbound PUBLISH (RFC 3903); mirrors the realtime branch. */
