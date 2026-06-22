@@ -453,10 +453,12 @@ srvlookup=yes
 ; federation layer uniquely identify this UA instance — useful because chan_sofia registers its Contacts
 ; under a wildcard user, so the instance is the only stable discriminator.
 ;
-; Scope (Phase 1 = ADVERTISEMENT only): it adds the +sip.instance parameter and nothing else. It does
-; NOT enable reg-id / the RFC 5626 outbound flow, sends no validation or keepalive OPTIONS, and does not
-; yet consume a returned pub-gruu for use in call/dialog Contacts (that is a future phase requiring a
-; GRUU-minting registrar to validate). Default off; opt-in per peer.
+; It also advertises Supported: gruu (RFC 5627 4.1, merged with the stack default timer,100rel) so the
+; registrar mints a GRUU. When a GRUU-capable registrar returns a pub-gruu (and rotating temp-gruu) for
+; our instance in the REGISTER 200 OK Contact (RFC 5627 5.2), chan_sofia learns + stores them (shown in
+; `sip show peer` as Pub-GRUU / Temp-GRUU); they are opaque and cleared when the registration goes
+; inactive. NOT enabled: reg-id / the RFC 5626 outbound flow, validation/keepalive OPTIONS, and USING a
+; learned pub-gruu as the outgoing-call Contact (the planned next phase). Default off; opt-in per peer.
 ;
 ;   [mytrunk]
 ;   type=peer

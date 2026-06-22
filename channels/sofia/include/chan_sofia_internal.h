@@ -162,6 +162,9 @@ void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len);
 /* Remove the per-token PRIORITY_HINT extensions for a regexten spec (ext1[@ctx]&ext2...). Splits like
  * the hint creator so multi-token hints are fully reclaimed; registrar matches the creator. */
 void sofia_remove_peer_hints(const char *regexten, const char *subscribecontext, const char *registrar);
+/* GRUU (RFC 5627/5626), sofia_gruu.c: advertise +sip.instance + consume the registrar's pub/temp-gruu. */
+void sofia_build_instance_feature(const struct sofia_peer *peer, char *buf, size_t len);
+void sofia_gruu_consume(struct sofia_peer *peer, sip_t const *sip);
 void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
 		char *out_url, size_t out_len);
 struct sofia_contact *sofia_peer_first_contact(struct sofia_peer *peer);
@@ -400,6 +403,8 @@ struct sofia_peer {
 		AST_STRING_FIELD(fromdomain);
 		AST_STRING_FIELD(regexten);
 		AST_STRING_FIELD(publish_exten);	/* outbound PUBLISH: explicit exten(s) to publish (ext1&ext2@ctx&...); overrides regexten/name as the publish source. Empty = use regexten/name. */
+		AST_STRING_FIELD(pub_gruu);	/* GRUU Phase 2: public GRUU minted by the registrar for this peer's +sip.instance (RFC 5627 §5.2), learned from the REGISTER 200 Contact. Opaque URI. Empty = none/not-registered. */
+		AST_STRING_FIELD(temp_gruu);	/* GRUU Phase 2: temporary GRUU (rotates per refresh). Opaque URI. Empty = none. */
 		AST_STRING_FIELD(callbackextension);	/* when registering AS a client to an upstream provider, user-portion of our Contact URI telling upstream which local extension to call back; wired via NUTAG_M_USERNAME at the 3 nua_register sites. Empty = no callback (chan_sip parity). */
 		AST_STRING_FIELD(subscribecontext);	/* SUBSCRIBE-method dispatch context override (chan_sip parity); inherits default_subscribecontext when empty. LIMITATION: per-peer dialplan dispatch not yet wired (MWI uses peer->mailboxes; unknown events auto-202). */
 		AST_STRING_FIELD(accountcode);	/* CDR billing-tag propagated to channel->accountcode at sofia_new (chan_sip parity); truncated to AST_MAX_ACCOUNT_CODE=20 at CDR-write. Per-peer only (no [general] default). */

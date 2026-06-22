@@ -2708,6 +2708,10 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 		} else if (!strcasecmp(v->name, "gruu")) {
 			/* Advertise a stable +sip.instance on this peer's outbound REGISTER. */
 			peer->gruu = ast_true(v->value);
+			if (!peer->gruu) {	/* gruu turned off -> drop any learned GRUU (else it lingers hidden) */
+				ast_string_field_set(peer, pub_gruu, "");
+				ast_string_field_set(peer, temp_gruu, "");
+			}
 		} else if (!strcasecmp(v->name, "publish")) {
 			/* outbound PUBLISH (RFC 3903): opt hint state into central publication. */
 			peer->publish = ast_true(v->value);
@@ -9928,25 +9932,6 @@ static struct sofia_pvt *sofia_pvt_ref_if_linked(nua_hmagic_t *hmagic)
  * does not discard a qualifier. */
 char sofia_sipnotify_sentinel;
 
-/* GRUU (gruu=yes): build the +sip.instance Contact param for a peer's REGISTER
- * (RFC 5626 §4.1). URN = stable UUID from server EID + peer name. Emitted via
- * NUTAG_M_FEATURES (NOT NUTAG_INSTANCE, which spins up the outbound engine). buf="" when
- * gruu off, so callers use TAG_IF(peer->gruu, ...). */
-static void sofia_build_instance_feature(const struct sofia_peer *peer, char *buf, size_t len)
-{
-	char seed[128], hash[33], eidstr[32] = "";
-
-	if (!peer->gruu) {
-		buf[0] = '\0';
-		return;
-	}
-	ast_eid_to_str(eidstr, sizeof(eidstr), &ast_eid_default);
-	snprintf(seed, sizeof(seed), "gabpbx-sofia-instance:%s:%s", eidstr, S_OR(peer->name, ""));
-	ast_md5_hash(hash, seed);	/* 32 hex chars formatted as a UUID below */
-	snprintf(buf, len, "+sip.instance=\"<urn:uuid:%.8s-%.4s-%.4s-%.4s-%.12s>\"",
-		hash, hash + 8, hash + 12, hash + 16, hash + 20);
-}
-
 static void sofia_event_callback(nua_event_t event, int status, char const *phrase,
 		nua_t *nua, nua_magic_t *magic,
 		nua_handle_t *nh, nua_hmagic_t *hmagic,
@@ -10159,6 +10144,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 						 * registered, start (idempotently) its message-summary watcher
 						 * if mwi_subscribe is configured. No-op otherwise. */
 						sofia_subscribe_on_registered(peer);
+						/* GRUU Phase 2a: learn the pub-gruu/temp-gruu the registrar minted for
+						 * our +sip.instance (RFC 5627 §5.2). No-op unless gruu=yes. */
+						sofia_gruu_consume(peer, sip);
 					}
 				}
 			} else if (status == 401 || status == 407) {
@@ -10227,6 +10215,10 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			if (peer) {
 				ast_mutex_lock(&peer->lock);
 				peer->registered = 0;
+				/* GRUU: do NOT clear learned GRUUs on a non-2xx REGISTER — RFC 5627 §4.2: a failed
+				 * request does not remove/invalidate a previously provided GRUU (a transient failed
+				 * refresh can arrive while the binding is still valid). They are cleared instead by the
+				 * consume path on a 2xx that returns no GRUU (de-registration / not re-issued). */
 				ast_mutex_unlock(&peer->lock);
 				manager_event(EVENT_FLAG_SYSTEM, "Registry",
 					"ChannelType: SIP\r\n"
@@ -12475,6 +12467,10 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			peer->allowsubscribe = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "gruu")) {
 			peer->gruu = ast_true(v->value);
+			if (!peer->gruu) {	/* gruu turned off -> drop any learned GRUU (else it lingers hidden) */
+				ast_string_field_set(peer, pub_gruu, "");
+				ast_string_field_set(peer, temp_gruu, "");
+			}
 		} else if (!strcasecmp(v->name, "publish")) {
 			/* outbound PUBLISH (RFC 3903); mirrors the realtime branch. */
 			peer->publish = ast_true(v->value);
@@ -13019,6 +13015,7 @@ static void sofia_do_register(void)
 					SIPTAG_TO_STR(uri),
 					TAG_IF(route_buf[0], NUTAG_INITIAL_ROUTE_STR(route_buf)),
 					TAG_IF(peer->gruu, NUTAG_M_FEATURES(instance_feature)),
+					TAG_IF(peer->gruu, NUTAG_SUPPORTED("gruu")),	/* RFC 5627 §4.1 */
 					TAG_END());
 
 				/* RFC 3261 §20.22 outbound REGISTER. */

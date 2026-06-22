@@ -528,6 +528,16 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 	if (!ast_strlen_zero(peer->callbackextension)) {
 		sofia_cli_peer_line(&buf, "Callback ext", "%s", peer->callbackextension);
 	}
+	/* GRUU (RFC 5627): advertisement opt-in + any GRUU the registrar minted (Phase 2). */
+	if (peer->gruu) {
+		sofia_cli_peer_line(&buf, "GRUU", "advertised (+sip.instance)");
+		if (!ast_strlen_zero(peer->pub_gruu)) {
+			sofia_cli_peer_line(&buf, "Pub-GRUU", "%s", peer->pub_gruu);
+		}
+		if (!ast_strlen_zero(peer->temp_gruu)) {
+			sofia_cli_peer_line(&buf, "Temp-GRUU", "%s", peer->temp_gruu);
+		}
+	}
 	/* setvar + header display (chan_sip parity): header= entries carry the
 	 * __SIPADDHEADERpre%2d= prefix. */
 	if (peer->chanvars) {
