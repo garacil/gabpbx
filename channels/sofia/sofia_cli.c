@@ -36,6 +36,7 @@
 
 #include "include/chan_sofia_internal.h"
 #include "include/sofia_publish.h"
+#include "include/sofia_history.h"
 #include "include/sofia_cli.h"
 
 #define SOFIA_CLI_PEER_RULE_WIDTH 78
@@ -833,6 +834,10 @@ char *sofia_cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 	/* Auth algorithms (RFC 7616): static report; challenges are MD5-first, SHA-256
 	 * omitted for md5secret-only peers. */
 	ast_cli(a->fd, "  Auth algorithms:        MD5, SHA-256\n");
+
+	ast_cli(a->fd, "  Record SIP history:     %s%s%s\n", sofia_record_history ? "Yes" : "No",
+		(sofia_record_history && !ast_strlen_zero(sofia_history_filter_str())) ? ", filter " : "",
+		(sofia_record_history && !ast_strlen_zero(sofia_history_filter_str())) ? sofia_history_filter_str() : "");
 
 	/* Outbound PUBLISH (RFC 3903) — password REDACTED. */
 	ast_cli(a->fd, "  Outbound PUBLISH:       %s\n",

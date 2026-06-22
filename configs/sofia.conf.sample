@@ -293,6 +293,16 @@ srvlookup=yes
 ; bindaddr; only the address offered to the far end changes. It WINS over externaddr/externip (a
 ; deliberate operator override); directmedia still redirects to the bridged peer. Empty = off.
 ;media_address=198.51.100.20
+;
+; recordhistory: boot default for per-call SIP history recording (default no = zero overhead). When on,
+; each call records a bounded ring of signalling events (Tx/Rx, state, hangup) inspectable with
+; 'sip show history <call-id>'; the last completed calls are retained for after-hangup inspection, and
+; 'sip show history <call-id> verbose' adds an analysis block (outcome, failure reason, timeline,
+; negotiated codecs). A runtime 'sip set history on|off' toggle persists across a reload unless this
+; knob re-applies. 'sip history clear' discards the retained calls. On a busy system,
+; 'sip set history on <match>' records only calls whose source or destination contains the
+; case-insensitive substring <match> (e.g. 'sip set history on 960800120' or '... on alice').
+;recordhistory=no
 
 ;
 ; Default qualify settings for all peers

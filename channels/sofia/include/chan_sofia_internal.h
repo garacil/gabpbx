@@ -199,6 +199,7 @@ struct sipqualifypeer_data {
 };
 void sipqualifypeer_callback(void *data);
 int sofia_qualify_peer_async(struct sofia_peer *peer);	/* manual qualify: consumes the peer ref; 0 ok, -1 fail */
+struct ao2_container *sofia_dialogs_container(void);	/* accessor for the live-dialogs container (split modules) */
 
 struct sofia_register_update {
 	int was_registered;
@@ -367,6 +368,9 @@ struct sofia_pvt {
 	struct ast_sockaddr ourip; /* kernel-routed source IP for outbound From/Contact + SDP c= (sofia_resolve_ourip) */
 	int callingpres; /* AST_PRES_* mask; inherits peer->callingpres */
 	int outgoing; /* 1=outbound dial, 0=inbound INVITE; drives RPID ;party=calling/called */
+	struct sofia_history *history;	/* SIP history ring (sofia_history.c); lazily allocated, freed in destructor */
+	int do_history;			/* per-dialog snapshot of sofia_record_history at creation (chan_sip parity) */
+	int history_retained;		/* idempotency net: history already snapshotted into the retained ring */
 	int call_inc_done; /* this pvt incremented peer->inUse — idempotency guard for DEC sites */
 	int ring_inc_done; /* this pvt incremented peer->inRinging — idempotency guard */
 	struct ast_dsp *dsp; /* set by sofia_enable_dsp_detect for inband/auto DTMF or fax-CNG; freed in destructor */

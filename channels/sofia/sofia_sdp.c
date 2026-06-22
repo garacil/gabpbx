@@ -33,6 +33,7 @@
 #include "include/srtp.h"
 #include "include/sdp_crypto.h"
 #include "include/sofia_sdp.h"
+#include "include/sofia_history.h"	/* codec-negotiation history markers (SIP history verbose analysis) */
 
 static int sofia_sdp_pt_in_use(const char *list, int pt)
 {
@@ -777,6 +778,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 						}
 					}
 					if (!has_t38) {
+						sofia_append_history_code(pvt, 488, "SDP", "no common audio codec");
 						ast_log(LOG_WARNING, "Sofia: no common audio codec with peer — rejecting (488 Not Acceptable Here)\n");
 						goto sdp_reject;
 					}
@@ -1119,6 +1121,13 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	if (staged_audio_valid) {
 		ast_rtp_codecs_payloads_copy(&staged_audio_codecs,
 			ast_rtp_instance_get_codecs(pvt->rtp), pvt->rtp);
+		/* SIP history: the SDP is ACCEPTED here (every reject gate passed) — record the negotiated
+		 * audio codec NAMES (metadata only, no body) for verbose analysis. */
+		if (pvt->capability & AST_FORMAT_AUDIO_MASK) {
+			char cbuf[64];
+			ast_getformatname_multiple(cbuf, sizeof(cbuf), pvt->capability & AST_FORMAT_AUDIO_MASK);
+			sofia_append_history(pvt, "SDP", "audio negotiated: %s", cbuf);
+		}
 	}
 	if (staged_video_valid && pvt->vrtp) {
 		ast_rtp_codecs_payloads_copy(&staged_video_codecs,

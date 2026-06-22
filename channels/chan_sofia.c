@@ -173,6 +173,7 @@
 #include "sofia/include/sofia_message.h"
 #include "sofia/include/sofia_transfer.h"
 #include "sofia/include/sofia_subscribe.h"
+#include "sofia/include/sofia_history.h"
 
 #include <sofia-sip/nua.h>
 #include <sofia-sip/su.h>
@@ -258,6 +259,13 @@ int sofia_srtp_per_suite_keys;
 
 struct ao2_container *peers;
 static struct ao2_container *dialogs;
+
+/* Accessor for the dialogs container so split modules (e.g. sofia_history.c's CLI handlers) can
+ * iterate live dialogs without the container leaving this translation unit's ownership. */
+struct ao2_container *sofia_dialogs_container(void)
+{
+	return dialogs;
+}
 
 /* Bounded REGISTER realtime-DB-write offload pool (kill-switch, default OFF).
  * Offloads the slow blocking ast_update_realtime() writes off sofia_thread so
@@ -1528,6 +1536,12 @@ static void sofia_pvt_destructor(void *obj)
 {
 	struct sofia_pvt *pvt = obj;
 
+	/* SIP history: snapshot this completed call into the retained ring (for post-hangup inspection),
+	 * then free the live ring. Runs once with no other refs (ao2 destructor), BEFORE the stringfields
+	 * (callid/peername) are released below. No-op unless the call was recording. */
+	sofia_history_retain(pvt);
+	sofia_history_free(pvt);
+
 	/* Safety net: a pending outbound REFER must be failed + its timer freed before the
 	 * pvt is released. In practice refer_pending is already 0 here (an armed timer holds
 	 * a +1 pvt ref, so the destructor cannot run while a transfer is in flight), but the
@@ -1639,6 +1653,9 @@ static struct sofia_pvt *sofia_pvt_alloc(void)
 	}
 
 	ast_mutex_init(&pvt->lock);
+	/* Snapshot the global history gate into the dialog (chan_sip parity): a call started with history
+	 * on stays recorded even if the operator toggles the global off before this call ends. */
+	pvt->do_history = sofia_record_history;
 	pvt->state = SOFIA_DIALOG_STATE_DOWN;
 	pvt->home = su_home_new(sizeof(*pvt->home));
 
@@ -3423,6 +3440,10 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		return -1;
 	}
 
+	/* SIP history: apply the capture filter (source = our caller-id number, destination = dial string). */
+	pvt->do_history = sofia_history_should_record(S_OR(ast->caller.id.number.str, ""), S_OR(dest, ""));
+	sofia_append_history(pvt, "Tx INVITE", "to %s", S_OR(dest, ""));
+
 	/* Outbound counter + 486 enforcement BEFORE any state transition (USER_BUSY →
 	 * 486). No-op when call_limit=0 + busy_level=0. */
 	if (sofia_update_call_counter(pvt, SOFIA_INC_CALL_RINGING) == -1) {
@@ -3930,6 +3951,9 @@ static int sofia_hangup(struct ast_channel *ast)
 	have_reason = (sofia_cfg.use_q850_reason
 		&& sofia_reason_build(ast->hangupcause, reason_buf, sizeof(reason_buf)));
 
+	sofia_append_history(pvt, "Hangup", "cause %d %s", ast->hangupcause,
+		ast_cause2str(ast->hangupcause));
+
 	/* Fail a pending outbound REFER + disarm its timer so Transfer() never blocks past
 	 * teardown (queues AST_CONTROL_TRANSFER=FAILED if pending). Off-thread-safe (it
 	 * marshals the su_timer ops onto sofia_thread). No-op if no transfer is pending. */
@@ -4021,6 +4045,8 @@ static int sofia_answer(struct ast_channel *ast)
 	if (!pvt || !pvt->nh) {
 		return -1;
 	}
+
+	sofia_append_history_code(pvt, 200, "Tx 200", "answer to INVITE (200 OK)");
 
 	{
 		/* Inbound 200-OK accept-path session timers (RFC 4028). */
@@ -5057,6 +5083,29 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 
 	pvt->nh = nh;
 	pvt->outgoing = 0; /* inbound INVITE — sofia_add_rpid reads this for ;party=called */
+	/* SIP history: apply the capture filter now the call identity is known (source = From-user,
+	 * destination = To/Request-URI user), then record the fresh inbound INVITE (this dialog has no
+	 * central-hook pvt yet). do_history was provisionally the global at pvt creation; refine it here. */
+	{
+		const char *h_src = (sip && sip->sip_from && sip->sip_from->a_url)
+			? S_OR(sip->sip_from->a_url->url_user, "") : "";
+		const char *to_u = (sip && sip->sip_to && sip->sip_to->a_url)
+			? S_OR(sip->sip_to->a_url->url_user, "") : "";
+		/* Destination = both the To-user AND the Request-URI user (RFC 3261 §8.2.2.1: the R-URI is the
+		 * resource to process the request). A routed INVITE can carry To=AOR but R-URI=the real exten. */
+		const char *ru_u = (sip && sip->sip_request && sip->sip_request->rq_url)
+			? S_OR(sip->sip_request->rq_url->url_user, "") : "";
+		char h_dst[160];
+
+		snprintf(h_dst, sizeof(h_dst), "%s %s", to_u, ru_u);
+		pvt->do_history = sofia_history_should_record(h_src, h_dst);
+	}
+	if (sip && sip->sip_from && sip->sip_from->a_url) {
+		sofia_append_history(pvt, "Rx INVITE", "from %s@%s",
+			S_OR(sip->sip_from->a_url->url_user, ""), S_OR(sip->sip_from->a_url->url_host, ""));
+	} else {
+		sofia_append_history(pvt, "Rx INVITE", "fresh inbound");
+	}
 	/* Capture the peer-requested Session-Expires (RFC 4028) for display. The
 	 * 200-OK sent via sofia_answer carries our NUTAG_SESSION_TIMER value
 	 * (sofia-sip negotiates it against the peer's request); the value here is
@@ -10396,6 +10445,20 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		break;
 	}
 
+	/* SIP history: record this inbound dialog event against the VALIDATED dialog pvt (one central hook
+	 * for re-INVITE/UPDATE/BYE/CANCEL/INFO/REFER/ACK/terminated + the r_* responses). Gated on
+	 * dialog_pvt — NOT the raw hmagic `pvt`, which for peer-magic events (OPTIONS/REGISTER) is a
+	 * sofia_peer, not a sofia_pvt. A fresh inbound INVITE has no pvt yet (NULL hmagic) —
+	 * sofia_process_invite records its own "Rx INVITE". No-op unless the call is recording. */
+	if (dialog_pvt) {
+		if (status) {
+			sofia_append_history_code(dialog_pvt, status, "Rx", "%s %d %s",
+				event_name, status, S_OR(phrase, ""));
+		} else {
+			sofia_append_history(dialog_pvt, "Rx", "%s", event_name);
+		}
+	}
+
 	switch (event) {
 	case nua_i_invite:
 		/* hmagic set = existing dialog usage -> re-INVITE; NULL = fresh inbound INVITE.
@@ -11413,6 +11476,7 @@ static void *sofia_thread_func(void *data)
 
 	/* Outbound PUBLISH teardown (sofia_thread, after the loop ends). */
 	sofia_publications_stop();
+	sofia_history_destroy();
 
 	/* Outbound MWI SUBSCRIBE watcher teardown (sofia_thread, before nua_destroy). */
 	sofia_subscribe_stop();
@@ -11658,6 +11722,7 @@ static char *sofia_cli_show_channelstats(struct ast_cli_entry *e, int cmd, struc
 }
 
 
+
 /* Peer-dump helpers: append into *out (assembled under peer->lock, emitted once after
  * the lock drops). All call sites live in sofia_cli_show_peer. */
 
@@ -11717,6 +11782,9 @@ static struct ast_cli_entry cli_sofia[] = {
 	AST_CLI_DEFINE(sofia_cli_show_channels, "List active Sofia-SIP channels"),
 	AST_CLI_DEFINE(sofia_cli_show_channel, "Show one Sofia-SIP channel in detail"),
 	AST_CLI_DEFINE(sofia_cli_show_channelstats, "Per-channel RTP statistics"),
+	AST_CLI_DEFINE(sofia_cli_set_history, "Enable/disable per-call SIP history recording"),
+	AST_CLI_DEFINE(sofia_cli_show_history, "Show a call's recorded SIP history"),
+	AST_CLI_DEFINE(sofia_cli_clear_history, "Clear retained SIP call histories"),
 	AST_CLI_DEFINE(sofia_cli_show_peer, "Show detailed Sofia-SIP peer info"),
 	AST_CLI_DEFINE(sofia_cli_show_inuse, "Show SIP peer call usage counters"),
 	AST_CLI_DEFINE(sofia_cli_show_settings, "Show Sofia-SIP global settings"),
@@ -12498,6 +12566,10 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			sofia_cfg.externtcpport = atoi(v->value);
 		} else if (!strcasecmp(v->name, "externtlsport")) {
 			sofia_cfg.externtlsport = atoi(v->value);
+		} else if (!strcasecmp(v->name, "recordhistory")) {
+			/* recordhistory (chan_sip parity): boot default for per-call SIP history recording. A
+			 * runtime 'sip set history' toggle persists across a reload UNLESS this knob re-applies. */
+			sofia_record_history = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "media_address")) {
 			/* media_address (chan_sip parity): advertise this address in the SDP c=/o= instead of the
 			 * kernel-routed source (the RTP still binds bindaddr — advertise-only). Validate as an IP and
@@ -14302,6 +14374,8 @@ static int load_module(void)
 		goto err_cleanup;
 	}
 
+	sofia_history_init();
+
 	/* outbound MWI SUBSCRIBE (a watcher): one subscription per mwi_subscribe= peer. */
 	if (sofia_subscribe_init()) {
 		ast_log(LOG_ERROR, "Unable to create Sofia MWI-subscribe container\n");
@@ -14422,6 +14496,10 @@ err_cleanup:
 		pthread_join(sofia_thread, NULL);
 		/* The thread tears down sofia_nua/sofia_root on exit; do not NULL them here. */
 	}
+
+	/* AFTER the join (the only history user, sofia_thread, is now gone) — idempotent: drops the
+	 * retained-history ring + rwlock if init ran. */
+	sofia_history_destroy();
 
 	/* domain_list — drain to prevent leak on retry-after-DECLINE. */
 	{
