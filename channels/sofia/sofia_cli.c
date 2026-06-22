@@ -543,6 +543,10 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 		sofia_cli_peer_line(&buf, "Service-Route", "%s",
 			!ast_strlen_zero(peer->service_route) ? peer->service_route : "(enabled, none learned)");
 	}
+	/* 100rel/PRACK (RFC 3262): reliable non-183 provisionals to this peer (opt-in). */
+	if (peer->rel100) {
+		sofia_cli_peer_line(&buf, "100rel", "reliable provisionals (PRACK)");
+	}
 	/* setvar + header display (chan_sip parity): header= entries carry the
 	 * __SIPADDHEADERpre%2d= prefix. */
 	if (peer->chanvars) {

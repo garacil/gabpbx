@@ -508,6 +508,22 @@ srvlookup=yes
 ;   path=yes
 
 ;
+; --- rel100 (RFC 3262 reliable provisional responses / PRACK — per-peer) ---
+; When rel100=yes, NON-183 provisional responses we send to this peer (180 Ringing, etc.) are sent
+; RELIABLY: chan_sofia adds Require: 100rel + an RSeq and waits for the caller's PRACK (sofia-sip's
+; native reliable-response machinery handles the PRACK transaction). Useful for carriers/gateways that
+; track ringing reliably. NOTE: the 183 Session Progress early-media response is ALREADY sent reliably
+; whenever the caller advertises Supported: 100rel — this knob only adds reliability to the OTHER
+; provisionals. Default off (opt-in: a few UACs advertise 100rel but mishandle a reliable 180; a PRACK
+; timeout then fails the INVITE). The outbound/UAC side (we PRACK a reliable provisional a far end sends
+; us) already works without configuration.
+;
+;   [mygateway]
+;   type=peer
+;   host=gw.example.com
+;   rel100=yes
+
+;
 ; --- regexten + regextenonqualify (post-T56 chan_sip parity, drop-in registration-coupled dialplan) ---
 ; Auto-add a dialplan extension when a peer registers; auto-remove when the peer
 ; unregisters or (optionally) when qualify reports the peer unreachable. Common

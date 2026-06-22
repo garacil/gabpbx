@@ -2085,6 +2085,7 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	peer->use_gruu_contact = 1;	/* GRUU Phase 2b: use a learned pub-gruu as the dialog Contact (default yes; gated by gruu) */
 	peer->use_service_route = 0;	/* Service-Route (RFC 3608): opt-in (applying it diverts outbound routing) */
 	peer->path_support = 0;		/* Path (RFC 3327): opt-in (accepting Path is a trust decision) */
+	peer->rel100 = 0;		/* 100rel/PRACK (RFC 3262): reliable non-183 provisionals, opt-in */
 	peer->buggymwi = 0;
 	peer->lockuseragent = 0;
 	ast_string_field_set(peer, lockuseragent_prefixes, "");
@@ -2730,6 +2731,8 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			if (!peer->path_support) {	/* drop stored Paths so a re-enable can't resurrect a stale route */
 				sofia_peer_clear_contact_paths(peer);
 			}
+		} else if (!strcasecmp(v->name, "rel100")) {
+			peer->rel100 = ast_true(v->value);	/* RFC 3262: reliable non-183 provisionals (opt-in) */
 		} else if (!strcasecmp(v->name, "publish")) {
 			/* outbound PUBLISH (RFC 3903): opt hint state into central publication. */
 			peer->publish = ast_true(v->value);
@@ -5191,6 +5194,13 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			 * nua adds the handle Supported pref to responses that lack one. */
 			if (pvt->peer && pvt->peer->gruu) {
 				nua_set_hparams(nh, NUTAG_SUPPORTED("gruu"), TAG_END());
+			}
+			/* 100rel/PRACK (RFC 3262): when rel100=yes, send NON-183 provisionals (180 Ringing etc.)
+			 * RELIABLY to this peer — NUTAG_EARLY_MEDIA makes nua add Require: 100rel + RSeq and await
+			 * the PRACK (sofia's native reliable-response machinery; sofia_process_prack 200s it). The
+			 * 183 early-media is already reliable when the caller advertises 100rel. */
+			if (pvt->peer && pvt->peer->rel100) {
+				nua_set_hparams(nh, NUTAG_EARLY_MEDIA(1), TAG_END());
 			}
 		}
 	}
@@ -12847,6 +12857,8 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			if (!peer->path_support) {	/* drop stored Paths so a re-enable can't resurrect a stale route */
 				sofia_peer_clear_contact_paths(peer);
 			}
+		} else if (!strcasecmp(v->name, "rel100")) {
+			peer->rel100 = ast_true(v->value);	/* RFC 3262: reliable non-183 provisionals (opt-in) */
 		} else if (!strcasecmp(v->name, "publish")) {
 			/* outbound PUBLISH (RFC 3903); mirrors the realtime branch. */
 			peer->publish = ast_true(v->value);

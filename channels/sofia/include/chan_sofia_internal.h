@@ -466,6 +466,7 @@ struct sofia_peer {
 	int use_gruu_contact;           /* GRUU Phase 2b (RFC 5627 §4.4): when 1 (default) AND gruu=yes AND a pub-gruu was learned, use it as the outbound dialog Contact. Interop kill-switch: set no to keep advertising/learning but not use it as Contact. Default 1. */
 	int use_service_route;          /* Service-Route (RFC 3608): when 1, ingest the registrar's Service-Route from the REGISTER 200 and pre-load it on outbound INVITEs to that domain. Default 0 (opt-in; applying it diverts outbound routing). */
 	int path_support;               /* Path (RFC 3327): when 1, as the registrar for this dynamic peer, accept + store the Path from its REGISTER and pre-load it as a Route on requests to its contacts. Default 0 (opt-in; accepting Path is a trust decision, RFC 3327 §7). */
+	int rel100;                     /* 100rel/PRACK (RFC 3262): when 1, send NON-183 provisionals (180 Ringing etc.) to this peer RELIABLY (Require: 100rel + RSeq, await PRACK) via NUTAG_EARLY_MEDIA on the inbound handle. The 183 early-media is already reliable when the caller advertises 100rel. Default 0 (opt-in; some UACs mishandle a reliable 180). */
 	/* Buggy-CISCO MWI fix (chan_sip parity): when set, the Voice-Message: NOTIFY
 	 * body line OMITS the trailing " (0/0)" suffix (some SIP stacks reject it).
 	 * Per-peer only (no [general] default); default 0 = standard RFC 3842. */
