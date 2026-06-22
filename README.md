@@ -101,11 +101,36 @@ Everything you expect from a SIP channel, plus capabilities `chan_sip` never had
 - ★ **Per-call SIP history with a verbose call-analysis pass** (outcome, failure
   reason, timeline, negotiated codecs) + a source/destination capture filter and a
   retained ring that keeps a call inspectable *after hangup*.
-- CLI: `sip qualify peer`, `sip notify`, `sip show channel`,
-  ★ `sip show channelstats`, `sip show history`, `sip history clear`, the full
-  `sip show peers/peer/settings/registry`, plus the `SIPpeers` / `SIPshowpeer` /
-  `SIPqualifypeer` / `SIPnotify` AMI actions.
-- The complete realtime peer/registration model (`sippeers`, `sipregs`).
+- ★ **Caller→called on every log line.** GABPBX prefixes the main log with
+  `[caller|called]`, so you can follow who is calling whom at a glance:
+  ```text
+  [alice|1000] Executing [1000@internal:1] Dial("SIP/alice-00000003", "SIP/1000")
+  [alice|1000] SIP/1000-00000004 answered SIP/alice-00000003
+  ```
+- The complete realtime peer/registration model (`sippeers`, `sipregs`), and the
+  `SIPpeers` / `SIPshowpeer` / `SIPqualifypeer` / `SIPnotify` AMI actions.
+
+### CLI commands
+
+```text
+# Inspect
+sip show peers                 sip show peer <name>
+sip show settings              sip show registry
+sip show channels              sip show channel <call-id>
+sip show channelstats          sip show inuse [all]
+sip show publications          sip show history [<call-id> [verbose]]
+sip show blacklist
+
+# Act
+sip qualify peer <name>        sip notify <type> <peer>
+sip unregister <peer>          sip reload
+sip prune realtime [peer|all]
+sip blacklist search|delete|clear <ip>
+
+# Debug & history
+sip set debug [on|off|peer <p>|ip <a>]
+sip set history {on [<match>]|off}    sip history clear
+```
 
 `chan_sofia` lives in `channels/chan_sofia.c` plus a clean `channels/sofia/`
 module tree (AMI, CLI, SDP, presence, T.38, PUBLISH, MESSAGE, transfer, GRUU,
