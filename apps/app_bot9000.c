@@ -16,7 +16,7 @@
  * third-party notices, and GPL licensing terms are preserved when present.
  *
  * Copyright 2021 (C) Germán Aracil Boned
- * contact mail, german@7kas.com
+ * contact mail, garacilb@gmail.com
  *
  * app_webrtincoming.c for GABPBX 2.5
  *

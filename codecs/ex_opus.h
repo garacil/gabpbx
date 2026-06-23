@@ -1,7 +1,7 @@
 /*! \file
  * \brief Opus codec sample frame data
  *
- * Copyright (C) 2025, 7Kas / Tucall VoIP
+ * Copyright (C) 2025, Germán Luis Aracil Boned <garacilb@gmail.com>
  *
  * Distributed under the terms of the GNU General Public License
  */

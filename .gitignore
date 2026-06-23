@@ -121,3 +121,7 @@ channels/h323/Makefile
 # OS files
 .DS_Store
 Thumbs.db
+voicemail.debug
+files_changed.txt
+default.exports
+heaptrack.*

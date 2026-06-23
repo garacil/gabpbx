@@ -15,7 +15,7 @@
  * Existing copyright, authorship, Asterisk/Digium notices,
  * third-party notices, and GPL licensing terms are preserved when present.
  *
- * Copyright (C) 2025, 7Kas / Tucall VoIP
+ * Copyright (C) 2025, Germán Luis Aracil Boned <garacilb@gmail.com>
  *
  * Based on codec_speex.c by Mark Spencer and
  * codec_opus_open_source.c by Lorenzo Miniero
