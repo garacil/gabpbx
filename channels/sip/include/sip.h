@@ -1230,7 +1230,6 @@ struct sip_peer {
 		AST_STRING_FIELD(unsolicited_mailbox);  /*!< Mailbox to store received unsolicited MWI NOTIFY messages information in */
 		AST_STRING_FIELD(realtime_id);          /*!< Unique ID from database. Realtime only */
 		AST_STRING_FIELD(sipserver);            /*!< Server where service is active TO REMOVE IN THE FUTURE */
-		AST_STRING_FIELD(tucloudpbx_name);
 		);
 	struct sip_socket socket;       /*!< Socket used for this peer */
 	enum sip_transport default_outbound_transport;   /*!< Peer Registration may change the default outbound transport.

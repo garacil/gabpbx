@@ -6670,7 +6670,6 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 			"Peer: SIP/%s\r\n"
 			"PeerStatus: CallCountUpdated\r\n"
 			"Address: %s\r\n"
-			"TuCloudPBXName: %s\r\n"
 			"Context: %s\r\n"
 			"Accountcode: %s\r\n"
 			"ActiveCalls: %d\r\n"
@@ -6679,7 +6678,6 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 			"Event: DEC_CALL_LIMIT\r\n",
 			p->name,
 			ast_sockaddr_stringify(&p->addr),
-			p->tucloudpbx_name ? p->tucloudpbx_name : "",
 			p->context,
 			p->accountcode,
 			*inuse,
@@ -6703,7 +6701,6 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 					"Peer: SIP/%s\r\n"
 					"PeerStatus: CallLimitExceeded\r\n"
 					"Address: %s\r\n"
-					"TuCloudPBXName: %s\r\n"
 					"Context: %s\r\n"
 					"Accountcode: %s\r\n"
 					"ActiveCalls: %d\r\n"
@@ -6712,7 +6709,6 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 					"Event: CALL_REJECTED\r\n",
 					p->name,
 					ast_sockaddr_stringify(&p->addr),
-					p->tucloudpbx_name ? p->tucloudpbx_name : "",
 					p->context,
 					p->accountcode,
 					*inuse,
@@ -6750,7 +6746,6 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 			"Peer: SIP/%s\r\n"
 			"PeerStatus: CallCountUpdated\r\n"
 			"Address: %s\r\n"
-			"TuCloudPBXName: %s\r\n"
 			"Context: %s\r\n"
 			"Accountcode: %s\r\n"
 			"ActiveCalls: %d\r\n"
@@ -6759,7 +6754,6 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 			"Event: %s\r\n",
 			p->name,
 			ast_sockaddr_stringify(&p->addr),
-			p->tucloudpbx_name ? p->tucloudpbx_name : "",
 			p->context,
 			p->accountcode,
 			*inuse,
@@ -6791,7 +6785,6 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 				"Peer: SIP/%s\r\n"
 				"PeerStatus: CallCountUpdated\r\n"
 				"Address: %s\r\n"
-				"TuCloudPBXName: %s\r\n"
 				"Context: %s\r\n"
 				"Accountcode: %s\r\n"
 				"ActiveCalls: %d\r\n"
@@ -6800,7 +6793,6 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 				"Event: DEC_CALL_RINGING\r\n",
 				p->name,
 				ast_sockaddr_stringify(&p->addr),
-				p->tucloudpbx_name ? p->tucloudpbx_name : "",
 				p->context,
 				p->accountcode,
 				*inuse,
@@ -13207,14 +13199,6 @@ static int transmit_invite(struct sip_pvt *p, int sipmethod, int sdp, int init, 
 		ast_channel_unlock(chan);
 	}
 
-	/* germanico add uniqueid on invite */
-	if ((sipmethod == SIP_INVITE) && p->owner) {
-		struct ast_channel *tchan = p->owner;
-		ast_channel_lock(tchan);
-		add_header(&req, "TucallUniqueid", tchan->uniqueid);
-		ast_channel_unlock(tchan);
-	}
-
 	if ((sipmethod == SIP_INVITE || sipmethod == SIP_UPDATE) && ast_test_flag(&p->flags[0], SIP_SENDRPID))
 		add_rpid(&req, p);
 	if (sipmethod == SIP_INVITE) {
@@ -15107,8 +15091,8 @@ static enum parse_register_result parse_register_contact(struct sip_pvt *pvt, st
 	/* We might not immediately be able to reconnect via TCP, but try caching it anyhow */
 	if (!peer->rt_fromcontact || !sip_cfg.peer_rtupdate)
 		ast_db_put("SIP/Registry", peer->name, data);
-	manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Registered\r\nExpire: %ld\r\nAddress: %s\r\nRegContact: %s\r\nUserAgent: %s\r\nTuCloudPBXName: %s\r\nContext: %s\r\nAccountcode: %s\r\n", 
-		peer->name,  ast_sched_when(sched, peer->expire), ast_sockaddr_stringify(&peer->addr), peer->fullcontact, peer->useragent, peer->tucloudpbx_name ? peer->tucloudpbx_name : "", peer->context, peer->accountcode);
+	manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Registered\r\nExpire: %ld\r\nAddress: %s\r\nRegContact: %s\r\nUserAgent: %s\r\nContext: %s\r\nAccountcode: %s\r\n",
+		peer->name,  ast_sched_when(sched, peer->expire), ast_sockaddr_stringify(&peer->addr), peer->fullcontact, peer->useragent, peer->context, peer->accountcode);
 
 	/* Is this a new IP address for us? */
 	if (VERBOSITY_ATLEAST(2) && ast_sockaddr_cmp(&peer->addr, &oldsin)) {
@@ -15923,11 +15907,11 @@ static enum check_auth_result register_verify(struct sip_pvt *p, struct ast_sock
 				ast_string_field_set(p, fullcontact, peer->fullcontact);
 				/* Say OK and ask subsystem to retransmit msg counter */
 				transmit_response_with_date(p, "200 OK", req);
-/*				manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Registered\r\nAddress: %s\r\nTuCloudPBXName: %s\r\nContext: %s\r\nAccountcode: %s\r\n", 
-								peer->name,  ast_sockaddr_stringify(&peer->addr), peer->tucloudpbx_name ? peer->tucloudpbx_name : "", peer->context, peer->accountcode);
+/*				manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Registered\r\nAddress: %s\r\nContext: %s\r\nAccountcode: %s\r\n",
+								peer->name,  ast_sockaddr_stringify(&peer->addr), peer->context, peer->accountcode);
 */
-				manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Registered\r\nExpire: %ld\r\nAddress: %s\r\nRegContact: %s\r\nUserAgent: %s\r\nTuCloudPBXName: %s\r\nContext: %s\r\nAccountcode: %s\r\n",
-						                peer->name,  ast_sched_when(sched, peer->expire), ast_sockaddr_stringify(&peer->addr), peer->fullcontact, peer->useragent, peer->tucloudpbx_name ? peer->tucloudpbx_name : "", peer->context, peer->accountcode);
+				manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Registered\r\nExpire: %ld\r\nAddress: %s\r\nRegContact: %s\r\nUserAgent: %s\r\nContext: %s\r\nAccountcode: %s\r\n",
+						                peer->name,  ast_sched_when(sched, peer->expire), ast_sockaddr_stringify(&peer->addr), peer->fullcontact, peer->useragent, peer->context, peer->accountcode);
 
 				send_mwi = 1;
 				res = 0;
@@ -18749,8 +18733,6 @@ static char *_sip_show_peer(int type, int fd, struct mansession *s, const struct
 
 		ast_cli(fd, "  SIP Server   : %s\n", peer->sipserver);
 
-		ast_cli(fd, "  TuCloudPBX   : %s\n", peer->tucloudpbx_name ? peer->tucloudpbx_name : "(none)");
-
 //		ast_cli(fd, "  Last Contact : %s\r\n", peer->lastfullcontact);
 		ast_cli(fd, "  Qualify Freq : %d ms\n", peer->qualifyfreq);
 		if (peer->chanvars) {
@@ -18779,8 +18761,6 @@ static char *_sip_show_peer(int type, int fd, struct mansession *s, const struct
 		astman_append(s, "RemoteSecretExist: %s\r\n", ast_strlen_zero(peer->remotesecret)?"N":"Y");
 		astman_append(s, "MD5SecretExist: %s\r\n", ast_strlen_zero(peer->md5secret)?"N":"Y");
 		astman_append(s, "Context: %s\r\n", peer->context);
-
-		astman_append(s, "TuCloudPBX: %s\r\n", peer->tucloudpbx_name ? peer->tucloudpbx_name : "");
 
 		astman_append(s, "Language: %s\r\n", peer->language);
 		if (!ast_strlen_zero(peer->accountcode))
@@ -23533,13 +23513,6 @@ static int handle_request_invite(struct sip_pvt *p, struct sip_request *req, int
 		if (!ast_strlen_zero(supported)) {
 			p->sipoptions = parse_sip_options(supported, NULL, 0);
 		}
-	}
-
-	/* germanico */
-	const char *remote_uniqueid = get_header(req, "TucallUniqueid");
-	if (!ast_strlen_zero(remote_uniqueid)) {
-		ast_string_field_set(p, remote_uniqueid, remote_uniqueid);
-		ast_log(LOG_WARNING, "Received SIP INVITE with remote uniqueid: %s\n", remote_uniqueid);
 	}
 
 	/* Find out what they require */
@@ -28757,9 +28730,6 @@ static struct sip_peer *build_peer(const char *name, struct ast_variable *v, str
 
 			} else if (realtime && !strcasecmp(v->name, "sipserver")) {
 				ast_string_field_set(peer, sipserver, v->value);
-
-			} else if (!strcasecmp(v->name, "tucloudpbx_name")) {
-				ast_string_field_set(peer, tucloudpbx_name, v->value);
 
 			} else if (!strcasecmp(v->name, "type")) {
 				if (!strcasecmp(v->value, "peer")) {

@@ -2937,8 +2937,6 @@ int ast_hangup(struct ast_channel *chan)
 		"CallerIDName: %s\r\n"
 		"ConnectedLineNum: %s\r\n"
 		"ConnectedLineName: %s\r\n"
-		"TucloudPBXName: %s\r\n"     /* T42.1: bug fix — args added in commit 2e49c36 (2026-03-18) without the format-spec lines */
-		"TucloudPBXID: %s\r\n"       /* T42.1: bug fix — same commit */
 		"Cause: %d\r\n"
 		"Cause-txt: %s\r\n",
 		chan->name,
@@ -2947,8 +2945,6 @@ int ast_hangup(struct ast_channel *chan)
 		S_COR(chan->caller.id.name.valid, chan->caller.id.name.str, "<unknown>"),
 		S_COR(chan->connected.id.number.valid, chan->connected.id.number.str, "<unknown>"),
 		S_COR(chan->connected.id.name.valid, chan->connected.id.name.str, "<unknown>"),
-		S_OR(chan->tucloudpbxname, ""),
-		S_OR(chan->tucloudpbxid, ""),
 		chan->hangupcause,
 		ast_cause2str(chan->hangupcause)
 		);
@@ -6862,10 +6858,8 @@ int ast_do_masquerade(struct ast_channel *original)
 	/* Copy the music class */
 	ast_string_field_set(original, musicclass, clonechan->musicclass);
 
-	/* copy over accountcode, tucloud fields and set peeraccount across the bridge */
+	/* copy over accountcode fields and set peeraccount across the bridge */
 	ast_string_field_set(original, accountcode, S_OR(clonechan->accountcode, ""));
-	ast_string_field_set(original, tucloudpbxid, S_OR(clonechan->tucloudpbxid, ""));
-	ast_string_field_set(original, tucloudpbxname, S_OR(clonechan->tucloudpbxname, ""));
 	if (original->_bridge) {
 		/* XXX - should we try to lock original->_bridge here? */
 		ast_string_field_set(original->_bridge, peeraccount, S_OR(clonechan->accountcode, ""));

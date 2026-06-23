@@ -354,10 +354,6 @@ static int func_channel_read(struct ast_channel *chan, const char *function,
 		locked_copy_string(chan, buf, chan->tech->type, len);
 	else if (!strcasecmp(data, "accountcode"))
 		locked_copy_string(chan, buf, chan->accountcode, len);
-	else if (!strcasecmp(data, "tucloudpbxid"))
-		locked_copy_string(chan, buf, chan->tucloudpbxid, len);
-	else if (!strcasecmp(data, "tucloudpbxname"))
-		locked_copy_string(chan, buf, chan->tucloudpbxname, len);
 	else if (!strcasecmp(data, "checkhangup")) {
 		ast_channel_lock(chan);
 		ast_copy_string(buf, ast_check_hangup(chan) ? "1" : "0", len);
@@ -449,10 +445,6 @@ static int func_channel_write_real(struct ast_channel *chan, const char *functio
 		locked_string_field_set(chan, musicclass, value);
 	else if (!strcasecmp(data, "accountcode"))
 		locked_string_field_set(chan, accountcode, value);
-	else if (!strcasecmp(data, "tucloudpbxid"))
-		locked_string_field_set(chan, tucloudpbxid, value);
-	else if (!strcasecmp(data, "tucloudpbxname"))
-		locked_string_field_set(chan, tucloudpbxname, value);
 	else if (!strcasecmp(data, "userfield"))
 		locked_string_field_set(chan, userfield, value);
 	else if (!strcasecmp(data, "amaflags")) {

@@ -799,8 +799,6 @@ struct ast_channel {
 		AST_STRING_FIELD(hangupsource);		/*! Who is responsible for hanging up this channel */
 		AST_STRING_FIELD(dialcontext);		/*!< Dial: Extension context that we were called from */
 		AST_STRING_FIELD(remote_uniqueid);	/* germanico */
-		AST_STRING_FIELD(tucloudpbxid);		/*!< TuCloud PBX ID for multi-tenant identification */
-		AST_STRING_FIELD(tucloudpbxname);	/*!< TuCloud PBX name for multi-tenant identification */
 	);
 
 	struct timeval whentohangup;        		/*!< Non-zero, set to actual time when channel is to be hung up */

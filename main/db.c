@@ -805,8 +805,5 @@ int astdb_init(void)
 	ast_manager_register_xml("DBDel", EVENT_FLAG_SYSTEM, manager_dbdel);
 	ast_manager_register_xml("DBDelTree", EVENT_FLAG_SYSTEM, manager_dbdeltree);
 
-        const char family[] = "tucloud";
-        ast_db_deltree((char*)family, NULL);
-
 	return 0;
 }
