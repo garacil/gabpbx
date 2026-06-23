@@ -43,6 +43,7 @@
  */
 
 /*** MODULEINFO
+	<use>openssl</use>
 	<support_level>core</support_level>
  ***/
 
@@ -67,6 +68,21 @@ GABPBX_FILE_VERSION(__FILE__, "$Revision: 366880 $")
 #include "gabpbx/unaligned.h"
 #include "gabpbx/module.h"
 #include "gabpbx/rtp_engine.h"
+#include "gabpbx/sched.h"		/* ast_sched_thread_* — dedicated DTLS retransmit scheduler (WebRTC Fix B) */
+
+/* WebRTC A2: DTLS-SRTP (optional, compiled out when OpenSSL is absent — MODULEINFO <use>openssl</use>). */
+#ifdef HAVE_OPENSSL
+#include <openssl/ssl.h>
+#include <openssl/bio.h>
+#include <openssl/err.h>
+#include <openssl/x509.h>
+#include <openssl/evp.h>
+#include <openssl/ec.h>
+#include <openssl/obj_mac.h>
+#include <openssl/srtp.h>
+#include <openssl/rand.h>
+#include <openssl/hmac.h>
+#endif
 
 #define MAX_TIMESTAMP_SKEW	640
 
@@ -97,6 +113,7 @@ GABPBX_FILE_VERSION(__FILE__, "$Revision: 366880 $")
 #define DEFAULT_LEARNING_MIN_SEQUENTIAL 4
 
 extern struct ast_srtp_res *res_srtp;
+extern struct ast_srtp_policy_res *res_srtp_policy;	/* WebRTC A2: SRTP policy backend (for DTLS key install) */
 static int dtmftimeout = DEFAULT_DTMF_TIMEOUT;
 
 static int rtpstart = DEFAULT_RTP_START;			/*!< First port for RTP sessions (set in rtp.conf) */
@@ -129,6 +146,19 @@ enum strict_rtp_state {
 #define FLAG_DTMF_COMPENSATE            (1 << 4)
 
 /*! \brief RTP session description */
+#ifdef HAVE_OPENSSL
+/*! \brief WebRTC A2: per-instance DTLS-SRTP association state (rtcp-mux: one per ast_rtp). */
+struct dtls_details {
+	SSL_CTX *ssl_ctx;             /*!< per-instance SSL context (cert/key/cipher/SRTP profile) */
+	SSL *ssl;                     /*!< per-association SSL object */
+	BIO *read_bio;                /*!< BIO_s_mem fed with inbound DTLS records (SSL reads here) */
+	BIO *write_bio;               /*!< custom BIO over rtp->s, drains outbound records to the wire */
+	enum ast_rtp_dtls_setup dtls_setup;      /*!< OUR a=setup role */
+	enum ast_rtp_dtls_connection connection; /*!< NEW / EXISTING */
+	int timeout_timer;            /*!< DTLSv1 retransmit sched id (-1 = none) */
+};
+#endif
+
 struct ast_rtp {
 	int s;
 	struct ast_frame f;
@@ -201,6 +231,31 @@ struct ast_rtp {
 	uint16_t learning_max_seq;		/*!< Highest sequence number heard */
 	int learning_probation;		/*!< Sequential packets untill source is valid */
 
+#ifdef HAVE_OPENSSL
+	struct dtls_details dtls;          /*!< WebRTC A2: RTP DTLS association (rtcp-mux: the only one) */
+	enum ast_rtp_dtls_hash remote_hash;                /*!< hash from the remote a=fingerprint */
+	unsigned char remote_fingerprint[EVP_MAX_MD_SIZE]; /*!< parsed binary remote fingerprint */
+	unsigned int remote_fingerprint_len;               /*!< its length (0 = none stored; C2 fail-closed) */
+	char local_fingerprint[160];       /*!< OUR cert fingerprint (colon-hex) for SDP a=fingerprint */
+	enum ast_srtp_suite suite;         /*!< negotiated SRTP suite (set from the DTLS-selected profile) */
+	struct ast_rtp_dtls_cfg dtls_cfg;  /*!< copy of cfg from set_configuration */
+	unsigned int dtls_failure:1;       /*!< handshake/fingerprint failed -> tear the call down */
+	int rekeyid;                       /*!< rekey sched id (-1 = none) */
+	/* WebRTC A3: ICE-lite state (RFC 8445 §2.5) — we are permanently the controlled, lite agent.
+	 * Touched on the channel/sofia thread (set_authentication/get_* during SDP) AND the RTP read path
+	 * (the STUN responder); all serialised by ao2_lock(instance): the A1 wrappers lock the engine
+	 * callbacks and the demux responder takes the SAME lock (like the DTLS branch). ao2 locks ARE
+	 * recursive (PTHREAD_MUTEX_RECURSIVE_NP, main/lock.c:88-91) so the responder's re-lock is safe. */
+	char local_ufrag[12];              /*!< OUR ice-ufrag (>=4, RFC 8445 §5.4); CSPRNG-generated */
+	char local_pwd[28];                /*!< OUR ice-pwd = HMAC key (>=22); CSPRNG-generated */
+	char remote_ufrag[257];            /*!< browser's ice-ufrag (<=256 + NUL); prefix-matched */
+	char remote_pwd[257];              /*!< browser's ice-pwd (<=256 + NUL); stored for symmetry */
+	struct ast_sockaddr ice_peer;      /*!< validated peer addr learned from the first good check */
+	enum ast_rtp_ice_role ice_role;    /*!< always AST_RTP_ICE_ROLE_CONTROLLED for a lite agent */
+	unsigned int ice_lite:1;           /*!< peer advertised a=ice-lite (recorded only) */
+	unsigned int ice_active:1;         /*!< start() called — the responder is armed (hardening: gate) */
+	unsigned int ice_complete:1;       /*!< a USE-CANDIDATE check passed → selected pair (RFC 8445 §8.2) */
+#endif
 	struct rtp_red *red;
 };
 
@@ -308,6 +363,1046 @@ static void ast_rtp_stop(struct ast_rtp_instance *instance);
 static int ast_rtp_qos_set(struct ast_rtp_instance *instance, int tos, int cos, const char* desc);
 static int ast_rtp_sendcng(struct ast_rtp_instance *instance, int level);
 
+#ifdef HAVE_OPENSSL
+/*
+ * WebRTC A2: DTLS-SRTP engine vtable. Called UNLOCKED by contract — the A1 wrapper vtable in
+ * main/rtp_engine.c already ao2_locks every dispatch, so locking here would double-lock needlessly.
+ * (The ao2 instance lock IS recursive — PTHREAD_MUTEX_RECURSIVE_NP, main/lock.c:88-91 — so a re-lock
+ * would not deadlock; A3's responder deliberately re-locks. The earlier "not recursive" note here was
+ * wrong; the A2 code is unaffected as it never re-enters.)
+ */
+/* WebRTC A2: DTLS-SRTP self-signed certs cannot chain-verify (RFC 5763 §5) — the SDP a=fingerprint is
+ * the sole trust anchor, enforced fail-closed by the post-handshake memcmp (step 6). This callback only
+ * lets the handshake capture the peer cert; it asserts NO chain validity (it is NOT verification). */
+static int gabpbx_dtls_verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
+{
+	return 1;
+}
+
+/* Generate an ephemeral EC P-256 keypair (the WebRTC norm; trust is via the SDP fingerprint, Q4). */
+static int gabpbx_dtls_ephemeral_keypair(EVP_PKEY **keypair)
+{
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	*keypair = EVP_EC_gen(SN_X9_62_prime256v1);
+	return *keypair ? 0 : -1;
+#else
+	EC_KEY *eckey;
+	EC_GROUP *group;
+
+	if (!(group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1))) {
+		return -1;
+	}
+	EC_GROUP_set_asn1_flag(group, OPENSSL_EC_NAMED_CURVE);
+	EC_GROUP_set_point_conversion_form(group, POINT_CONVERSION_UNCOMPRESSED);
+	if (!(eckey = EC_KEY_new()) || !EC_KEY_set_group(eckey, group) || !EC_KEY_generate_key(eckey)
+		|| !(*keypair = EVP_PKEY_new())) {
+		EC_KEY_free(eckey);
+		EC_GROUP_free(group);
+		return -1;
+	}
+	if (!EVP_PKEY_assign_EC_KEY(*keypair, eckey)) {
+		EC_KEY_free(eckey);
+		EVP_PKEY_free(*keypair);
+		*keypair = NULL;
+		EC_GROUP_free(group);
+		return -1;
+	}
+	EC_GROUP_free(group);
+	return 0;
+#endif
+}
+
+/* Build a self-signed X509 around the keypair (CN=gabpbx, SHA-256, notBefore-1d / notAfter+30d). */
+static int gabpbx_dtls_ephemeral_cert(EVP_PKEY *keypair, X509 **certificate)
+{
+	X509 *cert;
+	BIGNUM *serial;
+	X509_NAME *name;
+
+	if (!(cert = X509_new())) {
+		return -1;
+	}
+	X509_set_version(cert, 2);
+	X509_set_pubkey(cert, keypair);
+
+	if (!(serial = BN_new())) {
+		X509_free(cert);
+		return -1;
+	}
+	BN_rand(serial, 159, -1, 0);
+	BN_to_ASN1_INTEGER(serial, X509_get_serialNumber(cert));
+	BN_free(serial);
+
+	X509_time_adj_ex(X509_getm_notBefore(cert), -1, 0, NULL);
+	X509_time_adj_ex(X509_getm_notAfter(cert), 30, 0, NULL);
+
+	name = X509_get_subject_name(cert);
+	X509_NAME_add_entry_by_NID(name, NID_commonName, MBSTRING_ASC, (unsigned char *) "gabpbx", -1, -1, 0);
+	X509_set_issuer_name(cert, name);
+
+	if (!X509_sign(cert, keypair, EVP_sha256())) {
+		X509_free(cert);
+		return -1;
+	}
+	*certificate = cert;
+	return 0;
+}
+
+/* Load cert+key from configured PEM files (non-ephemeral path). */
+static int gabpbx_dtls_cert_from_file(const struct ast_rtp_dtls_cfg *cfg, EVP_PKEY **pkey, X509 **cert)
+{
+	FILE *fp;
+	BIO *certbio;
+	const char *keyfile = ast_strlen_zero(cfg->pvtfile) ? cfg->certfile : cfg->pvtfile;
+
+	*pkey = NULL;
+	*cert = NULL;
+	if (!(fp = fopen(keyfile, "r"))) {
+		return -1;
+	}
+	if (!PEM_read_PrivateKey(fp, pkey, NULL, NULL)) {
+		fclose(fp);
+		return -1;
+	}
+	fclose(fp);
+
+	if (!(certbio = BIO_new(BIO_s_file()))) {
+		EVP_PKEY_free(*pkey);
+		*pkey = NULL;
+		return -1;
+	}
+	if (!BIO_read_filename(certbio, cfg->certfile) || !(*cert = PEM_read_bio_X509(certbio, NULL, 0, NULL))) {
+		BIO_free_all(certbio);
+		EVP_PKEY_free(*pkey);
+		*pkey = NULL;
+		return -1;
+	}
+	BIO_free_all(certbio);
+	return 0;
+}
+
+/* Dispatch: ephemeral (Q4 default — when ephemeral_cert is set or no certfile) or configured files. */
+static int gabpbx_dtls_load_cert(const struct ast_rtp_dtls_cfg *cfg, EVP_PKEY **pkey, X509 **cert)
+{
+	if (cfg->ephemeral_cert || ast_strlen_zero(cfg->certfile)) {
+		if (gabpbx_dtls_ephemeral_keypair(pkey)) {
+			return -1;
+		}
+		if (gabpbx_dtls_ephemeral_cert(*pkey, cert)) {
+			EVP_PKEY_free(*pkey);
+			*pkey = NULL;
+			return -1;
+		}
+		return 0;
+	}
+	return gabpbx_dtls_cert_from_file(cfg, pkey, cert);
+}
+
+/* Free the instance-owned deep copy of the DTLS config (C5). */
+static void gabpbx_dtls_cfg_free(struct ast_rtp_dtls_cfg *cfg)
+{
+	ast_free(cfg->certfile);
+	ast_free(cfg->pvtfile);
+	ast_free(cfg->cipher);
+	ast_free(cfg->cafile);
+	ast_free(cfg->capath);
+	cfg->certfile = cfg->pvtfile = cfg->cipher = cfg->cafile = cfg->capath = NULL;
+}
+
+/* Deep-copy the caller's DTLS config into instance-owned storage (C5; ast_strdup(NULL)==NULL). */
+static int gabpbx_dtls_cfg_copy(struct ast_rtp_dtls_cfg *dst, const struct ast_rtp_dtls_cfg *src)
+{
+	gabpbx_dtls_cfg_free(dst);
+	*dst = *src;
+	dst->certfile = ast_strdup(src->certfile);
+	dst->pvtfile  = ast_strdup(src->pvtfile);
+	dst->cipher   = ast_strdup(src->cipher);
+	dst->cafile   = ast_strdup(src->cafile);
+	dst->capath   = ast_strdup(src->capath);
+	/* ast_strdup(NULL) returns NULL legitimately; flag only when a non-NULL source failed to copy. */
+	if ((src->certfile && !dst->certfile) || (src->pvtfile && !dst->pvtfile)
+		|| (src->cipher && !dst->cipher) || (src->cafile && !dst->cafile)
+		|| (src->capath && !dst->capath)) {
+		return -1;
+	}
+	return 0;
+}
+
+/* Keep DTLS handshake flights under the typical WebRTC path MTU. */
+#define GABPBX_DTLS_MTU 1200
+
+/* File-static DTLS write-BIO method, created in load_module / freed in unload_module. */
+static BIO_METHOD *dtls_bio_methods;
+
+/* Dedicated scheduler thread for DTLS handshake retransmit timers (WebRTC). The RTP instance's
+ * rtp->sched is the BORROWED sofia_sched context — arming a timer on it via ast_sched_add_variable does
+ * NOT wake that sleeping thread (only ast_sched_thread_add_variable signals the cond), so a lost DTLS
+ * flight is retransmitted late or never → ~1/3 no-audio intermittency. This module-private thread is
+ * woken on every add. Created in load_module, destroyed in unload_module. */
+static struct ast_sched_thread *dtls_sched_thread;
+
+/* WebRTC A2: raw datagram send bypassing res_srtp->protect — DTLS records (and the A3 STUN responder)
+ * go on the wire in the clear. */
+static int rtp_raw_sendto(struct ast_rtp *rtp, void *data, int len, struct ast_sockaddr *sa, int rtcp)
+{
+	return ast_sendto(rtcp ? rtp->rtcp->s : rtp->s, data, len, 0, sa);
+}
+
+static int dtls_bio_new(BIO *bio)
+{
+	BIO_set_init(bio, 1);
+	BIO_set_data(bio, NULL);
+	BIO_set_shutdown(bio, 0);
+	return 1;
+}
+
+static int dtls_bio_free(BIO *bio)
+{
+	/* The ast_rtp_instance* carried in the BIO data is NOT refcounted — its lifetime is the
+	 * instance's and it is touched only by the instance's own threads. */
+	BIO_set_data(bio, NULL);
+	return 1;
+}
+
+static int dtls_bio_write(BIO *bio, const char *buf, int len)
+{
+	struct ast_rtp_instance *instance = BIO_get_data(bio);
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	struct ast_sockaddr remote = { {0,} };
+
+	ast_rtp_instance_get_remote_address(instance, &remote);
+	if (ast_sockaddr_isnull(&remote)) {
+		return len;	/* nowhere to send yet; the DTLSv1 retransmit timer resends the flight */
+	}
+	rtp_raw_sendto(rtp, (void *) buf, len, &remote, 0);	/* rtcp-mux: always rtp->s */
+	return len;	/* always claim success — OpenSSL cannot tolerate a short/failed datagram send */
+}
+
+static long dtls_bio_ctrl(BIO *bio, int cmd, long arg1, void *arg2)
+{
+	switch (cmd) {
+	case BIO_CTRL_FLUSH:
+		return 1;
+	case BIO_CTRL_DGRAM_QUERY_MTU:
+		return GABPBX_DTLS_MTU;
+	case BIO_CTRL_WPENDING:
+	case BIO_CTRL_PENDING:
+		return 0L;
+	default:
+		return 0;
+	}
+}
+
+/* Build the per-association SSL object: the mem read-BIO the recv path feeds + the custom write-BIO,
+ * then arm accept/connect per our role. SSL_free later frees both attached BIOs. */
+static int dtls_details_initialize(struct ast_rtp *rtp, struct ast_rtp_instance *instance)
+{
+	struct dtls_details *dtls = &rtp->dtls;
+
+	if (!(dtls->ssl = SSL_new(dtls->ssl_ctx))) {
+		ast_log(LOG_ERROR, "Failed to create SSL object for RTP instance '%p'\n", instance);
+		return -1;
+	}
+	if (!(dtls->read_bio = BIO_new(BIO_s_mem()))) {
+		SSL_free(dtls->ssl);
+		dtls->ssl = NULL;
+		return -1;
+	}
+	BIO_set_mem_eof_return(dtls->read_bio, -1);	/* never signal EOF on the mem read BIO */
+	if (!(dtls->write_bio = BIO_new(dtls_bio_methods))) {
+		BIO_free(dtls->read_bio);
+		dtls->read_bio = NULL;
+		SSL_free(dtls->ssl);
+		dtls->ssl = NULL;
+		return -1;
+	}
+	BIO_set_data(dtls->write_bio, instance);
+	SSL_set_bio(dtls->ssl, dtls->read_bio, dtls->write_bio);
+
+	if (dtls->dtls_setup == AST_RTP_DTLS_SETUP_PASSIVE) {
+		SSL_set_accept_state(dtls->ssl);	/* we wait for the ClientHello */
+	} else {
+		SSL_set_connect_state(dtls->ssl);	/* active/actpass: we initiate */
+	}
+	dtls->connection = AST_RTP_DTLS_CONNECTION_NEW;
+	return 0;
+}
+
+/* Free the DTLS association objects (SSL_free also frees its attached read/write BIOs). The retransmit
+ * timer must already be stopped by the caller. */
+static void dtls_free_association(struct ast_rtp *rtp)
+{
+	if (rtp->dtls.ssl) {
+		SSL_free(rtp->dtls.ssl);
+		rtp->dtls.ssl = NULL;
+		rtp->dtls.read_bio = NULL;
+		rtp->dtls.write_bio = NULL;
+	}
+	if (rtp->dtls.ssl_ctx) {
+		SSL_CTX_free(rtp->dtls.ssl_ctx);
+		rtp->dtls.ssl_ctx = NULL;
+	}
+	gabpbx_dtls_cfg_free(&rtp->dtls_cfg);
+}
+
+static int dtls_srtp_handle_timeout(const void *data);
+
+/* Arm the DTLSv1 retransmit timer for the flight just sent (no-op if already armed). ao2_ref(+1)
+ * before sched, mirroring the canonical pattern at res_rtp_gabpbx.c:2323. PRECONDITION: instance locked. */
+static void dtls_srtp_start_timeout_timer(struct ast_rtp_instance *instance, struct ast_rtp *rtp)
+{
+	struct timeval tv = { 0, };
+	int timeout_ms;
+
+	/* Fail closed if the dedicated DTLS scheduler is unavailable (load_module create failed). Arming on the
+	 * borrowed rtp->sched (sofia_sched) context via ast_sched_add_variable would NOT wake that sleeping
+	 * thread, so the retransmit fires late/never → no-audio; we use the module-private waking thread instead.
+	 * set_configuration already refuses DTLS when this is NULL, so this is belt only. */
+	if (!dtls_sched_thread) {
+		ast_log(LOG_ERROR, "DTLS retransmit timer: no DTLS scheduler — failing the handshake (instance '%p')\n", instance);
+		rtp->dtls_failure = 1;
+		return;
+	}
+
+	if (rtp->dtls.timeout_timer > -1 || !rtp->dtls.ssl || !DTLSv1_get_timeout(rtp->dtls.ssl, &tv)) {
+		return;
+	}
+	timeout_ms = tv.tv_sec * 1000 + tv.tv_usec / 1000;
+	if (timeout_ms <= 0) {
+		timeout_ms = 1;	/* never schedule at 0 — a single sched thread serves all RTP */
+	}
+	ao2_ref(instance, +1);
+	/* variable=1: each reschedule uses the callback's returned next timeout (the DTLSv1 backoff).
+	 * ast_sched_add (== variable=0) IGNORES the callback return and reuses the fixed initial interval,
+	 * defeating DTLS's exponential retransmit backoff. Mirrors Asterisk res_rtp_asterisk's dtls timer.
+	 * NOTE: a stop that loses the race with a mid-flight callback can let it reschedule ONCE more after
+	 * the stop; that is benign — the retained instance ref keeps it alive and the next fire self-stops
+	 * (ssl==NULL after free, or DTLSv1_get_timeout==0) and drops the ref. */
+	if ((rtp->dtls.timeout_timer = ast_sched_thread_add_variable(dtls_sched_thread, timeout_ms, dtls_srtp_handle_timeout, instance, 1)) < 0) {
+		ao2_ref(instance, -1);
+	}
+}
+
+/* sched-thread callback: retransmit the timed-out handshake flight and reschedule. */
+static int dtls_srtp_handle_timeout(const void *data)
+{
+	struct ast_rtp_instance *instance = (struct ast_rtp_instance *) data;
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	struct timeval tv = { 0, };
+	int next_ms;
+
+	ao2_lock(instance);
+	if (!rtp->dtls.ssl) {
+		rtp->dtls.timeout_timer = -1;
+		ao2_unlock(instance);
+		ao2_ref(instance, -1);
+		return 0;
+	}
+	DTLSv1_handle_timeout(rtp->dtls.ssl);	/* retransmits the lost flight */
+	if (!DTLSv1_get_timeout(rtp->dtls.ssl, &tv)) {
+		rtp->dtls.timeout_timer = -1;
+		ao2_unlock(instance);
+		ao2_ref(instance, -1);	/* not rescheduled — drop the sched ref */
+		return 0;
+	}
+	next_ms = tv.tv_sec * 1000 + tv.tv_usec / 1000;
+	if (next_ms <= 0) {
+		next_ms = 1;	/* never 0 — a single sched thread serves all RTP */
+	}
+	ao2_unlock(instance);
+	return next_ms;	/* >0 reschedules; the ao2 ref is retained while armed */
+}
+
+/* Stop the retransmit timer. PRECONDITION: instance NOT locked (deadlocks against the locked callback).
+ * Mirrors the file's RTCP teardown idiom (ast_rtcp_write self-unrefs on its stop path, :2047):
+ * AST_SCHED_DEL retries until the entry is actually gone, and we drop the ref ONLY when it removed a
+ * still-pending entry (returns 0). If the callback is mid-flight (del fails), the callback owns the
+ * drop on its own return-0 path — so exactly one ao2 unref happens. (AST_SCHED_DEL_UNREF would
+ * unconditionally drop whenever id>-1 after the retry loop, double-dropping with the self-unref
+ * callback = an instance UAF.) */
+static void dtls_srtp_stop_timeout_timer(struct ast_rtp_instance *instance, struct ast_rtp *rtp)
+{
+	/* Crash belt: never delete on a NULL scheduler (or no armed timer). The DTLS timer lives on the
+	 * module-private dtls_sched_thread (not the borrowed rtp->sched). ast_sched_thread_del wraps the same
+	 * AST_SCHED_DEL retry idiom and returns 0 only when it removed a still-pending entry — drop the ref
+	 * ONLY then (a mid-flight callback owns its own drop; an unconditional drop would double-unref = UAF). */
+	if (!dtls_sched_thread || rtp->dtls.timeout_timer < 0) {
+		return;
+	}
+	if (ast_sched_thread_del(dtls_sched_thread, rtp->dtls.timeout_timer) == 0) {
+		ao2_ref(instance, -1);
+	}
+}
+
+static int gabpbx_dtls_set_configuration(struct ast_rtp_instance *instance, const struct ast_rtp_dtls_cfg *dtls_cfg)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	EVP_PKEY *pkey = NULL;
+	X509 *cert = NULL;
+	const EVP_MD *md;
+	unsigned char fingerprint[EVP_MAX_MD_SIZE];
+	unsigned int size, i;
+	char *p;
+
+	if (!dtls_cfg->enabled) {
+		return 0;
+	}
+
+	/* Fail closed: a DTLS association needs the dedicated DTLS scheduler for the handshake retransmit
+	 * timer (dtls_srtp_start_timeout_timer -> ast_sched_thread_add_variable(dtls_sched_thread,...)). If
+	 * load_module could not create it, REFUSE to configure DTLS so the caller (chan_sofia A4/A5 commit)
+	 * rejects the SDP — never build a DTLS association whose retransmit timer could never fire. */
+	if (!dtls_sched_thread) {
+		ast_log(LOG_ERROR, "Cannot configure DTLS on RTP instance '%p': no DTLS scheduler\n", instance);
+		return -1;
+	}
+
+	/* C5: own a deep copy of the config (the char* paths) for the instance lifetime. */
+	if (gabpbx_dtls_cfg_copy(&rtp->dtls_cfg, dtls_cfg)) {
+		ast_log(LOG_ERROR, "Failed to copy DTLS configuration for RTP instance '%p'\n", instance);
+		return -1;
+	}
+
+	/* (Re)build the per-instance DTLS context. Tear down any prior association first (call-once from
+	 * the SDP glue in practice, but be safe on reconfiguration — free the SSL before its ssl_ctx). */
+	rtp->dtls_failure = 0;	/* a fresh handshake starts clean (HIGH2/LOW7) */
+	if (rtp->dtls.timeout_timer > -1) {
+		/* MED4: cancel the old retransmit timer so the new handshake arms fresh and the stale sched id
+		 * is released. set_configuration runs LOCKED (A1 wrapper); the stop precondition is
+		 * instance-NOT-locked, so unlock/stop/relock. */
+		ao2_unlock(instance);
+		dtls_srtp_stop_timeout_timer(instance, rtp);
+		ao2_lock(instance);
+	}
+	if (rtp->dtls.ssl) {
+		SSL_free(rtp->dtls.ssl);
+		rtp->dtls.ssl = NULL;
+		rtp->dtls.read_bio = NULL;
+		rtp->dtls.write_bio = NULL;
+	}
+	if (rtp->dtls.ssl_ctx) {
+		SSL_CTX_free(rtp->dtls.ssl_ctx);
+		rtp->dtls.ssl_ctx = NULL;
+	}
+	if (!(rtp->dtls.ssl_ctx = SSL_CTX_new(DTLS_method()))) {
+		ast_log(LOG_ERROR, "Failed to create DTLS context for RTP instance '%p'\n", instance);
+		return -1;
+	}
+	SSL_CTX_set_read_ahead(rtp->dtls.ssl_ctx, 1);
+
+	/* C3: self-signed WebRTC certs — request the peer cert (so we can fingerprint it) but accept it at
+	 * the chain layer; the fail-closed a=fingerprint memcmp (step 6) is the trust. Full chain checking
+	 * only when AST_RTP_DTLS_VERIFY_CERTIFICATE is explicitly configured. */
+	SSL_CTX_set_verify(rtp->dtls.ssl_ctx,
+		(rtp->dtls_cfg.verify & (AST_RTP_DTLS_VERIFY_FINGERPRINT | AST_RTP_DTLS_VERIFY_CERTIFICATE))
+			? (SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT) : SSL_VERIFY_NONE,
+		(rtp->dtls_cfg.verify & AST_RTP_DTLS_VERIFY_CERTIFICATE) ? NULL : gabpbx_dtls_verify_callback);
+
+	/* Load the CA store only when full certificate-chain verification is requested; fail closed if the
+	 * configured trust path is unusable. */
+	if ((rtp->dtls_cfg.verify & AST_RTP_DTLS_VERIFY_CERTIFICATE)
+		&& (!ast_strlen_zero(rtp->dtls_cfg.cafile) || !ast_strlen_zero(rtp->dtls_cfg.capath))
+		&& !SSL_CTX_load_verify_locations(rtp->dtls.ssl_ctx,
+			ast_strlen_zero(rtp->dtls_cfg.cafile) ? NULL : rtp->dtls_cfg.cafile,
+			ast_strlen_zero(rtp->dtls_cfg.capath) ? NULL : rtp->dtls_cfg.capath)) {
+		ast_log(LOG_ERROR, "Failed to load the DTLS CA trust store for RTP instance '%p'\n", instance);
+		return -1;
+	}
+
+#ifndef OPENSSL_NO_SRTP
+	/* O3: offer both profiles; the negotiated one is read back via SSL_get_selected_srtp_profile and
+	 * installed at step 6 (do NOT pre-commit to cfg->suite). C4: guarded by OPENSSL_NO_SRTP. */
+	if (SSL_CTX_set_tlsext_use_srtp(rtp->dtls.ssl_ctx, "SRTP_AES128_CM_SHA1_80:SRTP_AES128_CM_SHA1_32")) {
+		ast_log(LOG_ERROR, "Failed to set SRTP profiles on DTLS context for RTP instance '%p'\n", instance);
+		return -1;
+	}
+#else
+	ast_log(LOG_ERROR, "OpenSSL was built without SRTP support; DTLS-SRTP is unavailable\n");
+	return -1;
+#endif
+
+	if (!ast_strlen_zero(rtp->dtls_cfg.cipher)
+		&& !SSL_CTX_set_cipher_list(rtp->dtls.ssl_ctx, rtp->dtls_cfg.cipher)) {
+		ast_log(LOG_ERROR, "Invalid DTLS cipher list '%s' for RTP instance '%p'\n",
+			rtp->dtls_cfg.cipher, instance);
+		return -1;
+	}
+
+	/* Obtain the certificate/key (ephemeral by default, Q4) and install into the context. */
+	if (gabpbx_dtls_load_cert(&rtp->dtls_cfg, &pkey, &cert)) {
+		ast_log(LOG_ERROR, "Failed to obtain a DTLS certificate for RTP instance '%p'\n", instance);
+		return -1;
+	}
+	if (!SSL_CTX_use_certificate(rtp->dtls.ssl_ctx, cert)
+		|| !SSL_CTX_use_PrivateKey(rtp->dtls.ssl_ctx, pkey)
+		|| !SSL_CTX_check_private_key(rtp->dtls.ssl_ctx)) {
+		ast_log(LOG_ERROR, "Failed to install DTLS certificate/key for RTP instance '%p'\n", instance);
+		X509_free(cert);
+		EVP_PKEY_free(pkey);
+		return -1;
+	}
+
+	/* Compute OUR fingerprint (colon-hex) for the SDP a=fingerprint line. */
+	md = (rtp->dtls_cfg.hash == AST_RTP_DTLS_HASH_SHA1) ? EVP_sha1() : EVP_sha256();
+	if (!X509_digest(cert, md, fingerprint, &size) || !size) {
+		ast_log(LOG_ERROR, "Failed to compute the DTLS fingerprint for RTP instance '%p'\n", instance);
+		X509_free(cert);
+		EVP_PKEY_free(pkey);
+		return -1;
+	}
+	p = rtp->local_fingerprint;
+	for (i = 0; i < size; i++) {
+		sprintf(p, "%02hhX:", fingerprint[i]);
+		p += 3;
+	}
+	*(p - 1) = '\0';	/* strip the trailing ':' */
+
+	/* The context holds its own refs now (SSL_CTX_use_* up-ref). */
+	X509_free(cert);
+	EVP_PKEY_free(pkey);
+
+	rtp->dtls.dtls_setup = rtp->dtls_cfg.default_setup;
+	rtp->suite = rtp->dtls_cfg.suite;	/* provisional; replaced by the DTLS-negotiated suite at step 6 */
+
+	/* Build the per-association SSL object + read/write BIOs. */
+	if (dtls_details_initialize(rtp, instance)) {
+		return -1;
+	}
+
+	return 0;
+}
+
+static int gabpbx_dtls_active(struct ast_rtp_instance *instance)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	return rtp->dtls.ssl != NULL;
+}
+
+static void gabpbx_dtls_stop(struct ast_rtp_instance *instance)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+
+	/* Vtable callback — runs LOCKED (the A1 wrapper takes ao2_lock). Stop the retransmit timer with the
+	 * lock briefly dropped (its precondition is instance-NOT-locked — it deadlocks against the locked
+	 * sched callback), then free the association. */
+	if (rtp->dtls.timeout_timer > -1) {
+		ao2_unlock(instance);
+		dtls_srtp_stop_timeout_timer(instance, rtp);
+		ao2_lock(instance);
+	}
+	dtls_free_association(rtp);
+}
+
+static void gabpbx_dtls_reset(struct ast_rtp_instance *instance)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+
+	if (!rtp->dtls.ssl) {
+		return;
+	}
+	rtp->dtls_failure = 0;
+	SSL_clear(rtp->dtls.ssl);
+	if (rtp->dtls.dtls_setup == AST_RTP_DTLS_SETUP_PASSIVE) {
+		SSL_set_accept_state(rtp->dtls.ssl);
+	} else {
+		SSL_set_connect_state(rtp->dtls.ssl);
+	}
+	rtp->dtls.connection = AST_RTP_DTLS_CONNECTION_NEW;
+}
+
+static enum ast_rtp_dtls_connection gabpbx_dtls_get_connection(struct ast_rtp_instance *instance)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	return rtp->dtls.connection;
+}
+
+static enum ast_rtp_dtls_setup gabpbx_dtls_get_setup(struct ast_rtp_instance *instance)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	return rtp->dtls.dtls_setup;
+}
+
+static void gabpbx_dtls_set_setup(struct ast_rtp_instance *instance, enum ast_rtp_dtls_setup setup)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	enum ast_rtp_dtls_setup old_setup = rtp->dtls.dtls_setup;
+
+	/* Map the REMOTE a=setup to OUR role (RFC 5763 §5). On a remote ACTPASS offer the answerer MAY pick
+	 * either role; we pick PASSIVE (RFC 5763 §5 SHOULD) so the BROWSER is the DTLS client and INITIATES the
+	 * handshake — the browser's native, reliable path. (gabpbx-active was intermittent: wire-confirmed the
+	 * browser stayed silent as the DTLS server, never answering our retransmitted ClientHello → no SRTP → no
+	 * audio.) Only the WebRTC ANSWERER passes actpass here; the offerer's answer-parse passes
+	 * the browser's concrete active/passive. */
+	switch (setup) {
+	case AST_RTP_DTLS_SETUP_ACTIVE:
+		rtp->dtls.dtls_setup = AST_RTP_DTLS_SETUP_PASSIVE;	/* remote active -> we passive */
+		break;
+	case AST_RTP_DTLS_SETUP_PASSIVE:
+		rtp->dtls.dtls_setup = AST_RTP_DTLS_SETUP_ACTIVE;	/* remote passive -> we active */
+		break;
+	case AST_RTP_DTLS_SETUP_ACTPASS:
+		rtp->dtls.dtls_setup = AST_RTP_DTLS_SETUP_PASSIVE;	/* remote actpass -> we PASSIVE (browser = DTLS client, it initiates) */
+		break;
+	case AST_RTP_DTLS_SETUP_HOLDCONN:
+		rtp->dtls.dtls_setup = AST_RTP_DTLS_SETUP_HOLDCONN;
+		return;	/* do not touch SSL state */
+	}
+
+	if (rtp->dtls.ssl && rtp->dtls.dtls_setup != old_setup) {
+		if (rtp->dtls.dtls_setup == AST_RTP_DTLS_SETUP_PASSIVE) {
+			SSL_set_accept_state(rtp->dtls.ssl);
+		} else {
+			SSL_set_connect_state(rtp->dtls.ssl);
+		}
+	}
+}
+
+static void gabpbx_dtls_set_fingerprint(struct ast_rtp_instance *instance, enum ast_rtp_dtls_hash hash, const char *fingerprint)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	const char *p = fingerprint;
+	unsigned int n = 0;
+
+	rtp->remote_hash = hash;
+	if (!fingerprint) {
+		rtp->remote_fingerprint_len = 0;
+		return;
+	}
+	/* Parse the colon-hex "AB:CD:.." remote fingerprint into binary for the step-6 memcmp. Require a
+	 * full hex pair before consuming two chars (p[1]==NUL is not xdigit) so a malformed/odd-length
+	 * fingerprint can never advance past the NUL terminator (LOW9 out-of-bounds read). */
+	while (*p && n < sizeof(rtp->remote_fingerprint)) {
+		if (*p == ':') {
+			p++;
+			continue;
+		}
+		if (!isxdigit((unsigned char) p[0]) || !isxdigit((unsigned char) p[1])
+			|| sscanf(p, "%02hhx", &rtp->remote_fingerprint[n]) != 1) {
+			break;
+		}
+		n++;
+		p += 2;
+	}
+	rtp->remote_fingerprint_len = n;
+}
+
+static enum ast_rtp_dtls_hash gabpbx_dtls_get_fingerprint_hash(struct ast_rtp_instance *instance)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	return rtp->dtls_cfg.hash;
+}
+
+static const char *gabpbx_dtls_get_fingerprint(struct ast_rtp_instance *instance)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	return rtp->local_fingerprint;
+}
+
+static struct ast_rtp_engine_dtls gabpbx_dtls = {
+	.set_configuration    = gabpbx_dtls_set_configuration,
+	.active               = gabpbx_dtls_active,
+	.stop                 = gabpbx_dtls_stop,
+	.reset                = gabpbx_dtls_reset,
+	.get_connection       = gabpbx_dtls_get_connection,
+	.get_setup            = gabpbx_dtls_get_setup,
+	.set_setup            = gabpbx_dtls_set_setup,
+	.set_fingerprint      = gabpbx_dtls_set_fingerprint,
+	.get_fingerprint_hash = gabpbx_dtls_get_fingerprint_hash,
+	.get_fingerprint      = gabpbx_dtls_get_fingerprint,
+};
+
+/* SRTP master key/salt lengths for the AES_CM_128 suites (the only DTLS-SRTP profiles A2 offers). */
+#define DTLS_SRTP_MASTER_KEY_LEN  16
+#define DTLS_SRTP_MASTER_SALT_LEN 14
+#define DTLS_SRTP_KEY_SALT_LEN    (DTLS_SRTP_MASTER_KEY_LEN + DTLS_SRTP_MASTER_SALT_LEN)	/* 30 */
+
+/* Build one SRTP policy from a contiguous [16-byte key || 14-byte salt] buffer — mirrors the SDES
+ * set_crypto_policy (sdp_crypto.c): same res_srtp seam, key sourced from the DTLS exporter. */
+static int dtls_set_srtp_policy(struct ast_srtp_policy *policy, enum ast_srtp_suite suite,
+	const unsigned char *key_salt, unsigned long ssrc, int inbound)
+{
+	if (res_srtp_policy->set_master_key(policy, key_salt, DTLS_SRTP_MASTER_KEY_LEN,
+			key_salt + DTLS_SRTP_MASTER_KEY_LEN, DTLS_SRTP_MASTER_SALT_LEN) < 0) {
+		return -1;
+	}
+	if (res_srtp_policy->set_suite(policy, suite)) {
+		return -1;
+	}
+	res_srtp_policy->set_ssrc(policy, ssrc, inbound);
+	return 0;
+}
+
+/* Install the inbound + outbound SRTP policies on the instance (Q2: self-contained in res, mirroring
+ * sdp_crypto_activate including the T39 RTCP-before-get_stats workaround for the libsrtp-2.x
+ * single-wildcard restriction). Keys come from the DTLS exporter, not a=crypto. */
+static int dtls_install_srtp(struct ast_rtp_instance *instance, struct ast_rtp *rtp,
+	const unsigned char *local_key_salt, const unsigned char *remote_key_salt)
+{
+	struct ast_srtp_policy *local_policy, *remote_policy;
+	struct ast_rtp_instance_stats stats = { 0, };
+	int res = -1;
+
+	if (!ast_rtp_engine_srtp_is_registered()) {
+		return -1;
+	}
+	if (!(local_policy = res_srtp_policy->alloc())) {
+		return -1;
+	}
+	if (!(remote_policy = res_srtp_policy->alloc())) {
+		res_srtp_policy->destroy(local_policy);
+		return -1;
+	}
+	/* T39: enable RTCP before get_stats so LOCAL_SSRC is real -> the outbound policy is ssrc_specific
+	 * (libsrtp 2.x allows only ONE wildcard policy per session). */
+	ast_rtp_instance_set_prop(instance, AST_RTP_PROPERTY_RTCP, 1);
+	if (ast_rtp_instance_get_stats(instance, &stats, AST_RTP_INSTANCE_STAT_LOCAL_SSRC)) {
+		stats.local_ssrc = 0;
+	}
+	if (dtls_set_srtp_policy(local_policy, rtp->suite, local_key_salt, stats.local_ssrc, 0)
+		|| dtls_set_srtp_policy(remote_policy, rtp->suite, remote_key_salt, 0, 1)) {
+		goto done;
+	}
+	if (ast_rtp_instance_add_srtp_policy(instance, remote_policy, local_policy)) {
+		ast_log(LOG_WARNING, "Could not install DTLS-SRTP policies for RTP instance '%p'\n", instance);
+		goto done;
+	}
+	res = 0;
+done:
+	res_srtp_policy->destroy(local_policy);
+	res_srtp_policy->destroy(remote_policy);
+	return res;
+}
+
+/* On handshake completion: verify the peer fingerprint (C2/C3, fail-closed), read the negotiated SRTP
+ * profile (O3), export the keying material, split by role, and install. Runs LOCKED (called from
+ * handle_record under the demux lock); briefly drops the lock only to stop the retransmit timer. */
+static void dtls_srtp_finish_negotiation(struct ast_rtp_instance *instance, struct ast_rtp *rtp)
+{
+	struct dtls_details *dtls = &rtp->dtls;
+	X509 *cert;
+	unsigned char material[DTLS_SRTP_KEY_SALT_LEN * 2];	/* client + server: 60 bytes */
+	unsigned char local_ks[DTLS_SRTP_KEY_SALT_LEN], remote_ks[DTLS_SRTP_KEY_SALT_LEN];
+	const unsigned char *local_key, *remote_key, *local_salt, *remote_salt;
+#ifndef OPENSSL_NO_SRTP
+	SRTP_PROTECTION_PROFILE *prof;
+#endif
+
+	/* Stop the retransmit timer (precondition instance-NOT-locked) — unlock/relock around it. */
+	if (dtls->timeout_timer > -1) {
+		ao2_unlock(instance);
+		dtls_srtp_stop_timeout_timer(instance, rtp);
+		ao2_lock(instance);
+	}
+
+	/* C2/C3: the SDP a=fingerprint is the trust anchor — fail closed. */
+	if (!(cert = SSL_get_peer_certificate(dtls->ssl))) {
+		ast_log(LOG_WARNING, "DTLS peer presented no certificate for RTP instance '%p'\n", instance);
+		rtp->dtls_failure = 1;
+		return;
+	}
+	if (rtp->dtls_cfg.verify & (AST_RTP_DTLS_VERIFY_FINGERPRINT | AST_RTP_DTLS_VERIFY_CERTIFICATE)) {
+		unsigned char fp[EVP_MAX_MD_SIZE];
+		unsigned int n;
+		const EVP_MD *md = (rtp->remote_hash == AST_RTP_DTLS_HASH_SHA1) ? EVP_sha1() : EVP_sha256();
+
+		if (!rtp->remote_fingerprint_len) {
+			ast_log(LOG_WARNING, "DTLS verify required but no remote fingerprint stored for RTP instance '%p'\n", instance);
+			X509_free(cert);
+			rtp->dtls_failure = 1;
+			return;
+		}
+		if (!X509_digest(cert, md, fp, &n) || n != rtp->remote_fingerprint_len
+			|| memcmp(fp, rtp->remote_fingerprint, n) != 0) {
+			ast_log(LOG_WARNING, "DTLS fingerprint mismatch for RTP instance '%p' — possible MITM, rejecting\n", instance);
+			X509_free(cert);
+			rtp->dtls_failure = 1;
+			return;
+		}
+	}
+	X509_free(cert);
+
+#ifndef OPENSSL_NO_SRTP
+	/* O3: install the DTLS-negotiated suite, not cfg->suite. */
+	if (!(prof = SSL_get_selected_srtp_profile(dtls->ssl))) {
+		ast_log(LOG_WARNING, "No SRTP profile negotiated for RTP instance '%p'\n", instance);
+		rtp->dtls_failure = 1;
+		return;
+	}
+	if (prof->id == SRTP_AES128_CM_SHA1_80) {
+		rtp->suite = AST_AES_CM_128_HMAC_SHA1_80;
+	} else if (prof->id == SRTP_AES128_CM_SHA1_32) {
+		rtp->suite = AST_AES_CM_128_HMAC_SHA1_32;
+	} else {
+		ast_log(LOG_WARNING, "Unsupported SRTP profile %lu for RTP instance '%p'\n", (unsigned long) prof->id, instance);
+		rtp->dtls_failure = 1;
+		return;
+	}
+#endif
+
+	/* RFC 5764 keying-material export. */
+	if (!SSL_export_keying_material(dtls->ssl, material, sizeof(material),
+			"EXTRACTOR-dtls_srtp", 19, NULL, 0, 0)) {
+		ast_log(LOG_WARNING, "DTLS key export failed for RTP instance '%p'\n", instance);
+		rtp->dtls_failure = 1;
+		return;
+	}
+
+	/* Exporter layout: client_key | server_key | client_salt | server_salt. We are client when ACTIVE.
+	 * local = what WE encrypt with (outbound); remote = what THEY encrypt with (inbound). */
+	if (dtls->dtls_setup == AST_RTP_DTLS_SETUP_ACTIVE) {
+		local_key   = material;
+		remote_key  = material + DTLS_SRTP_MASTER_KEY_LEN;
+		local_salt  = material + DTLS_SRTP_MASTER_KEY_LEN * 2;
+		remote_salt = material + DTLS_SRTP_MASTER_KEY_LEN * 2 + DTLS_SRTP_MASTER_SALT_LEN;
+	} else {
+		remote_key  = material;
+		local_key   = material + DTLS_SRTP_MASTER_KEY_LEN;
+		remote_salt = material + DTLS_SRTP_MASTER_KEY_LEN * 2;
+		local_salt  = material + DTLS_SRTP_MASTER_KEY_LEN * 2 + DTLS_SRTP_MASTER_SALT_LEN;
+	}
+	memcpy(local_ks, local_key, DTLS_SRTP_MASTER_KEY_LEN);
+	memcpy(local_ks + DTLS_SRTP_MASTER_KEY_LEN, local_salt, DTLS_SRTP_MASTER_SALT_LEN);
+	memcpy(remote_ks, remote_key, DTLS_SRTP_MASTER_KEY_LEN);
+	memcpy(remote_ks + DTLS_SRTP_MASTER_KEY_LEN, remote_salt, DTLS_SRTP_MASTER_SALT_LEN);
+
+	if (dtls_install_srtp(instance, rtp, local_ks, remote_ks)) {
+		rtp->dtls_failure = 1;
+		return;
+	}
+	dtls->connection = AST_RTP_DTLS_CONNECTION_EXISTING;
+	ast_debug(1, "DTLS-SRTP negotiated and installed for RTP instance '%p'\n", instance);
+}
+
+/* Feed an inbound DTLS record to OpenSSL and pump the handshake. Runs LOCKED — the demux holds
+ * ao2_lock(instance). The record is always consumed (returns 0). Step 5 arms the retransmit timer;
+ * step 6 detects completion, verifies the a=fingerprint, and installs the SRTP keys. */
+static int dtls_srtp_handle_record(struct ast_rtp_instance *instance, struct ast_rtp *rtp, char *buf, int len)
+{
+	struct dtls_details *dtls = &rtp->dtls;
+	char rxbuf[8192];
+	int res;
+
+	if (!dtls->ssl) {
+		return 0;
+	}
+	/* An inbound DTLS record at an ACTPASS offerer (provision_offer, before the answer fixes our role)
+	 * means the peer (browser answering a=setup:active) is the DTLS client: commit us to the SERVER role
+	 * NOW so SSL processes the ClientHello as the server (RFC 5763 §5 — an actpass offerer MUST be ready to
+	 * receive a ClientHello before the answer arrives). Companion to the early provision_offer ice->start.
+	 * Mirrors Asterisk 22 res_rtp_asterisk.c. */
+	if (dtls->dtls_setup == AST_RTP_DTLS_SETUP_ACTPASS) {
+		dtls->dtls_setup = AST_RTP_DTLS_SETUP_PASSIVE;
+		SSL_set_accept_state(dtls->ssl);
+	}
+	BIO_write(dtls->read_bio, buf, len);
+
+	if (!SSL_is_init_finished(dtls->ssl)) {
+		res = SSL_do_handshake(dtls->ssl);	/* drives the next flight out via the write BIO */
+		if (res <= 0) {
+			int err = SSL_get_error(dtls->ssl, res);
+			if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE && err != SSL_ERROR_NONE) {
+				ast_log(LOG_WARNING, "DTLS handshake error %d for RTP instance '%p'\n", err, instance);
+				rtp->dtls_failure = 1;
+				/* Stop any already-armed retransmit timer (unlock/stop/relock — handle_record runs
+				 * LOCKED) so a fatal failure does not leave it firing. */
+				if (rtp->dtls.timeout_timer > -1) {
+					ao2_unlock(instance);
+					dtls_srtp_stop_timeout_timer(instance, rtp);
+					ao2_lock(instance);
+				}
+				return -1;	/* fatal — fail the read so the call is torn down */
+			}
+		}
+		if (SSL_is_init_finished(dtls->ssl)) {
+			dtls_srtp_finish_negotiation(instance, rtp);	/* verify fingerprint + export keys + install SRTP */
+		} else {
+			dtls_srtp_start_timeout_timer(instance, rtp);	/* still handshaking — keep the retransmit timer armed */
+		}
+		/* finish_negotiation may fail closed (fingerprint mismatch / export / install) — propagate it. */
+		return rtp->dtls_failure ? -1 : 0;
+	}
+
+	/* Handshake finished — drain any DTLS app data (none expected on media). */
+	res = SSL_read(dtls->ssl, rxbuf, sizeof(rxbuf));
+	(void) res;
+	return rtp->dtls_failure ? -1 : 0;
+}
+
+/* Fire the active-side DTLS handshake (sends ClientHello via the write BIO). The passive side starts
+ * on the inbound ClientHello in the demux. O2: locked around the initiation. Initiate ONLY when the role
+ * is concretely ACTIVE — never while still ACTPASS: with the offerer's STUN responder now armed early
+ * (provision_offer ice->start), a USE-CANDIDATE can call this before the answer fixes our role, and an
+ * actpass offerer MUST NOT send a ClientHello (RFC 5763 §5 — it waits to receive the peer's; the inbound
+ * record handler commits us to PASSIVE). When the answer makes us ACTIVE (peer answered passive), the
+ * post-answer activate fires this. Mirrors Asterisk 22. */
+static void dtls_perform_handshake(struct ast_rtp_instance *instance, struct ast_rtp *rtp)
+{
+	ao2_lock(instance);
+	if (rtp->dtls.ssl && rtp->dtls.dtls_setup == AST_RTP_DTLS_SETUP_ACTIVE) {
+		SSL_do_handshake(rtp->dtls.ssl);
+		dtls_srtp_start_timeout_timer(instance, rtp);	/* arm the retransmit timer for the ClientHello */
+	}
+	ao2_unlock(instance);
+}
+#endif /* HAVE_OPENSSL */
+
+static int ast_rtp_activate(struct ast_rtp_instance *instance)
+{
+#ifdef HAVE_OPENSSL
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+
+	/* WebRTC A2/A3: kick the active-side DTLS handshake once the transport is ready. With ICE in play
+	 * (A3), defer until ICE has validated the peer so the ClientHello has a destination; without ICE
+	 * (plain A2 / non-WebRTC DTLS) fire immediately (ice_active stays 0 → condition true). */
+	if (rtp->dtls.ssl && (!rtp->ice_active || rtp->ice_complete)) {
+		dtls_perform_handshake(instance, rtp);
+	}
+#endif
+	return 0;
+}
+
+#ifdef HAVE_OPENSSL
+/* ===== WebRTC A3: ICE-lite (RFC 8445 §2.5) — minimal STUN responder agent, no pjproject =====
+ * The 9 engine callbacks below run UNLOCKED — the A1 wrapper vtable (main/rtp_engine.c) holds
+ * ao2_lock(instance) around every dispatch. */
+
+/* Fill dst with ICE-chars (RFC 8445 §5.4) from a CSPRNG (RAND_bytes; the pwd is the HMAC key, so it
+ * must be unpredictable — NOT ast_random()). The 64-char set divides 256 evenly, so no modulo bias. */
+static int ice_rand_string(char *dst, size_t len)
+{
+	static const char set[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	unsigned char raw[64];
+	size_t i, n = (len > 0) ? len - 1 : 0;
+
+	if (n > sizeof(raw)) {
+		n = sizeof(raw);
+	}
+	if (n && RAND_bytes(raw, (int) n) != 1) {
+		dst[0] = '\0';
+		return -1;	/* CSPRNG failure → the caller MUST fail closed (empty creds = publicly-known key) */
+	}
+	for (i = 0; i < n; i++) {
+		dst[i] = set[raw[i] % (sizeof(set) - 1)];
+	}
+	dst[i] = '\0';
+	return 0;
+}
+
+/* ao2 helpers for the single-HOST-candidate container returned by get_local_candidates. */
+static int ice_cand_hash(const void *obj, int flags) { return 0; }
+static int ice_cand_cmp(void *o, void *arg, int flags) { return CMP_MATCH | CMP_STOP; }
+static void ice_cand_dtor(void *obj)
+{
+	struct ast_rtp_engine_ice_candidate *c = obj;
+	ast_free(c->foundation);
+	ast_free(c->transport);
+}
+
+static void ast_rtp_ice_set_authentication(struct ast_rtp_instance *instance, const char *ufrag, const char *password)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	if (ufrag) {
+		ast_copy_string(rtp->remote_ufrag, ufrag, sizeof(rtp->remote_ufrag));	/* 257, bounded */
+	}
+	if (password) {
+		ast_copy_string(rtp->remote_pwd, password, sizeof(rtp->remote_pwd));
+	}
+}
+
+static const char *ast_rtp_ice_get_ufrag(struct ast_rtp_instance *instance)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	return rtp->local_ufrag;
+}
+
+static const char *ast_rtp_ice_get_password(struct ast_rtp_instance *instance)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	return rtp->local_pwd;
+}
+
+/* One HOST candidate, component 1 (rtcp-mux), UDP, the BOUND LOCAL address. A4's SDP glue overrides the
+ * advertised address with externaddr/media_address when configured (channel-owned NAT mapping). */
+static struct ao2_container *ast_rtp_ice_get_local_candidates(struct ast_rtp_instance *instance)
+{
+	struct ao2_container *cands;
+	struct ast_rtp_engine_ice_candidate *c;
+	struct ast_sockaddr local = { {0,} };
+
+	if (!(cands = ao2_container_alloc(1, ice_cand_hash, ice_cand_cmp))) {
+		return NULL;
+	}
+	if (!(c = ao2_alloc(sizeof(*c), ice_cand_dtor))) {
+		ao2_ref(cands, -1);
+		return NULL;
+	}
+	ast_rtp_instance_get_local_address(instance, &local);
+	ast_sockaddr_copy(&c->address, &local);
+	c->id = AST_RTP_ICE_COMPONENT_RTP;
+	c->type = AST_RTP_ICE_CANDIDATE_TYPE_HOST;
+	c->transport = ast_strdup("UDP");
+	c->foundation = ast_strdup("1");
+	if (!c->transport || !c->foundation) {
+		ao2_ref(c, -1);		/* dtor frees the partial strdups (NULL-safe) */
+		ao2_ref(cands, -1);
+		return NULL;
+	}
+	/* RFC 8445 §5.1.2.1: priority = 2^24*typepref(126) + 2^8*localpref(65535) + (256-component). */
+	c->priority = (126 << 24) | (65535 << 8) | (256 - AST_RTP_ICE_COMPONENT_RTP);
+	ao2_link(cands, c);
+	ao2_ref(c, -1);
+	return cands;
+}
+
+static void ast_rtp_ice_add_remote_candidate(struct ast_rtp_instance *instance, const struct ast_rtp_engine_ice_candidate *candidate)
+{
+	/* ICE-lite never pairs/probes remote candidates (RFC 8445 §2.5); we learn the peer from the
+	 * connectivity-check source. Accept-and-ignore so A4's parser can call us unconditionally (this
+	 * also ignores remote srflx/relay — the A1 carry-over). */
+	(void) instance;
+	(void) candidate;
+}
+
+static void ast_rtp_ice_ice_lite(struct ast_rtp_instance *instance)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	rtp->ice_lite = 1;	/* peer is also lite — irrelevant to us; record only */
+}
+
+static void ast_rtp_ice_set_role(struct ast_rtp_instance *instance, enum ast_rtp_ice_role role)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	(void) role;
+	rtp->ice_role = AST_RTP_ICE_ROLE_CONTROLLED;	/* a lite agent MUST be controlled (RFC 8445 §6.1.1) */
+}
+
+static void ast_rtp_ice_start(struct ast_rtp_instance *instance)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	rtp->ice_active = 1;	/* arm the responder; we never initiate a check (lite) */
+}
+
+static void ast_rtp_ice_stop(struct ast_rtp_instance *instance)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	rtp->ice_active = 0;
+	rtp->ice_complete = 0;
+	ast_sockaddr_setnull(&rtp->ice_peer);
+}
+
+static struct ast_rtp_engine_ice gabpbx_ice = {
+	.set_authentication = ast_rtp_ice_set_authentication,
+	.add_remote_candidate = ast_rtp_ice_add_remote_candidate,
+	.start = ast_rtp_ice_start,
+	.stop = ast_rtp_ice_stop,
+	.get_ufrag = ast_rtp_ice_get_ufrag,
+	.get_password = ast_rtp_ice_get_password,
+	.get_local_candidates = ast_rtp_ice_get_local_candidates,
+	.ice_lite = ast_rtp_ice_ice_lite,
+	.set_role = ast_rtp_ice_set_role,
+};
+#endif /* HAVE_OPENSSL */
+
 /* RTP Engine Declaration */
 static struct ast_rtp_engine gabpbx_rtp_engine = {
 	.name = "gabpbx",
@@ -335,6 +1430,11 @@ static struct ast_rtp_engine gabpbx_rtp_engine = {
 	.stop = ast_rtp_stop,
 	.qos = ast_rtp_qos_set,
 	.sendcng = ast_rtp_sendcng,
+	.activate = ast_rtp_activate,	/* WebRTC A2: drives the active-side DTLS handshake */
+#ifdef HAVE_OPENSSL
+	.dtls = &gabpbx_dtls,		/* WebRTC A2 */
+	.ice = &gabpbx_ice,		/* WebRTC A3 — ICE-lite */
+#endif
 };
 
 static inline int rtp_debug_test_addr(struct ast_sockaddr *addr)
@@ -369,15 +1469,326 @@ static inline int rtcp_debug_test_addr(struct ast_sockaddr *addr)
 	return 1;
 }
 
+#ifdef HAVE_OPENSSL
+/* ===== WebRTC A3: ICE-lite STUN responder (RFC 8445 §7.3 / RFC 5389), hand-rolled (main/stun.c is
+ * RFC 3489 legacy). Runs under ao2_lock(instance) from the demux. SILENT-DROP on any failure
+ * (anti-reflector, RFC 5389 §7.3.0; the browser retransmits). ===== */
+#define ICE_STUN_MAGIC_COOKIE       0x2112a442u
+#define ICE_STUN_BINDING_REQUEST    0x0001
+#define ICE_STUN_BINDING_SUCCESS    0x0101
+#define ICE_ATTR_USERNAME           0x0006
+#define ICE_ATTR_MESSAGE_INTEGRITY  0x0008
+#define ICE_ATTR_XOR_MAPPED_ADDRESS 0x0020
+#define ICE_ATTR_USE_CANDIDATE      0x0025
+#define ICE_ATTR_FINGERPRINT        0x8028
+#define ICE_FINGERPRINT_XOR         0x5354554eu
+
+struct ice_stun_hdr {
+	uint16_t msgtype;
+	uint16_t msglen;	/* EXCLUDES the 20-byte header */
+	uint32_t cookie;
+	uint8_t  tid[12];
+} __attribute__((packed));
+
+struct ice_stun_attr {
+	uint16_t type;
+	uint16_t len;		/* value length BEFORE 4-byte padding */
+} __attribute__((packed));
+
+/* STUN FINGERPRINT CRC-32 (IEEE, reflected, poly 0xEDB88320), RFC 5389 §15.5. Self-contained. */
+static uint32_t ice_crc32_table[256];
+/* Built once at module load (no lazy-init data race). */
+static void ice_crc32_init(void)
+{
+	uint32_t c;
+	int k, j;
+	for (k = 0; k < 256; k++) {
+		c = k;
+		for (j = 0; j < 8; j++) {
+			c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+		}
+		ice_crc32_table[k] = c;
+	}
+}
+static uint32_t ice_crc32(const uint8_t *p, size_t n)
+{
+	uint32_t crc = 0xffffffffu;
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		crc = ice_crc32_table[(crc ^ p[i]) & 0xff] ^ (crc >> 8);
+	}
+	return crc ^ 0xffffffffu;
+}
+
+/* HMAC-SHA1 over msg keyed on the ice-pwd (short-term cred, RFC 5389 §15.4). 20-byte digest. OpenSSL. */
+static int ice_hmac_sha1(const uint8_t *key, size_t keylen, const uint8_t *msg, size_t msglen, uint8_t out[20])
+{
+	unsigned int outlen = 20;
+	memset(out, 0, 20);	/* deterministic on failure — never emit uninitialised stack on the wire */
+	return (HMAC(EVP_sha1(), key, (int) keylen, msg, msglen, out, &outlen) && outlen == 20) ? 0 : -1;
+}
+
+/* Append a 4-byte-padded TLV; returns the new offset. Caller guarantees the buffer fits. */
+static int ice_put_attr(uint8_t *out, int off, uint16_t type, const void *val, int vlen)
+{
+	struct ice_stun_attr *a = (struct ice_stun_attr *) (out + off);
+	int padded = (vlen + 3) & ~3;
+
+	a->type = htons(type);
+	a->len = htons((uint16_t) vlen);
+	memcpy(out + off + sizeof(*a), val, vlen);
+	if (padded > vlen) {
+		memset(out + off + sizeof(*a) + vlen, 0, padded - vlen);
+	}
+	return off + sizeof(*a) + padded;
+}
+
+/* Build XOR-MAPPED-ADDRESS value for sa (RFC 5389 §15.2). Raw sockaddr access keeps everything in
+ * network order (avoids the host/network ambiguity of ast_sockaddr_ipv4). Returns 8 (v4) / 20 (v6). */
+static int ice_build_xor_mapped(struct ast_sockaddr *sa, struct ice_stun_hdr *req, uint8_t *xma)
+{
+	uint16_t xport;
+
+	xma[0] = 0;
+	if (sa->ss.ss_family == AF_INET) {
+		struct sockaddr_in *sin = (struct sockaddr_in *) &sa->ss;
+		uint32_t xaddr = sin->sin_addr.s_addr ^ htonl(ICE_STUN_MAGIC_COOKIE);
+		xport = sin->sin_port ^ htons((uint16_t)(ICE_STUN_MAGIC_COOKIE >> 16));
+		xma[1] = 0x01;	/* family IPv4 */
+		memcpy(xma + 2, &xport, 2);
+		memcpy(xma + 4, &xaddr, 4);
+		return 8;
+	} else {
+		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *) &sa->ss;
+		uint8_t mask[16];
+		uint32_t ck = htonl(ICE_STUN_MAGIC_COOKIE);
+		int i;
+		xport = sin6->sin6_port ^ htons((uint16_t)(ICE_STUN_MAGIC_COOKIE >> 16));
+		xma[1] = 0x02;	/* family IPv6 */
+		memcpy(xma + 2, &xport, 2);
+		memcpy(mask, &ck, 4);
+		memcpy(mask + 4, req->tid, 12);	/* X-Address mask = cookie || transaction-id */
+		for (i = 0; i < 16; i++) {
+			xma[4 + i] = sin6->sin6_addr.s6_addr[i] ^ mask[i];
+		}
+		return 20;
+	}
+}
+
+/* The responder. Runs LOCKED (demux ao2_lock). Silent-drop on ANY failure. On a valid authenticated
+ * check: learn the source as the peer + set the RTP remote address + reply success; on USE-CANDIDATE:
+ * mark ice_complete + fire the active DTLS handshake (RFC 8445 §7.3.2 / §8.2). */
+static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *rtp,
+	unsigned char *buf, int len, struct ast_sockaddr *sa)
+{
+	struct ice_stun_hdr *h = (struct ice_stun_hdr *) buf;
+	int mlen, off, mi_off = -1, fp_off = -1, has_use_candidate = 0;
+	const unsigned char *username = NULL;
+	int username_len = 0;
+	uint8_t calc[20], out[512], xma[20], mi[20];
+	uint16_t saved;
+	uint32_t fp;
+	size_t ul;
+	int oo, xlen;
+	struct ice_stun_hdr *r;
+
+	/* Hardening: answer only when ICE was negotiated AND we hold non-empty credentials (defense in
+	 * depth vs a CSPRNG fail-open — an empty pwd is a publicly-known HMAC key; ast_rtp_new already
+	 * fails the instance on CSPRNG failure, this is belt-and-suspenders). */
+	if (!rtp->ice_active || ast_strlen_zero(rtp->local_ufrag) || ast_strlen_zero(rtp->local_pwd)) {
+		return;
+	}
+
+	/* 0. Frame sanity. */
+	if (len < (int) sizeof(*h)) return;
+	if (ntohs(h->msgtype) != ICE_STUN_BINDING_REQUEST) return;
+	if (ntohl(h->cookie) != ICE_STUN_MAGIC_COOKIE) return;	/* not RFC 5389 → drop (anti-spoof) */
+	mlen = ntohs(h->msglen);
+	if (20 + mlen > len) return;
+
+	/* 1. Single bounds-checked, non-destructive TLV walk. */
+	for (off = sizeof(*h); off + (int) sizeof(struct ice_stun_attr) <= 20 + mlen; ) {
+		struct ice_stun_attr *a = (struct ice_stun_attr *) (buf + off);
+		int atype = ntohs(a->type), alen = ntohs(a->len);
+		int vstart = off + sizeof(*a);
+		int padded = (alen + 3) & ~3;
+
+		if (vstart + alen > 20 + mlen) return;	/* truncated attr */
+		switch (atype) {
+		case ICE_ATTR_USERNAME:
+			if (mi_off < 0) {	/* HIGH2: ignore attrs after MESSAGE-INTEGRITY (RFC 5389) — unauthenticated */
+				username = buf + vstart;
+				username_len = alen;
+			}
+			break;
+		case ICE_ATTR_MESSAGE_INTEGRITY:
+			if (alen != 20) return;	/* hardening 3: fixed length */
+			mi_off = off;
+			break;
+		case ICE_ATTR_FINGERPRINT:
+			if (alen != 4) return;	/* hardening 3 */
+			fp_off = off;
+			break;
+		case ICE_ATTR_USE_CANDIDATE:
+			if (mi_off < 0) {	/* HIGH2: only an authenticated USE-CANDIDATE (before MI) may nominate */
+				has_use_candidate = 1;
+			}
+			break;
+		default:
+			break;	/* PRIORITY / ICE-CONTROLLING etc.: parsed past, never acted on (we are controlled) */
+		}
+		off = vstart + padded;
+	}
+
+	/* 2. FINGERPRINT must be present, LAST (hardening 3), and valid (RFC 5389 §15.5). */
+	if (fp_off < 0 || fp_off + (int) sizeof(struct ice_stun_attr) + 4 != 20 + mlen) return;
+	if ((ice_crc32(buf, fp_off) ^ ICE_FINGERPRINT_XOR)
+		!= ntohl(*(uint32_t *)(buf + fp_off + sizeof(struct ice_stun_attr)))) {
+		return;
+	}
+
+	/* 3. USERNAME + MI present, and USERNAME prefix == our local_ufrag (RFC 8445 §7.3). */
+	if (!username || mi_off < 0) return;
+	ul = strlen(rtp->local_ufrag);
+	if ((size_t) username_len < ul + 1 || memcmp(username, rtp->local_ufrag, ul) != 0 || username[ul] != ':') {
+		return;
+	}
+
+	/* 4. MESSAGE-INTEGRITY: HMAC-SHA1 with OUR local_pwd over buf[0..mi_off), header length temporarily
+	 *    rewritten to cover through MI (RFC 5389 §15.4). Restored afterwards (non-destructive). */
+	saved = h->msglen;
+	h->msglen = htons((uint16_t)(mi_off - 20 + 24));
+	if (ice_hmac_sha1((const uint8_t *) rtp->local_pwd, strlen(rtp->local_pwd), buf, mi_off, calc)) {
+		h->msglen = saved;
+		return;	/* HMAC failure — silent drop */
+	}
+	h->msglen = saved;
+	if (memcmp(calc, buf + mi_off + sizeof(struct ice_stun_attr), 20) != 0) {
+		return;	/* MI mismatch — silent drop */
+	}
+
+
+	/* 5. AUTHENTICATED. LATCH the RTP remote address to the live authenticated check source for the WHOLE call
+	 *    (symmetric-RTP, like Asterisk's pjproject aiming at valid_check->rcand->addr). The controlling browser
+	 *    nominates several candidates and then runs RFC 7675 consent freshness ONLY on its SELECTED pair, which
+	 *    can differ from the first/transient USE-CANDIDATE; a WebRTC browser binds its DTLS to that selected pair
+	 *    (RFC 8445 §2.3) and ignores DTLS on any other candidate. Freezing on the first nominated pair misdirects
+	 *    our ServerHello + SRTP to a dead 5-tuple → no audio. Updating on EVERY authenticated check follows the
+	 *    selected pair, and is SAFE because the MESSAGE-INTEGRITY (our secret local_pwd, exchanged only over the
+	 *    secure SIP/WSS signaling) cannot be forged — a spoofer cannot move the tuple. */
+	ast_sockaddr_copy(&rtp->ice_peer, sa);
+	ast_rtp_instance_set_remote_address(instance, sa);
+
+	/* 6. Build + send the success Binding Response FIRST (MED2 — the browser confirms the pair before
+	 *    our ClientHello arrives): XOR-MAPPED-ADDRESS + MESSAGE-INTEGRITY + FINGERPRINT (last). */
+	r = (struct ice_stun_hdr *) out;
+	r->msgtype = htons(ICE_STUN_BINDING_SUCCESS);
+	r->cookie = htonl(ICE_STUN_MAGIC_COOKIE);
+	memcpy(r->tid, h->tid, sizeof(r->tid));
+	oo = sizeof(*r);
+
+	xlen = ice_build_xor_mapped(sa, h, xma);
+	oo = ice_put_attr(out, oo, ICE_ATTR_XOR_MAPPED_ADDRESS, xma, xlen);
+
+	r->msglen = htons((uint16_t)((oo - 20) + 24));	/* cover through MI before hashing */
+	if (ice_hmac_sha1((const uint8_t *) rtp->local_pwd, strlen(rtp->local_pwd), out, oo, mi)) {
+		return;	/* HMAC failure — do not emit a response with a bad MI */
+	}
+	oo = ice_put_attr(out, oo, ICE_ATTR_MESSAGE_INTEGRITY, mi, 20);
+
+	r->msglen = htons((uint16_t)((oo - 20) + 8));	/* cover through FINGERPRINT before the CRC */
+	fp = htonl(ice_crc32(out, oo) ^ ICE_FINGERPRINT_XOR);
+	oo = ice_put_attr(out, oo, ICE_ATTR_FINGERPRINT, &fp, 4);
+
+	rtp_raw_sendto(rtp, out, oo, sa, 0);
+
+	/* 7. USE-CANDIDATE → selected pair → ICE complete; fire the active DTLS handshake AFTER the success
+	 *    reply + remote address are set (MED2). dtls_perform_handshake re-locks ao2 (recursive — safe);
+	 *    no-op on the passive side. */
+	if (has_use_candidate && !rtp->ice_complete) {
+		rtp->ice_complete = 1;
+		dtls_perform_handshake(instance, rtp);
+	}
+}
+#endif /* HAVE_OPENSSL */
+
 static int __rtp_recvfrom(struct ast_rtp_instance *instance, void *buf, size_t size, int flags, struct ast_sockaddr *sa, int rtcp)
 {
 	int len;
 	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
 	struct ast_srtp *srtp = ast_rtp_instance_get_srtp(instance);
+#ifdef HAVE_OPENSSL
+	int demux_guard = 0;
+#endif
 
+#ifdef HAVE_OPENSSL
+read_again:
+#endif
 	if ((len = ast_recvfrom(rtcp ? rtp->rtcp->s : rtp->s, buf, size, flags, sa)) < 0) {
 	   return len;
 	}
+
+#ifdef HAVE_OPENSSL
+	/* WebRTC A2: RFC 7983 first-byte demux. Active ONLY when DTLS is set up on this instance, so the
+	 * plain-RTP/SRTP path below is byte-for-byte unchanged for non-WebRTC calls. Consumed control
+	 * packets loop to the next datagram (C1: never surfaced to ast_rtp_read as a short read), and an
+	 * EAGAIN from ast_recvfrom exits cleanly above (ast_rtp_read maps it to ast_null_frame, no log). */
+	if (len > 0 && !rtcp && rtp->dtls.ssl) {
+		/* Only the RTP socket carries the muxed DTLS/STUN (rtcp-mux); the separate RTCP socket, if the
+		 * SRTP-install T39 workaround allocated one, must NOT feed this single DTLS association (LOW8). */
+		unsigned char first = ((unsigned char *) buf)[0];
+
+		/* Defensive bound: a sustained DTLS/STUN flood on the read path must not spin the loop;
+		 * yield to ast_rtp_read (EAGAIN -> ast_null_frame, no log) after draining a burst. */
+		if (++demux_guard > 200) {
+			errno = EAGAIN;
+			return -1;
+		}
+		if (first <= 3) {
+			/* STUN — A3 ICE-lite responder, under the SAME ao2_lock the DTLS branch takes
+			 * (the responder re-locks via dtls_perform_handshake on USE-CANDIDATE — ao2 is recursive). */
+			ao2_lock(instance);
+			ice_handle_stun(instance, rtp, (unsigned char *) buf, len, sa);
+			ao2_unlock(instance);
+			goto read_again;
+		}
+		if (first >= 20 && first <= 63) {
+			/* DTLS record — feed OpenSSL under the SAME ao2_lock the A1 wrappers take
+			 * (lock order channel->pvt->instance->peer; we are already below pvt here). */
+			int dres;
+			ao2_lock(instance);
+			dres = dtls_srtp_handle_record(instance, rtp, buf, len);
+			ao2_unlock(instance);
+			if (dres < 0) {
+				/* DTLS failed (fingerprint mismatch / fatal handshake) — fail the read so the
+				 * channel layer tears the call down (RFC 5763 §5 fail-closed). */
+				errno = EIO;
+				return -1;
+			}
+			goto read_again;
+		}
+		if (first < 128 || first > 191) {
+			/* C6: RFC 7983 non-RTP/RTCP range — drop, read next. */
+			goto read_again;
+		}
+		/* 128-191 is RTP OR, under rtcp-mux (WebRTC always mandates it), muxed (S)RTCP on the same
+		 * socket. SRTP-unprotect would FAIL on an SRTCP packet and return -1 → ast_rtp_read would hang
+		 * the call up (the browser sends RTCP RR every ~5s). RFC 5761 §4: an RTCP packet's type (byte 1,
+		 * with the marker bit masked) is in 64-95 (RTP forbids those PTs); the 8-byte SRTCP header incl.
+		 * the PT is in the clear. Drop muxed RTCP for v1 (audio still flows; proper SRTCP unprotect +
+		 * ast_rtcp_read processing is a follow-up). Gated by the rtp->dtls.ssl outer condition, so
+		 * non-WebRTC RTP is byte-for-byte unaffected. */
+		if (len >= 2 && (((unsigned char *) buf)[1] & 0x7f) >= 64 && (((unsigned char *) buf)[1] & 0x7f) <= 95) {
+			goto read_again;
+		}
+		/* else 128-191 RTP → fall through to the unchanged SRTP path. */
+	}
+
+	/* The demux may have installed SRTP on the handshake-completing record (MED5): re-fetch the srtp
+	 * context so the first post-handshake media packet drained in this same loop is unprotected. */
+	srtp = ast_rtp_instance_get_srtp(instance);
+#endif
 
 	if (res_srtp && srtp && res_srtp->unprotect(srtp, buf, &len, rtcp) < 0) {
 	   return -1;
@@ -402,6 +1813,17 @@ static int __rtp_sendto(struct ast_rtp_instance *instance, void *buf, size_t siz
 	void *temp = buf;
 	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
 	struct ast_srtp *srtp = ast_rtp_instance_get_srtp(instance);
+
+#ifdef HAVE_OPENSSL
+	/* WebRTC: never emit media before DTLS-SRTP is established. While the connection is NEW there are no
+	 * SRTP keys yet, so this path would send PLAIN RTP — leaking cleartext media and confusing the peer
+	 * (RFC 5763 §6.10: media flows after the DTLS Finished). connection flips to EXISTING on handshake
+	 * completion + key install (dtls_srtp_finish_negotiation). STUN/DTLS use rtp_raw_sendto (not this
+	 * path); a non-WebRTC call has no dtls.ssl → unaffected. Mirrors Asterisk 22. */
+	if (rtp->dtls.ssl && rtp->dtls.connection == AST_RTP_DTLS_CONNECTION_NEW) {
+		return 0;
+	}
+#endif
 
 	if (res_srtp && srtp && res_srtp->protect(srtp, &temp, &len, rtcp) < 0) {
 	   return -1;
@@ -591,6 +2013,22 @@ static int ast_rtp_new(struct ast_rtp_instance *instance,
 
 	/* Record any information we may need */
 	rtp->sched = sched;
+#ifdef HAVE_OPENSSL
+	/* WebRTC A2: sched-id sentinels (the ast_calloc above zeroed the rest of the DTLS state) */
+	rtp->dtls.timeout_timer = -1;
+	rtp->rekeyid = -1;
+	/* WebRTC A3: generate our ICE-lite locals once (CSPRNG, RFC 8445 §5.4); the bind above set the
+	 * local address so the host candidate is ready. FAIL CLOSED on CSPRNG failure — empty creds would
+	 * be a publicly-known HMAC key (auth bypass + remote-address steering). */
+	if (ice_rand_string(rtp->local_ufrag, sizeof(rtp->local_ufrag))
+		|| ice_rand_string(rtp->local_pwd, sizeof(rtp->local_pwd))) {
+		ast_log(LOG_ERROR, "Failed to generate ICE credentials (CSPRNG) for RTP instance '%p'\n", instance);
+		close(rtp->s);
+		ast_free(rtp);
+		return -1;
+	}
+	rtp->ice_role = AST_RTP_ICE_ROLE_CONTROLLED;
+#endif
 
 	/* Associate the RTP structure with the RTP instance and be done */
 	ast_rtp_instance_set_data(instance, rtp);
@@ -606,6 +2044,13 @@ static int ast_rtp_destroy(struct ast_rtp_instance *instance)
 	if (rtp->smoother) {
 		ast_smoother_free(rtp->smoother);
 	}
+
+#ifdef HAVE_OPENSSL
+	/* WebRTC A2: free the DTLS association directly. At destroy the retransmit timer cannot be armed
+	 * (an armed timer holds an instance ref, so the refcount could not have reached 0) and no other
+	 * thread can reach this instance, so no lock and no timer-stop are needed here. */
+	dtls_free_association(rtp);
+#endif
 
 	/* Close our own socket so we no longer get packets */
 	if (rtp->s > -1) {
@@ -3061,6 +4506,30 @@ static int load_module(void)
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
+#ifdef HAVE_OPENSSL
+	/* WebRTC A2: the DTLS write-BIO method that drains handshake records to the RTP socket. Allocated
+	 * AFTER the registrations so a DECLINEd load (whose unload_module never runs) cannot leak it (MED3). */
+	dtls_bio_methods = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "rtp dtls");
+	if (dtls_bio_methods) {
+		BIO_meth_set_write(dtls_bio_methods, dtls_bio_write);
+		BIO_meth_set_ctrl(dtls_bio_methods, dtls_bio_ctrl);
+		BIO_meth_set_create(dtls_bio_methods, dtls_bio_new);
+		BIO_meth_set_destroy(dtls_bio_methods, dtls_bio_free);
+	} else {
+		ast_log(LOG_WARNING, "Failed to create the DTLS write-BIO method; DTLS-SRTP (WebRTC media) will be unavailable\n");
+	}
+	/* WebRTC A3: build the ICE STUN FINGERPRINT CRC-32 table once (no lazy-init data race). */
+	ice_crc32_init();
+
+	/* Dedicated WAKING scheduler for DTLS handshake retransmit timers (see dtls_sched_thread). Created
+	 * here, after the engine/CLI registrations, so a DECLINEd load (whose unload_module never runs) is
+	 * clean. Leave it NULL on failure → gabpbx_dtls_set_configuration fails closed (no WebRTC DTLS
+	 * without a working retransmit timer). */
+	if (!(dtls_sched_thread = ast_sched_thread_create())) {
+		ast_log(LOG_WARNING, "Failed to create the DTLS retransmit scheduler; DTLS-SRTP (WebRTC media) will be unavailable\n");
+	}
+#endif
+
 	rtp_reload(0);
 
 	return AST_MODULE_LOAD_SUCCESS;
@@ -3070,6 +4539,16 @@ static int unload_module(void)
 {
 	ast_rtp_engine_unregister(&gabpbx_rtp_engine);
 	ast_cli_unregister_multiple(cli_rtp, ARRAY_LEN(cli_rtp));
+
+#ifdef HAVE_OPENSSL
+	if (dtls_bio_methods) {
+		BIO_meth_free(dtls_bio_methods);
+		dtls_bio_methods = NULL;
+	}
+	if (dtls_sched_thread) {
+		dtls_sched_thread = ast_sched_thread_destroy(dtls_sched_thread);	/* joins the thread, then frees the context */
+	}
+#endif
 
 	return 0;
 }

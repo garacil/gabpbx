@@ -320,6 +320,146 @@ if (stat == combined) { \
 return 0; \
 }
 
+/*! \brief ICE candidate types
+ *
+ * \note ICE-lite (RFC 8445 §2.5, Lite Implementations) advertises HOST candidates
+ * only. SRFLX (STUN server-reflexive) and RELAYED (TURN) are intentionally NOT
+ * defined: this engine is ICE-lite and never gathers reflexive/relayed candidates.
+ */
+enum ast_rtp_ice_candidate_type {
+	AST_RTP_ICE_CANDIDATE_TYPE_HOST, /*!< Actual local transport address on the host */
+};
+
+/*! \brief ICE component types
+ *
+ * \note Single-component only (RTP). RTCP rides the same 5-tuple via rtcp-mux
+ * (RFC 5761), so no AST_RTP_ICE_COMPONENT_RTCP is defined.
+ */
+enum ast_rtp_ice_component_type {
+	AST_RTP_ICE_COMPONENT_RTP = 1,
+};
+
+/*! \brief ICE role during negotiation
+ *
+ * \note As an ICE-lite agent we are permanently CONTROLLED (RFC 8445 §6.1.1: a full
+ * agent is controlling, a lite agent is controlled). CONTROLLING is defined for
+ * SDP/role-parsing completeness but our agent never assumes it.
+ */
+enum ast_rtp_ice_role {
+	AST_RTP_ICE_ROLE_CONTROLLED,
+	AST_RTP_ICE_ROLE_CONTROLLING,
+};
+
+/*! \brief Structure for an ICE candidate (ICE-lite: host candidates only) */
+struct ast_rtp_engine_ice_candidate {
+	char *foundation;                     /*!< Foundation identifier */
+	enum ast_rtp_ice_component_type id;   /*!< Component identifier (always RTP) */
+	char *transport;                      /*!< Transport for the media */
+	int priority;                         /*!< Priority used when multiple candidates exist */
+	struct ast_sockaddr address;          /*!< Address of the candidate */
+	enum ast_rtp_ice_candidate_type type; /*!< Type of candidate (always HOST) */
+};
+
+/*! \brief Structure that represents the optional ICE support within an RTP engine
+ *
+ * \note ICE-lite minimal vtable; turn_request and change_components are DROPPED (no
+ * TURN, single-component). Optional: an engine without ICE leaves
+ * struct ast_rtp_engine.ice == NULL. Callbacks are invoked via the locking wrappers
+ * returned by ast_rtp_instance_get_ice() — engine implementations stay unlocked.
+ */
+struct ast_rtp_engine_ice {
+	/*! Set received authentication information (remote ice-ufrag/ice-pwd) */
+	void (*set_authentication)(struct ast_rtp_instance *instance, const char *ufrag, const char *password);
+	/*! Add a remote candidate parsed from a=candidate */
+	void (*add_remote_candidate)(struct ast_rtp_instance *instance, const struct ast_rtp_engine_ice_candidate *candidate);
+	/*! Start ICE negotiation */
+	void (*start)(struct ast_rtp_instance *instance);
+	/*! Stop ICE support */
+	void (*stop)(struct ast_rtp_instance *instance);
+	/*! Get our local username (the ice-ufrag we advertise) */
+	const char *(*get_ufrag)(struct ast_rtp_instance *instance);
+	/*! Get our local password (the ice-pwd we advertise) */
+	const char *(*get_password)(struct ast_rtp_instance *instance);
+	/*! Get local candidates (host candidate(s) only) */
+	struct ao2_container *(*get_local_candidates)(struct ast_rtp_instance *instance);
+	/*! Tell the ICE support it is talking to an ice-lite implementation */
+	void (*ice_lite)(struct ast_rtp_instance *instance);
+	/*! Change our role in negotiation (we stay CONTROLLED) */
+	void (*set_role)(struct ast_rtp_instance *instance, enum ast_rtp_ice_role role);
+};
+
+/*! \brief DTLS setup types (a=setup:) */
+enum ast_rtp_dtls_setup {
+	AST_RTP_DTLS_SETUP_ACTIVE,   /*!< Endpoint is willing to initiate connections */
+	AST_RTP_DTLS_SETUP_PASSIVE,  /*!< Endpoint is willing to accept connections */
+	AST_RTP_DTLS_SETUP_ACTPASS,  /*!< Endpoint is willing to both accept and initiate */
+	AST_RTP_DTLS_SETUP_HOLDCONN, /*!< Endpoint does not want the connection established yet */
+};
+
+/*! \brief DTLS connection states */
+enum ast_rtp_dtls_connection {
+	AST_RTP_DTLS_CONNECTION_NEW,      /*!< Endpoint wants to use a new connection */
+	AST_RTP_DTLS_CONNECTION_EXISTING, /*!< Endpoint wishes to use an existing connection */
+};
+
+/*! \brief DTLS fingerprint hashes (a=fingerprint:) */
+enum ast_rtp_dtls_hash {
+	AST_RTP_DTLS_HASH_SHA256, /*!< SHA-256 fingerprint hash */
+	AST_RTP_DTLS_HASH_SHA1,   /*!< SHA-1 fingerprint hash */
+};
+
+/*! \brief DTLS verification settings (bitmask) */
+enum ast_rtp_dtls_verify {
+	AST_RTP_DTLS_VERIFY_NONE = 0,               /*!< Don't verify anything */
+	AST_RTP_DTLS_VERIFY_FINGERPRINT = (1 << 0), /*!< Verify the fingerprint */
+	AST_RTP_DTLS_VERIFY_CERTIFICATE = (1 << 1), /*!< Verify the certificate */
+};
+
+/*! \brief DTLS configuration (backing config passed to set_configuration) */
+struct ast_rtp_dtls_cfg {
+	unsigned int enabled:1;                /*!< Whether DTLS support is enabled or not */
+	unsigned int rekey;                    /*!< Renegotiate/rekey interval - 0 (off) by default */
+	enum ast_rtp_dtls_setup default_setup; /*!< Default setup type for outgoing */
+	enum ast_srtp_suite suite;             /*!< Crypto suite in use */
+	enum ast_rtp_dtls_hash hash;           /*!< Hash to use for the fingerprint */
+	enum ast_rtp_dtls_verify verify;       /*!< What should be verified */
+	char *certfile;                        /*!< Certificate file */
+	char *pvtfile;                         /*!< Private key file */
+	char *cipher;                          /*!< Cipher to use */
+	char *cafile;                          /*!< Certificate authority file */
+	char *capath;                          /*!< Path to certificate authority */
+	unsigned int ephemeral_cert:1;         /*!< Generate a per-session ephemeral cert - 0 (off) by default */
+};
+
+/*! \brief Structure that represents the optional DTLS-SRTP support within an RTP engine
+ *
+ * \note Complete DTLS-SRTP handshake surface (RFC 5763/5764). Optional: an engine
+ * without DTLS leaves struct ast_rtp_engine.dtls == NULL. Callbacks are invoked via
+ * the locking wrappers returned by ast_rtp_instance_get_dtls().
+ */
+struct ast_rtp_engine_dtls {
+	/*! Set the DTLS configuration on the instance */
+	int (*set_configuration)(struct ast_rtp_instance *instance, const struct ast_rtp_dtls_cfg *dtls_cfg);
+	/*! Get whether DTLS-SRTP support is active or not */
+	int (*active)(struct ast_rtp_instance *instance);
+	/*! Stop and terminate DTLS-SRTP support */
+	void (*stop)(struct ast_rtp_instance *instance);
+	/*! Reset the connection and start fresh */
+	void (*reset)(struct ast_rtp_instance *instance);
+	/*! Get the current connection state */
+	enum ast_rtp_dtls_connection (*get_connection)(struct ast_rtp_instance *instance);
+	/*! Get the current setup state */
+	enum ast_rtp_dtls_setup (*get_setup)(struct ast_rtp_instance *instance);
+	/*! Set the remote setup state */
+	void (*set_setup)(struct ast_rtp_instance *instance, enum ast_rtp_dtls_setup setup);
+	/*! Set the remote fingerprint */
+	void (*set_fingerprint)(struct ast_rtp_instance *instance, enum ast_rtp_dtls_hash hash, const char *fingerprint);
+	/*! Get the local fingerprint hash type */
+	enum ast_rtp_dtls_hash (*get_fingerprint_hash)(struct ast_rtp_instance *instance);
+	/*! Get the local fingerprint */
+	const char *(*get_fingerprint)(struct ast_rtp_instance *instance);
+};
+
 /*! Structure that represents an RTP stack (engine) */
 struct ast_rtp_engine {
 	/*! Name of the RTP engine, used when explicitly requested */
@@ -391,6 +531,10 @@ struct ast_rtp_engine {
 	int (*available_formats)(struct ast_rtp_instance *instance, format_t to_endpoint, format_t to_gabpbx);
 	/*! Callback to send CNG */
 	int (*sendcng)(struct ast_rtp_instance *instance, int level);
+	/*! Optional ICE support (ICE-lite); NULL if the engine has no ICE (WebRTC A1) */
+	struct ast_rtp_engine_ice *ice;
+	/*! Optional DTLS-SRTP support; NULL if the engine has no DTLS (WebRTC A1) */
+	struct ast_rtp_engine_dtls *dtls;
 	/*! Linked list information */
 	AST_RWLIST_ENTRY(ast_rtp_engine) entry;
 };
@@ -1665,6 +1809,31 @@ int ast_rtp_instance_activate(struct ast_rtp_instance *instance);
  * \since 1.8
  */
 void ast_rtp_instance_stun_request(struct ast_rtp_instance *instance, struct ast_sockaddr *suggestion, const char *username);
+
+/*!
+ * \brief Obtain a pointer to the ICE support (locking wrapper vtable) on an RTP instance
+ *
+ * \param instance the RTP instance
+ *
+ * \retval ICE support vtable if present (its callbacks ao2_lock the instance)
+ * \retval NULL if no ICE support is available on the engine
+ *
+ * \note WebRTC A1. The returned vtable wraps the engine's ICE callbacks under
+ * ao2_lock(instance); engine implementations therefore stay unlocked.
+ */
+struct ast_rtp_engine_ice *ast_rtp_instance_get_ice(struct ast_rtp_instance *instance);
+
+/*!
+ * \brief Obtain a pointer to the DTLS-SRTP support (locking wrapper vtable) on an RTP instance
+ *
+ * \param instance the RTP instance
+ *
+ * \retval DTLS support vtable if present (its callbacks ao2_lock the instance)
+ * \retval NULL if no DTLS support is available on the engine
+ *
+ * \note WebRTC A1.
+ */
+struct ast_rtp_engine_dtls *ast_rtp_instance_get_dtls(struct ast_rtp_instance *instance);
 
 /*!
  * \brief Set the RTP timeout value

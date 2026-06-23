@@ -1737,6 +1737,238 @@ void ast_rtp_instance_stun_request(struct ast_rtp_instance *instance,
 	}
 }
 
+/*
+ * WebRTC (A1): ICE/DTLS engine-API locking wrappers.
+ *
+ * ast_rtp_instance_get_ice()/get_dtls() return these STATIC wrapper vtables (not the
+ * raw engine vtable) so every ICE/DTLS callback runs under ao2_lock(instance). The
+ * DTLS-SRTP and ICE state is touched cross-thread: the SDP glue (set_fingerprint,
+ * set_setup, get_*) runs on the channel/sofia thread during INVITE/200-OK parse, while
+ * the DTLS handshake/demux and the STUN responder run on the RTP read path (and DTLS
+ * retransmit timers on the sched thread). Centralising the lock here means the engine
+ * implementations (A2/A3) provide plain, unlocked callbacks. A1 adds ZERO behaviour:
+ * the wrappers only lock + dispatch to callbacks that stay NULL until A3 populates them
+ * (the getters return NULL while the slot is unset, so they are never invoked).
+ *
+ * A2 NOTE (opencode): the instance lock is a NEW lock surface (rtp_engine.c had no
+ * ao2_lock today). For it to be effective, the A2 packet-path DTLS demux at the
+ * rtp_recvfrom insertion point MUST take the SAME ao2_lock(instance) as these wrappers
+ * — a one-sided lock is cosmetic. Lock order: channel -> pvt -> instance -> peer
+ * (the instance is owned by pvt->rtp).
+ */
+
+static void rtp_ice_wrap_set_authentication(struct ast_rtp_instance *instance, const char *ufrag, const char *password)
+{
+	ao2_lock(instance);
+	instance->engine->ice->set_authentication(instance, ufrag, password);
+	ao2_unlock(instance);
+}
+
+static void rtp_ice_wrap_add_remote_candidate(struct ast_rtp_instance *instance, const struct ast_rtp_engine_ice_candidate *candidate)
+{
+	ao2_lock(instance);
+	instance->engine->ice->add_remote_candidate(instance, candidate);
+	ao2_unlock(instance);
+}
+
+static void rtp_ice_wrap_start(struct ast_rtp_instance *instance)
+{
+	ao2_lock(instance);
+	instance->engine->ice->start(instance);
+	ao2_unlock(instance);
+}
+
+static void rtp_ice_wrap_stop(struct ast_rtp_instance *instance)
+{
+	ao2_lock(instance);
+	instance->engine->ice->stop(instance);
+	ao2_unlock(instance);
+}
+
+static const char *rtp_ice_wrap_get_ufrag(struct ast_rtp_instance *instance)
+{
+	const char *ufrag;
+
+	ao2_lock(instance);
+	ufrag = instance->engine->ice->get_ufrag(instance);
+	ao2_unlock(instance);
+
+	return ufrag;
+}
+
+static const char *rtp_ice_wrap_get_password(struct ast_rtp_instance *instance)
+{
+	const char *password;
+
+	ao2_lock(instance);
+	password = instance->engine->ice->get_password(instance);
+	ao2_unlock(instance);
+
+	return password;
+}
+
+static struct ao2_container *rtp_ice_wrap_get_local_candidates(struct ast_rtp_instance *instance)
+{
+	struct ao2_container *local_candidates;
+
+	ao2_lock(instance);
+	local_candidates = instance->engine->ice->get_local_candidates(instance);
+	ao2_unlock(instance);
+
+	return local_candidates;
+}
+
+static void rtp_ice_wrap_ice_lite(struct ast_rtp_instance *instance)
+{
+	ao2_lock(instance);
+	instance->engine->ice->ice_lite(instance);
+	ao2_unlock(instance);
+}
+
+static void rtp_ice_wrap_set_role(struct ast_rtp_instance *instance, enum ast_rtp_ice_role role)
+{
+	ao2_lock(instance);
+	instance->engine->ice->set_role(instance, role);
+	ao2_unlock(instance);
+}
+
+static struct ast_rtp_engine_ice rtp_ice_wrappers = {
+	.set_authentication = rtp_ice_wrap_set_authentication,
+	.add_remote_candidate = rtp_ice_wrap_add_remote_candidate,
+	.start = rtp_ice_wrap_start,
+	.stop = rtp_ice_wrap_stop,
+	.get_ufrag = rtp_ice_wrap_get_ufrag,
+	.get_password = rtp_ice_wrap_get_password,
+	.get_local_candidates = rtp_ice_wrap_get_local_candidates,
+	.ice_lite = rtp_ice_wrap_ice_lite,
+	.set_role = rtp_ice_wrap_set_role,
+};
+
+struct ast_rtp_engine_ice *ast_rtp_instance_get_ice(struct ast_rtp_instance *instance)
+{
+	if (instance->engine->ice) {
+		return &rtp_ice_wrappers;
+	}
+
+	return NULL;
+}
+
+static int rtp_dtls_wrap_set_configuration(struct ast_rtp_instance *instance, const struct ast_rtp_dtls_cfg *dtls_cfg)
+{
+	int res;
+
+	ao2_lock(instance);
+	res = instance->engine->dtls->set_configuration(instance, dtls_cfg);
+	ao2_unlock(instance);
+
+	return res;
+}
+
+static int rtp_dtls_wrap_active(struct ast_rtp_instance *instance)
+{
+	int res;
+
+	ao2_lock(instance);
+	res = instance->engine->dtls->active(instance);
+	ao2_unlock(instance);
+
+	return res;
+}
+
+static void rtp_dtls_wrap_stop(struct ast_rtp_instance *instance)
+{
+	ao2_lock(instance);
+	instance->engine->dtls->stop(instance);
+	ao2_unlock(instance);
+}
+
+static void rtp_dtls_wrap_reset(struct ast_rtp_instance *instance)
+{
+	ao2_lock(instance);
+	instance->engine->dtls->reset(instance);
+	ao2_unlock(instance);
+}
+
+static enum ast_rtp_dtls_connection rtp_dtls_wrap_get_connection(struct ast_rtp_instance *instance)
+{
+	enum ast_rtp_dtls_connection res;
+
+	ao2_lock(instance);
+	res = instance->engine->dtls->get_connection(instance);
+	ao2_unlock(instance);
+
+	return res;
+}
+
+static enum ast_rtp_dtls_setup rtp_dtls_wrap_get_setup(struct ast_rtp_instance *instance)
+{
+	enum ast_rtp_dtls_setup res;
+
+	ao2_lock(instance);
+	res = instance->engine->dtls->get_setup(instance);
+	ao2_unlock(instance);
+
+	return res;
+}
+
+static void rtp_dtls_wrap_set_setup(struct ast_rtp_instance *instance, enum ast_rtp_dtls_setup setup)
+{
+	ao2_lock(instance);
+	instance->engine->dtls->set_setup(instance, setup);
+	ao2_unlock(instance);
+}
+
+static void rtp_dtls_wrap_set_fingerprint(struct ast_rtp_instance *instance, enum ast_rtp_dtls_hash hash, const char *fingerprint)
+{
+	ao2_lock(instance);
+	instance->engine->dtls->set_fingerprint(instance, hash, fingerprint);
+	ao2_unlock(instance);
+}
+
+static enum ast_rtp_dtls_hash rtp_dtls_wrap_get_fingerprint_hash(struct ast_rtp_instance *instance)
+{
+	enum ast_rtp_dtls_hash res;
+
+	ao2_lock(instance);
+	res = instance->engine->dtls->get_fingerprint_hash(instance);
+	ao2_unlock(instance);
+
+	return res;
+}
+
+static const char *rtp_dtls_wrap_get_fingerprint(struct ast_rtp_instance *instance)
+{
+	const char *res;
+
+	ao2_lock(instance);
+	res = instance->engine->dtls->get_fingerprint(instance);
+	ao2_unlock(instance);
+
+	return res;
+}
+
+static struct ast_rtp_engine_dtls rtp_dtls_wrappers = {
+	.set_configuration = rtp_dtls_wrap_set_configuration,
+	.active = rtp_dtls_wrap_active,
+	.stop = rtp_dtls_wrap_stop,
+	.reset = rtp_dtls_wrap_reset,
+	.get_connection = rtp_dtls_wrap_get_connection,
+	.get_setup = rtp_dtls_wrap_get_setup,
+	.set_setup = rtp_dtls_wrap_set_setup,
+	.set_fingerprint = rtp_dtls_wrap_set_fingerprint,
+	.get_fingerprint_hash = rtp_dtls_wrap_get_fingerprint_hash,
+	.get_fingerprint = rtp_dtls_wrap_get_fingerprint,
+};
+
+struct ast_rtp_engine_dtls *ast_rtp_instance_get_dtls(struct ast_rtp_instance *instance)
+{
+	if (instance->engine->dtls) {
+		return &rtp_dtls_wrappers;
+	}
+
+	return NULL;
+}
+
 void ast_rtp_instance_set_timeout(struct ast_rtp_instance *instance, int timeout)
 {
 	instance->timeout = timeout;

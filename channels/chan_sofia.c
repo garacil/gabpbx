@@ -498,10 +498,14 @@ static void sofia_contact_transport_from_url(const url_t *url, char *out, size_t
 	}
 }
 
-/* Append ;transport= so an outbound request to a TCP/TLS-registered phone routes
- * over the transport it registered on (sofia-sip otherwise defaults to UDP). Only
- * tcp/tls act; udp/empty/unknown/ws/wss are no-ops. Scheme is NOT rewritten to
- * sips: — ";transport=tls" alone selects TLS. */
+/* Append ;transport= so an outbound request to a TCP/TLS/WS/WSS-registered phone routes
+ * over the transport it registered on (sofia-sip otherwise defaults to UDP). tcp/tls/ws/wss
+ * act; udp/empty/unknown are no-ops. For ws/wss this is REQUIRED: NTA selects the WS/WSS transport
+ * from the URI param (RFC 7118) and the tport pool REUSES the accepted WebSocket connection the
+ * client registered on (TPTAG_REUSE default; a browser is a WS client and only listens on that
+ * persistent connection — without ;transport=wss the RURI defaults to UDP and the INVITE is sent to
+ * the WS source port as UDP, which never reaches the browser → no ringing). Scheme is NOT
+ * rewritten to sips: — ";transport=tls"/";transport=wss" alone selects the transport. */
 void sofia_uri_append_transport(char *url, size_t len, const char *transport)
 {
 	size_t cur;
@@ -509,7 +513,8 @@ void sofia_uri_append_transport(char *url, size_t len, const char *transport)
 	if (!url || ast_strlen_zero(transport)) {
 		return;
 	}
-	if (strcasecmp(transport, "tcp") && strcasecmp(transport, "tls")) {
+	if (strcasecmp(transport, "tcp") && strcasecmp(transport, "tls")
+			&& strcasecmp(transport, "ws") && strcasecmp(transport, "wss")) {
 		return;
 	}
 	cur = strlen(url);
@@ -534,7 +539,14 @@ static int sofia_build_nat_proxy_url_from_peer(const struct sofia_peer *peer,
 	}
 	buf[0] = '\0';
 
-	if (!(peer->nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA))) {
+	/* WS/WSS: a WebSocket client always registers a placeholder Contact host (SIP.js .invalid / TEST-NET,
+	 * RFC 7118 §8.1) and is reachable ONLY over its accepted WSS connection — so in-dialog ACK/BYE MUST be
+	 * proxy-routed to its real registered source (peer->src_addr) over WSS, exactly like a NAT'd phone, even
+	 * without an explicit nat=force_rport. Otherwise the BYE goes to the unroutable placeholder and the UA
+	 * never tears down (caller stuck "call in progress"). */
+	if (!(peer->nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA))
+			&& strcasecmp(peer->reg_transport, "ws")
+			&& strcasecmp(peer->reg_transport, "wss")) {
 		return 0;
 	}
 	if (ast_sockaddr_isnull(&peer->src_addr)) {
@@ -571,7 +583,12 @@ static int sofia_pvt_build_nat_target_url(struct sofia_pvt *pvt, char *buf, size
 
 	contact = pvt->active_contact;
 	if (!contact) {
-		return 0;
+		/* No active_contact — e.g. an INBOUND WSS caller leg: the SIP.js placeholder Contact host
+		 * (192.0.2.x) never matched a registered contact by host, so active_contact stayed NULL. Fall back
+		 * to the peer-level src_addr proxy so an in-dialog ACK/BYE to a placeholder-Contact WSS UA still
+		 * routes over its real WSS connection (else the BYE hits the unroutable placeholder and the caller
+		 * stays "call in progress"). */
+		return pvt->peer ? sofia_build_nat_proxy_url_from_peer(pvt->peer, buf, len) : 0;
 	}
 	/* Snapshot contact's mutable src_addr + transport under its ao2 lock — a
 	 * concurrent REGISTER refresh rewrites them, so an unlocked read could route
@@ -703,9 +720,34 @@ static struct sofia_contact *sofia_peer_find_contact_by_host_port(struct sofia_p
 	struct sofia_contact *c, *found = NULL;
 	if (!peer || !peer->contacts || !host)
 		return NULL;
+	/* Pass 1: exact Contact host:port — the common udp/tcp/tls case (c->host is the real routable host). */
 	ci = ao2_iterator_init(peer->contacts, 0);
 	while ((c = ao2_iterator_next(&ci))) {
 		if (c->port == port && strcasecmp(c->host, host) == 0) {
+			found = c;
+			break;
+		}
+		ao2_ref(c, -1);
+	}
+	ao2_iterator_destroy(&ci);
+	if (found) {
+		return found;
+	}
+	/* Pass 2: match the registered src_addr. A WSS/NAT peer's Contact host is a placeholder (SIP.js
+	 * .invalid / TEST-NET, RFC 7118 §8.1) or a private LAN IP, so an outbound request whose host:port was
+	 * built from the registered src_addr never matches c->host in pass 1 — leaving active_contact
+	 * NULL, which broke in-dialog ACK/BYE NAT routing (the caller never learned the call ended → 15s RTP
+	 * timeout). Pass 1 wins whenever the Contact host is routable, so this is zero-regression for udp/tcp/tls.
+	 * With multiple contacts the src_addr is unique per registration, so only the right one matches.
+	 * src_addr is refresh-mutable → read under the contact lock. */
+	ci = ao2_iterator_init(peer->contacts, 0);
+	while ((c = ao2_iterator_next(&ci))) {
+		int match;
+		ao2_lock(c);
+		match = (ast_sockaddr_port(&c->src_addr) == port
+			&& !strcasecmp(ast_sockaddr_stringify_host(&c->src_addr), host));
+		ao2_unlock(c);
+		if (match) {
 			found = c;
 			break;
 		}
@@ -1354,7 +1396,20 @@ static int sofia_rtp_init(struct sofia_pvt *pvt)
 	}
 
 	ast_sockaddr_parse(&addr, sofia_cfg.bindaddr, 0);
-	pvt->rtp = ast_rtp_instance_new("gabpbx", NULL, &addr, NULL);
+	/* ALWAYS give the RTP instance the module-global sofia_sched context when
+	 * it exists — NOT gated on pvt->peer->webrtc. Inbound INVITEs create the RTP instance BEFORE the peer
+	 * is resolved (sofia_rtp_init precedes the pvt->peer assignment), so a peer->webrtc gate here is
+	 * racy/false for real inbound calls and would leave a WebRTC leg with rtp->sched==NULL, segfaulting
+	 * the DTLS retransmit timer (ast_sched_add_variable(NULL)). The sched is only a stored pointer for a
+	 * plain call: non-WebRTC never arms a DTLS timer, and audio RTCP/RED only schedule when rtp->rtcp /
+	 * rtp->red are non-NULL (which chan_sofia never enables for plain audio) — zero load, zero regression.
+	 * set_configuration is the instance-level fail-closed proof (returns -1 on a NULL sched). */
+	if (sofia_sched) {
+		pvt->rtp = ast_rtp_instance_new("gabpbx",
+			ast_sched_thread_get_context(sofia_sched), &addr, NULL);
+	} else {
+		pvt->rtp = ast_rtp_instance_new("gabpbx", NULL, &addr, NULL);
+	}
 	if (!pvt->rtp) {
 		ast_log(LOG_ERROR, "Failed to create RTP instance for Sofia\n");
 		return -1;
@@ -1364,13 +1419,15 @@ static int sofia_rtp_init(struct sofia_pvt *pvt)
 	ast_rtp_instance_dtmf_mode_set(pvt->rtp, AST_RTP_DTMF_MODE_RFC2833);
 
 	if (!pvt->vrtp && (pvt->capability & AST_FORMAT_VIDEO_MASK)) {
-		pvt->vrtp = ast_rtp_instance_new("gabpbx", NULL, &addr, NULL);
+		/* Same sched provisioning as the audio instance (crash fix) — a future WebRTC video leg needs it. */
+		pvt->vrtp = ast_rtp_instance_new("gabpbx",
+			sofia_sched ? ast_sched_thread_get_context(sofia_sched) : NULL, &addr, NULL);
 		if (pvt->vrtp) {
 			ast_rtp_instance_set_prop(pvt->vrtp, AST_RTP_PROPERTY_RTCP, 1);
 		}
 	}
 
-	/* post-T56 tos/cos bundle [general] parity (2026-04-28): chan_sip parity at
+	/* tos/cos bundle [general] parity: chan_sip parity at
 	 * chan_sip.c:5888 verbatim — apply audio QoS markings (TOS/DSCP at L3 +
 	 * 802.1p CoS at L2) to RTP audio instance via gabpbx-core API
 	 * ast_rtp_instance_set_qos (rtp_engine.h:1311). Same for video on pvt->vrtp.
@@ -1386,7 +1443,7 @@ static int sofia_rtp_init(struct sofia_pvt *pvt)
 			(int)sofia_cfg.cos_video, "Sofia RTP video");
 	}
 
-	/* post-T56 rtp-timeout bundle per-peer parity (2026-04-28): chan_sip parity at
+	/* rtp-timeout bundle per-peer parity: chan_sip parity at
 	 * chan_sip.c:5862-5864 + L5880-5882 verbatim — apply per-peer RTP timeouts +
 	 * keepalive via gabpbx-core APIs (rtp_engine.h:1671/1689/1707). Each non-zero
 	 * value enables the respective behavior on the RTP instance: rtptimeout drops
@@ -1906,6 +1963,7 @@ static void sofia_subscribe_peer_gone_cb(void *data)
 	char *name = data;
 
 	sofia_subscribe_on_peer_gone(name);
+	sofia_eventsub_on_peer_gone(name);
 	ast_free(name);
 }
 
@@ -2103,6 +2161,7 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	peer->busy_on_active = sofia_cfg.busy_on_active;
 	peer->max_contacts = sofia_cfg.max_contacts ? sofia_cfg.max_contacts : 6;
 	peer->encryption = 0;
+	peer->webrtc = sofia_cfg.webrtc;	/* A4: inherit [general] webrtc; per-peer webrtc= overrides */
 	ast_string_field_set(peer, srtpcipher, S_OR(sofia_cfg.default_srtpcipher, ""));
 	peer->session_timers = sofia_cfg.default_session_timers;
 	peer->session_expires = sofia_cfg.default_session_expires;
@@ -2151,6 +2210,7 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	ast_string_field_set(peer, forceddiversion, "");
 	ast_string_field_set(peer, message_context, "");
 	ast_string_field_set(peer, mwi_subscribe, "");
+	ast_string_field_set(peer, subscribe_event, "");
 	ast_string_field_set(peer, callbackextension, "");
 	ast_string_field_set(peer, accountcode, "");
 	ast_string_field_set(peer, cid_name, "");
@@ -2425,6 +2485,9 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			/* Outbound MWI watcher: <localmailbox>[@context]. SUBSCRIBE this trunk for
 			 * Event: message-summary and inject the result into the local MWI cache. */
 			ast_string_field_set(peer, mwi_subscribe, v->value);
+		} else if (!strcasecmp(v->name, "subscribe_event")) {
+			/* Generic outbound SUBSCRIBE (RFC 6665): <event>[;<accept-mime>][;<expires>]. */
+			ast_string_field_set(peer, subscribe_event, v->value);
 		} else if (!strcasecmp(v->name, "callerid")) {
 			ast_string_field_set(peer, callerid, v->value);
 		} else if (!strcasecmp(v->name, "regexten")) {
@@ -2508,6 +2571,8 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			peer->max_contacts = sofia_clamp_max_contacts(atoi(v->value), peer->name);
 		} else if (!strcasecmp(v->name, "encryption")) {
 			peer->encryption = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "webrtc")) {
+			peer->webrtc = ast_true(v->value);	/* WebRTC A4: DTLS-SRTP + ICE-lite + rtcp-mux */
 		} else if (!strcasecmp(v->name, "srtpcipher")) {
 			/* SRTP suite preference for outbound a=crypto:N (RFC 4568 §6.1); typo
 			 * warnings deferred to emit time (a future res_srtp may add the suite). */
@@ -2770,7 +2835,7 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			/* outbound PUBLISH (RFC 3903): opt hint state into central publication. */
 			peer->publish = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "buggymwi")) {
-			/* a buggy SIP stack workaround: gates the Voice-Message " (0/0)" suffix. */
+			/* Cisco buggy-stack workaround: gates the Voice-Message " (0/0)" suffix. */
 			peer->buggymwi = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "lockuseragent")) {
 			peer->lockuseragent = ast_true(v->value);
@@ -2989,8 +3054,8 @@ struct sofia_peer *sofia_find_peer_cached(const char *name)
 /* chan_sip parity: IP-based fallback peer match.
  * Used by sofia_process_invite after the From-username lookup fails — typical
  * for trunk gateways whose From-user is the caller-ID number, not the peer
- * name (e.g. a carrier softswitch sending From: <sip:NNNNNNNNN@…> while the peer
- * is configured as [trunk_example] host=203.0.113.10). Matches peer->src_addr
+ * name (e.g. some UAs sending From: <sip:an-extension@…> while the peer
+ * is configured as [a-peer] host=an-upstream-host). Matches peer->src_addr
  * (set both by dnsmgr for static host=<ip> peers and by REGISTER for dynamic
  * peers) or, if that is unset, peer->defaddr. Port is ignored on purpose so
  * the existing SOFIA_INSECURE_PORT semantic stays the only port-mismatch
@@ -3597,17 +3662,32 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				{
 					char hbuf[80];
 					char c_transport[8];
-					snprintf(ruri, sizeof(ruri), "sip:%s@%s:%d", pvt->exten,
-						sofia_uri_format_host(c->host, hbuf, sizeof(hbuf)),
-						c->port);
-					/* Fork each branch over its contact's transport (snapshot the
-					 * refresh-mutable field). */
+					char c_host[128];
+					int c_port;
+					/* Snapshot the refresh-mutable contact fields under its lock, then
+					 * fork each branch over its contact's transport. */
 					ao2_lock(c);
 					ast_copy_string(c_transport, c->transport, sizeof(c_transport));
+					/* WSS fork: a SIP.js WS/WSS Contact host is a TEST-NET placeholder
+					 * (192.0.2.x) — a WebSocket client is reachable ONLY over its accepted
+					 * connection, so target the registered Via source (c->src_addr); sofia-sip
+					 * then reuses that tport once ;transport=wss is appended (RFC 7118; mirrors
+					 * sofia_resolve_peer_target). udp/tcp/tls keep the Contact host:port. */
+					if ((!strcasecmp(c_transport, "ws") || !strcasecmp(c_transport, "wss"))
+							&& !ast_sockaddr_isnull(&c->src_addr)) {
+						ast_copy_string(c_host, ast_sockaddr_stringify_host(&c->src_addr), sizeof(c_host));
+						c_port = ast_sockaddr_port(&c->src_addr);
+					} else {
+						ast_copy_string(c_host, c->host, sizeof(c_host));
+						c_port = c->port;
+					}
 					if (child->peer && child->peer->path_support) {
 						ast_copy_string(child_path, c->path, sizeof(child_path));	/* RFC 3327 */
 					}
 					ao2_unlock(c);
+					snprintf(ruri, sizeof(ruri), "sip:%s@%s:%d", pvt->exten,
+						sofia_uri_format_host(c_host, hbuf, sizeof(hbuf)),
+						c_port);
 					sofia_uri_append_transport(ruri, sizeof(ruri), c_transport);
 				}
 				ast_string_field_set(child, ruri, ruri);
@@ -3625,6 +3705,18 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				/* Init RTP + (if encryption=yes) per-child SRTP, then SDP. */
 				if (child->nh && sofia_rtp_init(child) == 0) {
 					int crypto_ok = 1;
+					/* A5: each fork child gets its own DTLS cert + ICE creds for an
+					 * independent WebRTC offer (mirrors the per-child SDES keys below).
+					 * child->rtp exists from sofia_rtp_init(child) above. Mutually
+					 * exclusive with the per-child a=crypto block. Fail per child (skip
+					 * its INVITE); if ALL children fail, the fork-empty path → 503. */
+					if (pvt->peer->webrtc) {
+						if (sofia_webrtc_provision_offer(child)) {
+							ast_log(LOG_ERROR, "Sofia: fork-child %d WebRTC offer provisioning failed (peer '%s')\n",
+								branch_idx, pvt->peer->name);
+							crypto_ok = 0;
+						}
+					} else
 					/* Each child needs independent crypto keys (RFC 4568). Hard-fail per
 					 * child → skip its INVITE; if ALL fail, the fork-empty path → 503.
 					 * No silent downgrade. */
@@ -3787,6 +3879,20 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 	 * non-inband peers pay zero alloc cost. */
 	sofia_enable_dsp_detect(pvt);
 
+	/* A5: outbound WebRTC offer — provision DTLS(actpass)+ICE-lite BEFORE generate_sdp
+	 * so the emitter produces a UDP/TLS/RTP/SAVPF offer carrying our fingerprint +
+	 * ufrag/pwd + host candidate. Mutually exclusive with the SDES a=crypto block
+	 * below (a WebRTC leg never offers a=crypto). pvt->peer is reliably set here
+	 * (sofia_request_call assigns it before sofia_rtp_init), so peer->webrtc is
+	 * authoritative on the outbound path. Fail closed: a webrtc=yes peer is never
+	 * downgraded to plain RTP. */
+	if (pvt->peer && pvt->peer->webrtc) {
+		if (sofia_webrtc_provision_offer(pvt)) {
+			ast_log(LOG_ERROR, "Sofia: webrtc=yes peer '%s' but WebRTC offer provisioning failed — aborting call\n",
+				pvt->peer->name);
+			return -1;
+		}
+	} else
 	/* Outbound encryption setup BEFORE generate_sdp (SAVP + a=crypto in the offer).
 	 * Hard-fail on alloc errors (-1 → 503); never silently downgrade. */
 	if (pvt->peer && pvt->peer->encryption) {
@@ -4090,6 +4196,14 @@ static int sofia_answer(struct ast_channel *ast)
 				TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
 				TAG_END());
 		}
+	}
+
+	/* A4 OQ6: activate the RTP instance AFTER the 200 OK is dispatched (the browser
+	 * starts ICE only once it has our answer). For a WebRTC leg this arms the
+	 * ICE/DTLS state machine; A3 also fires DTLS from the authenticated USE-CANDIDATE
+	 * path, so an early/duplicate activate is a no-op. Harmless for plain SIP. */
+	if (pvt->is_webrtc && pvt->rtp) {
+		ast_rtp_instance_activate(pvt->rtp);
 	}
 
 	ast_mutex_lock(&pvt->lock);
@@ -6901,7 +7015,16 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 			|| (peer->nonce_issued_at && (now_nr - peer->nonce_issued_at) > ttl_nr);
 		int nonce_matches = (auth_nonce && !ast_strlen_zero(peer->nonce)
 			&& !strcmp(auth_nonce, peer->nonce));
-		int nc_replay = (using_qop && nonce_matches && new_nc <= peer->last_nc);
+		/* nc-replay = qop + same live nonce + a non-advancing nc — BUT a TRUE replay only if the cnonce
+		 * ALSO repeats. RFC 2617 §3.2.2: the cnonce SHOULD be fresh per request and the digest binds it, so
+		 * a legit REGISTER refresh (the client restarts at nc=1 with a NEW cnonce, having no idea the server
+		 * silently reused the nonce) is NOT a replay; only a byte-identical (nonce,nc,cnonce) resend is.
+		 * Without the cnonce test, the reused per-peer nonce + carried last_nc rejected nearly every
+		 * refresh's first authed attempt as a false replay → spurious 401 stale=true + extra round-trip.
+		 * */
+		int nc_replay = (using_qop && nonce_matches && new_nc <= peer->last_nc
+			&& auth_cnonce && !ast_strlen_zero(peer->last_cnonce)
+			&& !strcmp(auth_cnonce, peer->last_cnonce));
 
 		if (nonce_dead || nc_replay) {
 			char fresh_nonce[64];
@@ -6990,6 +7113,9 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	 * RFC 2069 (no qop): clear nonce (single-use). */
 	if (using_qop) {
 		peer->last_nc = new_nc;
+		/* Remember this request's cnonce so the next nc-replay test can tell a legit refresh (fresh cnonce)
+		 * from a byte-identical resend (same cnonce). auth_cnonce is guaranteed present under qop. */
+		ast_copy_string(peer->last_cnonce, S_OR(auth_cnonce, ""), sizeof(peer->last_cnonce));
 	} else {
 		ast_string_field_set(peer, nonce, "");
 	}
@@ -7006,6 +7132,7 @@ static void sofia_regen_nonce_locked(struct sofia_peer *peer, char *out_buf, siz
 	ast_string_field_set(peer, nonce, out_buf);
 	peer->nonce_issued_at = time(NULL);
 	peer->last_nc = 0;
+	peer->last_cnonce[0] = '\0';	/* a fresh nonce starts a fresh nc/cnonce counting window */
 }
 
 /* domainsasrealm (chan_sip parity): when set + domain_list non-empty, check the
@@ -9304,11 +9431,14 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	ao2_ref(peer, -1);
 	peer = NULL;
 
-	/* The watched extension must have a dialplan hint, else nothing to watch. */
+	/* The watched extension must have a dialplan hint, else nothing to watch. A watcher subscribing to an
+	 * exten with no hint is a NORMAL/expected condition (not an error), so this is debug-only — at NOTICE it
+	 * floods the log on every such SUBSCRIBE. Visible with `sip set debug on`. */
 	if (!ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, l_context, to_user)) {
-		ast_log(LOG_NOTICE,
-			"Sofia presence: no hint for %s@%s (watcher SIP/%s) — 404\n",
-			to_user, l_context, l_peername);
+		if (sofia_debug) {
+			ast_verbose("Sofia presence: no hint for %s@%s (watcher SIP/%s) — 404\n",
+				to_user, l_context, l_peername);
+		}
 		nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
 		sofia_subscribe_reject_reap(nh);	/* reap the challenge handle */
 		return;
@@ -9549,6 +9679,12 @@ static void sofia_process_notify(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	 * dialogs. Checked FIRST (before the transfer hook and presence/MWI dispatch). The check
 	 * is pvt-free — it only reads nua_handle_magic — and 200-OKs internally when it consumes. */
 	if (sofia_subscribe_on_notify(nh, nua, sip)) {
+		return;
+	}
+	/* Generic outbound SUBSCRIBE (RFC 6665) watcher: a NOTIFY on one of OUR generic SUBSCRIBE dialogs
+	 * (distinct sentinel from the MWI watcher). Surfaces it as the AMI event SofiaEventNotify;
+	 * 200-OKs internally when it consumes. */
+	if (sofia_eventsub_on_notify(nh, nua, sip)) {
 		return;
 	}
 
@@ -10693,6 +10829,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 						 * registered, start (idempotently) its message-summary watcher
 						 * if mwi_subscribe is configured. No-op otherwise. */
 						sofia_subscribe_on_registered(peer);
+						sofia_eventsub_on_registered(peer);
 						/* GRUU Phase 2a: learn the pub-gruu/temp-gruu the registrar minted for
 						 * our +sip.instance (RFC 5627 §5.2). No-op unless gruu=yes. */
 						sofia_gruu_consume(peer, sip);
@@ -11066,10 +11203,15 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					ast_log(LOG_NOTICE,
 						"Sofia: orphan 200 OK on terminated INVITE %s: ACK + BYE per RFC 3261 13.2.2.4\n",
 						pvt->callid ? pvt->callid : "(no-callid)");
-					/* sofia-sip auto-ACKs unless AUTOACK(0) (NAT peer); then ACK here. */
-					if (sofia_build_nat_proxy_url_from_peer(pvt->peer, orphan_proxy_url, sizeof(orphan_proxy_url)))
+					/* sofia-sip auto-ACKs unless AUTOACK(0) (NAT peer); then ACK here. The BYE needs the
+					 * SAME proxy override (WSS/NAT placeholder Contact) or it hits the unroutable remote
+					 * target and the orphan dialog is never torn down. */
+					if (sofia_build_nat_proxy_url_from_peer(pvt->peer, orphan_proxy_url, sizeof(orphan_proxy_url))) {
 						nua_ack(nh, NUTAG_PROXY(orphan_proxy_url), TAG_END());
-					nua_bye(nh, TAG_END());
+						nua_bye(nh, NUTAG_PROXY(orphan_proxy_url), TAG_END());
+					} else {
+						nua_bye(nh, TAG_END());
+					}
 					break;
 				}
 				owner = pvt->owner;
@@ -11286,6 +11428,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		/* Outbound MWI SUBSCRIBE (a watcher) response — reactive digest auth + status handling.
 		 * Returns 1 (break) when nh is one of our MWISUB handles. */
 		if (sofia_subscribe_on_subscribe_response(nh, sip, status))
+			break;
+		/* Generic outbound SUBSCRIBE (RFC 6665) watcher response (distinct sentinel). */
+		if (sofia_eventsub_on_subscribe_response(nh, sip, status))
 			break;
 		if (sofia_debug)
 			ast_verbose("Sofia: SUBSCRIBE response %d %s\n", status, phrase);
@@ -11586,6 +11731,7 @@ static void *sofia_thread_func(void *data)
 	 * (re)start via sofia_subscribe_on_registered after their REGISTER 200. A later
 	 * `sip reload` reconciles via sofia_subscribe_reconcile. */
 	sofia_subscribe_start();
+	sofia_eventsub_start();
 
 	su_root_run(sofia_root);
 
@@ -11597,6 +11743,7 @@ static void *sofia_thread_func(void *data)
 
 	/* Outbound MWI SUBSCRIBE watcher teardown (sofia_thread, before nua_destroy). */
 	sofia_subscribe_stop();
+	sofia_eventsub_stop();
 
 	/* Ownership-correct teardown — su_root_destroy MUST run on the creating thread
 	 * (sofia-sip asserts; cross-thread aborts). unload_module signals us via
@@ -12200,6 +12347,8 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			sofia_cfg.max_contacts = sofia_clamp_max_contacts(atoi(v->value), "general");
 		} else if (!strcasecmp(v->name, "encryption")) {
 			sofia_cfg.encryption = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "webrtc")) {
+			sofia_cfg.webrtc = ast_true(v->value);	/* A4 WebRTC general default */
 		} else if (!strcasecmp(v->name, "default_srtpcipher") || !strcasecmp(v->name, "srtpcipher")) {
 			/* Default SRTP cipher list inherited by sofia_peer_alloc; both spellings accepted. */
 			ast_copy_string(sofia_cfg.default_srtpcipher, v->value, sizeof(sofia_cfg.default_srtpcipher));
@@ -12890,6 +13039,9 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			/* Outbound MWI watcher: <localmailbox>[@context]. SUBSCRIBE this trunk for
 			 * Event: message-summary and inject the result into the local MWI cache. */
 			ast_string_field_set(peer, mwi_subscribe, v->value);
+		} else if (!strcasecmp(v->name, "subscribe_event")) {
+			/* Generic outbound SUBSCRIBE (RFC 6665): <event>[;<accept-mime>][;<expires>]. */
+			ast_string_field_set(peer, subscribe_event, v->value);
 		} else if (!strcasecmp(v->name, "type")) {
 			if (!strcasecmp(v->value, "friend")) {
 				peer->type = SOFIA_TYPE_FRIEND;
@@ -12984,6 +13136,8 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			peer->max_contacts = sofia_clamp_max_contacts(atoi(v->value), peer->name);
 		} else if (!strcasecmp(v->name, "encryption")) {
 			peer->encryption = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "webrtc")) {
+			peer->webrtc = ast_true(v->value);	/* WebRTC A4: DTLS-SRTP + ICE-lite + rtcp-mux */
 		} else if (!strcasecmp(v->name, "srtpcipher")) {
 			/* SRTP suite preference; typo WARN happens at sdp_crypto_offer_list emit, not here. */
 			ast_string_field_set(peer, srtpcipher, v->value);
@@ -14380,6 +14534,7 @@ static void sofia_reload_worker(void *data)
 
 		/* Outbound MWI-SUBSCRIBE reconcile: add/remove watchers to match the new config. */
 		sofia_subscribe_reconcile();
+		sofia_eventsub_reconcile();
 	}
 
 	ast_config_destroy(cfg);
@@ -14487,6 +14642,13 @@ static int load_module(void)
 	/* outbound MWI SUBSCRIBE (a watcher): one subscription per mwi_subscribe= peer. */
 	if (sofia_subscribe_init()) {
 		ast_log(LOG_ERROR, "Unable to create Sofia MWI-subscribe container\n");
+		rc = AST_MODULE_LOAD_FAILURE;
+		goto err_cleanup;
+	}
+
+	/* generic outbound SUBSCRIBE (RFC 6665): one subscription per subscribe_event= peer. */
+	if (sofia_eventsub_init()) {
+		ast_log(LOG_ERROR, "Unable to create Sofia event-subscribe container\n");
 		rc = AST_MODULE_LOAD_FAILURE;
 		goto err_cleanup;
 	}
@@ -14632,6 +14794,7 @@ err_cleanup:
 	sofia_presence_destroy();
 	sofia_publications_destroy();
 	sofia_subscribe_destroy();
+	sofia_eventsub_destroy();
 	if (dialogs) {
 		ao2_ref(dialogs, -1);
 		dialogs = NULL;
@@ -14724,6 +14887,7 @@ static int unload_module(void)
 	sofia_presence_destroy();
 	sofia_publications_destroy();
 	sofia_subscribe_destroy();
+	sofia_eventsub_destroy();
 
 	return 0;
 }
