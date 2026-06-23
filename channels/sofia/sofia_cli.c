@@ -395,6 +395,7 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 	sofia_cli_peer_line(&buf, "DTMF mode", "%s", dtmf_str);
 	sofia_cli_peer_line(&buf, "Direct media", "%s", AST_CLI_YESNO(peer->directmedia));
 	sofia_cli_peer_line(&buf, "Encryption", "%s", AST_CLI_YESNO(peer->encryption));
+	sofia_cli_peer_line(&buf, "WebRTC", "%s", AST_CLI_YESNO(peer->webrtc));
 	sofia_cli_peer_line(&buf, "Codecs", "%s", ast_strlen_zero(codec_buf) ? "(default)" : codec_buf);
 	sofia_cli_peer_line(&buf, "Max call BR", "%d kbps", peer->maxcallbitrate);
 
@@ -829,6 +830,8 @@ char *sofia_cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 	ast_cli(a->fd, "  Allow overlap dialing:  %s\n", sofia_allowoverlap_str(sofia_cfg.default_allowoverlap_mode));
 	/* SRTP per-suite fresh-key option (chan_sofia-only). */
 	ast_cli(a->fd, "  SRTP per-suite keys:    %s\n", AST_CLI_YESNO(sofia_cfg.srtp_per_suite_keys));
+	/* WebRTC [general] default (DTLS-SRTP + ICE-lite + rtcp-mux); per-peer webrtc= overrides. */
+	ast_cli(a->fd, "  WebRTC (default):       %s\n", AST_CLI_YESNO(sofia_cfg.webrtc));
 	/* Force INVITE auth (chan_sofia-only global security override). */
 	ast_cli(a->fd, "  Force INVITE auth:      %s\n", AST_CLI_YESNO(sofia_cfg.force_invite_auth));
 	/* Auth algorithms (RFC 7616): static report; challenges are MD5-first, SHA-256

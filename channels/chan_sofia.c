@@ -13589,6 +13589,11 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.busy_on_active = 0;
 	sofia_cfg.max_contacts = 6;
 	sofia_cfg.encryption = 0;
+	/* WebRTC (DTLS-SRTP + ICE-lite + rtcp-mux) is OFF by default; [general] webrtc=yes opts in and
+	 * per-peer webrtc= overrides. RESET here in the compiled-default block so a `sip reload` that DROPS
+	 * webrtc=yes from [general] actually disables it — without this the live sofia_cfg.webrtc stayed
+	 * sticky across a reload (peers re-inherit it in sofia_peer_set_defaults; an explicit peer webrtc= still wins). */
+	sofia_cfg.webrtc = 0;
 	/* empty default = sdp_crypto.c fallback (AES_CM_128_HMAC_SHA1_80). */
 	sofia_cfg.default_srtpcipher[0] = '\0';
 	/* default 0 = shared-key mode. Module-scope mirror reset for sdp_crypto.c extern visibility. */

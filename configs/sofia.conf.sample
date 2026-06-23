@@ -146,7 +146,7 @@ srvlookup=yes
 ;   openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=mypbx"
 ;   cat cert.pem key.pem > /etc/gabpbx/keys/agent.pem
 ;   cp cert.pem /etc/gabpbx/keys/cafile.pem
-; T36: WebRTC media (DTLS-SRTP/ICE/BUNDLE) is Stage B — signaling-only here.
+; WebRTC media (DTLS-SRTP + ICE-lite + BUNDLE + rtcp-mux) IS supported — set webrtc=yes (see (4) below).
 ;
 ; --- Connection keepalive (TCP) — optional ---
 ; For connection-oriented transports, sofia-sip already keeps the OS socket alive with SO_KEEPALIVE
@@ -165,7 +165,7 @@ srvlookup=yes
 ;tcp_keepalive = 0
 ;tcp_pingpong = 0
 ;
-; --- WS+WSS deployment guidance (post-T56 Task #2 D-3 SS2 operator-honest expansion) ---
+; --- WS+WSS deployment guidance ---
 ;
 ; (1) ORIGIN HEADER VALIDATION (RFC 7118 §4.1.4) — DELEGATED TO REVERSE-PROXY:
 ;     The underlying sofia-sip ws.c does NOT validate the WebSocket Origin
@@ -198,11 +198,11 @@ srvlookup=yes
 ;     For signaling-only deployments behind a reverse-proxy, lenient acceptance
 ;     is safe (the reverse-proxy gates connection establishment).
 ;
-; (3) BROWSER SIP STACK EXAMPLES — sip.js + JsSIP (non-WebRTC media path):
-;     chan_sofia D-3 ships SIP signaling over WS+WSS only. Browser clients
-;     using sip.js or JsSIP libraries with plain RTP / SDES-SRTP media work
-;     out-of-the-box. WebRTC-mandated DTLS-SRTP + ICE + BUNDLE media remains
-;     Stage B (D-2 future task — see migration path below).
+; (3) BROWSER SIP STACK EXAMPLES — sip.js + JsSIP:
+;     chan_sofia ships SIP signaling over WS+WSS AND full WebRTC media. Browser
+;     clients using sip.js or JsSIP work both ways: plain RTP / SDES-SRTP, and
+;     native WebRTC media (DTLS-SRTP + ICE + BUNDLE + rtcp-mux) when the peer has
+;     webrtc=yes — see (4) below.
 ;
 ;     sip.js (https://sipjs.com/) minimal config:
 ;       const ua = new SIP.UserAgent({
@@ -228,41 +228,35 @@ srvlookup=yes
 ;       const ua = new JsSIP.UA(config);
 ;       ua.start();
 ;
-; (4) D-2 FUTURE-TASK MIGRATION PATH (full WebRTC media):
-;     Current D-3 scope: SIP signaling over WS+WSS only; media-layer remains
-;     plain RTP/SAVP (SDES-SRTP per RFC 4568) compatible with sip.js + JsSIP
-;     browser SIP stacks WITHOUT WebRTC mandate.
+; (4) WEBRTC MEDIA — set webrtc=yes (per-peer, or in [general] so all peers inherit it):
+;     chan_sofia speaks native WebRTC media end-to-end. A browser
+;     RTCPeerConnection (and sip.js / JsSIP using WebRTC media) registers over
+;     WSS and gets two-way audio — including browser-to-browser bridged by gabpbx.
+;       - DTLS-SRTP (RFC 5763/5764) — SRTP keys from the DTLS handshake
+;       - ICE-lite (RFC 8445 §2.5) — gabpbx answers connectivity checks; the
+;         browser is the full-ICE controlling agent
+;       - BUNDLE + rtcp-mux (RFC 8843 / RFC 5761) — one 5-tuple for RTP+RTCP
+;       - the WebRTC offer/answer is audio-only (RFC 8827)
+;     webrtc=yes makes chan_sofia offer/answer UDP/TLS/RTP/SAVPF with DTLS+ICE;
+;     a plain-RTP/SDES peer is unaffected (only a SAVPF offer engages the WebRTC
+;     path), so webrtc=yes in [general] is safe for a mixed fleet.
 ;
-;     WebRTC compliance limitations under D-3:
-;       - NO DTLS-SRTP (RFC 5763/5764) — chan_sofia uses SDES key exchange
-;       - NO ICE (RFC 8445) candidate gathering — chan_sofia uses host RTP only
-;       - NO BUNDLE / RTCP-MUX (RFC 8843) — chan_sofia uses separate RTCP port
-;     Operators MUST use non-WebRTC-mandate browser SIP stacks (sip.js / JsSIP
-;     with `mediaConstraints` set to plain RTP) for media. Native WebRTC
-;     `RTCPeerConnection` clients require D-2 (multi-month dedicated project,
-;     ~10,000+ LoC port from gabpbx77 reference + sofia-sip media-engine
-;     integration). D-2 deferred indefinitely pending operator commitment.
+;     ICE-lite REQUIRES the server's media address be reachable by the browser:
+;     on a NAT'd host set externip / media_address to the public IP. Full ICE
+;     candidate gathering + TURN for a server behind NAT is a future item — until
+;     then deploy gabpbx with a public-reachable media address (or a media relay).
 ;
-;     If full WebRTC is required, operator options:
-;       (a) deploy a WebRTC-to-SIP gateway (Janus, FreeSWITCH mod_verto) in
-;           front of chan_sofia — gateway handles DTLS-SRTP/ICE/BUNDLE,
-;           chan_sofia speaks plain RTP/SAVP behind it
-;       (b) wait for chan_sofia D-2 (no committed timeline)
-;       (c) use the existing chan_sip + res_pjsip stack on a parallel deploy
-;
-; (5) chan_sofia SURPASS over chan_sip on WS+WSS dimensions:
-;     chan_sip has NO WebSocket support whatsoever (verified — 0 hits in
-;     chan_sip.c for websocket/RFC 7118/wsbindport). chan_sofia D-3 ships:
-;       - WS + WSS listeners (T36 ec1bcd9)
-;       - transport=ws / transport=wss per-peer parser (D-3 SS1)
-;       - sip show peer / sip show settings / AMI SIPshowpeer Transport
-;         display extension (D-3 SS1, 28-FIELD MILESTONE on sip show settings)
-;       - LOG_WARNING on unknown transport= values (chan_sip silent fallback)
-;       - WSS auto-cert-link from agent.pem + cafile.pem (T36)
-;       - this operator-honest deployment guidance (D-3 SS2)
-;     This is Pattern 12 chan_sofia-feature-not-in-chan_sip-at-all sub-pattern
-;     33rd-instance — chan_sip operators with browser-UA needs migrate to
-;     chan_sofia for WS+WSS support.
+; (5) chan_sofia advantage over chan_sip on WS+WSS:
+;     chan_sip has NO WebSocket support whatsoever (0 hits in chan_sip.c for
+;     websocket / RFC 7118 / wsbindport). chan_sofia adds:
+;       - WS + WSS listeners
+;       - transport=ws / transport=wss per-peer parser
+;       - sip show peer / sip show settings / AMI SIPshowpeer Transport display
+;       - LOG_WARNING on unknown transport= values (chan_sip fell back silently)
+;       - WSS auto-cert-link from agent.pem + cafile.pem
+;       - this WS+WSS deployment guidance
+;     chan_sip operators with browser-UA needs migrate to chan_sofia for WS+WSS
+;     — and now full WebRTC media (see (4) above).
 ;
 ; --- end WS+WSS deployment guidance ---
 
