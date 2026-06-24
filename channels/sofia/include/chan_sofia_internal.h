@@ -201,6 +201,7 @@ void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
 struct sofia_contact *sofia_peer_first_contact(struct sofia_peer *peer);
 const char *sofia_uri_format_host(const char *host, char *out_buf, size_t out_len);
 void sofia_uri_append_transport(char *url, size_t len, const char *transport);
+const char *sofia_transport_name(int transport);
 void sofia_qualify_peer(struct sofia_peer *peer);
 #define SOFIA_SIPNOTIFY_HMAGIC ((nua_hmagic_t *)&sofia_sipnotify_sentinel)
 

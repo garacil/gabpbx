@@ -716,19 +716,23 @@ static void sipnotify_resolve_target(struct sofia_peer *peer, struct sofia_conta
 	} else {
 		char hbuf[80];
 		char l_defaultuser[256], l_name[256], l_host[256];
-		int l_port;
+		int l_port, l_transport;
 
 		ast_mutex_lock(&peer->lock);
 		ast_copy_string(l_defaultuser, peer->defaultuser, sizeof(l_defaultuser));
 		ast_copy_string(l_name, peer->name, sizeof(l_name));
 		ast_copy_string(l_host, peer->host, sizeof(l_host));
 		l_port = peer->port;
+		l_transport = peer->transport;
 		ast_mutex_unlock(&peer->lock);
 
 		snprintf(target_uri, len, "sip:%s@%s:%d",
 			!ast_strlen_zero(l_defaultuser) ? l_defaultuser : l_name,
 			sofia_uri_format_host(!ast_strlen_zero(l_host) ? l_host : "unknown", hbuf, sizeof(hbuf)),
 			l_port ? l_port : 5060);
+		/* Append the static peer's configured transport= so an out-of-dialog NOTIFY to a
+		 * never-registered TLS/TCP/WS/WSS peer doesn't silently default to UDP. */
+		sofia_uri_append_transport(target_uri, len, sofia_transport_name(l_transport));
 	}
 	*out_contact = contact;
 }

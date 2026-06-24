@@ -522,6 +522,18 @@ void sofia_uri_append_transport(char *url, size_t len, const char *transport)
 	}
 }
 
+/* Map a SOFIA_TRANSPORT_* bitmask to its lowercase ;transport= token (udp for unknown/default). */
+const char *sofia_transport_name(int transport)
+{
+	switch (transport) {
+	case SOFIA_TRANSPORT_TCP: return "tcp";
+	case SOFIA_TRANSPORT_TLS: return "tls";
+	case SOFIA_TRANSPORT_WS:  return "ws";
+	case SOFIA_TRANSPORT_WSS: return "wss";
+	default:                  return "udp";
+	}
+}
+
 /* Build a NAT-traversal proxy URL from peer->src_addr for outbound in-dialog
  * messages when peer has nat=force_rport (or comedia). Without it sofia-sip
  * routes the 2xx-ACK/BYE to the dialog remote_target (the Contact's unroutable
@@ -646,8 +658,9 @@ void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
 	const char *target_host = peer->host;
 	int target_port = peer->port;
 	char addr_buf[128];
-	/* Only the registered-source branch carries a learned transport; a static host
-	 * stays UDP. */
+	/* The registered-source branch carries a learned transport (peer->reg_transport);
+	 * a static host now routes over its configured transport= (peer->transport),
+	 * applied below via sofia_transport_name. */
 	int routed_via_registration = 0;
 
 	if (peer->registered && !ast_sockaddr_isnull(&peer->src_addr)
@@ -673,6 +686,11 @@ void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
 	}
 	if (routed_via_registration) {
 		sofia_uri_append_transport(out_url, out_len, peer->reg_transport);
+	} else {
+		/* Static host: route over the peer's configured transport= (tls/tcp/ws/wss). Without the
+		 * ;transport= param sofia-sip defaults the RURI to UDP, so a static TLS trunk silently went
+		 * out over UDP; udp/unknown is a no-op in the helper, so plain UDP peers are unaffected. */
+		sofia_uri_append_transport(out_url, out_len, sofia_transport_name(peer->transport));
 	}
 	/* usereqphone: append ;user=phone when set AND the user-part is a phone number. */
 	if (peer->usereqphone && sofia_user_looks_like_phone(user)) {
@@ -2902,10 +2920,23 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 		} else if (!strcasecmp(v->name, "expiresecs")) {
 			peer->expiresecs = atoi(v->value);
 		} else if (!strcasecmp(v->name, "transport")) {
-			/* Accepted but not applied (drop-in compat). Per-peer inbound transport is
-			 * not gated (chan_sip's check_request_transport allowlist is policy, not
-			 * attack-surface reduction); transports come from [general] *bindaddr and
-			 * the Contact URL scheme at REGISTER-time. Legacy rows are safe to leave. */
+			/* Store the configured transport so OUTBOUND requests to a STATIC peer route over it.
+			 * sofia-sip otherwise defaults the RURI to UDP, so transport=tls/tcp/ws/wss to a static
+			 * host (e.g. an external TLS trunk) silently went out over UDP.
+			 * This sets only the peer's outbound default; INBOUND transport is still governed by the
+			 * [general] *bindaddr listeners and the REGISTER Contact scheme (no inbound allowlist implied).
+			 * chan_sip parity: a comma-list (e.g. transport=tls,udp) uses the first/preferred token. */
+			char tbuf[16];
+			char *comma;
+			ast_copy_string(tbuf, v->value, sizeof(tbuf));
+			if ((comma = strchr(tbuf, ','))) {
+				*comma = '\0';
+			}
+			if (!strcasecmp(tbuf, "tls")) peer->transport = SOFIA_TRANSPORT_TLS;
+			else if (!strcasecmp(tbuf, "tcp")) peer->transport = SOFIA_TRANSPORT_TCP;
+			else if (!strcasecmp(tbuf, "ws")) peer->transport = SOFIA_TRANSPORT_WS;
+			else if (!strcasecmp(tbuf, "wss")) peer->transport = SOFIA_TRANSPORT_WSS;
+			else peer->transport = SOFIA_TRANSPORT_UDP;
 		} else if (!strcasecmp(v->name, "allow")) {
 			ast_parse_allow_disallow(&peer->prefs, &peer->capability, v->value, 1);
 		} else if (!strcasecmp(v->name, "disallow")) {
@@ -8050,8 +8081,8 @@ static void sofia_resolve_ourip(struct sofia_pvt *pvt, const struct ast_sockaddr
 
 		/* Per-transport external port (chan_sip parity): TCP->externtcpport,
 		 * TLS->externtlsport, UDP keeps externaddr/bindport.
-		 * NOTE: per-peer transport= never writes peer->transport (stays UDP), so the
-		 * TCP/TLS branches are dead for normal peers; kept for listener-level paths. */
+		 * NOTE: the transport= parse now writes peer->transport, so the TCP/TLS
+		 * externport branches are live for static TCP/TLS peers. */
 		if (pvt->peer) {
 			switch (pvt->peer->transport) {
 			case SOFIA_TRANSPORT_TCP:
