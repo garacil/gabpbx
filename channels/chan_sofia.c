@@ -13502,8 +13502,20 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "expiresecs") || !strcasecmp(v->name, "defaultexpiry")) {
 			peer->expiresecs = atoi(v->value);
 		} else if (!strcasecmp(v->name, "transport")) {
-			/* Silently accepted for drop-in compat; transports are per-listener ([general] bind
-			 * addrs) and per-Contact at REGISTER-time, not per-peer. */
+			/* Outbound transport for a static config-file peer (realtime twin: sofia_apply_peer_variables).
+			 * Without it a static TLS/TCP/WS/WSS host's RURI defaults to UDP; inbound stays per-listener
+			 * ([general] bind addrs) + per-Contact at REGISTER-time. Comma-list uses the first token. */
+			char tbuf[16];
+			char *comma;
+			ast_copy_string(tbuf, v->value, sizeof(tbuf));
+			if ((comma = strchr(tbuf, ','))) {
+				*comma = '\0';
+			}
+			if (!strcasecmp(tbuf, "tls")) peer->transport = SOFIA_TRANSPORT_TLS;
+			else if (!strcasecmp(tbuf, "tcp")) peer->transport = SOFIA_TRANSPORT_TCP;
+			else if (!strcasecmp(tbuf, "ws")) peer->transport = SOFIA_TRANSPORT_WS;
+			else if (!strcasecmp(tbuf, "wss")) peer->transport = SOFIA_TRANSPORT_WSS;
+			else peer->transport = SOFIA_TRANSPORT_UDP;
 		} else if (!strcasecmp(v->name, "allow")) {
 			ast_parse_allow_disallow(&peer->prefs, &peer->capability, v->value, 1);
 		} else if (!strcasecmp(v->name, "disallow")) {
