@@ -1528,6 +1528,56 @@ int ast_codec_get_samples(struct ast_frame *f)
 		/* 48,000 samples per second at 64kbps is 8,000 bytes per second */
 		samples = (int) f->datalen * ((float) 48000 / 8000);
 		break;
+	case AST_FORMAT_OPUS:
+		/* Opus is VBR — samples cannot be derived from datalen. Parse the packet's TOC byte
+		 * (RFC 6716 §3.1): the top 5 bits (config) select the per-frame duration, and the low 2
+		 * bits (code c) the frame count. samples = per-frame-samples@48kHz × frame-count. Without
+		 * this case ast_codec_get_samples returned 0 for every Opus frame (res_rtp_gabpbx.c sets
+		 * f->samples from here), which broke all Opus transcoding (no audio on transcoded calls). */
+		if (f->datalen < 1 || !f->data.ptr) {
+			samples = 0;
+			break;
+		}
+		{
+			unsigned char toc = ((unsigned char *) f->data.ptr)[0];
+			int config = toc >> 3;		/* 0..31 */
+			int code = toc & 0x3;		/* frame-count code c */
+			int fs;				/* per-frame samples @ 48 kHz */
+			int count;
+			static const int silk_fs[4] = { 480, 960, 1920, 2880 };	/* SILK 10/20/40/60 ms */
+			static const int celt_fs[4] = { 120, 240, 480, 960 };	/* CELT 2.5/5/10/20 ms */
+
+			if (config < 12) {		/* SILK NB/MB/WB */
+				fs = silk_fs[config & 0x3];
+			} else if (config < 16) {	/* Hybrid SWB/FB: 10/20 ms */
+				fs = (config & 0x1) ? 960 : 480;
+			} else {			/* CELT NB/WB/SWB/FB */
+				fs = celt_fs[config & 0x3];
+			}
+			if (code == 0) {
+				count = 1;
+			} else if (code == 1 || code == 2) {
+				count = 2;
+			} else {		/* code 3: frame count M in the low six bits (C mask 0x3f) of byte[1] (RFC 6716 §3.2.5) */
+				if (f->datalen < 2) {
+					samples = 0;	/* a code-3 packet MUST carry ≥2 bytes — fail closed on a malformed packet */
+					break;
+				}
+				count = ((unsigned char *) f->data.ptr)[1] & 0x3F;
+				if (count < 1) {
+					samples = 0;	/* M MUST NOT be 0 (RFC 6716 §3.2.5) — fail closed */
+					break;
+				}
+			}
+			/* RFC 6716 §3.2.5: a packet's total duration MUST NOT exceed 120 ms (5760 samples @ 48 kHz) —
+			 * reject a malformed/oversized frame count rather than inflate the sample count. */
+			if (fs * count > 5760) {
+				samples = 0;
+				break;
+			}
+			samples = fs * count;
+		}
+		break;
 	default:
 		ast_log(LOG_WARNING, "Unable to calculate samples for format %s\n", ast_getformatname_multiple(tmp, sizeof(tmp), f->subclass.codec));
 	}
