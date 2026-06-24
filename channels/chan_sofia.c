@@ -735,11 +735,11 @@ static struct sofia_contact *sofia_peer_find_contact_by_host_port(struct sofia_p
 	}
 	/* Pass 2: match the registered src_addr. A WSS/NAT peer's Contact host is a placeholder (SIP.js
 	 * .invalid / TEST-NET, RFC 7118 §8.1) or a private LAN IP, so an outbound request whose host:port was
-	 * built from the registered src_addr never matches c->host in pass 1 — leaving active_contact
+	 * built from the registered src_addr (BUG1/2) never matches c->host in pass 1 — leaving active_contact
 	 * NULL, which broke in-dialog ACK/BYE NAT routing (the caller never learned the call ended → 15s RTP
 	 * timeout). Pass 1 wins whenever the Contact host is routable, so this is zero-regression for udp/tcp/tls.
 	 * With multiple contacts the src_addr is unique per registration, so only the right one matches.
-	 * src_addr is refresh-mutable → read under the contact lock. */
+	 * src_addr is refresh-mutable → read under the contact lock. (robustness fix.) */
 	ci = ao2_iterator_init(peer->contacts, 0);
 	while ((c = ao2_iterator_next(&ci))) {
 		int match;
@@ -1017,6 +1017,23 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	child->srtp = NULL;
 	master->vsrtp = child->vsrtp;
 	child->vsrtp = NULL;
+
+	/* Carry the WebRTC pvt state that BELONGS
+	 * to the just-stolen rtp/vrtp/srtp instances onto master. Otherwise a forked WebRTC(-video) winner keeps
+	 * the media instances but master->is_webrtc stays 0 and master->capability/mids/tls-ids are unset, so a
+	 * later master re-INVITE/hold would emit plain RTP/AVP on a DTLS-SRTP leg and lose video. */
+	master->is_webrtc = child->is_webrtc;
+	master->webrtc_offerer = child->webrtc_offerer;
+	master->webrtc_bundle = child->webrtc_bundle;	/* sofia_generate_sdp emits the session a=group:BUNDLE only when is_webrtc && webrtc_bundle — a forked winner must keep it */
+	master->webrtc_answer_applied = child->webrtc_answer_applied;
+	master->webrtc_video_offerer = child->webrtc_video_offerer;
+	master->webrtc_video_answer_applied = child->webrtc_video_answer_applied;
+	master->webrtc_video_accepted = child->webrtc_video_accepted;
+	master->capability = child->capability;
+	ast_copy_string(master->webrtc_mid, child->webrtc_mid, sizeof(master->webrtc_mid));
+	ast_copy_string(master->webrtc_tls_id, child->webrtc_tls_id, sizeof(master->webrtc_tls_id));
+	ast_copy_string(master->webrtc_video_mid, child->webrtc_video_mid, sizeof(master->webrtc_video_mid));
+	ast_copy_string(master->webrtc_video_tls_id, child->webrtc_video_tls_id, sizeof(master->webrtc_video_tls_id));
 
 	/* Compute the stolen-RTP fds here (master->rtp/vrtp stable under master->lock)
 	 * but DEFER writing owner->fds[] until below under the channel lock, else it
@@ -1396,7 +1413,7 @@ static int sofia_rtp_init(struct sofia_pvt *pvt)
 	}
 
 	ast_sockaddr_parse(&addr, sofia_cfg.bindaddr, 0);
-	/* ALWAYS give the RTP instance the module-global sofia_sched context when
+	/* A4 OQ3 (crash fix): ALWAYS give the RTP instance the module-global sofia_sched context when
 	 * it exists — NOT gated on pvt->peer->webrtc. Inbound INVITEs create the RTP instance BEFORE the peer
 	 * is resolved (sofia_rtp_init precedes the pvt->peer assignment), so a peer->webrtc gate here is
 	 * racy/false for real inbound calls and would leave a WebRTC leg with rtp->sched==NULL, segfaulting
@@ -1427,7 +1444,7 @@ static int sofia_rtp_init(struct sofia_pvt *pvt)
 		}
 	}
 
-	/* tos/cos bundle [general] parity: chan_sip parity at
+	/* post-T56 tos/cos bundle [general] parity (2026-04-28): chan_sip parity at
 	 * chan_sip.c:5888 verbatim — apply audio QoS markings (TOS/DSCP at L3 +
 	 * 802.1p CoS at L2) to RTP audio instance via gabpbx-core API
 	 * ast_rtp_instance_set_qos (rtp_engine.h:1311). Same for video on pvt->vrtp.
@@ -1443,7 +1460,7 @@ static int sofia_rtp_init(struct sofia_pvt *pvt)
 			(int)sofia_cfg.cos_video, "Sofia RTP video");
 	}
 
-	/* rtp-timeout bundle per-peer parity: chan_sip parity at
+	/* post-T56 rtp-timeout bundle per-peer parity (2026-04-28): chan_sip parity at
 	 * chan_sip.c:5862-5864 + L5880-5882 verbatim — apply per-peer RTP timeouts +
 	 * keepalive via gabpbx-core APIs (rtp_engine.h:1671/1689/1707). Each non-zero
 	 * value enables the respective behavior on the RTP instance: rtptimeout drops
@@ -3054,8 +3071,8 @@ struct sofia_peer *sofia_find_peer_cached(const char *name)
 /* chan_sip parity: IP-based fallback peer match.
  * Used by sofia_process_invite after the From-username lookup fails — typical
  * for trunk gateways whose From-user is the caller-ID number, not the peer
- * name (e.g. some UAs sending From: <sip:an-extension@…> while the peer
- * is configured as [a-peer] host=an-upstream-host). Matches peer->src_addr
+ * name (e.g. Huawei SoftX3000 sending From: <sip:621120700@…> while the peer
+ * is configured as [trunk_eli4] host=213.162.195.21). Matches peer->src_addr
  * (set both by dnsmgr for static host=<ip> peers and by REGISTER for dynamic
  * peers) or, if that is unset, peer->defaddr. Port is ignored on purpose so
  * the existing SOFIA_INSECURE_PORT semantic stays the only port-mismatch
@@ -3109,10 +3126,11 @@ static enum ast_rtp_glue_result sofia_get_rtp_peer(struct ast_channel *chan,
 	ao2_ref(pvt->rtp, +1);
 	*instance = pvt->rtp;
 
-	/* SRTP active → force LOCAL relay (directmedia would disclose this leg's SRTP
-	 * key to the remote endpoint via re-INVITE). */
-	if (pvt->srtp || pvt->vsrtp) {
-		ast_debug(2, "Sofia: get_rtp_peer LOCAL (SRTP active, direct media inhibited)\n");
+	/* SRTP / DTLS-SRTP active → force LOCAL relay. directmedia would bridge this leg's encrypted media to a
+	 * possibly non-DTLS peer or disclose the SRTP key via re-INVITE. DTLS-SRTP (WebRTC) keys live in the
+	 * engine instance, NOT pvt->srtp/vsrtp, so is_webrtc must be checked explicitly. */
+	if (pvt->srtp || pvt->vsrtp || pvt->is_webrtc) {
+		ast_debug(2, "Sofia: get_rtp_peer LOCAL (SRTP/DTLS active, direct media inhibited)\n");
 		return AST_RTP_GLUE_RESULT_LOCAL;
 	}
 	if (!pvt->peer || !pvt->peer->directmedia) {
@@ -3668,7 +3686,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 					 * fork each branch over its contact's transport. */
 					ao2_lock(c);
 					ast_copy_string(c_transport, c->transport, sizeof(c_transport));
-					/* WSS fork: a SIP.js WS/WSS Contact host is a TEST-NET placeholder
+					/* BUG 2 / WSS fork: a SIP.js WS/WSS Contact host is a TEST-NET placeholder
 					 * (192.0.2.x) — a WebSocket client is reachable ONLY over its accepted
 					 * connection, so target the registered Via source (c->src_addr); sofia-sip
 					 * then reuses that tport once ;transport=wss is appended (RFC 7118; mirrors
@@ -4204,6 +4222,9 @@ static int sofia_answer(struct ast_channel *ast)
 	 * path, so an early/duplicate activate is a no-op. Harmless for plain SIP. */
 	if (pvt->is_webrtc && pvt->rtp) {
 		ast_rtp_instance_activate(pvt->rtp);
+	}
+	if (pvt->is_webrtc && pvt->webrtc_video_accepted && pvt->vrtp) {
+		ast_rtp_instance_activate(pvt->vrtp);	/* v1b: arm the non-BUNDLE video ICE/DTLS state machine (mirrors the audio rtp) */
 	}
 
 	ast_mutex_lock(&pvt->lock);
@@ -4931,6 +4952,13 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 			SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 			SIPTAG_PAYLOAD_STR(sdp_buf),
 			TAG_END());
+		/* Fix: this re-INVITE may have armed a fresh vrtp in sofia_parse_sdp (STEP 5) for an
+		 * added/updated video, but — unlike sofia_answer — never activated it. For an a=setup:passive video
+		 * offer our DTLS role is ACTIVE and the ClientHello only fires on activate, so video DTLS would never
+		 * start. Activate now the 200 OK is out, mirroring sofia_answer; a duplicate activate is a no-op. */
+		if (pvt->is_webrtc && pvt->webrtc_video_accepted && pvt->vrtp) {
+			ast_rtp_instance_activate(pvt->vrtp);
+		}
 	} else {
 		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, TAG_END());
 	}
@@ -5124,6 +5152,12 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 				SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 				SIPTAG_PAYLOAD_STR(sdp_buf),
 				TAG_END());
+			/* Fix: like the re-INVITE path — activate the freshly armed vrtp after the 200 OK so an
+			 * added-video UPDATE actually starts video DTLS (ACTIVE role fires its ClientHello on activate).
+			 * Mirrors sofia_answer; a duplicate activate is a no-op. */
+			if (pvt->is_webrtc && pvt->webrtc_video_accepted && pvt->vrtp) {
+				ast_rtp_instance_activate(pvt->vrtp);
+			}
 		} else {
 			nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, TAG_END());
 		}
@@ -7021,7 +7055,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		 * silently reused the nonce) is NOT a replay; only a byte-identical (nonce,nc,cnonce) resend is.
 		 * Without the cnonce test, the reused per-peer nonce + carried last_nc rejected nearly every
 		 * refresh's first authed attempt as a false replay → spurious 401 stale=true + extra round-trip.
-		 * */
+		 * (robustness fix.) */
 		int nc_replay = (using_qop && nonce_matches && new_nc <= peer->last_nc
 			&& auth_cnonce && !ast_strlen_zero(peer->last_cnonce)
 			&& !strcmp(auth_cnonce, peer->last_cnonce));
@@ -8823,6 +8857,7 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 				"Peer: SIP/%s\r\n"
 				"PeerStatus: CallLimitExceeded\r\n"
 				"Address: %s\r\n"
+				"TuCloudPBXName: \r\n"
 				"Context: %s\r\n"
 				"Accountcode: %s\r\n"
 				"ActiveCalls: %d\r\n"
@@ -8860,6 +8895,7 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 				"Peer: SIP/%s\r\n"
 				"PeerStatus: CallCountUpdated\r\n"
 				"Address: %s\r\n"
+				"TuCloudPBXName: \r\n"
 				"Context: %s\r\n"
 				"Accountcode: %s\r\n"
 				"ActiveCalls: %d\r\n"

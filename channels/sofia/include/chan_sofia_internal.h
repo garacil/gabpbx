@@ -165,8 +165,10 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip);
  * get_password. On success sets pvt->is_webrtc + pvt->webrtc_offerer + seeds
  * webrtc_mid="0"/webrtc_bundle/webrtc_tls_id so the emitter produces a complete
  * WebRTC offer. Does NOT call set_setup() (no remote role yet — keeps get_setup()
- * == ACTPASS so a=setup:actpass is emitted) and does NOT call ice->start() (no
- * remote creds yet — start() is deferred to the answer parse).
+ * == ACTPASS so a=setup:actpass is emitted). DOES call ice->start() to arm the STUN
+ * responder BEFORE the offer leaves the wire (early-STUN fix; safe with no remote creds,
+ * authenticated by our local ufrag/pwd set at ast_rtp_new). v1c also provisions pvt->vrtp
+ * (the video offer transport) when the capability has VP8/H264.
  *
  * \retval 0 success (pvt is now a provisioned WebRTC offerer)
  * \retval -1 failure (no dtls/ice/sched, or set_configuration failed) — caller
@@ -447,6 +449,12 @@ struct sofia_pvt {
 	 * built for the offer and must not be rebuilt). 0 for the A4 answerer path and
 	 * for every plain-SIP leg. */
 	unsigned int webrtc_offerer:1;
+	/* v1c: gabpbx OFFERED video over WebRTC (the video offerer). DISTINCT from webrtc_video_accepted (the
+	 * answerer path) — they are mutually exclusive per call. sofia_generate_sdp emits a real m=video when
+	 * webrtc_video_accepted OR (webrtc_video_offerer && !webrtc_video_answer_applied), NEVER both. Set in
+	 * sofia_webrtc_provision_offer when the effective capability has VP8/H264 and pvt->vrtp already exists
+	 * (sofia_rtp_init created it at chan_sofia.c:1421). */
+	unsigned int webrtc_video_offerer:1;
 	/* A5: remote DTLS/ICE from the browser ANSWER has been applied to the live
 	 * engine (set-once; guards a re-INVITE/2nd 18x+200 from re-applying). */
 	unsigned int webrtc_answer_applied:1;
@@ -460,6 +468,28 @@ struct sofia_pvt {
 	char webrtc_mid[64];
 	unsigned int webrtc_bundle:1;
 	char webrtc_tls_id[40];
+	/* A6 multi-m / video over WebRTC (RFC 3264 §6 + RFC 8843): the WebRTC answer MUST carry one m=
+	 * line per offered m= line (unaccepted ones reflected at port 0). Recorded at parse, emitted by
+	 * sofia_generate_sdp. v1a accepts audio and port-0 reflects ALL non-audio sections (incl. video) so a
+	 * browser audio+video+datachannel offer is not rejected for an m-line mismatch; v1b ACCEPTS video on a
+	 * separate non-BUNDLE pvt->vrtp transport (its own DTLS/ICE), datachannel stays port-0. */
+	char webrtc_video_mid[64];           /* offered m=video a=mid ("" = no video offered) */
+	unsigned int webrtc_video_offered:1;
+	unsigned int webrtc_video_accepted:1;    /* VP8/H264 intersect + own DTLS/ICE attrs + rtcp-mux + NOT bundle-only */
+	/* v1b non-BUNDLE video transport (audit STEP 1): the m=video runs on pvt->vrtp with its OWN
+	 * DTLS association + ICE, NOT bundled with the audio transport (RFC 8843 §7 separate-transport). */
+	char webrtc_video_tls_id[40];                /* RFC 8842 a=tls-id for the VIDEO association (distinct from webrtc_tls_id) */
+	unsigned int webrtc_video_answer_applied:1;  /* one-shot: vrtp DTLS/ICE already armed — do NOT re-arm on a re-INVITE */
+	unsigned int webrtc_video_bundle_only:1;     /* offer's m=video carried a=bundle-only (RFC 8843 §7.3.2) → MUST keep video port-0 reflected, cannot move out */
+	int webrtc_reject_m_count;
+	int webrtc_accepted_video_idx;           /* reject_m index of the accepted video — STEP 6 emits it real, the emit skips ONLY this entry; every OTHER m=video is port-0 reflected (1:1, RFC 3264 §6 count). -1 = none */
+	unsigned int webrtc_reject_overflow:1;   /* >ARRAY_LEN(webrtc_reject_m) non-audio m= offered → emit fails closed (RFC 3264 §6: cannot drop m-lines) */
+	struct sofia_webrtc_reject_m {
+		char type_name[16];  /* offered m= media-type STRING (sofia m_type_name), echoed verbatim (RFC 3264 §6) */
+		char proto[40];      /* m= transport proto-name (a port-0 reflect keeps it; RFC 3264) */
+		char fmt[24];        /* first m= format token */
+		char mid[64];        /* its a=mid (RFC 8843 — must appear in the answer too) */
+	} webrtc_reject_m[6];
 };
 
 struct sofia_peer {

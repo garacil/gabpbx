@@ -1,25 +1,31 @@
 # GABPBX
 
-GABPBX is the Germán Aracil Boned PBX: a GPLv2 open-source PBX and telephony
-toolkit maintained by Germán Luis Aracil Boned <garacilb@gmail.com>.
-
-The project was first created in **2008** and is based on the **Asterisk 1.8**
-codebase, later updated to the final stable 1.8 release. GABPBX keeps the proven
-Asterisk architecture, dialplan, AMI and realtime APIs where they are useful, and
-puts its new engineering where it matters most today: a modern, hardened SIP
-channel driver. Existing Asterisk, Digium and third-party copyright notices and
-the GPLv2 terms are preserved in the source files where they apply.
+GABPBX is the Germán Aracil Boned PBX: a GPLv2 open-source PBX and telephony toolkit maintained by Germán Luis Aracil Boned <garacilb@gmail.com>.
 
 ---
 
-## GABPBX 1.1.1 — meet `chan_sofia`
+## The basics — a fork of Asterisk 1.8
 
-`chan_sofia` is the headline of this project: a **modern SIP channel driver built
-on the battle-tested [Sofia-SIP](https://github.com/freeswitch/sofia-sip) NUA
-stack**, written as a **drop-in replacement for the aging `chan_sip`** — and then
-taken well beyond it.
+GABPBX is a **fork of the Asterisk 1.8 codebase**, first created in **2008** and tracked to the final stable 1.8 release. It keeps everything that made that generation of Asterisk dependable, and concentrates its new engineering where it matters most — the SIP channel.
 
-Migration is usually two lines:
+| You keep | What it means |
+| :-- | :-- |
+| **The proven Asterisk architecture** | Modules, channels, the PBX core, the scheduler — unchanged. |
+| **The same dialplan** | Contexts, extensions, priorities, applications and functions, byte-for-byte familiar. |
+| **The same AMI** | The Asterisk Manager Interface and its event/action model. |
+| **The same realtime APIs** | `extconfig.conf`, the realtime engines, and the familiar `sippeers` / `sipregs` families. |
+
+Existing Asterisk, Digium and third-party copyright notices and the GPLv2 terms are preserved in the source files where they apply.
+
+---
+
+## GABPBX 1.1.2 — the star is `chan_sofia`
+
+**`chan_sofia` is a complete, modern SIP channel driver built on the battle-tested [Sofia-SIP](https://github.com/freeswitch/sofia-sip) NUA stack — a true drop-in replacement for the aging `chan_sip`, with every `chan_sip` capability and a great deal more.** It is **feature-complete in release 1.1.2** and now adds **two-way WebRTC video**.
+
+Where `chan_sip` hand-rolled its own parser, `chan_sofia` rides a real SIP transaction state machine — the same library lineage that powers large-scale softswitches — and puts the PBX behavior on top. The result is a SIP driver that is at once **more capable, more secure, and dramatically more scalable** than the channel it replaces.
+
+### Drop-in migration in two lines
 
 ```ini
 ; /etc/gabpbx/modules.conf
@@ -27,184 +33,149 @@ noload => chan_sip.so
 load   => chan_sofia.so
 ```
 
-Your dial plans, `sip show …` CLI muscle memory, `SIPpeers` / `SIPshowpeer` AMI
-integrations, the `sippeers` realtime family and the `SIPPEER` / `SIP_HEADER`
-dialplan functions all keep working — now on a maintained SIP stack with a real
-transaction layer underneath. (`chan_sofia` and `chan_sip` register the same
-public names, so load one or the other per instance, not both.)
+Your dial plans, your `sip show …` muscle memory, your `SIPpeers` / `SIPshowpeer` AMI integrations, the `sippeers` realtime family and the `SIPPEER` / `SIP_HEADER` dialplan functions **all keep working**. The channel tech is still `SIP`, so every `${CHANNEL(...)}`, CDR, AMI and dialplan consumer sees `SIP/<peer>` exactly as before. (`chan_sofia` and `chan_sip` register the same public names — load one or the other per instance, not both.)
 
-## Why `chan_sofia` is special
+### At a glance
 
-**A real SIP stack, not a hand-rolled parser.** Sofia-SIP gives `chan_sofia` a
-proper transaction state machine, multi-transport handling and RFC-correct
-message construction — the same library lineage that powers large-scale
-softswitches. `chan_sofia` adds the PBX behaviour on top and stays out of the
-stack's way.
+- **Drop-in for `chan_sip`** — same `SIP/<peer>` channel, same `sip show …` CLI, same `SIPpeers` AMI, same `sippeers` realtime family.
+- **Far beyond `chan_sip`** — SIP Outbound, Path, Service-Route, GRUU, PRACK/100rel, UPDATE, REFER transfer, MESSAGE, PUBLISH, presence/BLF, SHA-256 auth, and more.
+- **WebRTC ready** — browsers register and call over secure WebSocket with DTLS-SRTP, ICE-lite, rtcp-mux and BUNDLE, **two-way audio and two-way video**, with **no `pjproject` and no `libnice`** in the tree.
+- **Built for carrier scale** — a single Sofia event thread plus a small fixed I/O pool, O(1) hash tables, a bounded register pool under storms, and a lean high-throughput media engine.
+- **Exceptionally robust** — hardened and security-audited by the world's most advanced AI systems through a rigorous, multi-round adversarial correctness, concurrency and security review.
 
-**Lean and concurrent by design.** Signalling runs on a single Sofia event thread
-plus a small fixed I/O pool — not a thread per registration or per TLS connection —
-so a few threads carry thousands of peers. Per-peer and per-call state is compact
-and reference-counted, peer/dialog lookups are O(1) hash tables sized for carrier
-load, and under a registration storm the realtime database writes can be handed to
-a bounded worker pool (`register_pool`) so the signalling thread never blocks.
+---
 
-**Hardened on purpose.** `chan_sofia` went through a deep, multi-round correctness
-and concurrency campaign: one canonical lock order (channel → pvt → peer), the
-snapshot-under-lock discipline everywhere off the Sofia thread, teardown-race and
-reload use-after-free fixes, a validate-then-commit SDP engine (a rejected
-re-INVITE never disturbs the live call), bounded SDP build buffers, and SRTP
-applied only after the offer is accepted — all verified under a concurrency stress
-harness with `DEBUG_THREADS`.
+## `chan_sofia` — the complete feature catalogue
 
-**A lean, high-throughput media engine.** GabPBX keeps its RTP core deliberately
-small, and it shows under load. Compared against the `res_rtp_asterisk` engine in
-**Asterisk Certified 22.8**, the GabPBX RTP engine:
+Every capability is enumerated below, grouped for scanning. Each is real and lives in `channels/chan_sofia.c`, `channels/sofia/*.c`, or `res/res_rtp_gabpbx.c`.
 
-- carries **zero mutex locks in the RTP read hot path** — the modern engine takes
-  the per-instance lock several times *per packet* for ICE/bundling;
-- runs **no mandatory per-packet ICE, DTLS, BUNDLE, header-extension or
-  NACK-retransmit work** for ordinary RTP — those are opt-in, not always-on taxes;
-- keeps a compact RTP instance of **~60 fields, ~8–10 KB per call**, versus ~115
-  fields that grow to **~270–320 KB per call** once retransmission buffers are active.
+### 1. SIP signaling
 
-For plain SIP/RTP that is roughly **an order of magnitude less work per packet** and
-far less memory per call, so the same hardware carries substantially more concurrent
-calls. Throughput-costly features stay opt-in — the engine is lean *by design*.
+| Feature | What it does |
+| :-- | :-- |
+| **Inbound REGISTER / registrar** | Phones register their location with credential checks, per-peer source ACLs and unknown-peer rejection. |
+| **REGISTER expiry bounds** | Enforces min/max registration lifetimes; a too-short refresh gets `423 Interval Too Brief` with `Min-Expires`, blunting registration-flood abuse. |
+| **Contact binding registry + query** | Stores each phone's reachable Contact under lock; a Contact-less REGISTER is answered as a pure "where am I registered?" query without changing state. |
+| **Outbound REGISTER (trunk)** | `register =>` lines register the PBX to upstream providers, with scheduled re-registration and an AMI `Registry` event on the response. |
+| **Qualify / OPTIONS keepalive** | Periodic SIP OPTIONS pings confirm reachability, measure round-trip time, and mark dead peers unreachable. |
+| **RTP keepalive** | Optional tiny periodic media packets keep NAT/firewall pinholes open during a call or on hold. |
+| **INVITE handling (in + out)** | The call-setup engine: incoming calls into the dialplan, outgoing calls to peers and trunks, plus re-INVITE. |
+| **INVITE digest authentication** | Incoming calls can be challenged for a password, with toll-fraud guards for unknown and guest callers (`alwaysauthreject`, `allowguest=no`). |
+| **Digest algorithms — MD5 + SHA-256 (RFC 7616)** | Selectable per deployment, with anti-downgrade so the server accepts only an algorithm it offered. |
+| **Cryptographic nonce + TTL/stale** | Each challenge uses a fresh 128-bit nonce from `/dev/urandom` with a configurable lifetime; an expired-nonce client is re-challenged (`stale`), not rejected. |
+| **WWW-Authenticate per policy** | Advertises exactly the algorithms the operator enabled (MD5 first for legacy phones, SHA-256, or both). |
+| **100rel / PRACK (RFC 3262)** | Reliable provisional responses, so call-progress like "ringing" is acknowledged and never lost on a lossy link. |
+| **UPDATE (RFC 3311)** | In-dialog media renegotiation — hold, codec swap, session-timer refresh — without disrupting the dialog. |
+| **Session timers (RFC 4028)** | Long calls are periodically refreshed so a crashed phone or dropped link cannot leave a zombie call billing forever. |
+| **Q.850 cause / Reason (RFC 3326)** | Internal hangup reasons map to standardized telephony cause codes on outbound BYE/CANCEL and parse back inbound. |
+| **REFER transfer — outbound** | Transfers a connected call to a third party, blind or attended (with `Replaces`), via a tech callback and a `SofiaTransfer()` application. |
+| **REFER transfer — inbound** | Honors a phone's REFER, including attended transfers via `Replaces` and the RFC 5589 transferer-leg BYE deferral. |
+| **Out-of-dialog MESSAGE / SIP SIMPLE** | Sends and receives SIP instant messages independent of a call; inbound routes to a `message_context`, outbound from the dialplan or AMI. |
+| **Inbound SUBSCRIBE/NOTIFY routing** | Routes each event-package subscription to the right handler (MWI, dialog-info, presence), rejecting unsupported packages with `489 Bad Event`. |
+| **Presence + BLF / dialog-info** | Drives speed-dial lamps showing whether a monitored colleague is idle, ringing or on a call, in `dialog-info+xml`, `pidf+xml` or `xpidf+xml`. |
+| **MWI — inbound subscription + NOTIFY (RFC 3842)** | Lights message-waiting indicators with the voicemail count, solicited or unsolicited. |
+| **MWI — outbound SUBSCRIBE watcher** | Subscribes to a provider's voicemail-status notifications and re-lights local phones, with retry/backoff on a failed initial subscribe. |
+| **Generic outbound SUBSCRIBE (RFC 6665)** | Subscribes a trunk to any event package and surfaces each notification as a `SofiaEventNotify` AMI event. |
+| **Outbound PUBLISH / EPA (RFC 3903)** | Publishes a local extension's presence/state upstream, refreshing with `SIP-If-Match`/ETag. |
+| **INFO — DTMF relay** | Carries key-press digits inside SIP signaling both ways, separate from inband or RFC 2833. |
+| **OPTIONS — capability responder** | Answers SIP OPTIONS pings with a 200 OK advertising every supported method plus `Accept: application/sdp`. |
+| **GRUU (RFC 5627/5626)** | Advertises a stable per-device instance ID and learns the routable address the registrar mints. |
+| **Path (RFC 3327)** | As a registrar, records and honors the edge-proxy route a phone registered through, rejecting forged Path with `420 Bad Extension`. |
+| **Service-Route (RFC 3608)** | On outbound registration, remembers the provider-mandated route and pre-loads it on outgoing calls. |
+| **SIP Outbound / reg-id + Flow-Timer (RFC 5626)** | Advertises outbound support and a registration ID and honors the provider's flow-keepalive timer, for reliable connectivity behind firewalls. |
+| **Diversion (RFC 5806)** | Carries forwarding history outbound and parses it inbound into redirecting info, with a per-trunk forced-Diversion override. |
+| **SIP history / call-event recording** | A per-call timeline of every SIP request and response for diagnostics, viewable while a call is traced. |
+| **Local anti-abuse SIP blacklist** | Counts and bans abusive source IPs (failed-auth probes, malformed requests, unknown-peer REGISTERs) to blunt brute-force and scanning. |
 
-## What it does — and where it surpasses `chan_sip`
+### 2. Media & WebRTC
 
-Everything you expect from a SIP channel, plus capabilities `chan_sip` never had
-(★ = beyond `chan_sip`):
+| Feature | What it does |
+| :-- | :-- |
+| **RTP/RTCP media stack (forked engine)** | RFC 3550 RTP/RTCP with symmetric-RTP NAT traversal, jitter handling, RED and sender/receiver reports. One forked engine (`gabpbx_rtp_engine`) carries plain calls and WebRTC alike. |
+| **SRTP with SDES (RFC 4568)** | Encrypted media via SDP `a=crypto` — AES-CM 128/192/256 with HMAC-SHA1 80/32 and two GCM suites — validated and staged so a bad `a=crypto` never silently downgrades a live call to plaintext. |
+| **DTLS-SRTP keying (RFC 5763/5764)** | WebRTC-grade keying derived from a DTLS handshake over the media path, with SHA-256 fingerprints, ephemeral self-signed certs, and `a=setup` role negotiation. A fingerprint mismatch fails the call closed. |
+| **WebRTC ICE-lite STUN responder (RFC 8445)** | A dependency-free ICE-lite agent — no `pjproject`, no `libnice`. GABPBX is permanently the controlled lite agent; it answers STUN checks, learns the peer, and latches the nominated pair on USE-CANDIDATE. |
+| **RTCP multiplexing (RFC 5761)** | `rtcp-mux` so RTP and RTCP share one socket on WebRTC legs, with exactly one DTLS association per media stream. |
+| **BUNDLE negotiation (RFC 8843)** | Emits session-level `a=group:BUNDLE` and per-m-line `a=mid`; unsupported offered m-lines are reflected back as port-0 rejections rather than 488-ing the session. |
+| **SIP over secure WebSocket (WSS / RFC 7118)** | Browsers register and call over SIP-over-WSS (and plain WS); in-dialog ACK/BYE route back over the exact accepted WebSocket connection. |
+| **WebRTC audio (browser-to-browser)** | A real two-way audio call between two WSS browsers, opt-in per peer with `webrtc=yes`. A `webrtc=yes` peer fails the call rather than fall back to insecure media. |
+| **Two-way WebRTC video (VP8/H.264)** | GABPBX both accepts a browser's offered video and offers video itself; video runs on its own transport (separate mid, port and DTLS association from audio). |
+| **Opus with passthrough-correctness fixes** | Opus (RFC 7587, 48 kHz, stereo, `useinbandfec`) is offered and answered, and a both-Opus call relays with no transcoding (codec selection, 48 kHz clocking, and a smoother exemption for Opus's variable-size frames). |
+| **T.38 fax (UDPTL) with state machine** | Real-time T.38 over UDPTL with a 4-state negotiation machine, re-INVITE handling, `far-max-IFP` and a 5-second abort timeout; correctly suppressed inside WebRTC SDP. |
+| **Direct media (re-INVITE bridging) with safety gates** | `directmedia` (alias `canreinvite`) lets endpoints exchange RTP directly when safe; any SRTP/DTLS leg, NAT'd peer or ACL mismatch forces local relay. |
+| **Codec negotiation (offer/answer)** | Codecs emitted in preference order, answer intersected with local capability, no-common-audio offer cleanly rejected with `488`; `preferred_codec_only` narrows to one codec; per-codec fmtp for G.729, Opus and iLBC. |
+| **DTMF: RFC 2833, SIP INFO, inband, auto** | All standard modes per peer, with a clash-safe telephone-event payload type, `relaxdtmf` for poor lines, and `SIPDtmfMode` to switch mode mid-call. |
+| **RFC 7983 packet demux** | On a WebRTC leg, demuxes STUN, DTLS and (S)RTP/RTCP by first byte on the one muxed socket — dormant unless DTLS is active, so plain calls are untouched. |
 
-**Registration & trunking**
-- Inbound registrar + outbound `register =>` trunks with working digest auth,
-  `sip show registry`, `sip unregister <peer>`.
-- ★ **RFC 5626 SIP Outbound** (`sip_outbound`), ★ **RFC 3327 Path** (`path=yes`),
-  ★ **RFC 3608 Service-Route** ingestion, ★ **GRUU** (`+sip.instance`, pub-GRUU as
-  the dialog Contact).
+### 3. Transports
 
-**Call signalling**
-- ★ **RFC 3262 reliable provisionals / PRACK** (`rel100`), ★ **RFC 3311 in-dialog
-  UPDATE**, ★ **RFC 3326 Q.850 Reason** on BYE/CANCEL, REFER transfer, and
-  out-of-dialog **SIP MESSAGE** (SIMPLE).
+| Feature | What it does |
+| :-- | :-- |
+| **Multi-transport listener** | One `nua_create()` spins up UDP, TCP, TLS, WS and WSS, each enabled only when its bind port is non-zero. |
+| **Per-transport bind addresses/ports** | `bindaddr`/`bindport`, `tlsbindaddr`/`tlsbindport`, `wsbindaddr`/`wsbindport`, `wssbindaddr`/`wssbindport`, IPv6-aware per RFC 3261 §19.1.2. |
+| **TLS hardening** | `tlsverify`, `tlsverifyclient` (mutual TLS), `tls_min_version`, `tls_ciphers`, `tls_verify_depth`, and verify-date — closing the accept-any-cert MITM hole sofia-sip leaves open by default. |
+| **WSS certificate auto-aliasing** | Auto-creates the WSS-named cert/ca-bundle files the WebSocket transport expects from the standard `agent.pem`/`cafile.pem`. |
+| **Placeholder-Contact routing** | A browser's Contact host is a placeholder, so requests route over the live accepted WebSocket with `;transport=wss` appended. |
 
-**Presence, BLF & voicemail**
-- Inbound SUBSCRIBE → NOTIFY for dialog-info / PIDF (BLF), device-state on call
-  transitions, both **solicited and ★ unsolicited MWI** (`subscribemwi`).
-- ★ **Outbound PUBLISH (RFC 3903)** — publish local state to a central presence
-  server; ★ **generic outbound SUBSCRIBE** for any event package; ★ **outbound MWI
-  SUBSCRIBE watcher** that mirrors an upstream voicemail server's lamps locally.
+### 4. Operations & `chan_sip` parity
 
-**Media**
-- Full codec negotiation (including Opus), **SDES-SRTP**, **T.38 fax**, direct
-  media, per-peer RTP timeouts, and ★ **`media_address`** to advertise media on a
-  different interface than signalling.
+| Feature | What it does |
+| :-- | :-- |
+| **CLI — `sip show …`** | `sip show peers`, `sip show peer <name>` (full detail, tab-completed), `sip show settings`, `sip show registry`, `sip show channels` / `channelstats`, `sip show inuse` — chan_sip's column layout, snapshotted under lock. |
+| **CLI operations** | `sip reload`, `sip set debug [on|off|peer|ip]`, `sip qualify peer`, `sip unregister`, `sip prune realtime`, `sip notify`, plus the history and blacklist families. |
+| **AMI parity** | `SIPpeers`/`SIPshowpeer`, `SIPqualifypeer`, `SIPshowregistry`, `SIPnotify`, and `SofiaMessageSend`, each mirroring chan_sip's field set (Transport extended to `ws`/`wss`). |
+| **Realtime `sippeers` family** | On a cache miss a peer is loaded from `sippeers`, with optional dual-load of `sipregs` auto-detected via `ast_check_realtime`. |
+| **Realtime registration write-back** | For realtime peers with `rtupdate=yes`, bindings are written back on REGISTER and cleared on unregister, with an optional bounded background pool. |
+| **Dialplan functions** | `${SIPPEER()}`, `${SIP_HEADER()}`, `${SIPCHANINFO()}`, `${CHECKSIPDOMAIN()}` — chan_sip-parity verbatim. |
+| **Per-peer option parity** | The full chan_sip per-peer vocabulary (`host`/`context`/`secret`/`transport`/`allow`/`disallow`/`nat`/`directmedia`/`qualify`/`callgroup`/`mohinterpret`/session timers/`insecure`/`permit`/`deny` and more) loads unchanged. |
+| **NAT, ACL, MOH, qualify** | `nat=force_rport,comedia`; three independent ACL chains (source, contact, direct-media) plus a global `localha`; per-peer MOH; qualify with RTT and `PeerStatus` AMI transitions. |
 
-**Security & transport**
-- UDP / TCP / TLS, ★ **mutual TLS** (`tlsverifyclient`) and TLS hardening
-  (`tls_min_version`, `tls_ciphers`, `tls_verify_depth`), ★ **TCP keepalive**
-  (`tcp_keepalive` / `tcp_pingpong`), digest auth with MD5 **and SHA-256**,
-  anti-downgrade `qop`, source-IP and contact ACLs, and a REGISTER brute-force
-  blacklist.
+### 5. Security & Robustness
 
-**NAT**
-- `externip` / `externaddr` / `externhost` / `localnet`, `comedia`, `force_rport`,
-  and registered-transport-aware routing so a TCP/TLS phone is reached over the
-  transport it registered on.
+| Feature | What it does |
+| :-- | :-- |
+| **MD5 + SHA-256 digest auth (RFC 7616)** | Per-deployment algorithm selection with anti-downgrade. |
+| **Crypto-secure nonces + TTL/stale** | Fresh 128-bit `/dev/urandom` nonces; expired-nonce clients re-challenged, not rejected. |
+| **Constant-time digest compare** | Response compared with a constant-time `memcmp` to deny a timing oracle. |
+| **Fail-closed challenges** | `alwaysauthreject` makes an unknown peer indistinguishable from a bad password; `allowguest=no` returns 403; `force_invite_auth` overrides `insecure=invite` and raises an auditable AMI event. |
+| **Three independent ACL chains** | Source, Contact, and direct-media ACLs, plus a global `localha`, with a timing-equalized 403 so ACL denial is not a peer-existence oracle. |
+| **Multi-Contact REGISTER preflight** | A multi-Contact REGISTER is validated in full before any binding is applied. |
+| **Local anti-abuse SIP blacklist** | Counts and bans abusive source IPs. |
+| **REGISTER expiry bounds** | Enforced min/max lifetimes to blunt registration-flood abuse. |
+| **TLS / WSS hardening** | Mutual TLS, min-version, ciphers, verify-depth/date on the TLS listener; WSS builds its own SSL context. |
+| **SRTP validated, staged & deferred** | `a=crypto` validated in full and committed only past every reject gate; live keying withheld until the single commit block. |
+| **DTLS-SRTP trust anchored on the fingerprint** | Fail-closed `X509_digest` + `memcmp` against the SDP `a=fingerprint`; any absence or mismatch tears the call down as a possible MITM. |
+| **Anti-downgrade SDP gating** | A DTLS/SAVPF offer is never answered as plain RTP/AVP, and a plain answer to a DTLS offer is rejected, so media never connects silently insecure. |
+| **Encryption never bridged** | Direct media is force-disabled on any SRTP/DTLS leg, so keys are never relayed to a non-secure peer. |
+| **Documented concurrency model** | A single canonical lock order (`channel → pvt → peer`), single-owner Sofia thread, snapshot-under-lock off-thread, reload UAF fixes, and foreign-thread `nua_*` marshalling. |
 
-**Diagnostics & operations**
-- ★ **Per-call SIP history with a verbose call-analysis pass** (outcome, failure
-  reason, timeline, negotiated codecs) + a source/destination capture filter and a
-  retained ring that keeps a call inspectable *after hangup*.
-- ★ **Caller→called on every log line.** GABPBX prefixes the main log with
-  `[caller|called]`, so you can follow who is calling whom at a glance:
-  ```text
-  [alice|1000] Executing [1000@internal:1] Dial("SIP/alice-00000003", "SIP/1000")
-  [alice|1000] SIP/1000-00000004 answered SIP/alice-00000003
-  ```
-- The complete realtime peer/registration model (`sippeers`, `sipregs`), and the
-  `SIPpeers` / `SIPshowpeer` / `SIPqualifypeer` / `SIPnotify` AMI actions.
+---
 
-### CLI commands
+## Engineered for large workloads — carrier scale
 
-```text
-# Inspect
-sip show peers                 sip show peer <name>
-sip show settings              sip show registry
-sip show channels              sip show channel <call-id>
-sip show channelstats          sip show inuse [all]
-sip show publications          sip show history [<call-id> [verbose]]
-sip show blacklist
+`chan_sofia` is built for high-volume, carrier-grade deployments, not just small installs.
 
-# Act
-sip qualify peer <name>        sip notify <type> <peer>
-sip unregister <peer>          sip reload
-sip prune realtime [peer|all]
-sip blacklist search|delete|clear <ip>
+- **Lean concurrency.** A **single Sofia event thread** owns all mutable signaling state and runs every callback, complemented by a **small fixed I/O pool** — not a thread per peer. This keeps context-switching and lock contention flat as registrations climb into the tens of thousands.
+- **O(1) hash tables sized for carrier load.** Peer, dialog and registration lookups are constant-time hash lookups dimensioned for carrier-scale populations, so call setup does not slow down as the system fills.
+- **Bounded register pool under storms.** A bounded background worker pool absorbs realtime registration write-backs off the event thread, with OOM-safe drop semantics (the next REGISTER refreshes a dropped update) so a registration storm cannot stall signaling or exhaust memory.
+- **A lean high-throughput media engine.** A single forked RTP engine carries both plain SIP and WebRTC media on a tight datapath, with the WebRTC demux path dormant until DTLS is active so non-WebRTC RTP pays no overhead.
 
-# Debug & history
-sip set debug [on|off|peer <p>|ip <a>]
-sip set history {on [<match>]|off}    sip history clear
-```
+The result is a SIP driver whose resource use scales with **work**, not with **endpoint count** — the property a carrier deployment depends on.
 
-`chan_sofia` lives in `channels/chan_sofia.c` plus a clean `channels/sofia/`
-module tree (AMI, CLI, SDP, presence, T.38, PUBLISH, MESSAGE, transfer, GRUU,
-subscribe, history). Every option is documented in `configs/sofia.conf.sample`
-and on the [**project wiki**](https://github.com/garacil/gabpbx/wiki/Chan-Sofia).
+---
 
-## Quick start
+## Hardened and AI-security-audited
 
-```bash
-# Debian 12 build deps (chan_sofia + Opus)
-sudo apt install build-essential libncurses5-dev libjansson-dev libsqlite3-dev \
-                 uuid-dev libxml2-dev libssl-dev libopus-dev libsofia-sip-ua-dev
+`chan_sofia` is engineered to be exceptionally robust, and it has been **hardened and security-audited by the world's most advanced AI systems** through a **rigorous, multi-round adversarial review** of its correctness, concurrency and security posture.
 
-./configure
-make menuselect          # enable chan_sofia (Channel Drivers) + codec_opus
-make
-sudo make install        # add 'make samples' on a fresh box
-```
+That review repeatedly stressed the driver's reject paths, its lock ordering and lifetime management, and its authentication, transport-security and media-security gates — catching and closing defects that conventional testing rarely surfaces. The hardening is reflected throughout: validate-then-commit SDP that leaves an established call untouched when a re-INVITE fails any gate; fail-closed authentication, ACL and fingerprint checks; a documented single-owner concurrency model with one canonical lock order; and an anti-downgrade media posture in which encryption never silently falls back to plaintext.
 
-Point `modules.conf` at `chan_sofia` (above), drop a peer in
-`/etc/gabpbx/sofia.conf`, and start GABPBX:
+The outcome is a SIP channel you can put in front of the public internet and trust at scale.
 
-```ini
-[general]
-udpbindaddr = 0.0.0.0:5060
-context     = default
-
-[1001]
-type     = peer
-host     = dynamic
-secret   = change-me
-context  = internal
-mailbox  = 1001@default      ; unsolicited MWI by default (subscribemwi=no)
-```
-
-```text
-gabpbx -c
-*CLI> sip show settings
-*CLI> sip show peers
-*CLI> sip set history on
-```
-
-See the wiki [Build and Installation](https://github.com/garacil/gabpbx/wiki/Build-and-Installation)
-page for the full walkthrough.
-
-## Documentation
-
-- **Wiki:** https://github.com/garacil/gabpbx/wiki — start at
-  [Chan-Sofia](https://github.com/garacil/gabpbx/wiki/Chan-Sofia).
-- **Sample config:** `configs/sofia.conf.sample` documents every knob.
-
-## Roadmap
-
-WebRTC media (DTLS-SRTP / ICE — pending an RTP-engine upgrade), richer
-presence/dialog-event publishing, and continued scaling work. The signalling and
-registration features above ship today.
+---
 
 ## License
 
-GABPBX is free software under the **GNU General Public License, version 2**.
-Asterisk, Digium and third-party copyrights and licenses are retained in the files
-where they apply.
+GABPBX is distributed under the GNU General Public License v2 (GPLv2). Existing Asterisk, Digium and third-party copyright notices and license terms are preserved in the source files where they apply.
+
+— Germán Luis Aracil Boned

@@ -383,6 +383,151 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 		overflow = 1;
 	}
 
+	/* v1b STEP 6 — emit the accepted non-BUNDLE m=video on pvt->vrtp's OWN transport (RFC 8843 §7): its
+	 * own port + ICE/fingerprint/setup/candidate, a=rtcp-mux, VP8/H264 rtpmap, a=mid + a=tls-id — but NOT
+	 * added to a=group:BUNDLE (the group stays audio-only). Placed right after m=audio so the answer
+	 * m-line order matches the standard browser offer (audio, video, [application]). Mirrors the audio a=
+	 * block above but reads pvt->vrtp's OWN credentials. */
+	if (pvt->is_webrtc && pvt->vrtp
+			&& (pvt->webrtc_video_accepted
+				|| (pvt->webrtc_video_offerer && !pvt->webrtc_video_answer_applied))) {	/* v1c: answerer-accepted OR offerer-offered (mutually exclusive) */
+		struct ast_rtp_engine_dtls *vdtls = ast_rtp_instance_get_dtls(pvt->vrtp);
+		struct ast_rtp_engine_ice *vice = ast_rtp_instance_get_ice(pvt->vrtp);
+		const char *vfp = vdtls ? vdtls->get_fingerprint(pvt->vrtp) : NULL;
+		const char *vufrag = vice ? vice->get_ufrag(pvt->vrtp) : NULL;
+		const char *vpwd = vice ? vice->get_password(pvt->vrtp) : NULL;
+		enum ast_rtp_dtls_setup vos = vdtls ? vdtls->get_setup(pvt->vrtp) : AST_RTP_DTLS_SETUP_PASSIVE;
+		const char *vss = (vos == AST_RTP_DTLS_SETUP_PASSIVE) ? "passive"
+			: (vos == AST_RTP_DTLS_SETUP_ACTPASS) ? "actpass" : "active";
+		struct ast_sockaddr vla;
+		int vport = 0;
+		char vpayload_buf[128] = "";
+		char vmap_buf[1536] = "";
+		int vfirst = 1;
+		format_t vf;
+		int vblen;
+
+		ast_rtp_instance_get_local_address(pvt->vrtp, &vla);
+		vport = ast_sockaddr_port(&vla);
+		/* VP8/H264 payload list + rtpmap from the negotiated video capability (90 kHz video clock). The PT
+		 * comes from vrtp's codec map: for the ANSWERER it is the BROWSER's offered PT (staged at commit,
+		 * RFC 3264 keeps it); for the OFFERER the map is empty so ast_rtp_codecs_payload_code falls back to
+		 * the static table (VP8=96, H264=99, rtp_engine.c:187/191). */
+		for (vf = 1; vf; vf <<= 1) {
+			int vpt;
+			const char *venc;
+			if (!(vf & pvt->capability) || !(vf & (AST_FORMAT_VP8 | AST_FORMAT_H264))) {
+				continue;
+			}
+			vpt = ast_rtp_codecs_payload_code(ast_rtp_instance_get_codecs(pvt->vrtp), 1, vf);
+			if (vpt < 0) {
+				continue;
+			}
+			venc = ast_rtp_lookup_mime_subtype2(1, vf, 0);
+			if (ast_strlen_zero(venc)) {
+				continue;
+			}
+			if (!vfirst) {
+				overflow |= sofia_sdp_cat(vpayload_buf, sizeof(vpayload_buf), " ");
+			}
+			snprintf(tmp_buf, sizeof(tmp_buf), "%d", vpt);
+			overflow |= sofia_sdp_cat(vpayload_buf, sizeof(vpayload_buf), tmp_buf);
+			vfirst = 0;
+			if (snprintf(tmp_buf, sizeof(tmp_buf), "a=rtpmap:%d %s/90000\r\n", vpt, venc) >= (int)sizeof(tmp_buf)) {
+				overflow = 1;
+			} else {
+				overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+			}
+		}
+		overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), "a=sendrecv\r\n");
+		overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), "a=rtcp-mux\r\n");
+		if (snprintf(tmp_buf, sizeof(tmp_buf), "a=setup:%s\r\n", vss) >= (int)sizeof(tmp_buf)) {
+			overflow = 1;
+		} else {
+			overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+		}
+		if (vfp) {
+			if (snprintf(tmp_buf, sizeof(tmp_buf), "a=fingerprint:sha-256 %s\r\n", vfp) >= (int)sizeof(tmp_buf)) {
+				overflow = 1;
+			} else {
+				overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+			}
+		}
+		overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), "a=ice-lite\r\n");
+		if (vufrag) {
+			if (snprintf(tmp_buf, sizeof(tmp_buf), "a=ice-ufrag:%s\r\n", vufrag) >= (int)sizeof(tmp_buf)) {
+				overflow = 1;
+			} else {
+				overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+			}
+		}
+		if (vpwd) {
+			if (snprintf(tmp_buf, sizeof(tmp_buf), "a=ice-pwd:%s\r\n", vpwd) >= (int)sizeof(tmp_buf)) {
+				overflow = 1;
+			} else {
+				overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+			}
+		}
+		if (snprintf(tmp_buf, sizeof(tmp_buf), "a=candidate:0 1 UDP 2130706431 %s %d typ host\r\n", host, vport) >= (int)sizeof(tmp_buf)) {
+			overflow = 1;
+		} else {
+			overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+		}
+		overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), "a=end-of-candidates\r\n");
+		if (snprintf(tmp_buf, sizeof(tmp_buf), "a=mid:%s\r\n",
+			!ast_strlen_zero(pvt->webrtc_video_mid) ? pvt->webrtc_video_mid : "1") >= (int)sizeof(tmp_buf)) {
+			overflow = 1;
+		} else {
+			overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+		}
+		if (!ast_strlen_zero(pvt->webrtc_video_tls_id)) {
+			if (snprintf(tmp_buf, sizeof(tmp_buf), "a=tls-id:%s\r\n", pvt->webrtc_video_tls_id) >= (int)sizeof(tmp_buf)) {
+				overflow = 1;
+			} else {
+				overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+			}
+		}
+		vblen = strlen(buf);
+		if (snprintf(buf + vblen, len - vblen,
+				"m=video %d UDP/TLS/RTP/SAVPF %s\r\n"
+				"c=IN %s %s\r\n"
+				"%s",
+				vport, vpayload_buf, sdp_family, host, vmap_buf) >= (int)(len - vblen)) {
+			overflow = 1;
+		}
+	}
+
+	/* A6 multi-m: port-0 REFLECT the offered non-accepted m= sections (RFC 3264 §6) right AFTER the
+	 * audio (the accepted, tagged BUNDLE transport), in the offered order. Each: port 0, its media
+	 * type + transport proto + first format, and its a=mid echoed (RFC 8843) — but NOT added to the
+	 * answer's a=group:BUNDLE (only the accepted audio is bundled). Without this a browser audio+video+
+	 * datachannel offer gets fewer answer m= lines than it offered → m-line mismatch reject. (v1a: video
+	 * is reflected here too; video ACCEPTANCE lands next, which moves it out of this reject set.) */
+	if (pvt->is_webrtc && pvt->webrtc_reject_m_count > 0) {
+		int ri;
+		if (pvt->webrtc_reject_overflow) {
+			overflow = 1;	/* more non-audio m= sections offered than we can reflect → fail closed (RFC 3264 §6) */
+		}
+		for (ri = 0; ri < pvt->webrtc_reject_m_count; ri++) {
+			struct sofia_webrtc_reject_m *r = &pvt->webrtc_reject_m[ri];
+			char mid_line[80] = "";
+			int blen = strlen(buf);
+			if (pvt->webrtc_video_accepted && ri == pvt->webrtc_accepted_video_idx) {
+				/* Note: the accepted video is emitted as a REAL m=video above (STEP 6) — skip
+				 * its port-0 reflection. If STEP 5 arming FAILED, webrtc_video_accepted is now 0, so we DO
+				 * emit the port-0 reflection here: exactly one m=video either way (RFC 3264 §6). */
+				continue;
+			}
+			if (!ast_strlen_zero(r->mid)) {
+				snprintf(mid_line, sizeof(mid_line), "a=mid:%s\r\n", r->mid);
+			}
+			if (snprintf(buf + blen, len - blen, "m=%s 0 %s %s\r\n%s",
+					r->type_name, r->proto, r->fmt, mid_line) >= (int)(len - blen)) {
+				overflow = 1;
+			}
+		}
+	}
+
 	/* Video block — only when video capability present and vrtp allocated. SUPPRESSED on a WebRTC leg
 	 * (A4/A5 are AUDIO-ONLY): a plain RTP/AVP m=video in a WebRTC offer/answer (no a=mid/ice/fingerprint,
 	 * not in a=group:BUNDLE) makes the browser reject the WHOLE SDP with 488 Not Acceptable Here — this is
@@ -487,7 +632,7 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 	/* T.38 fax UDPTL outbound emitter: m=image + a=T38Fax* (5 mandatory + 3 optional
 	 * bare-flag attrs, emitted only when the our_parms bit is set). Gated on udptl. */
 	/* SUPPRESSED on a WebRTC leg (A4/A5 audio-only): a plain m=image udptl t38 in a WebRTC SDP is the
-	 * same mixed-media 488 class as plain video (Codex audit) — no mid/ICE/fingerprint/BUNDLE. T.38 fax
+	 * same mixed-media 488 class as plain video (spec compliance) — no mid/ICE/fingerprint/BUNDLE. T.38 fax
 	 * is never active on a browser audio call anyway; gate for completeness. */
 	if (!pvt->is_webrtc && pvt->udptl) {
 		struct ast_sockaddr udptl_local;
@@ -669,8 +814,11 @@ static void sofia_sdp_stage_rollback(struct sofia_pvt *pvt, int audio_was_new, i
 
 /* A5: provision local DTLS(actpass)+ICE-lite for an OUTBOUND WebRTC OFFER. Mirror
  * of the A4 answerer commit (this file's WebRTC commit block) with NO remote
- * inputs: default_setup = ACTPASS, role CONTROLLED, ice_lite advertised. set_setup
- * and ice->start are intentionally NOT called here (no remote role/creds yet). */
+ * inputs: default_setup = ACTPASS, role CONTROLLED, ice_lite advertised. set_setup is
+ * NOT called (no remote role yet, so get_setup() stays ACTPASS), but ice->start() IS, to
+ * arm the STUN responder before the offer leaves the wire (early-STUN; authenticated by
+ * our local ufrag/pwd, safe with no remote creds). v1c also provisions pvt->vrtp here when
+ * the capability has VP8/H264 (the video offer transport). */
 int sofia_webrtc_provision_offer(struct sofia_pvt *pvt)
 {
 	struct ast_rtp_engine_dtls *dtls;
@@ -719,7 +867,7 @@ int sofia_webrtc_provision_offer(struct sofia_pvt *pvt)
 	 * validated → no DTLS → no audio. Safe with no remote creds yet: the responder authenticates
 	 * with our LOCAL ufrag/pwd only (CSPRNG-seeded at ast_rtp_new), never the remote creds; the
 	 * answer's set_authentication still runs later. ice->start() only sets ice_active=1, idempotent
-	 * with the answer-apply's call. */
+	 * with the answer-apply's call. (the browser-to-browser primary fix.) */
 	if (ice->start) {
 		ice->start(pvt->rtp);
 	}
@@ -738,6 +886,49 @@ int sofia_webrtc_provision_offer(struct sofia_pvt *pvt)
 		for (ti = 0; ti < (int)sizeof(tb); ti++) {
 			snprintf(pvt->webrtc_tls_id + ti * 2,
 				sizeof(pvt->webrtc_tls_id) - ti * 2, "%02x", tb[ti]);
+		}
+	}
+	/* v1c: provision the VIDEO transport for the OFFER too, when the effective capability has VP8/H264.
+	 * sofia_rtp_init already created pvt->vrtp (chan_sofia.c:1421); we only DTLS/ICE-provision it here,
+	 * mirroring the audio rtp above (ACTPASS, ice-lite, role CONTROLLED, ice->start). Fail OPEN for video —
+	 * an audio-only WebRTC offer is valid, so a video-provision failure just keeps the audio offer. */
+	if (pvt->vrtp && (pvt->capability & (AST_FORMAT_VP8 | AST_FORMAT_H264))) {
+		struct ast_rtp_engine_dtls *vdtls = ast_rtp_instance_get_dtls(pvt->vrtp);
+		struct ast_rtp_engine_ice *vice = ast_rtp_instance_get_ice(pvt->vrtp);
+		struct ast_rtp_dtls_cfg vdtls_cfg = { 0 };
+		vdtls_cfg.enabled = 1;
+		vdtls_cfg.default_setup = AST_RTP_DTLS_SETUP_ACTPASS;	/* offerer advertises actpass (RFC 5763 §5) */
+		vdtls_cfg.suite = AST_AES_CM_128_HMAC_SHA1_80;
+		vdtls_cfg.hash = AST_RTP_DTLS_HASH_SHA256;
+		vdtls_cfg.verify = AST_RTP_DTLS_VERIFY_FINGERPRINT;
+		vdtls_cfg.ephemeral_cert = 1;
+		if (!vdtls || !vice || !sofia_sched) {
+			ast_log(LOG_NOTICE, "Sofia: WebRTC video offer skipped for peer '%s' — no dtls/ice/sched on vrtp (audio-only offer)\n",
+				pvt->peer ? pvt->peer->name : "<unknown>");
+		} else if (vdtls->set_configuration(pvt->vrtp, &vdtls_cfg)) {
+			ast_log(LOG_WARNING, "Sofia: WebRTC video offer skipped for peer '%s' — vrtp DTLS set_configuration failed (audio-only offer)\n",
+				pvt->peer ? pvt->peer->name : "<unknown>");
+		} else {
+			if (vice->ice_lite) {
+				vice->ice_lite(pvt->vrtp);	/* we advertise a=ice-lite on the video m-line too */
+			}
+			vice->set_role(pvt->vrtp, AST_RTP_ICE_ROLE_CONTROLLED);
+			if (vice->start) {
+				vice->start(pvt->vrtp);	/* arm the video STUN responder before the offer leaves (early-STUN, like audio) */
+			}
+			ast_copy_string(pvt->webrtc_video_mid, "1", sizeof(pvt->webrtc_video_mid));	/* distinct mid; NOT in a=group:BUNDLE (non-BUNDLE) */
+			if (ast_strlen_zero(pvt->webrtc_video_tls_id)) {
+				unsigned char vtb[16];
+				int vti;
+				for (vti = 0; vti < (int)sizeof(vtb); vti++) {
+					vtb[vti] = ast_random() & 0xff;
+				}
+				for (vti = 0; vti < (int)sizeof(vtb); vti++) {
+					snprintf(pvt->webrtc_video_tls_id + vti * 2,
+						sizeof(pvt->webrtc_video_tls_id) - vti * 2, "%02x", vtb[vti]);
+				}
+			}
+			pvt->webrtc_video_offerer = 1;	/* the emitter now sends a real m=video in the offer */
 		}
 	}
 	pvt->webrtc_offerer = 1;	/* A5 discriminator (set BEFORE is_webrtc) */
@@ -765,7 +956,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	int audio_webrtc_offered = 0;
 	int audio_savpf_offered = 0;	/* a DTLS (UDP/TLS/) audio media profile was offered (HIGH1) */
 	int video_savpf_offered = 0;	/* a DTLS (UDP/TLS/) video media profile was offered (audit HIGH) */
-	struct {
+	struct sofia_wrtc_attrs {
 		int have_fingerprint;
 		int have_setup;
 		int have_ice_ufrag;	/* HIGH3: ICE creds tracked separately, both required */
@@ -785,12 +976,16 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 		char mid[64];
 		int have_mid;
 		int have_bundle;	/* a=group:BUNDLE seen (session or media level) */
-	} wrtc = { 0 };
+	};
+	struct sofia_wrtc_attrs wrtc = { 0 };
+	struct sofia_wrtc_attrs video_wrtc = { 0 };	/* v1b: the m=video section's OWN DTLS/ICE attrs (non-BUNDLE) */
 	int image_active_seen = 0;	/* a live UDPTL T.38 image leg was present this parse */
 	/* Whether THIS parse's a=crypto lazily creates the SRTP context (for reject
 	 * rollback). Captured AFTER the !pvt guard below — do not deref pvt here. */
 	int audio_srtp_was_new = 0;
 	int video_srtp_was_new = 0;
+	format_t video_offered_fmts = 0;	/* v1b: browser-offered video formats — the accept-gate intersection (STEP 3) */
+	int vrtp_stage_fds23 = 0;		/* v1b STEP 8: attach o->fds[2]/[3] at the commit channel-lock when vrtp was lazily created THIS parse (re-INVITE add-video; the initial INVITE wires them in sofia_new) */
 
 	if (!sip || !pvt || !pvt->rtp) {
 		return 0;
@@ -898,6 +1093,10 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 		}
 	}
 
+	/* Note: reset per-SDP WebRTC video state — these pvt fields are persistent, so a prior
+	 * a=bundle-only offer or a prior acceptance must NOT poison this parse (force permanent port-0). */
+	pvt->webrtc_video_bundle_only = 0;
+	pvt->webrtc_video_accepted = 0;
 	for (media = sdp->sdp_media; media; media = media->m_next) {
 		if (media->m_type == sdp_media_audio && media->m_port != 0) {
 			sdp_attribute_t *a;
@@ -1127,6 +1326,135 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 			sdp_connection_t *conn = media->m_connections;
 			sdp_attribute_t *a;
 
+			/* v1b STEP 2 — non-BUNDLE WebRTC video: negotiate the m=video on pvt->vrtp with its OWN
+			 * DTLS/ICE (RFC 8843 §7 separate transport, NOT bundled with audio). Capture the section's
+			 * OWN attrs into video_wrtc, detect a=bundle-only (RFC 8843 §7.3.2 → cannot move out, keep
+			 * port-0 reflected), lazy-create vrtp WITH the sched (HIGH1: the legacy create at this site
+			 * passed NULL sched → the DTLS retransmit timer would deref NULL), set its remote, stage
+			 * VP8/H264. Arming + the accept-gate run post-loop; any miss leaves the video port-0 reflected
+			 * (audio-only, NO regression). */
+			if (audio_webrtc_offered) {
+				sdp_attribute_t *va;
+				for (va = media->m_attributes; va; va = va->a_next) {
+					if (!va->a_name) {
+						continue;
+					}
+					if (su_casematch(va->a_name, "bundle-only")) {
+						pvt->webrtc_video_bundle_only = 1;
+					} else if (va->a_value && su_casematch(va->a_name, "fingerprint")) {
+						char fp_alg[32];
+						char fp_hex[256];
+						if (sscanf(va->a_value, "%31s %255s", fp_alg, fp_hex) == 2
+								&& !strcasecmp(fp_alg, "sha-256")) {
+							video_wrtc.fp_hash = AST_RTP_DTLS_HASH_SHA256;
+							ast_copy_string(video_wrtc.fp_value, fp_hex, sizeof(video_wrtc.fp_value));
+							video_wrtc.have_fingerprint = 1;
+						}
+					} else if (va->a_value && su_casematch(va->a_name, "setup")) {
+						if (!strcasecmp(va->a_value, "active")) {
+							video_wrtc.remote_setup = AST_RTP_DTLS_SETUP_ACTIVE;
+							video_wrtc.have_setup = 1;
+						} else if (!strcasecmp(va->a_value, "passive")) {
+							video_wrtc.remote_setup = AST_RTP_DTLS_SETUP_PASSIVE;
+							video_wrtc.have_setup = 1;
+						} else if (!strcasecmp(va->a_value, "actpass")) {
+							video_wrtc.remote_setup = AST_RTP_DTLS_SETUP_ACTPASS;
+							video_wrtc.have_setup = 1;
+						}
+					} else if (va->a_value && su_casematch(va->a_name, "ice-ufrag")) {
+						ast_copy_string(video_wrtc.ice_ufrag, va->a_value, sizeof(video_wrtc.ice_ufrag));
+						video_wrtc.have_ice_ufrag = 1;
+					} else if (va->a_value && su_casematch(va->a_name, "ice-pwd")) {
+						ast_copy_string(video_wrtc.ice_pwd, va->a_value, sizeof(video_wrtc.ice_pwd));
+						video_wrtc.have_ice_pwd = 1;
+					} else if (va->a_value && su_casematch(va->a_name, "candidate")) {
+						char c_ip[64];
+						char c_transport[16];
+						unsigned int c_port = 0;
+						char c_typ[16] = "";
+						if (sscanf(va->a_value, "%*s %*u %15s %*u %63s %u typ %15s",
+								c_transport, c_ip, &c_port, c_typ) == 4
+								&& !strcasecmp(c_typ, "host") && !strcasecmp(c_transport, "udp")
+								&& video_wrtc.cand_count < (int)(sizeof(video_wrtc.cand) / sizeof(video_wrtc.cand[0]))) {
+							struct ast_sockaddr ca;
+							if (ast_sockaddr_parse(&ca, c_ip, PARSE_PORT_FORBID)) {
+								ast_sockaddr_set_port(&ca, c_port);
+								video_wrtc.cand[video_wrtc.cand_count++] = ca;
+							}
+						}
+					} else if (su_casematch(va->a_name, "ice-lite")) {
+						video_wrtc.remote_ice_lite = 1;
+					} else if (su_casematch(va->a_name, "rtcp-mux")) {
+						video_wrtc.have_rtcp_mux = 1;
+					} else if (va->a_value && su_casematch(va->a_name, "mid")) {
+						ast_copy_string(pvt->webrtc_video_mid, va->a_value, sizeof(pvt->webrtc_video_mid));
+					}
+				}
+				pvt->webrtc_video_offered = 1;
+				if (pvt->webrtc_video_bundle_only) {
+					/* RFC 8843 §7.3.2: a bundle-only section MUST NOT be moved to its own transport —
+					 * leave it for the port-0 reflection (this client wants max-bundle; stay audio-only). */
+					continue;
+				}
+				if (!pvt->vrtp) {
+					struct ast_sockaddr vbind;
+					ast_sockaddr_parse(&vbind, sofia_cfg.bindaddr, 0);
+					pvt->vrtp = ast_rtp_instance_new("gabpbx",
+						sofia_sched ? ast_sched_thread_get_context(sofia_sched) : NULL, &vbind, NULL);
+					if (pvt->vrtp) {
+						ast_rtp_instance_set_prop(pvt->vrtp, AST_RTP_PROPERTY_RTCP, 1);	/* rtcp-mux: RTP+RTCP on one fd */
+						vrtp_stage_fds23 = 1;	/* STEP 8: a re-INVITE add-video must wire o->fds[2]/[3] at commit */
+					}
+				}
+				if (pvt->vrtp) {
+					struct ast_sockaddr vremote;
+					sdp_connection_t *vconn = media->m_connections ? media->m_connections : sdp->sdp_connection;
+					format_t voffered = 0;
+					int vnoncodec = 0;
+					sdp_rtpmap_t *vrm;
+					sdp_list_t *vfmt2;
+					int vhave_remote = 0;
+
+					if (vconn && vconn->c_address) {
+						vhave_remote = ast_sockaddr_parse(&vremote, vconn->c_address, 0);
+						if (vhave_remote) {
+							ast_sockaddr_set_port(&vremote, media->m_port);
+						}
+					}
+					if (pvt->peer && (pvt->peer->nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA))
+							&& !ast_sockaddr_isnull(&pvt->peer->src_addr)) {
+						vremote = pvt->peer->src_addr;
+						ast_sockaddr_set_port(&vremote, media->m_port);
+						vhave_remote = 1;
+					}
+					if (vhave_remote) {
+						ast_rtp_instance_set_remote_address(pvt->vrtp, &vremote);
+					}
+					ast_rtp_codecs_payloads_clear(&staged_video_codecs, NULL);
+					for (vfmt2 = media->m_format; vfmt2; vfmt2 = vfmt2->l_next) {
+						ast_rtp_codecs_payloads_set_m_type(&staged_video_codecs, NULL, atoi(vfmt2->l_text));
+					}
+					for (vrm = media->m_rtpmaps; vrm; vrm = vrm->rm_next) {
+						if (vrm->rm_encoding) {
+							if (ast_rtp_codecs_payloads_set_rtpmap_type_rate(&staged_video_codecs, NULL,
+									vrm->rm_pt, "video", (char *)vrm->rm_encoding, 0, vrm->rm_rate)) {
+								ast_rtp_codecs_payloads_unset(&staged_video_codecs, NULL, vrm->rm_pt);
+							}
+						}
+					}
+					ast_rtp_codecs_payload_formats(&staged_video_codecs, &voffered, &vnoncodec);
+					video_offered_fmts = voffered & (AST_FORMAT_VP8 | AST_FORMAT_H264);	/* VP8-first scope (scope note): only VP8/H264, never H261/H263/H263+ */
+					/* Fix: intersect against orig_capability (the pre-:977-clear snapshot), NOT
+					 * the already-video-cleared pvt->capability — else the intersection is always 0 (dead code). */
+					/* Fix: require the m=video DTLS proto (UDP/TLS/RTP/SAVPF|AVPF), mirroring the audio
+					 * path (:1065) — never answer a forged plain RTP/AVP video with a UDP/TLS/RTP/SAVPF m-line. */
+					if ((video_offered_fmts & orig_capability)
+							&& media->m_proto_name && !strncasecmp(media->m_proto_name, "UDP/TLS/", 8)) {
+						staged_video_valid = 1;	/* a VP8/H264 intersection exists; install into vrtp at commit */
+					}
+				}
+				continue;	/* WebRTC video handled — skip the legacy non-WebRTC video path below */
+			}
 			video_offered = 1;
 			if (media->m_proto == sdp_proto_srtp) {
 				video_secure_offered = 1;
@@ -1419,22 +1747,74 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 		}
 	}
 
-	{
+	/* A6 multi-m: RECORD every offered non-audio m= section so the answer can port-0 REFLECT it
+	 * (RFC 3264 §6: one answer m= per offer m=, unaccepted at port 0) instead of dropping it — a
+	 * dropped section makes a browser audio+video+datachannel offer fail with an m-line mismatch.
+	 * v1a: audio is the accepted/tagged transport; video + datachannel + image are reflected at port 0
+	 * (video acceptance lands next). Recorded on pvt; sofia_generate_sdp emits the reflections. */
+	/* v1b STEP 3 — video acceptance gate (answerer-only, non-BUNDLE). Accept the offered m=video onto
+	 * pvt->vrtp ONLY when ALL hold: a WebRTC audio session, vrtp allocated, a VP8/H264 intersection with
+	 * our configured video capability, the section's OWN DTLS fingerprint + setup + ICE ufrag/pwd +
+	 * rtcp-mux (each non-BUNDLE instance is single-component), and NOT a=bundle-only. Any miss →
+	 * webrtc_video_accepted stays 0 and the loop below port-0 reflects the video (audio-only, NO
+	 * regression). When accepted, narrow capability's video to exactly the agreed intersection so the
+	 * answer advertises only what both sides support. */
+	pvt->webrtc_video_accepted = audio_webrtc_offered && !pvt->webrtc_offerer	/* v1c POINT 2: ANSWERER leg only — the offerer's video answer is owned by the offerer answer-apply below, never this accept gate (else both emit gates collide) */
+		&& pvt->vrtp && staged_video_valid
+		&& !pvt->webrtc_video_bundle_only
+		&& video_wrtc.have_fingerprint && video_wrtc.have_setup
+		&& video_wrtc.have_ice_ufrag && video_wrtc.have_ice_pwd && video_wrtc.have_rtcp_mux
+		&& (video_offered_fmts & orig_capability & AST_FORMAT_VIDEO_MASK);	/* Fix: orig_capability, not the :977-cleared pvt->capability */
+	if (pvt->webrtc_video_accepted) {
+		format_t agreed_video = video_offered_fmts & orig_capability & AST_FORMAT_VIDEO_MASK;
+		pvt->capability = (pvt->capability & ~((format_t)AST_FORMAT_VIDEO_MASK)) | agreed_video;
+	}
+	pvt->webrtc_reject_m_count = 0;
+	pvt->webrtc_accepted_video_idx = -1;	/* Note (1:1): no accepted video recorded yet this parse */
+	pvt->webrtc_reject_overflow = 0;
+	pvt->webrtc_video_offered = 0;
+	pvt->webrtc_video_mid[0] = '\0';
+	if (audio_webrtc_offered) {
 		sdp_media_t *mm;
-		int extra_mlines = 0;
 		for (mm = sdp->sdp_media; mm; mm = mm->m_next) {
-			if (mm->m_type != sdp_media_audio
-					&& mm->m_type != sdp_media_video
-					&& mm->m_type != sdp_media_image) {
-				extra_mlines++;
+			sdp_attribute_t *ma;
+			const char *mid = "";
+			if (mm->m_type == sdp_media_audio) {
+				continue;	/* the audio section IS the accepted, tagged BUNDLE transport */
 			}
-		}
-		if (audio_webrtc_offered && extra_mlines) {
-			ast_log(LOG_NOTICE, "Sofia: WebRTC offer for '%s' has %d extra m= section(s) "
-				"(e.g. datachannel) the answer does not reflect at port 0 "
-				"(RFC 3264 §6) — the browser may reject the answer for an m-line "
-				"mismatch; audio-only offers are unaffected\n",
-				S_OR(pvt->callid, "<unknown>"), extra_mlines);
+			for (ma = mm->m_attributes; ma; ma = ma->a_next) {	/* its a=mid (RFC 8843) */
+				if (ma->a_name && su_casematch(ma->a_name, "mid") && ma->a_value) {
+					mid = ma->a_value;
+					break;
+				}
+			}
+			if (mm->m_type == sdp_media_video) {
+				pvt->webrtc_video_offered = 1;
+				ast_copy_string(pvt->webrtc_video_mid, mid, sizeof(pvt->webrtc_video_mid));
+				/* Note (1:1): mark which reject_m index is the accepted video (STEP 2 stages the LAST
+				 * acceptable video, so the last video's index wins); the emit skips exactly this one entry. */
+				if (pvt->webrtc_video_accepted && pvt->webrtc_reject_m_count < (int)ARRAY_LEN(pvt->webrtc_reject_m)) {
+					pvt->webrtc_accepted_video_idx = pvt->webrtc_reject_m_count;
+				}
+				/* Note: RECORD the video in reject_m ALWAYS. The real-vs-port0 decision is
+				 * deferred to EMIT time (sofia_generate_sdp skips this entry iff webrtc_video_accepted is
+				 * STILL true after STEP 5 arming). This guarantees exactly ONE m=video even if STEP 5 arming
+				 * fails and drops accepted to 0 — no missing/extra m-line (RFC 3264 §6 exact count). */
+			}
+			if (pvt->webrtc_reject_m_count < (int)ARRAY_LEN(pvt->webrtc_reject_m)) {
+				struct sofia_webrtc_reject_m *r = &pvt->webrtc_reject_m[pvt->webrtc_reject_m_count++];
+				if (!ast_strlen_zero(mm->m_type_name)) {
+					ast_copy_string(r->type_name, mm->m_type_name, sizeof(r->type_name));
+				} else {
+					ast_copy_string(r->type_name, (mm->m_type == sdp_media_video) ? "video"
+						: (mm->m_type == sdp_media_image) ? "image" : "application", sizeof(r->type_name));
+				}
+				ast_copy_string(r->proto, mm->m_proto_name ? mm->m_proto_name : "RTP/AVP", sizeof(r->proto));
+				ast_copy_string(r->fmt, (mm->m_format && mm->m_format->l_text) ? mm->m_format->l_text : "0", sizeof(r->fmt));
+				ast_copy_string(r->mid, mid, sizeof(r->mid));
+			} else {
+				pvt->webrtc_reject_overflow = 1;
+			}
 		}
 	}
 
@@ -1465,10 +1845,12 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 			pvt->peer ? pvt->peer->name : "<unknown>");
 		goto sdp_reject;
 	}
-	/* Audit HIGH: video-over-WebRTC is deferred (A4 is audio-only); reject ANY DTLS video offer rather
-	 * than silently answer it RTP/AVP (the audio HIGH1 downgrade defect, mirrored for video). */
-	if (video_savpf_offered) {
-		ast_log(LOG_NOTICE, "Sofia: SDP rejected — DTLS/WebRTC video offered but A4 is audio-only (peer '%s')\n",
+	/* Audit HIGH (A6 update): reject a DTLS video offer ONLY for a NON-WebRTC audio session. A real WebRTC
+	 * audio+video offer now port-0 REFLECTS the video m= section (RFC 3264) instead of 488ing the whole body
+	 * (v1b accepts the video). A non-webrtc-audio leg still rejects DTLS video — no silent RTP/AVP downgrade
+	 * (the audio HIGH1 defect, mirrored for video). */
+	if (video_savpf_offered && !audio_webrtc_offered) {
+		ast_log(LOG_NOTICE, "Sofia: SDP rejected — DTLS video offered but the session is not WebRTC audio (peer '%s')\n",
 			pvt->peer ? pvt->peer->name : "<unknown>");
 		goto sdp_reject;
 	}
@@ -1566,7 +1948,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 		 * tears the call down on sdp_rc<0). */
 		if (!wrtc.have_fingerprint || !wrtc.have_setup || !wrtc.have_ice_ufrag
 				|| !wrtc.have_ice_pwd || !wrtc.have_rtcp_mux) {
-			/* Codex BLOCKER: require a=rtcp-mux in the ANSWER too. Our engine is mux-ONLY (single
+			/* Fix: require a=rtcp-mux in the ANSWER too. Our engine is mux-ONLY (single
 			 * socket); RFC 5761 §5.1.1 — an answerer that omits a=rtcp-mux means the offerer MUST NOT
 			 * multiplex (separate RTCP), which we cannot do → fail closed. Browsers always mux. */
 			ast_log(LOG_NOTICE, "Sofia: SDP rejected — WebRTC ANSWER missing required attrs (fp=%d setup=%d ufrag=%d pwd=%d mux=%d)\n",
@@ -1604,13 +1986,60 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 		}
 	}
 
+	/* v1c OFFERER VIDEO ANSWER-APPLY: when WE offered video (webrtc_video_offerer), apply the browser's
+	 * m=video ANSWER to pvt->vrtp. set_configuration already ran in provision_offer — apply only the remote
+	 * params (fp/setup/ICE/candidates), then start + activate. The answer's video codec map is installed into
+	 * vrtp by the staged_video_valid commit copy below (so RX maps the browser's PTs, e.g. H264 on 102/125).
+	 * STEP 3's accept gate is answerer-only (!webrtc_offerer), so this block alone owns the offerer's video and
+	 * narrows pvt->capability to the agreed intersection. If the browser rejected video (port 0 / missing attrs
+	 * / no VP8-H264 intersection), disable the offerer video and keep the audio call. */
+	if (audio_webrtc_offered && pvt->webrtc_video_offerer && !pvt->webrtc_video_answer_applied && pvt->vrtp) {
+		struct ast_rtp_engine_dtls *vdtls = ast_rtp_instance_get_dtls(pvt->vrtp);
+		struct ast_rtp_engine_ice *vice = ast_rtp_instance_get_ice(pvt->vrtp);
+		format_t agreed_v = video_offered_fmts & orig_capability & AST_FORMAT_VIDEO_MASK;
+		if (vdtls && vice && staged_video_valid
+				&& video_wrtc.have_fingerprint && video_wrtc.have_setup
+				&& video_wrtc.have_ice_ufrag && video_wrtc.have_ice_pwd && video_wrtc.have_rtcp_mux
+				&& agreed_v) {
+			int vi;
+			vdtls->set_fingerprint(pvt->vrtp, video_wrtc.fp_hash, video_wrtc.fp_value);
+			vdtls->set_setup(pvt->vrtp, video_wrtc.remote_setup);	/* browser answers active → we PASSIVE (RFC 5763 §5) */
+			vice->set_authentication(pvt->vrtp, video_wrtc.ice_ufrag, video_wrtc.ice_pwd);
+			for (vi = 0; vi < video_wrtc.cand_count; vi++) {
+				struct ast_rtp_engine_ice_candidate vcand = { 0 };
+				vcand.foundation = "0";
+				vcand.id = AST_RTP_ICE_COMPONENT_RTP;
+				vcand.transport = "udp";
+				vcand.priority = 0;
+				vcand.address = video_wrtc.cand[vi];
+				vcand.type = AST_RTP_ICE_CANDIDATE_TYPE_HOST;
+				vice->add_remote_candidate(pvt->vrtp, &vcand);
+			}
+			if (video_wrtc.remote_ice_lite && vice->ice_lite) {
+				vice->ice_lite(pvt->vrtp);
+			}
+			vice->set_role(pvt->vrtp, AST_RTP_ICE_ROLE_CONTROLLED);
+			vice->start(pvt->vrtp);	/* remote creds set now — safe to arm the video STUN responder */
+			pvt->capability = (pvt->capability & ~((format_t)AST_FORMAT_VIDEO_MASK)) | agreed_v;	/* narrow to the agreed video */
+			pvt->webrtc_video_answer_applied = 1;
+			ast_rtp_instance_activate(pvt->vrtp);	/* video codec map is installed by the staged_video_valid commit copy below */
+		} else {
+			/* browser rejected our video (port 0 / missing attrs / no VP8-H264 intersection) — keep audio-only */
+			ast_log(LOG_NOTICE, "Sofia: WebRTC video answer not usable for peer '%s' — continuing audio-only\n",
+				pvt->peer ? pvt->peer->name : "<unknown>");
+			pvt->webrtc_video_offerer = 0;
+			pvt->capability &= ~((format_t)AST_FORMAT_VIDEO_MASK);
+			staged_video_valid = 0;	/* Fix: don't let the staged_video_valid commit copy install a codec map onto a vrtp we never activate for this rejected-video offerer */
+		}
+	}
+
 	if (audio_webrtc_offered && !pvt->is_webrtc) {
 		struct ast_rtp_engine_dtls *dtls = ast_rtp_instance_get_dtls(pvt->rtp);
 		struct ast_rtp_engine_ice *ice = ast_rtp_instance_get_ice(pvt->rtp);
 		struct ast_rtp_dtls_cfg dtls_cfg = { 0 };
 		int i;
 
-		/* OQ3 fail-closed (Codex): the dtls/ice vtables are ALWAYS non-NULL (engine-level, not
+		/* OQ3 fail-closed: the dtls/ice vtables are ALWAYS non-NULL (engine-level, not
 		 * per-instance), so the real provisioning check is sofia_sched. When it is NULL, sofia_rtp_init
 		 * created pvt->rtp with a NULL sched and the DTLS retransmit timer
 		 * (ast_sched_add_variable(rtp->sched,...)) would deref NULL → reject the WebRTC leg rather than
@@ -1631,7 +2060,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 		}
 
 		dtls_cfg.enabled = 1;
-		dtls_cfg.default_setup = AST_RTP_DTLS_SETUP_PASSIVE;	/* answerer-only: answer a=setup:passive so the BROWSER is the DTLS client and initiates (RFC 5763 §5 SHOULD; gabpbx-active left the browser silent as the DTLS server → no audio). set_setup(remote actpass) below also maps to PASSIVE. */
+		dtls_cfg.default_setup = AST_RTP_DTLS_SETUP_PASSIVE;	/* answerer-only: answer a=setup:passive so the BROWSER is the DTLS client and initiates (RFC 5763 §5 SHOULD; robustness fix — gabpbx-active left the browser silent as the DTLS server → no audio). set_setup(remote actpass) below also maps to PASSIVE. */
 		dtls_cfg.suite = AST_AES_CM_128_HMAC_SHA1_80;
 		dtls_cfg.hash = AST_RTP_DTLS_HASH_SHA256;
 		dtls_cfg.verify = AST_RTP_DTLS_VERIFY_FINGERPRINT;
@@ -1682,6 +2111,89 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 		pvt->is_webrtc = 1;	/* M7: only here, after full success */
 	}
 
+	/* v1b STEP 5 — arm pvt->vrtp's OWN DTLS-SRTP + ICE for the accepted non-BUNDLE video. Mirrors the
+	 * audio answerer commit above but targets pvt->vrtp + video_wrtc, with a per-video one-shot guard so a
+	 * re-INVITE does not restart the video DTLS handshake. Provisioned ONLY here (after every reject gate)
+	 * so a rejected SDP never leaves a half-armed vrtp. a=setup:PASSIVE matches the audio interop choice
+	 * (browser is the DTLS client). vsrtp stays NULL — DTLS-SRTP carries no a=crypto. activate happens in
+	 * chan_sofia.c after the 200 OK (mirrors the audio rtp). On ANY arming failure → drop to audio-only. */
+	if (audio_webrtc_offered && pvt->webrtc_video_accepted && !pvt->webrtc_video_answer_applied && pvt->vrtp) {
+		struct ast_rtp_engine_dtls *vdtls = ast_rtp_instance_get_dtls(pvt->vrtp);
+		struct ast_rtp_engine_ice *vice = ast_rtp_instance_get_ice(pvt->vrtp);
+		struct ast_rtp_dtls_cfg vcfg = { 0 };
+		int vi;
+
+		if (!vdtls || !vice || !sofia_sched) {
+			ast_log(LOG_WARNING, "Sofia: WebRTC video NOT armed for peer '%s' (sched=%p dtls=%p ice=%p) — video left audio-only\n",
+				pvt->peer ? pvt->peer->name : "<unknown>", (void *)sofia_sched, (void *)vdtls, (void *)vice);
+			pvt->webrtc_video_accepted = 0;
+		} else {
+			vcfg.enabled = 1;
+			vcfg.default_setup = AST_RTP_DTLS_SETUP_PASSIVE;
+			vcfg.suite = AST_AES_CM_128_HMAC_SHA1_80;
+			vcfg.hash = AST_RTP_DTLS_HASH_SHA256;
+			vcfg.verify = AST_RTP_DTLS_VERIFY_FINGERPRINT;
+			vcfg.ephemeral_cert = 1;
+			if (vdtls->set_configuration(pvt->vrtp, &vcfg)) {
+				ast_log(LOG_WARNING, "Sofia: WebRTC video DTLS set_configuration failed for peer '%s' — video left audio-only\n",
+					pvt->peer ? pvt->peer->name : "<unknown>");
+				pvt->webrtc_video_accepted = 0;
+			} else {
+				vdtls->set_fingerprint(pvt->vrtp, video_wrtc.fp_hash, video_wrtc.fp_value);
+				vdtls->set_setup(pvt->vrtp, video_wrtc.remote_setup);
+				vice->set_authentication(pvt->vrtp, video_wrtc.ice_ufrag, video_wrtc.ice_pwd);
+				for (vi = 0; vi < video_wrtc.cand_count; vi++) {
+					struct ast_rtp_engine_ice_candidate vcand = { 0 };
+					vcand.foundation = "0";
+					vcand.id = AST_RTP_ICE_COMPONENT_RTP;
+					vcand.transport = "udp";
+					vcand.priority = 0;
+					vcand.address = video_wrtc.cand[vi];
+					vcand.type = AST_RTP_ICE_CANDIDATE_TYPE_HOST;
+					vice->add_remote_candidate(pvt->vrtp, &vcand);
+				}
+				if (video_wrtc.remote_ice_lite && vice->ice_lite) {
+					vice->ice_lite(pvt->vrtp);
+				}
+				vice->set_role(pvt->vrtp, AST_RTP_ICE_ROLE_CONTROLLED);
+				vice->start(pvt->vrtp);
+				if (ast_strlen_zero(pvt->webrtc_video_tls_id)) {
+					unsigned char vtb[16];
+					int vti;
+					for (vti = 0; vti < (int)sizeof(vtb); vti++) {
+						vtb[vti] = ast_random() & 0xff;
+					}
+					for (vti = 0; vti < (int)sizeof(vtb); vti++) {
+						snprintf(pvt->webrtc_video_tls_id + vti * 2,
+							sizeof(pvt->webrtc_video_tls_id) - vti * 2, "%02x", vtb[vti]);
+					}
+				}
+				pvt->webrtc_video_answer_applied = 1;
+			}
+		}
+	}
+
+	/* Note: the video gate/arm did NOT accept (no codec intersection, missing attrs, bundle-only,
+	 * or an arming failure) → tear down a vrtp this parse LAZILY created, so the audio-only fallback leaves
+	 * NO unused live video RTP instance (sofia_new wires fds[2]/[3] whenever pvt->vrtp exists). had_vrtp
+	 * guards a pre-existing vrtp (re-INVITE). Mutually exclusive with the sdp_reject rollback below.
+	 * Fix: gate on (audio_webrtc_offered && webrtc_video_offered) so this NEVER collects the
+	 * legacy vrtp of a plain (non-WebRTC) SIP audio+video call — that path ALSO lazily creates pvt->vrtp with
+	 * webrtc_video_accepted==0 && had_vrtp==0, and destroying it would drop m=video from the legacy answer. */
+	if (audio_webrtc_offered && pvt->webrtc_video_offered && !pvt->webrtc_video_accepted && !had_vrtp && pvt->vrtp) {
+		ast_rtp_instance_destroy(pvt->vrtp);
+		pvt->vrtp = NULL;
+		staged_video_valid = 0;
+	}
+	/* Fix: if a WebRTC video offer was NOT accepted (no intersection, missing attrs, bundle-only,
+	 * wrong proto, or a STEP 5 arm failure that dropped accepted to 0), clear the provisional video bit STEP 3
+	 * may have added to pvt->capability, so sofia_new never publishes a video native format with no vrtp behind
+	 * it. Gated on audio_webrtc_offered so a plain (non-WebRTC) legacy audio+video call keeps its video. */
+	if (audio_webrtc_offered && !pvt->webrtc_video_accepted
+			&& !(pvt->webrtc_video_offerer && pvt->webrtc_video_answer_applied)) {	/* Fix: do NOT re-strip the offerer's just-narrowed agreed video — Part 3 set capability + webrtc_video_answer_applied, and webrtc_video_accepted is always 0 for the offerer */
+		pvt->capability &= ~((format_t)AST_FORMAT_VIDEO_MASK);
+	}
+
 	/* COMMIT: every reject gate passed. Install the staged codec maps into the live
 	 * RTP instances now (a reject returned via sdp_reject before reaching here). */
 	if (staged_audio_valid) {
@@ -1708,7 +2220,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	 * sees the UDPTL fd) → arm/cancel t38id → snapshot fax-redirect inputs; THEN drop
 	 * the lock and run ast_exists_extension / FAXEXTEN / ast_async_goto (they take
 	 * their own locks). Advance and withdraw are mutually exclusive. */
-	if (staged_chosen_audio_valid || t38_stage_fds5 || t38_stage_enter_reinvite || t38_stage_withdraw) {
+	if (staged_chosen_audio_valid || t38_stage_fds5 || t38_stage_enter_reinvite || t38_stage_withdraw || vrtp_stage_fds23 || audio_webrtc_offered) {	/* + audio_webrtc_offered so the WebRTC nativeformats/fds sync below is never skipped by an unusual parse with no chosen-audio side effect */
 		struct ast_channel *o = pvt->owner;
 		if (o) {
 			char fax_context[AST_MAX_CONTEXT] = "";
@@ -1726,6 +2238,28 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 				}
 				if (t38_stage_fds5 && pvt->udptl) {
 					o->fds[5] = ast_udptl_fd(pvt->udptl);
+				}
+				if (vrtp_stage_fds23 && pvt->vrtp) {
+					/* v1b STEP 8: a re-INVITE lazily created vrtp AFTER sofia_new ran — wire its fds now
+					 * (rtcp-mux: fd0 RTP, fd1 RTCP), mirroring sofia_new's initial-INVITE wiring, else
+					 * inbound video on vrtp is never polled and the call is one-way/dead. */
+					o->fds[2] = ast_rtp_instance_fd(pvt->vrtp, 0);
+					o->fds[3] = ast_rtp_instance_fd(pvt->vrtp, 1);
+				}
+				if (audio_webrtc_offered) {	/* Fix: sync o->nativeformats video to the negotiated pvt->capability for ANY WebRTC leg — publishes the agreed VP8/H264 on accept/offer-apply, and CLEARS a stale video bit when an OFFERED video was rejected (sofia_new exposed it from the pre-answer vrtp) so the bridge never sees phantom video */
+					/* Fix: a re-INVITE that adds video must publish the agreed VP8/H264 into
+					 * o->nativeformats (sofia_new published the pre-video capability), else bridge/format
+					 * negotiation never learns this leg accepts video. Same owner lock as the fds above. */
+					o->nativeformats = (o->nativeformats & ~AST_FORMAT_VIDEO_MASK)
+						| (pvt->capability & AST_FORMAT_VIDEO_MASK);
+					if (!(pvt->capability & AST_FORMAT_VIDEO_MASK)) {
+						/* no negotiated video on this WebRTC leg → detach the video fds
+						 * sofia_new wired from the pre-answer vrtp (rejected/withdrawn offerer video), so the
+						 * channel never polls a dormant video instance. Detach the channel fds ONLY — do NOT
+						 * destroy the pre-existing vrtp mid-parse (note: that risks the restore/UAF paths). */
+						o->fds[2] = -1;
+						o->fds[3] = -1;
+					}
 				}
 				if (t38_stage_enter_reinvite) {
 					/* frame AFTER the fds[5] attach above */
@@ -1824,6 +2358,7 @@ sdp_reject:
 	 * them. Clearing an empty/unbuilt map is a safe no-op. */
 	ast_rtp_codecs_payloads_clear(&staged_audio_codecs, NULL);
 	ast_rtp_codecs_payloads_clear(&staged_video_codecs, NULL);
+	pvt->webrtc_video_accepted = 0;	/* v1b STEP 10: a rejected SDP accepts no video (the gate ran before the reject gates) */
 	/* If pvt->vrtp was LAZILY CREATED this parse (!had_vrtp but now non-NULL), a rejected SDP must
 	 * not leave a stray video RTP instance — destroy it (mirrors the SRTP was_new rollback). Placed
 	 * AFTER sofia_sdp_stage_rollback above so a was_new vsrtp is torn down first (sofia_srtp_destroy
