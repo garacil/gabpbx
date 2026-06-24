@@ -1114,6 +1114,11 @@ format_t ast_best_codec(format_t fmts)
 		AST_FORMAT_G729A,
 		/*! Down to G.723.1 which is proprietary but at least designed for voice */
 		AST_FORMAT_G723_1,
+		/*! Opus is WebRTC's default audio codec. Listed LAST so it changes nothing for any existing
+		 * mixed-codec call (ulaw/alaw/g722/... still win); it is only chosen when a leg is opus-ONLY
+		 * (a WebRTC peer negotiated down to opus). Without it ast_best_codec returned 0 there and the
+		 * bridge logged "Don't know any of opus formats" with no audio. */
+		AST_FORMAT_OPUS,
 	};
 	char buf[512];
 

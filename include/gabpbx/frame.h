@@ -805,6 +805,7 @@ static force_inline int ast_format_rate(format_t format)
 	case AST_FORMAT_SIREN14:
 		return 32000;
 	case AST_FORMAT_G719:
+	case AST_FORMAT_OPUS:	/* Opus is 48 kHz; without this ast_format_rate defaults to 8000 and the RTP TX timestamp clocks Opus at 8 kHz (+160 not +960 per 20 ms) → the receiver de-jitter mis-clocks → garbled "noise" on a both-Opus passthrough */
 		return 48000;
 	default:
 		return 8000;

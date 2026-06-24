@@ -2837,8 +2837,12 @@ static int ast_rtp_write(struct ast_rtp_instance *instance, struct ast_frame *fr
 		case AST_FORMAT_SIREN7:
 		case AST_FORMAT_SIREN14:
 		case AST_FORMAT_G719:
+		case AST_FORMAT_OPUS:
 			/* these are all frame-based codecs and cannot be safely run through
-			   a smoother */
+			   a smoother. Opus is VBR: the default smoother (fr_len 960, frame.c:144) would
+			   re-chunk its variable-size compressed packets into fixed 960-byte frames,
+			   concatenating/splitting them — exactly the garbled "noise" on a both-Opus
+			   WebRTC passthrough. opus->ulaw transcoded calls are unaffected (no raw Opus TX). */
 			break;
 		default:
 			if (fmt.inc_ms) {
