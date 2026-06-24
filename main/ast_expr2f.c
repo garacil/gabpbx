@@ -501,8 +501,7 @@ static yyconst flex_int16_t yy_chk[159] =
  * GABPBX was first created in 2008 by
  * Germán Luis Aracil Boned <garacilb@gmail.com>.
  *
- * GABPBX as a project is based on Asterisk 1.8 and was later updated
- * to the final stable Asterisk 1.8 release.
+ * GABPBX as a project is based on Asterisk.
  *
  * Copyleft: GABPBX is free software, distributed under the terms of
  * the GNU General Public License Version 2.

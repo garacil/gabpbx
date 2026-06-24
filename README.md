@@ -4,9 +4,9 @@ GABPBX is the Germán Aracil Boned PBX: a GPLv2 open-source PBX and telephony to
 
 ---
 
-## The basics — a fork of Asterisk 1.8
+## The basics — a fork of Asterisk
 
-GABPBX is a **fork of the Asterisk 1.8 codebase**, first created in **2008** and tracked to the final stable 1.8 release. It keeps everything that made that generation of Asterisk dependable, and concentrates its new engineering where it matters most — the SIP channel.
+GABPBX is a **fork of Asterisk**, first created in **2008**. It keeps everything that made Asterisk dependable, and concentrates its new engineering where it matters most — the SIP channel.
 
 | You keep | What it means |
 | :-- | :-- |

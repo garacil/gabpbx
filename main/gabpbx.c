@@ -6,8 +6,7 @@
  * GABPBX was first created in 2008 by
  * Germán Luis Aracil Boned <garacilb@gmail.com>.
  *
- * GABPBX as a project is based on Asterisk 1.8 and was later updated
- * to the final stable Asterisk 1.8 release.
+ * GABPBX as a project is based on Asterisk.
  *
  * Copyleft: GABPBX is free software, distributed under the terms of
  * the GNU General Public License Version 2.
@@ -54,7 +53,7 @@
  * \section copyright Copyright and Author
  *
  * Copyright (C) 2008 - present, Germán Luis Aracil Boned.
- * GABPBX is based on Asterisk 1.8, whose original work is
+ * GABPBX is based on Asterisk, whose original work is
  * Copyright (C) 1999 - 2012, Digium, Inc. and others.
  *
  * \author Germán Luis Aracil Boned <garacilb@gmail.com>
@@ -177,7 +176,7 @@ int daemon(int, int);  /* defined in libresolv of all places */
 #define WELCOME_MESSAGE \
 	ast_verbose("GABpbx %s, Copyright (C) 2008 - present, Germán Luis Aracil Boned <garacilb@gmail.com> and others.\n" \
 		"Created by Germán Luis Aracil Boned <garacilb@gmail.com>\n" \
-		"Based on Asterisk 1.8, Copyright (C) 1999 - 2012, Digium, Inc. and others.\n" \
+		"Based on Asterisk, Copyright (C) 1999 - 2012, Digium, Inc. and others.\n" \
 		"Original Asterisk author: Mark Spencer <markster@digium.com>\n" \
 		"GABpbx comes with ABSOLUTELY NO WARRANTY; type 'core show warranty' for details.\n" \
 		"This is free software, with components licensed under the GNU General Public\n" \
@@ -2192,7 +2191,7 @@ static const char license_lines[] = {
 	"it under the terms of the GNU General Public License version 2 as\n"
 	"published by the Free Software Foundation.\n"
 	"\n"
-	"GABPBX is based on Asterisk 1.8. Original Asterisk copyright,\n"
+	"GABPBX is based on Asterisk. Original Asterisk copyright,\n"
 	"authorship, contributor notices, and license terms are preserved in\n"
 	"the source tree, including Copyright (C) 1999 - 2012, Digium, Inc.\n"
 	"and others, with original work by Mark Spencer <markster@digium.com>.\n"
@@ -2944,7 +2943,7 @@ static int show_version(void)
 static int show_cli_help(void)
 {
 	printf("GABpbx %s, Copyright (C) 2008 - present, Germán Luis Aracil Boned <garacilb@gmail.com> and others.\n", ast_get_version());
-	printf("Based on Asterisk 1.8, Copyright (C) 1999 - 2012, Digium, Inc. and others.\n");
+	printf("Based on Asterisk, Copyright (C) 1999 - 2012, Digium, Inc. and others.\n");
 	printf("Original Asterisk author: Mark Spencer <markster@digium.com>\n");
 	printf("Usage: gabpbx [OPTIONS]\n");
 	printf("Valid Options:\n");
