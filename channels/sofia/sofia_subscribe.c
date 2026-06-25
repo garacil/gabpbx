@@ -18,7 +18,7 @@
  * sofia_thread. The MWI injection (ast_event_queue_and_cache) is thread-safe. Peer strings are
  * snapshotted under peer->lock.
  *
- * Hardening (3-way reviewed, grounded in the sofia-sip nua/nta sources):
+ * Hardening (grounded in the sofia-sip nua/nta sources):
  *  - F2: the outbound SUBSCRIBE honors outboundproxy via NUTAG_INITIAL_ROUTE_STR (REGISTER parity).
  *  - F3: a body-less `Subscription-State: terminated` NOTIFY clears the local MWI (lamp off), while a
  *    NOTIFY that carries a body is always rendered (RFC 6665 §3.1.4, RFC 3842 §3.8/§3.9).
@@ -567,7 +567,7 @@ int sofia_subscribe_on_subscribe_response(nua_handle_t *nh, sip_t const *sip, in
 		}
 		/* No usable credentials (missing secret / unparseable challenge) — a persistent CONFIG error,
 		 * not a transient one. Tear the failed watcher down WITHOUT scheduling a retry; a config fix +
-		 * reload, or the next REGISTER 200, recreates it cleanly. (3-way grounded: mwisub_send_subscribe
+		 * reload, or the next REGISTER 200, recreates it cleanly. (grounded: mwisub_send_subscribe
 		 * resets auth_tries each attempt, so a scheduled retry would re-challenge forever.) */
 		ast_log(LOG_WARNING, "Sofia MWI-SUBSCRIBE: auth failed for peer '%s' (%d) — check secret; not retrying\n",
 			sub->peername, status);

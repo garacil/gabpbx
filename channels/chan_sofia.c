@@ -3173,7 +3173,7 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 		} else if (!strcasecmp(v->name, "transport")) {
 			/* Store the configured transport so OUTBOUND requests to a STATIC peer route over it.
 			 * sofia-sip otherwise defaults the RURI to UDP, so transport=tls/tcp/ws/wss to a static
-			 * host (e.g. an external TLS trunk like sip.rtc.elevenlabs.io) silently went out over UDP.
+			 * host (e.g. an external TLS (SIPS) trunk) silently went out over UDP.
 			 * This sets only the peer's outbound default; INBOUND transport is still governed by the
 			 * [general] *bindaddr listeners and the REGISTER Contact scheme (no inbound allowlist implied).
 			 * chan_sip parity: a comma-list (e.g. transport=tls,udp) uses the first/preferred token. */

@@ -44,7 +44,7 @@
 int sofia_publication_sentinel;	/* hmagic identity; HMAGIC macro in sofia_publish.h */
 
 struct sofia_publication {
-	char key[AST_MAX_EXTENSION + AST_MAX_CONTEXT + 96];	/* "peer|context|exten" — provably sufficient (Codex) */
+	char key[AST_MAX_EXTENSION + AST_MAX_CONTEXT + 96];	/* "peer|context|exten" — provably sufficient */
 	char exten[AST_MAX_EXTENSION];		/* published extension (peer regexten) */
 	char context[AST_MAX_CONTEXT];		/* hint lookup context (peer subscribecontext) */
 	char entity[256];			/* presentity URI: sip:exten@publish_domain */
@@ -185,7 +185,7 @@ static void sofia_publication_send(struct sofia_publication *pub, int removing)
 }
 
 /* Schedule (re)publication: the sweep will send `pub` at the next tick where next_send <= now. Jitter
- * spreads bursts across [0, span) seconds so 5-10k pubs never fire together (opencode/Codex #6). */
+ * spreads bursts across [0, span) seconds so 5-10k pubs never fire together. */
 static void sofia_publication_schedule(struct sofia_publication *pub, int base, int span)
 {
 	int jitter = (span > 0) ? (int)(ast_random() % (unsigned)span) : 0;
@@ -353,7 +353,7 @@ static void sofia_publication_state_destroy_cb(int id, void *data)
 	}
 }
 
-/* Parse publish_server into its host + port (after stripping sip:/sips: and any userinfo — Codex).
+/* Parse publish_server into its host + port (after stripping sip:/sips: and any userinfo).
  * The host is the publish_domain default; the port is the ESC SIP port for the PUBLISH target R-URI. */
 static void sofia_publish_server_hostport(char *host, size_t hlen, int *port)
 {
@@ -497,7 +497,7 @@ static void sofia_publication_create_one(struct sofia_peer *peer, const char *ex
 	ast_copy_string(pub->entity, entity, sizeof(pub->entity));
 	pub->expires = (sofia_cfg.publish_expires > 0) ? sofia_cfg.publish_expires : SOFIA_PUBLISH_DEFAULT_EXPIRES;
 	if (pub->expires < SOFIA_PUBLISH_MIN_EXPIRES) {
-		pub->expires = SOFIA_PUBLISH_MIN_EXPIRES;	/* a 1Hz sweep cannot refresh a sub-30s TTL (Codex) */
+		pub->expires = SOFIA_PUBLISH_MIN_EXPIRES;	/* a 1Hz sweep cannot refresh a sub-30s TTL */
 	}
 	pub->stateid = -1;
 	pub->etag[0] = '\0';
@@ -934,7 +934,7 @@ void sofia_publications_start(void)
 }
 /* Stop the sweep timer and tear down every publication (sofia_thread). Each teardown best-effort sends
  * an Expires:0 unpublish (sofia_publication_teardown), but note the KNOWN, BOUNDED, RFC-COMPLIANT limit
- * (3-way reviewed; operator chose "document, not engineer around it"): on `systemctl stop` chan_sofia's
+ * (operator chose "document, not engineer around it"): on `systemctl stop` chan_sofia's
  * unload_module returns -1 (no runtime unload), so this teardown path does NOT run before SIGKILL; and
  * on a load-failure path nua_shutdown() has already set nua_shutdown_started=1, so nua_signal() rejects
  * the Expires:0 nua_method (silently dropped). Either way the ESC clears the stale state on its own when

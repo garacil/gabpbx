@@ -375,7 +375,7 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 	{
 		int parsed_tag = atoi(tag);
 		int idx = (parsed_tag >= 1 && parsed_tag <= p->suite_count) ? parsed_tag - 1 : -1;
-		/* Round5 C5 (Codex): selected_suite_index feeds sdp_crypto_activate's per-suite key
+		/* Round5 C5: selected_suite_index feeds sdp_crypto_activate's per-suite key
 		 * pick, so in defer mode STAGE it — do not mutate the live field before the SDP is
 		 * accepted (a rejected re-INVITE must not change key selection). Commit applies it
 		 * just before activation. */
@@ -535,14 +535,14 @@ int sdp_crypto_commit(struct sdp_crypto *p, struct ast_rtp_instance *rtp)
 		}
 	}
 	/* selected_suite_index is an INPUT to activation (per-suite local-key pick), so apply
-	 * the staged value just BEFORE activating (Codex fix 3 — not mutated during validate).
+	 * the staged value just BEFORE activating (not mutated during validate).
 	 * SAVE the old one so the -2 path can RESTORE it: on -2 we keep ALL accepted metadata
 	 * (suite/remote_key) unchanged, so the live index must not be left at the new value
-	 * either (Codex re-review). */
+	 * either. */
 	int prev_selected = p->selected_suite_index;
 	p->selected_suite_index = p->staged_selected_suite_index;
 	if (sdp_crypto_activate(p, p->staged_suite_val, p->staged_remote_key, rtp) < 0) {
-		/* Round5 C5 (Codex): ast_rtp_instance_add_srtp_policy / ast_srtp_replace can
+		/* Round5 C5: ast_rtp_instance_add_srtp_policy / ast_srtp_replace can
 		 * mutate/destroy the existing SRTP BEFORE failing, so an activation failure means
 		 * the live media may already be half-changed. Return -2 (NOT -1) so the caller does
 		 * NOT 488 after a possible live mutation (that would leave the media corrupted AND
@@ -553,7 +553,7 @@ int sdp_crypto_commit(struct sdp_crypto *p, struct ast_rtp_instance *rtp)
 		p->staged_pending = 0;
 		return -2;
 	}
-	/* Activation succeeded — only NOW commit the accepted metadata (Codex fix 2), so a -2
+	/* Activation succeeded — only NOW commit the accepted metadata, so a -2
 	 * path never leaves p->suite/p->remote_key mismatched against the live policy. */
 	ast_copy_string(p->suite, p->staged_suite, sizeof(p->suite));
 	memcpy(p->remote_key, p->staged_remote_key, sizeof(p->remote_key));
