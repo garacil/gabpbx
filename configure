@@ -726,6 +726,10 @@ PBX_SRTP
 SRTP_DIR
 SRTP_INCLUDE
 SRTP_LIB
+PBX_USRSCTP
+USRSCTP_DIR
+USRSCTP_INCLUDE
+USRSCTP_LIB
 PBX_SQLITE3
 SQLITE3_DIR
 SQLITE3_INCLUDE
@@ -1932,6 +1936,7 @@ Optional Packages:
   --with-sqlite3=PATH     use SQLite files in PATH
   --with-srtp=PATH        use Secure RTP files in PATH
   --with-ssl=PATH         use OpenSSL Secure Sockets Layer files in PATH
+  --with-usrsctp=PATH     use Userland SCTP (WebRTC DataChannel) files in PATH
   --with-suppserv=PATH    use mISDN Supplemental Services files in PATH
   --with-tds=PATH         use FreeTDS files in PATH
   --with-termcap=PATH     use Termcap files in PATH
@@ -11148,6 +11153,39 @@ if test "${with_ssl+set}" = set; then :
 	esac
 
 fi
+
+
+
+
+
+
+
+
+    USRSCTP_DESCRIP="Userland SCTP (WebRTC DataChannel)"
+    USRSCTP_OPTION="usrsctp"
+    PBX_USRSCTP=0
+
+# Check whether --with-usrsctp was given.
+if test "${with_usrsctp+set}" = set; then :
+  withval=$with_usrsctp;
+	case ${withval} in
+	n|no)
+	USE_USRSCTP=no
+	# -1 is a magic value used by menuselect to know that the package
+	# was disabled, other than 'not found'
+	PBX_USRSCTP=-1
+	;;
+	y|ye|yes)
+	ac_mandatory_list="${ac_mandatory_list} USRSCTP"
+	;;
+	*)
+	USRSCTP_DIR="${withval}"
+	ac_mandatory_list="${ac_mandatory_list} USRSCTP"
+	;;
+	esac
+
+fi
+
 
 
 
@@ -27483,6 +27521,110 @@ rm -f core conftest.err conftest.$ac_objext \
     LDFLAGS="${saved_ldflags}"
     CFLAGS="${saved_cflags}"
 fi
+
+
+if test "x${PBX_USRSCTP}" != "x1" -a "${USE_USRSCTP}" != "no"; then
+   pbxlibdir=""
+   # if --with-USRSCTP=DIR has been specified, use it.
+   if test "x${USRSCTP_DIR}" != "x"; then
+      if test -d ${USRSCTP_DIR}/lib; then
+      	 pbxlibdir="-L${USRSCTP_DIR}/lib"
+      else
+      	 pbxlibdir="-L${USRSCTP_DIR}"
+      fi
+   fi
+   pbxfuncname="usrsctp_init"
+   if test "x${pbxfuncname}" = "x" ; then   # empty lib, assume only headers
+      AST_USRSCTP_FOUND=yes
+   else
+      ast_ext_lib_check_save_CFLAGS="${CFLAGS}"
+      CFLAGS="${CFLAGS} "
+      as_ac_Lib=`$as_echo "ac_cv_lib_usrsctp_${pbxfuncname}" | $as_tr_sh`
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking for ${pbxfuncname} in -lusrsctp" >&5
+$as_echo_n "checking for ${pbxfuncname} in -lusrsctp... " >&6; }
+if eval \${$as_ac_Lib+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  ac_check_lib_save_LIBS=$LIBS
+LIBS="-lusrsctp ${pbxlibdir}  $LIBS"
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char ${pbxfuncname} ();
+int
+main ()
+{
+return ${pbxfuncname} ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"; then :
+  eval "$as_ac_Lib=yes"
+else
+  eval "$as_ac_Lib=no"
+fi
+rm -f core conftest.err conftest.$ac_objext \
+    conftest$ac_exeext conftest.$ac_ext
+LIBS=$ac_check_lib_save_LIBS
+fi
+eval ac_res=\$$as_ac_Lib
+	       { $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_res" >&5
+$as_echo "$ac_res" >&6; }
+if eval test \"x\$"$as_ac_Lib"\" = x"yes"; then :
+  AST_USRSCTP_FOUND=yes
+else
+  AST_USRSCTP_FOUND=no
+fi
+
+      CFLAGS="${ast_ext_lib_check_save_CFLAGS}"
+   fi
+
+   # now check for the header.
+   if test "${AST_USRSCTP_FOUND}" = "yes"; then
+      USRSCTP_LIB="${pbxlibdir} -lusrsctp "
+      # if --with-USRSCTP=DIR has been specified, use it.
+      if test "x${USRSCTP_DIR}" != "x"; then
+         USRSCTP_INCLUDE="-I${USRSCTP_DIR}/include"
+      fi
+      USRSCTP_INCLUDE="${USRSCTP_INCLUDE} "
+      if test "xusrsctp.h" = "x" ; then	# no header, assume found
+         USRSCTP_HEADER_FOUND="1"
+      else				# check for the header
+         ast_ext_lib_check_saved_CPPFLAGS="${CPPFLAGS}"
+         CPPFLAGS="${CPPFLAGS} ${USRSCTP_INCLUDE}"
+         ac_fn_c_check_header_mongrel "$LINENO" "usrsctp.h" "ac_cv_header_usrsctp_h" "$ac_includes_default"
+if test "x$ac_cv_header_usrsctp_h" = xyes; then :
+  USRSCTP_HEADER_FOUND=1
+else
+  USRSCTP_HEADER_FOUND=0
+fi
+
+
+         CPPFLAGS="${ast_ext_lib_check_saved_CPPFLAGS}"
+      fi
+      if test "x${USRSCTP_HEADER_FOUND}" = "x0" ; then
+         USRSCTP_LIB=""
+         USRSCTP_INCLUDE=""
+      else
+         if test "x${pbxfuncname}" = "x" ; then		# only checking headers -> no library
+            USRSCTP_LIB=""
+         fi
+         PBX_USRSCTP=1
+         cat >>confdefs.h <<_ACEOF
+#define HAVE_USRSCTP 1
+_ACEOF
+
+      fi
+   fi
+fi
+
 
 
     if test "x${PBX_GMIME}" != "x1" -a "${USE_GMIME}" != "no"; then

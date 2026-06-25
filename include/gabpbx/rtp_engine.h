@@ -457,6 +457,8 @@ struct ast_rtp_engine_dtls {
 	enum ast_rtp_dtls_hash (*get_fingerprint_hash)(struct ast_rtp_instance *instance);
 	/*! Get the local fingerprint */
 	const char *(*get_fingerprint)(struct ast_rtp_instance *instance);
+	/*! Write DTLS application data (e.g. SCTP) out over the established DTLS association. Returns bytes written or <0. */
+	int (*write_appdata)(struct ast_rtp_instance *instance, const void *buf, size_t len);
 };
 
 /*! Structure that represents an RTP stack (engine) */
@@ -1833,6 +1835,63 @@ struct ast_rtp_engine_ice *ast_rtp_instance_get_ice(struct ast_rtp_instance *ins
  * \note WebRTC A1.
  */
 struct ast_rtp_engine_dtls *ast_rtp_instance_get_dtls(struct ast_rtp_instance *instance);
+
+/*!
+ * \brief Callback invoked with decrypted DTLS application data (e.g. SCTP datachannel)
+ *
+ * \param instance the RTP instance the data arrived on
+ * \param data the decrypted application-data payload
+ * \param len length of \a data in bytes
+ * \param cb_data opaque pointer supplied at registration time
+ *
+ * \note WebRTC DataChannel (Phase 1). Invoked from the RTP read path while the
+ * instance is locked — the consumer MUST NOT block or take the channel/pvt/peer
+ * locks here (lock order channel -> pvt -> instance -> peer); queue work instead.
+ */
+typedef void (*ast_rtp_dtls_appdata_cb)(struct ast_rtp_instance *instance, const uint8_t *data, size_t len, void *cb_data);
+
+/*!
+ * \brief Register (or clear) the consumer for decrypted DTLS application data
+ *
+ * \param instance the RTP instance
+ * \param cb the callback to receive DTLS application data, or NULL to clear it
+ * \param cb_data opaque pointer passed back to \a cb on every delivery
+ *
+ * \note WebRTC DataChannel (Phase 1). With no consumer registered the engine
+ * drains and discards DTLS application data exactly as before (no-op delivery).
+ */
+void ast_rtp_instance_set_dtls_appdata_cb(struct ast_rtp_instance *instance, ast_rtp_dtls_appdata_cb cb, void *cb_data);
+
+/*!
+ * \brief Write DTLS application data out over the established DTLS association
+ *
+ * \param instance the RTP instance
+ * \param buf the application-data payload to send
+ * \param len length of \a buf in bytes
+ *
+ * \retval >=0 bytes written
+ * \retval <0 on error, or if the engine has no DTLS support
+ *
+ * \note WebRTC DataChannel (Phase 1). The data is encrypted and sent out over the
+ * same DTLS association used for DTLS-SRTP (BUNDLE).
+ */
+int ast_rtp_instance_dtls_write_appdata(struct ast_rtp_instance *instance, const void *buf, size_t len);
+
+/*!
+ * \brief Deliver decrypted DTLS application data to the registered consumer (engine-internal)
+ *
+ * \param instance the RTP instance
+ * \param data the decrypted application-data payload
+ * \param len length of \a data in bytes
+ *
+ * \retval 1 a consumer was registered and was invoked with the data
+ * \retval 0 no consumer is registered (the caller should discard the data)
+ *
+ * \note WebRTC DataChannel (Phase 1). Called by the RTP engine's read path (e.g.
+ * res_rtp_gabpbx's DTLS drain loop) to hand off decrypted application data. This is
+ * an engine-internal delivery hook, not a public consumer API.
+ */
+int ast_rtp_instance_dtls_deliver_appdata(struct ast_rtp_instance *instance, const uint8_t *data, size_t len);
 
 /*!
  * \brief Set the RTP timeout value

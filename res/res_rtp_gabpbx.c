@@ -997,6 +997,27 @@ static const char *gabpbx_dtls_get_fingerprint(struct ast_rtp_instance *instance
 	return rtp->local_fingerprint;
 }
 
+/* WebRTC DataChannel (Phase 1). Encrypt and send application data out over the established DTLS
+ * association. SSL_write hands the record to the write BIO (dtls_bio_write -> rtp_raw_sendto), so it
+ * rides the same datagram socket as DTLS-SRTP (BUNDLE). Runs LOCKED — invoked via the A1 wrapper which
+ * holds ao2_lock(instance); we re-lock (recursive) to mirror the locking discipline of this file. */
+static int gabpbx_dtls_write_appdata(struct ast_rtp_instance *instance, const void *buf, size_t len)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	struct dtls_details *dtls = &rtp->dtls;
+	int res;
+
+	ao2_lock(instance);
+	if (!dtls->ssl || !SSL_is_init_finished(dtls->ssl)) {
+		ao2_unlock(instance);
+		return -1;	/* no established DTLS association to write over */
+	}
+	res = SSL_write(dtls->ssl, buf, len);
+	ao2_unlock(instance);
+
+	return res <= 0 ? -1 : res;
+}
+
 static struct ast_rtp_engine_dtls gabpbx_dtls = {
 	.set_configuration    = gabpbx_dtls_set_configuration,
 	.active               = gabpbx_dtls_active,
@@ -1008,6 +1029,7 @@ static struct ast_rtp_engine_dtls gabpbx_dtls = {
 	.set_fingerprint      = gabpbx_dtls_set_fingerprint,
 	.get_fingerprint_hash = gabpbx_dtls_get_fingerprint_hash,
 	.get_fingerprint      = gabpbx_dtls_get_fingerprint,
+	.write_appdata        = gabpbx_dtls_write_appdata,
 };
 
 /* SRTP master key/salt lengths for the AES_CM_128 suites (the only DTLS-SRTP profiles A2 offers). */
@@ -1221,9 +1243,15 @@ static int dtls_srtp_handle_record(struct ast_rtp_instance *instance, struct ast
 		return rtp->dtls_failure ? -1 : 0;
 	}
 
-	/* Handshake finished — drain any DTLS app data (none expected on media). */
-	res = SSL_read(dtls->ssl, rxbuf, sizeof(rxbuf));
-	(void) res;
+	/* Handshake finished — drain any DTLS application data and hand each chunk to a registered
+	 * consumer (WebRTC DataChannel, Phase 1). ast_rtp_instance_dtls_deliver_appdata is a no-op
+	 * returning 0 when no consumer is registered, so with no datachannel the behaviour is unchanged:
+	 * drain the records and drop them (none expected on plain media). Runs LOCKED. */
+	while ((res = SSL_read(dtls->ssl, rxbuf, sizeof(rxbuf))) > 0) {
+		ast_rtp_instance_dtls_deliver_appdata(instance, (uint8_t *) rxbuf, res);
+	}
+	/* res <= 0: SSL_ERROR_WANT_READ is the normal "no more data" exit; any other error is benign here
+	 * (handshake completion/teardown is handled above and by the demux). */
 	return rtp->dtls_failure ? -1 : 0;
 }
 

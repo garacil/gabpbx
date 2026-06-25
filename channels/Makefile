@@ -110,8 +110,14 @@ chan_usbradio.so: _ASTCFLAGS+=-DNDEBUG
 
 chan_sofia.o: _ASTCFLAGS+=-I/usr/local/include/sofia-sip-1.13
 chan_sofia.so: LIBS+=-L/usr/local/lib -lsofia-sip-ua
+# OPTIONAL WebRTC DataChannel: link usrsctp when ./configure detected it ($(USRSCTP_LIB) = -lusrsctp,
+# empty otherwise). HAVE_USRSCTP itself comes from gabpbx/autoconfig.h — the standard GabPBX mechanism,
+# exactly like HAVE_SRTP / HAVE_OPENSSL — so chan_sofia gates datachannel code with #ifdef HAVE_USRSCTP
+# regardless of make. Absent → USRSCTP_LIB empty → no link, no usrsctp symbols, RTP engine + plain builds untouched.
+chan_sofia.so: LIBS+=$(USRSCTP_LIB)
+chan_sofia.o: _ASTCFLAGS+=$(USRSCTP_INCLUDE)
 $(if $(filter chan_sofia,$(EMBEDDED_MODS)),modules.link,chan_sofia.so): $(subst .c,.o,$(wildcard sofia/*.c))
-$(subst .c,.o,$(wildcard sofia/*.c)): _ASTCFLAGS+=$(call MOD_ASTCFLAGS,chan_sofia) -I/usr/local/include/sofia-sip-1.13
+$(subst .c,.o,$(wildcard sofia/*.c)): _ASTCFLAGS+=$(call MOD_ASTCFLAGS,chan_sofia) -I/usr/local/include/sofia-sip-1.13 $(USRSCTP_INCLUDE)
 
 h323/Makefile.ast:
 	$(CMD_PREFIX) $(MAKE) -C h323 Makefile.ast

@@ -444,6 +444,7 @@ AST_EXT_LIB_SETUP([SQLITE], [SQLite], [sqlite])
 AST_EXT_LIB_SETUP([SQLITE3], [SQLite], [sqlite3])
 AST_EXT_LIB_SETUP([SRTP], [Secure RTP], [srtp])
 AST_EXT_LIB_SETUP([OPENSSL], [OpenSSL Secure Sockets Layer], [ssl])
+AST_EXT_LIB_SETUP([USRSCTP], [Userland SCTP (WebRTC DataChannel)], [usrsctp])
 AST_EXT_LIB_SETUP([SUPPSERV], [mISDN Supplemental Services], [suppserv])
 AST_EXT_LIB_SETUP([FREETDS], [FreeTDS], [tds])
 AST_EXT_LIB_SETUP([TERMCAP], [Termcap], [termcap])
@@ -2031,6 +2032,9 @@ fi
 
 dnl T38: probe libsrtp 2.x — header srtp2/srtp.h, lib -lsrtp2, srtp_init exists in both 1.x and 2.x.
 AST_EXT_LIB_CHECK([SRTP], [srtp2], [srtp_init], [srtp2/srtp.h])
+
+dnl WebRTC DataChannel: OPTIONAL userland SCTP — header usrsctp.h, lib -lusrsctp, usrsctp_init. Absent → DataChannel unsupported, RTP engine unaffected.
+AST_EXT_LIB_CHECK([USRSCTP], [usrsctp], [usrsctp_init], [usrsctp.h])
 
 if test "$PBX_SRTP" = "1";
 then

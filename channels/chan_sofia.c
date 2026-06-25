@@ -173,6 +173,7 @@
 #include "sofia/include/sofia_transfer.h"
 #include "sofia/include/sofia_subscribe.h"
 #include "sofia/include/sofia_history.h"
+#include "sofia/include/sofia_datachannel.h"  /* WebRTC DataChannel (usrsctp) — Phase 2a foundation */
 
 #include <sofia-sip/nua.h>
 #include <sofia-sip/su.h>
@@ -703,6 +704,100 @@ void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
 	}
 }
 
+/*
+ * Build the outbound RURI for a SPECIFIC registered contact (per-contact routing),
+ * the single source of truth shared by the fork loop and the single-live-contact
+ * request path. Snapshots the refresh-mutable contact fields under ao2_lock(c), then:
+ *   - for ws/wss with a non-null src_addr, targets the registered Via source
+ *     (c->src_addr) — a SIP.js WS/WSS Contact host is a TEST-NET placeholder
+ *     (192.0.2.x / .invalid) and a WebSocket client is reachable ONLY over its
+ *     accepted connection; sofia-sip reuses that tport once ;transport=wss is
+ *     appended (RFC 7118; mirrors sofia_resolve_peer_target);
+ *   - otherwise targets c->host:c->port;
+ *   - formats "sip:user@host:port" (IPv6-bracket-wrapped, RFC 3261 §19.1.2) and
+ *     appends the contact's transport.
+ * When path_support is set and path_out is provided, also copies this contact's
+ * stored RFC 3327 Path (ready "<uri;lr>,..." Route value) for pre-loading on the
+ * INVITE. Lock order: takes ONLY the contact ao2 lock (the caller must not hold it).
+ */
+static void sofia_build_contact_ruri(struct sofia_contact *c, const char *user,
+	char *out, size_t outlen, int path_support, char *path_out, size_t path_outlen)
+{
+	char hbuf[80];
+	char c_transport[8];
+	char c_host[128];
+	int c_port;
+
+	if (!c || !out || !outlen)
+		return;
+
+	ao2_lock(c);
+	ast_copy_string(c_transport, c->transport, sizeof(c_transport));
+	if ((!strcasecmp(c_transport, "ws") || !strcasecmp(c_transport, "wss"))
+			&& !ast_sockaddr_isnull(&c->src_addr)) {
+		ast_copy_string(c_host, ast_sockaddr_stringify_host(&c->src_addr), sizeof(c_host));
+		c_port = ast_sockaddr_port(&c->src_addr);
+	} else {
+		ast_copy_string(c_host, c->host, sizeof(c_host));
+		c_port = c->port;
+	}
+	if (path_support && path_out && path_outlen) {
+		ast_copy_string(path_out, c->path, path_outlen);	/* RFC 3327 */
+	}
+	ao2_unlock(c);
+
+	snprintf(out, outlen, "sip:%s@%s:%d", user ? user : "",
+		sofia_uri_format_host(c_host, hbuf, sizeof(hbuf)),
+		c_port);
+	sofia_uri_append_transport(out, outlen, c_transport);
+}
+
+/*
+ * Select the peer's SINGLE live (expires > now) registered contact, if and only if
+ * EXACTLY ONE exists, returning it with a +1 ref the caller must release. Mirrors the
+ * fork's live-count loop (expires snapshotted under ao2_lock(c) against a concurrent
+ * REGISTER refresh) and preserves the fork threshold: this returns non-NULL only for
+ * live == 1, so live > 1 still falls to the fork and live == 0 to the peer-aggregate
+ * fallback. Lock order: iterates the contacts container + takes per-contact ao2 locks;
+ * the caller must NOT hold peer->lock (mirrors the post-release Path lookup).
+ */
+static struct sofia_contact *sofia_peer_select_single_live_contact(struct sofia_peer *peer)
+{
+	struct ao2_iterator ci;
+	struct sofia_contact *c, *winner = NULL;
+	int live = 0;
+	time_t now = time(NULL);
+
+	if (!peer || !peer->contacts)
+		return NULL;
+
+	ci = ao2_iterator_init(peer->contacts, 0);
+	while ((c = ao2_iterator_next(&ci))) {
+		time_t c_exp;
+		ao2_lock(c);
+		c_exp = c->expires;
+		ao2_unlock(c);
+		if (c_exp > now) {
+			live++;
+			if (live == 1) {
+				winner = c;	/* keep this ref as the candidate */
+				ao2_ref(winner, +1);
+			}
+		}
+		ao2_ref(c, -1);
+	}
+	ao2_iterator_destroy(&ci);
+
+	if (live != 1) {
+		/* 0 → peer-aggregate fallback; >1 → fork path. Drop any candidate. */
+		if (winner) {
+			ao2_ref(winner, -1);
+			winner = NULL;
+		}
+	}
+	return winner;
+}
+
 /* Contact lookup by source address (inbound traffic). */
 static struct sofia_contact *sofia_peer_find_contact_by_addr(struct sofia_peer *peer,
 	const struct ast_sockaddr *addr)
@@ -756,7 +851,7 @@ static struct sofia_contact *sofia_peer_find_contact_by_host_port(struct sofia_p
 	 * NULL, which broke in-dialog ACK/BYE NAT routing (the caller never learned the call ended → 15s RTP
 	 * timeout). Pass 1 wins whenever the Contact host is routable, so this is zero-regression for udp/tcp/tls.
 	 * With multiple contacts the src_addr is unique per registration, so only the right one matches.
-	 * src_addr is refresh-mutable → read under the contact lock. (robustness fix.) */
+	 * src_addr is refresh-mutable → read under the contact lock. */
 	ci = ao2_iterator_init(peer->contacts, 0);
 	while ((c = ao2_iterator_next(&ci))) {
 		int match;
@@ -1035,7 +1130,7 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	master->vsrtp = child->vsrtp;
 	child->vsrtp = NULL;
 
-	/* Carry the WebRTC pvt state that BELONGS
+	/* Review MED (pre-existing, predates v1c but widened by it): carry the WebRTC pvt state that BELONGS
 	 * to the just-stolen rtp/vrtp/srtp instances onto master. Otherwise a forked WebRTC(-video) winner keeps
 	 * the media instances but master->is_webrtc stays 0 and master->capability/mids/tls-ids are unset, so a
 	 * later master re-INVITE/hold would emit plain RTP/AVP on a DTLS-SRTP leg and lose video. */
@@ -1051,6 +1146,23 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	ast_copy_string(master->webrtc_tls_id, child->webrtc_tls_id, sizeof(master->webrtc_tls_id));
 	ast_copy_string(master->webrtc_video_mid, child->webrtc_video_mid, sizeof(master->webrtc_video_mid));
 	ast_copy_string(master->webrtc_video_tls_id, child->webrtc_video_tls_id, sizeof(master->webrtc_video_tls_id));
+
+	/* Phase 3 WebRTC DataChannel fork-steal: the DC transport rides the just-stolen
+	 * master->rtp (its engine cb_data already moved with the rtp instance above), so we only MOVE the
+	 * dc pointer child->master + the negotiated DC fields, then REPOINT dc->pvt to master (no re-attach).
+	 * Mirrors the webrtc_* steal. sofia_dc_set_pvt is a no-op stub without usrsctp. */
+	master->dc = child->dc;
+	child->dc = NULL;
+	master->dc_offered = child->dc_offered;
+	master->dc_accepted = child->dc_accepted;
+	master->dc_offerer = child->dc_offerer;		/* OFFER-side: the winner child provisioned its own outbound DC offer; carry the emit/answer-apply state */
+	master->dc_answer_applied = child->dc_answer_applied;
+	master->dc_sctp_port = child->dc_sctp_port;
+	master->dc_max_message_size = child->dc_max_message_size;
+	ast_copy_string(master->dc_mid, child->dc_mid, sizeof(master->dc_mid));
+	if (master->dc) {
+		sofia_dc_set_pvt(master->dc, master);
+	}
 
 	/* Compute the stolen-RTP fds here (master->rtp/vrtp stable under master->lock)
 	 * but DEFER writing owner->fds[] until below under the channel lock, else it
@@ -1179,7 +1291,9 @@ static int sofia_send_digit_end(struct ast_channel *ast, char digit, unsigned in
 static const char *sofia_get_callid(struct ast_channel *ast);
 static int sofia_devicestate(void *data);	/* BLF/presence: report SIP/<peer> device state to the core */
 
-static struct ast_channel_tech sofia_tech = {
+/* Non-static: the WebRTC DataChannel relay (sofia_datachannel.c) compares a bridged channel's
+ * ->tech against this to confirm a far leg is a Sofia channel (declared in chan_sofia_internal.h). */
+struct ast_channel_tech sofia_tech = {
 	.type = SOFIA_CHANNEL_TYPE,
 	.description = "Sofia-SIP Channel Driver",
 	.capabilities = AST_FORMAT_G723_1 | AST_FORMAT_GSM | AST_FORMAT_ULAW | AST_FORMAT_ALAW
@@ -1676,6 +1790,17 @@ static void sofia_pvt_destructor(void *obj)
 	/* DSP cleanup before pvt->rtp destroy (chan_sip ordering convention). NULL-safe. */
 	sofia_disable_dsp_detect(pvt);
 
+	/* Phase 3 WebRTC DataChannel teardown — BEFORE ast_rtp_instance_destroy(pvt->rtp). sofia_dc_detach
+	 * clears the engine appdata cb FIRST (instance-lock barrier, anti-UAF), so it MUST
+	 * run while pvt->rtp is still live; destroying the rtp first would leave the cb pointing at freed
+	 * state. No-op stub without usrsctp; NULL-safe (dc is NULL on a non-DataChannel leg). */
+#ifdef HAVE_USRSCTP
+	if (pvt->dc) {
+		sofia_dc_detach(pvt->dc);
+		pvt->dc = NULL;
+	}
+#endif
+
 	if (pvt->rtp) {
 		ast_rtp_instance_destroy(pvt->rtp);
 		pvt->rtp = NULL;
@@ -1771,7 +1896,9 @@ void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len);
 /* sofia_resolve_ourip mirrors ast_sip_ouraddrfor (kernel routing + externaddr remap). */
 static void sofia_resolve_ourip(struct sofia_pvt *pvt, const struct ast_sockaddr *target);
 static void sofia_build_from(struct sofia_pvt *pvt, char *buf, size_t len);
-static struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op);
+/* Non-static: reused by the WebRTC DataChannel relay (sofia_datachannel.c) to resolve the bridged
+ * far leg (+1-reffed channel). Declared in chan_sofia_internal.h. */
+struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op);
 /* dnsmgr update callback — arg order (old, new, data) per dnsmgr.h dns_update_func. */
 static void sofia_on_dns_update_peer(struct ast_sockaddr *old, struct ast_sockaddr *new, void *data);
 static void sofia_build_contact(struct sofia_pvt *pvt, char *buf, size_t len);
@@ -2196,6 +2323,7 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	peer->max_contacts = sofia_cfg.max_contacts ? sofia_cfg.max_contacts : 6;
 	peer->encryption = 0;
 	peer->webrtc = sofia_cfg.webrtc;	/* A4: inherit [general] webrtc; per-peer webrtc= overrides */
+	peer->datachannel = sofia_cfg.datachannel;	/* Phase 3: inherit [general] datachannel; per-peer datachannel= overrides */
 	ast_string_field_set(peer, srtpcipher, S_OR(sofia_cfg.default_srtpcipher, ""));
 	peer->session_timers = sofia_cfg.default_session_timers;
 	peer->session_expires = sofia_cfg.default_session_expires;
@@ -2607,6 +2735,8 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			peer->encryption = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "webrtc")) {
 			peer->webrtc = ast_true(v->value);	/* WebRTC A4: DTLS-SRTP + ICE-lite + rtcp-mux */
+		} else if (!strcasecmp(v->name, "datachannel")) {
+			peer->datachannel = ast_true(v->value);	/* Phase 3: accept the WebRTC m=application (RFC 8841 SCTP); requires webrtc=yes + usrsctp */
 		} else if (!strcasecmp(v->name, "srtpcipher")) {
 			/* SRTP suite preference for outbound a=crypto:N (RFC 4568 §6.1); typo
 			 * warnings deferred to emit time (a future res_srtp may add the suite). */
@@ -2922,7 +3052,7 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 		} else if (!strcasecmp(v->name, "transport")) {
 			/* Store the configured transport so OUTBOUND requests to a STATIC peer route over it.
 			 * sofia-sip otherwise defaults the RURI to UDP, so transport=tls/tcp/ws/wss to a static
-			 * host (e.g. an external TLS trunk) silently went out over UDP.
+			 * host (e.g. an external TLS trunk like sip.rtc.elevenlabs.io) silently went out over UDP.
 			 * This sets only the peer's outbound default; INBOUND transport is still governed by the
 			 * [general] *bindaddr listeners and the REGISTER Contact scheme (no inbound allowlist implied).
 			 * chan_sip parity: a comma-list (e.g. transport=tls,udp) uses the first/preferred token. */
@@ -3102,7 +3232,7 @@ struct sofia_peer *sofia_find_peer_cached(const char *name)
  * Used by sofia_process_invite after the From-username lookup fails — typical
  * for trunk gateways whose From-user is the caller-ID number, not the peer
  * name (e.g. Huawei SoftX3000 sending From: <sip:621120700@…> while the peer
- * is configured as [trunk_eli4] host=213.162.195.21). Matches peer->src_addr
+ * is configured as [mytrunk] host=192.0.2.10). Matches peer->src_addr
  * (set both by dnsmgr for static host=<ip> peers and by REGISTER for dynamic
  * peers) or, if that is unset, peer->defaddr. Port is ignored on purpose so
  * the existing SOFIA_INSECURE_PORT semantic stays the only port-mismatch
@@ -3158,7 +3288,7 @@ static enum ast_rtp_glue_result sofia_get_rtp_peer(struct ast_channel *chan,
 
 	/* SRTP / DTLS-SRTP active → force LOCAL relay. directmedia would bridge this leg's encrypted media to a
 	 * possibly non-DTLS peer or disclose the SRTP key via re-INVITE. DTLS-SRTP (WebRTC) keys live in the
-	 * engine instance, NOT pvt->srtp/vsrtp, so is_webrtc must be checked explicitly. */
+	 * engine instance, NOT pvt->srtp/vsrtp, so is_webrtc must be checked explicitly (review fix). */
 	if (pvt->srtp || pvt->vsrtp || pvt->is_webrtc) {
 		ast_debug(2, "Sofia: get_rtp_peer LOCAL (SRTP/DTLS active, direct media inhibited)\n");
 		return AST_RTP_GLUE_RESULT_LOCAL;
@@ -3705,39 +3835,14 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				ast_sockaddr_copy(&child->ourip, &pvt->ourip);
 				char child_path[1024] = "";	/* RFC 3327 Path of THIS contact, pre-loaded as Route on its forked INVITE */
 
-				/* Build RURI for this contact. c->host may be unbracketed IPv6 —
+				/* Build RURI for this contact via the shared per-contact builder
+				 * (single source of truth with the single-live-contact request path):
+				 * snapshots c->transport/src_addr/host/port under ao2_lock(c), routes
+				 * ws/wss to c->src_addr (BUG 2 / WSS fork), appends the transport, and
+				 * copies this contact's RFC 3327 Path. c->host may be unbracketed IPv6 —
 				 * the helper wraps it (RFC 3261 §19.1.2). */
-				{
-					char hbuf[80];
-					char c_transport[8];
-					char c_host[128];
-					int c_port;
-					/* Snapshot the refresh-mutable contact fields under its lock, then
-					 * fork each branch over its contact's transport. */
-					ao2_lock(c);
-					ast_copy_string(c_transport, c->transport, sizeof(c_transport));
-					/* BUG 2 / WSS fork: a SIP.js WS/WSS Contact host is a TEST-NET placeholder
-					 * (192.0.2.x) — a WebSocket client is reachable ONLY over its accepted
-					 * connection, so target the registered Via source (c->src_addr); sofia-sip
-					 * then reuses that tport once ;transport=wss is appended (RFC 7118; mirrors
-					 * sofia_resolve_peer_target). udp/tcp/tls keep the Contact host:port. */
-					if ((!strcasecmp(c_transport, "ws") || !strcasecmp(c_transport, "wss"))
-							&& !ast_sockaddr_isnull(&c->src_addr)) {
-						ast_copy_string(c_host, ast_sockaddr_stringify_host(&c->src_addr), sizeof(c_host));
-						c_port = ast_sockaddr_port(&c->src_addr);
-					} else {
-						ast_copy_string(c_host, c->host, sizeof(c_host));
-						c_port = c->port;
-					}
-					if (child->peer && child->peer->path_support) {
-						ast_copy_string(child_path, c->path, sizeof(child_path));	/* RFC 3327 */
-					}
-					ao2_unlock(c);
-					snprintf(ruri, sizeof(ruri), "sip:%s@%s:%d", pvt->exten,
-						sofia_uri_format_host(c_host, hbuf, sizeof(hbuf)),
-						c_port);
-					sofia_uri_append_transport(ruri, sizeof(ruri), c_transport);
-				}
+				sofia_build_contact_ruri(c, pvt->exten, ruri, sizeof(ruri),
+					(child->peer && child->peer->path_support), child_path, sizeof(child_path));
 				ast_string_field_set(child, ruri, ruri);
 
 				/* Create handle auto-bound to child. */
@@ -4791,6 +4896,23 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 					ao2_ref(fc, -1);
 				}
 			}
+			/* Single-live-contact override (PER-CONTACT routing). sofia_resolve_peer_target
+			 * above routes via the PEER-aggregate src_addr/reg_transport, which is WRONG for a
+			 * peer whose live binding is per-contact (e.g. a WebRTC peer registered over WSS with
+			 * a SIP.js .invalid Contact host — the live transport is c->src_addr/wss). When the
+			 * peer has EXACTLY ONE live contact, rebuild url + Path from THAT contact using the
+			 * same builder the fork uses, so the nua_handle below targets the real binding. live>1
+			 * still falls to the fork; live==0 keeps the peer-aggregate url. Done after the
+			 * peer->lock release (the selector locks the contacts container + per-contact ao2). */
+			{
+				struct sofia_contact *single = sofia_peer_select_single_live_contact(peer);
+				if (single) {
+					sofia_build_contact_ruri(single, exten, url, sizeof(url),
+						peer->path_support, path_buf, sizeof(path_buf));
+					sofia_pvt_set_active_contact(pvt, single);	/* in-dialog BYE/ACK route + call accounting */
+					ao2_ref(single, -1);
+				}
+			}
 			ast_string_field_set(pvt, ruri, url);
 			if (sofia_debug) {
 				ast_verbose("Sofia: Outbound call to peer %s, RURI=%s%s%s\n",
@@ -4816,6 +4938,10 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 					TAG_IF(proxy_url[0], NUTAG_PROXY(proxy_url)),
 					TAG_IF(peer_gruu, NUTAG_SUPPORTED("gruu")),	/* RFC 5627 §4.4 */
 					TAG_END());
+				if (!pvt->nh) {
+					ast_log(LOG_WARNING, "Sofia: nua_handle NULL for outbound call to peer '%s' (url=%s)\n",
+						peername, url);
+				}
 			}
 		}
 
@@ -4982,7 +5108,7 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 			SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 			SIPTAG_PAYLOAD_STR(sdp_buf),
 			TAG_END());
-		/* Fix: this re-INVITE may have armed a fresh vrtp in sofia_parse_sdp (STEP 5) for an
+		/* Review HIGH 2: this re-INVITE may have armed a fresh vrtp in sofia_parse_sdp (STEP 5) for an
 		 * added/updated video, but — unlike sofia_answer — never activated it. For an a=setup:passive video
 		 * offer our DTLS role is ACTIVE and the ClientHello only fires on activate, so video DTLS would never
 		 * start. Activate now the 200 OK is out, mirroring sofia_answer; a duplicate activate is a no-op. */
@@ -5182,7 +5308,7 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 				SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 				SIPTAG_PAYLOAD_STR(sdp_buf),
 				TAG_END());
-			/* Fix: like the re-INVITE path — activate the freshly armed vrtp after the 200 OK so an
+			/* Review HIGH 2: like the re-INVITE path — activate the freshly armed vrtp after the 200 OK so an
 			 * added-video UPDATE actually starts video DTLS (ACTIVE role fires its ClientHello on activate).
 			 * Mirrors sofia_answer; a duplicate activate is a no-op. */
 			if (pvt->is_webrtc && pvt->webrtc_video_accepted && pvt->vrtp) {
@@ -6388,6 +6514,17 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 			/* Last Contact ;transport= seen is snapshotted into reg_transport
 			 * after the loop. */
 			sofia_contact_transport_from_url(m->m_url, reg_transport, sizeof(reg_transport));
+			/* RFC 7118: the SIP URI ;transport= param is always "ws" (there is NO "wss" URI param —
+			 * secure WebSocket is conveyed by the Via sent-protocol SIP/2.0/WSS, not the Contact). A
+			 * browser registering over WSS therefore sends Contact ;transport=ws, but the OUTBOUND
+			 * INVITE must use ;transport=wss so NTA reuses the accepted WSS tport (a ws RURI selects
+			 * the ws primary, never the wss primary's open connection -> 503). Override ws -> wss when
+			 * this REGISTER's Via sent-protocol is WSS. */
+			if (!strcasecmp(reg_transport, "ws") && sip->sip_via && sip->sip_via->v_protocol) {
+				if (strstr(sip->sip_via->v_protocol, "WSS") || strstr(sip->sip_via->v_protocol, "wss")) {
+					ast_copy_string(reg_transport, "wss", sizeof(reg_transport));
+				}
+			}
 
 			c = ao2_find(peer->contacts, uri, OBJ_POINTER);
 			if (c) {
@@ -7085,7 +7222,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		 * silently reused the nonce) is NOT a replay; only a byte-identical (nonce,nc,cnonce) resend is.
 		 * Without the cnonce test, the reused per-peer nonce + carried last_nc rejected nearly every
 		 * refresh's first authed attempt as a false replay → spurious 401 stale=true + extra round-trip.
-		 * (robustness fix.) */
+		 * (registration-path fix.) */
 		int nc_replay = (using_qop && nonce_matches && new_nc <= peer->last_nc
 			&& auth_cnonce && !ast_strlen_zero(peer->last_cnonce)
 			&& !strcmp(auth_cnonce, peer->last_cnonce));
@@ -9781,7 +9918,7 @@ static void sofia_process_notify(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
  *
  * Returns a +1-REFFED ast_channel (or NULL); the CALLER must ast_channel_unref()
  * it when done. */
-static struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op)
+struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op)
 {
 	struct ast_channel *bridged = NULL;
 	const char *bridgepeer_name = NULL;
@@ -9860,6 +9997,180 @@ static struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op)
 
 	ast_channel_unref(self);
 	return bridged;
+}
+
+/* ===================================================================================
+ * DataChannel far-leg pairing — sofia_dc_pair_bridged
+ * ===================================================================================
+ *
+ * The load-bearing cross-leg primitive for the WebRTC DataChannel relay. It runs on the
+ * shared "sofia-datachannel" worker lane — OUTSIDE the owning channel thread — so the
+ * ast_bridged_channel() locking contract (channel.h:2318-2327) applies: the channel passed
+ * to ast_bridged_channel() MUST be locked before the call AND while its result is used.
+ *
+ * This is a self-contained, contract-correct rewrite of what sofia_dc_get_bridged_dc()
+ * used to do via sofia_find_bridged_channel() + raw reads. The whole channel-walk + far-pvt
+ * resolution lives HERE so sofia_pvt internals, sofia_tech, and the canonical lock order
+ * (channel -> pvt -> peer) are all in scope.
+ *
+ * FINAL LOCK / REF SEQUENCE (the NO-ABBA, NO-INVERSION proof):
+ *   1. self_pvt->lock          : snapshot+ref self_pvt->owner (self_chan), then UNLOCK pvt.
+ *                                 (sofia_hangup NULLs pvt->owner under pvt->lock then frees the
+ *                                 channel — the ref+revalidate window is what keeps self_chan alive.)
+ *   2. ast_channel_lock(self_chan) : WITH self LOCKED, do ONLY two lock-internal things: (a) Method 1
+ *                                 — ast_bridged_channel(self_chan), the live _bridge pointer, +1-ref
+ *                                 the result if any (channel-container-free, the contract requires
+ *                                 self locked); and (b) COPY the BRIDGEPEER channel var and
+ *                                 self_chan->linkedid into local fixed buffers. Then UNLOCK self.
+ *                                 We may BLOCK on self's OWN lock — no ABBA: we hold nothing else
+ *                                 here (the worker lane runs off the instance lock) and drop self's
+ *                                 lock before touching any far channel or the channels container.
+ *   2b. (NO channel lock held)  : Method 2 + Method 3 run OFF the self lock. Method 2 =
+ *                                 ast_channel_get_by_name_prefix(copied BRIDGEPEER) — this takes the
+ *                                 global `channels` CONTAINER lock via ast_channel_get_full/ao2_find
+ *                                 (main/channel.c). channel.h:1319-1322 mandates container-BEFORE-
+ *                                 channel (inverse paths: ast_change_name @ main/channel.c:6234,
+ *                                 masquerade @ main/channel.c:6610 lock the container THEN a channel),
+ *                                 so it MUST NOT run with self_chan (a channel) locked — that would be
+ *                                 a channel->container ABBA. Method 3 = the dialogs linkedid walk over
+ *                                 the copied linkedid, also with no self lock held.
+ *   3. ast_channel_trylock(far_chan) : NEVER block on the FAR channel (the ABBA defense) — on
+ *                                 contention drop. Read far->tech / far->tech_pvt only under this.
+ *                                 Confirm far->tech == &sofia_tech and far != self (pointer compare).
+ *   4. far_pvt->lock           : take it (channel -> pvt order) before reading + ao2_ref'ing
+ *                                 far_pvt->dc; then RELEASE far_pvt->lock, far_chan's lock, and the
+ *                                 far_chan ref. Return the +1 dc with NO lock held — the caller
+ *                                 usrsctp_sendv's off every lock.
+ *
+ * NO-INVERSION: the only re-entrancy of the caller's later usrsctp_sendv is the global output cb,
+ * which takes the engine INSTANCE lock (never a channel/pvt lock); we hold neither on return.
+ */
+void *sofia_dc_pair_bridged(struct sofia_pvt *self_pvt, void *self_dc)
+{
+	struct ast_channel *self_chan;
+	struct ast_channel *far_chan = NULL;
+	void *far_dc = NULL;
+	/* BRIDGEPEER is a channel name (<= AST_CHANNEL_NAME); linkedid is a uniqueid (name + suffix).
+	 * Copy both under the self lock into generous local buffers — their backing store (channel var
+	 * storage / the linkedid string field) is only stable while self_chan is locked, and Methods 2/3
+	 * run AFTER we unlock self (review fix). */
+	char bridgepeer_copy[AST_CHANNEL_NAME];
+	char linkedid_copy[AST_CHANNEL_NAME + 64];
+
+	if (!self_pvt) {
+		return NULL;
+	}
+
+	/* STEP 1: pin self_pvt->owner under self_pvt->lock (anti-UAF vs sofia_hangup). */
+	ast_mutex_lock(&self_pvt->lock);
+	self_chan = self_pvt->owner;
+	if (self_chan) {
+		ast_channel_ref(self_chan);
+	}
+	ast_mutex_unlock(&self_pvt->lock);
+	if (!self_chan) {
+		return NULL;
+	}
+
+	/* STEP 2: WITH self LOCKED do ONLY the lock-internal work — Method 1 (ast_bridged_channel
+	 * contract) and copying BRIDGEPEER + linkedid into locals. We take NO channel-container lock
+	 * here: ast_channel_get_by_name_prefix (Method 2) takes the channels container and would invert
+	 * the documented container->channel order (channel.h:1319-1322) if called under a channel lock,
+	 * so it is deferred to STEP 2b below, off the self lock. */
+	bridgepeer_copy[0] = '\0';
+	linkedid_copy[0] = '\0';
+	ast_channel_lock(self_chan);
+
+	/* Method 1: the live _bridge pointer (ast_bridged_channel returns a borrowed ref → take one).
+	 * It reads self_chan->_bridge only — no container lock — so it is safe under the self lock. */
+	far_chan = ast_bridged_channel(self_chan);
+	if (far_chan) {
+		ast_channel_ref(far_chan);
+	} else {
+		/* Method 1 missed: copy the inputs Methods 2/3 need so we can run them OFF the self lock. */
+		const char *bridgepeer_name = pbx_builtin_getvar_helper(self_chan, "BRIDGEPEER");
+		if (!ast_strlen_zero(bridgepeer_name)) {
+			ast_copy_string(bridgepeer_copy, bridgepeer_name, sizeof(bridgepeer_copy));
+		}
+		if (self_chan->linkedid) {
+			ast_copy_string(linkedid_copy, self_chan->linkedid, sizeof(linkedid_copy));
+		}
+	}
+	ast_channel_unlock(self_chan);
+
+	/* STEP 2b (NO channel lock held — review fix). Methods 2 and 3 both
+	 * touch the global channels container (Method 2 directly via ast_channel_get_by_name_prefix;
+	 * Method 3 via the dialogs container + per-sibling pvt locks). They MUST run with self_chan
+	 * UNLOCKED to honor channel.h:1319-1322 (container BEFORE channel, never channel->container). */
+
+	/* Method 2: the BRIDGEPEER channel var (ast_channel_get_by_name_prefix already +1's it). It takes
+	 * the channels CONTAINER lock internally — hence run here, off the self lock, to avoid the
+	 * channel->container ABBA vs ast_change_name/masquerade. */
+	if (!far_chan && !ast_strlen_zero(bridgepeer_copy)) {
+		far_chan = ast_channel_get_by_name_prefix(bridgepeer_copy, strlen(bridgepeer_copy));
+	}
+
+	/* Method 3: dialogs linkedid walk (sibling sofia leg) — only if 1+2 found nothing. Self is
+	 * unlocked; we compare against the COPIED linkedid (self_chan still refed) and ref each sibling's
+	 * owner under ITS pvt->lock (channel -> pvt order; the sibling's sofia_hangup NULLs p->owner then
+	 * frees it). No self/channel lock is held while we take the dialogs + sibling-pvt locks. */
+	if (!far_chan && !ast_strlen_zero(linkedid_copy)) {
+		struct ao2_iterator it = ao2_iterator_init(dialogs, 0);
+		struct sofia_pvt *p;
+		while ((p = ao2_iterator_next(&it))) {
+			if (p != self_pvt) {
+				struct ast_channel *po;
+				ast_mutex_lock(&p->lock);
+				po = p->owner;
+				if (po && po->linkedid && !strcmp(po->linkedid, linkedid_copy)) {
+					far_chan = ast_channel_ref(po);
+				}
+				ast_mutex_unlock(&p->lock);
+			}
+			ao2_ref(p, -1);
+			if (far_chan) {
+				break;
+			}
+		}
+		ao2_iterator_destroy(&it);
+	}
+
+	if (!far_chan) {
+		ast_channel_unref(self_chan);
+		return NULL;
+	}
+
+	/* Self-loop guard (pathological leg bridged to itself): pointer compare only, never deref. */
+	if (far_chan == self_chan) {
+		ast_channel_unref(far_chan);
+		ast_channel_unref(self_chan);
+		return NULL;
+	}
+	ast_channel_unref(self_chan);	/* self_chan no longer needed past the identity check */
+
+	/* STEP 3: trylock the FAR channel (NEVER block — the ABBA defense). On contention, drop. */
+	if (ast_channel_trylock(far_chan)) {
+		ast_channel_unref(far_chan);
+		return NULL;
+	}
+
+	/* DataChannel relay is sofia<->sofia only — read tech/tech_pvt ONLY under the far channel lock. */
+	if (far_chan->tech == &sofia_tech) {
+		struct sofia_pvt *far_pvt = far_chan->tech_pvt;
+		if (far_pvt && far_pvt != self_pvt) {
+			/* STEP 4: take far_pvt->lock (channel -> pvt order) before reading + ao2_ref'ing dc. */
+			ast_mutex_lock(&far_pvt->lock);
+			if (far_pvt->dc && (void *)far_pvt->dc != self_dc) {
+				far_dc = far_pvt->dc;
+				ao2_ref(far_dc, +1);	/* survive the far leg's hangup racing us */
+			}
+			ast_mutex_unlock(&far_pvt->lock);
+		}
+	}
+
+	ast_channel_unlock(far_chan);	/* release ALL channel locks BEFORE returning to the sender */
+	ast_channel_unref(far_chan);
+	return far_dc;
 }
 
 struct sofia_replaces_info {
@@ -11316,8 +11627,11 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				ast_mutex_unlock(&pvt->lock);
 				ast_queue_control(owner, AST_CONTROL_ANSWER);
 				ast_setstate(owner, AST_STATE_UP);
-				/* Set active contact for the single-contact outbound path. */
-				if (pvt->peer && !pvt->is_fork_child && !pvt->fork && !ast_strlen_zero(pvt->ruri)) {
+				/* Set active contact for the single-contact outbound path. Skip if already
+				 * set at request time (sofia_request_call now selects the single live contact
+				 * up front for per-contact WSS routing) — avoids a spurious "already set"
+				 * warning + redundant lookup; still covers legacy peer-aggregate single calls. */
+				if (pvt->peer && !pvt->active_contact && !pvt->is_fork_child && !pvt->fork && !ast_strlen_zero(pvt->ruri)) {
 					const char *at = strchr(pvt->ruri, '@');
 					if (at) {
 						char rhost[64] = "";
@@ -12413,6 +12727,8 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			sofia_cfg.encryption = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "webrtc")) {
 			sofia_cfg.webrtc = ast_true(v->value);	/* A4 WebRTC general default */
+		} else if (!strcasecmp(v->name, "datachannel")) {
+			sofia_cfg.datachannel = ast_true(v->value);	/* Phase 3 WebRTC DataChannel general default; per-peer datachannel= overrides */
 		} else if (!strcasecmp(v->name, "default_srtpcipher") || !strcasecmp(v->name, "srtpcipher")) {
 			/* Default SRTP cipher list inherited by sofia_peer_alloc; both spellings accepted. */
 			ast_copy_string(sofia_cfg.default_srtpcipher, v->value, sizeof(sofia_cfg.default_srtpcipher));
@@ -13202,6 +13518,8 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			peer->encryption = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "webrtc")) {
 			peer->webrtc = ast_true(v->value);	/* WebRTC A4: DTLS-SRTP + ICE-lite + rtcp-mux */
+		} else if (!strcasecmp(v->name, "datachannel")) {
+			peer->datachannel = ast_true(v->value);	/* Phase 3: accept the WebRTC m=application (RFC 8841 SCTP); requires webrtc=yes + usrsctp */
 		} else if (!strcasecmp(v->name, "srtpcipher")) {
 			/* SRTP suite preference; typo WARN happens at sdp_crypto_offer_list emit, not here. */
 			ast_string_field_set(peer, srtpcipher, v->value);
@@ -13670,6 +13988,10 @@ static int sofia_apply_config(struct ast_config *cfg)
 	 * webrtc=yes from [general] actually disables it — without this the live sofia_cfg.webrtc stayed
 	 * sticky across a reload (peers re-inherit it in sofia_peer_set_defaults; an explicit peer webrtc= still wins). */
 	sofia_cfg.webrtc = 0;
+	/* Phase 3 WebRTC DataChannel general default OFF; RESET here so a `sip reload` that DROPS
+	 * datachannel=yes from [general] actually disables it (mirrors sofia_cfg.webrtc above). An
+	 * explicit per-peer datachannel= still wins. */
+	sofia_cfg.datachannel = 0;
 	/* empty default = sdp_crypto.c fallback (AES_CM_128_HMAC_SHA1_80). */
 	sofia_cfg.default_srtpcipher[0] = '\0';
 	/* default 0 = shared-key mode. Module-scope mirror reset for sdp_crypto.c extern visibility. */
@@ -14734,6 +15056,12 @@ static int load_module(void)
 		goto err_cleanup;
 	}
 
+	/* WebRTC DataChannel (usrsctp) transport — Phase 2a foundation. Non-fatal: a failure (or a
+	 * build without usrsctp) just leaves m=application unsupported (the SDP keeps it port-0). */
+	if (sofia_dc_init()) {
+		ast_log(LOG_WARNING, "Sofia: WebRTC DataChannel init failed — datachannels disabled\n");
+	}
+
 	if (sofia_load_config(0)) {
 		ast_log(LOG_ERROR, "Unable to load config %s\n", SOFIA_CONFIG);
 		rc = AST_MODULE_LOAD_DECLINE;
@@ -14876,6 +15204,8 @@ err_cleanup:
 	sofia_publications_destroy();
 	sofia_subscribe_destroy();
 	sofia_eventsub_destroy();
+	/* WebRTC DataChannel — drop the init ref (idempotent if init never ran / no usrsctp). */
+	sofia_dc_finish();
 	if (dialogs) {
 		ao2_ref(dialogs, -1);
 		dialogs = NULL;
@@ -14969,6 +15299,9 @@ static int unload_module(void)
 	sofia_publications_destroy();
 	sofia_subscribe_destroy();
 	sofia_eventsub_destroy();
+	/* WebRTC DataChannel — last init ref → usrsctp_finish(). Reached only by a
+	 * future clean-unload; the live module returns -1 above. Matches the load_module init pairing. */
+	sofia_dc_finish();
 
 	return 0;
 }

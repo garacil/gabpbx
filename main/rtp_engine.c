@@ -91,6 +91,9 @@ struct ast_rtp_instance {
 	struct ast_channel *chan;
 	/*! SRTP info associated with the instance */
 	struct ast_srtp *srtp;
+	/*! Consumer callback for decrypted DTLS application data (e.g. SCTP datachannel), or NULL */
+	ast_rtp_dtls_appdata_cb dtls_appdata_cb;
+	void *dtls_appdata_cb_data;
 };
 
 /*! List of RTP engines that are currently registered */
@@ -1749,7 +1752,7 @@ void ast_rtp_instance_stun_request(struct ast_rtp_instance *instance,
  * the wrappers only lock + dispatch to callbacks that stay NULL until A3 populates them
  * (the getters return NULL while the slot is unset, so they are never invoked).
  *
- * A2 NOTE (opencode): the instance lock is a NEW lock surface (rtp_engine.c had no
+ * A2 NOTE: the instance lock is a NEW lock surface (rtp_engine.c had no
  * ao2_lock today). For it to be effective, the A2 packet-path DTLS demux at the
  * rtp_recvfrom insertion point MUST take the SAME ao2_lock(instance) as these wrappers
  * — a one-sided lock is cosmetic. Lock order: channel -> pvt -> instance -> peer
@@ -1946,6 +1949,22 @@ static const char *rtp_dtls_wrap_get_fingerprint(struct ast_rtp_instance *instan
 	return res;
 }
 
+static int rtp_dtls_wrap_write_appdata(struct ast_rtp_instance *instance, const void *buf, size_t len)
+{
+	int res;
+
+	ao2_lock(instance);
+	/* A third-party DTLS engine may not implement this optional op (the public getter exposes this
+	 * wrapper table for every DTLS engine, not only ones that populate write_appdata). Guard the
+	 * slot rather than dereference NULL. (Review hardening.) */
+	res = instance->engine->dtls->write_appdata
+		? instance->engine->dtls->write_appdata(instance, buf, len)
+		: -1;
+	ao2_unlock(instance);
+
+	return res;
+}
+
 static struct ast_rtp_engine_dtls rtp_dtls_wrappers = {
 	.set_configuration = rtp_dtls_wrap_set_configuration,
 	.active = rtp_dtls_wrap_active,
@@ -1957,6 +1976,7 @@ static struct ast_rtp_engine_dtls rtp_dtls_wrappers = {
 	.set_fingerprint = rtp_dtls_wrap_set_fingerprint,
 	.get_fingerprint_hash = rtp_dtls_wrap_get_fingerprint_hash,
 	.get_fingerprint = rtp_dtls_wrap_get_fingerprint,
+	.write_appdata = rtp_dtls_wrap_write_appdata,
 };
 
 struct ast_rtp_engine_dtls *ast_rtp_instance_get_dtls(struct ast_rtp_instance *instance)
@@ -1966,6 +1986,36 @@ struct ast_rtp_engine_dtls *ast_rtp_instance_get_dtls(struct ast_rtp_instance *i
 	}
 
 	return NULL;
+}
+
+void ast_rtp_instance_set_dtls_appdata_cb(struct ast_rtp_instance *instance, ast_rtp_dtls_appdata_cb cb, void *cb_data)
+{
+	ao2_lock(instance);
+	instance->dtls_appdata_cb = cb;
+	instance->dtls_appdata_cb_data = cb_data;
+	ao2_unlock(instance);
+}
+
+int ast_rtp_instance_dtls_deliver_appdata(struct ast_rtp_instance *instance, const uint8_t *data, size_t len)
+{
+	/* Called from the engine read path with the instance already locked (the DTLS demux holds
+	 * ao2_lock(instance)). The consumer must not block or take channel/pvt/peer locks here. */
+	if (instance->dtls_appdata_cb) {
+		instance->dtls_appdata_cb(instance, data, len, instance->dtls_appdata_cb_data);
+		return 1;
+	}
+
+	return 0;
+}
+
+int ast_rtp_instance_dtls_write_appdata(struct ast_rtp_instance *instance, const void *buf, size_t len)
+{
+	if (instance->engine->dtls && instance->engine->dtls->write_appdata) {
+		/* Route through the locking wrapper, matching how other DTLS ops are invoked. */
+		return rtp_dtls_wrappers.write_appdata(instance, buf, len);
+	}
+
+	return -1;
 }
 
 void ast_rtp_instance_set_timeout(struct ast_rtp_instance *instance, int timeout)

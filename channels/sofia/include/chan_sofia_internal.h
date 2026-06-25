@@ -53,6 +53,33 @@ extern nua_t *sofia_nua;
 extern su_root_t *sofia_root;
 extern int sofia_debug;
 
+/* The Sofia channel tech (chan_sofia.c). The WebRTC DataChannel relay (sofia_datachannel.c)
+ * compares a bridged channel's ->tech against this to confirm the far leg is a Sofia channel. */
+extern struct ast_channel_tech sofia_tech;
+
+/*! \brief Resolve the bridged far leg of \a op, returning a +1-reffed ast_channel (or NULL).
+ * Defined in chan_sofia.c; three UAF-safe methods (_bridge / BRIDGEPEER / linkedid walk). Reused
+ * by the DataChannel relay's far-leg pairing (sofia_dc_get_bridged_dc). Caller must ast_channel_unref. */
+struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op);
+
+/*! \brief DataChannel far-leg pairing (the load-bearing cross-leg primitive). Resolve the bridged
+ * sofia leg of \a self_pvt and return its DataChannel object (\a struct sofia_datachannel *) +1-reffed
+ * (an opaque void* — sofia_datachannel.c knows the type), with NO channel/pvt lock held on return.
+ *
+ * Returns NULL when there is no bridged sofia leg, the far leg has no DC, on contention (trylock
+ * failed — NEVER blocks, the ABBA defense), or on a self-loop. Defined in chan_sofia.c so the whole
+ * channel-walk + far-pvt resolution runs where sofia_pvt internals, sofia_tech, and the canonical
+ * lock order (channel -> pvt -> peer) are all in scope.
+ *
+ * Locking contract (channel.h:2318-2327): the far channel is resolved with the
+ * SELF channel LOCKED (as ast_bridged_channel() requires outside the owning thread), the far channel is
+ * +1-reffed, then self is unlocked; the far channel is ast_channel_trylock'd (never blocked) before its
+ * ->tech / ->tech_pvt are read; far_pvt->lock is taken before reading + ao2_ref'ing far_pvt->dc; then
+ * all locks/refs are released. The returned dc carries a +1 ref the caller must ao2_ref(-1).
+ *
+ * \param self_dc the caller's own DataChannel object (for the self != far identity check), or NULL. */
+void *sofia_dc_pair_bridged(struct sofia_pvt *self_pvt, void *self_dc);
+
 /* ===== Peer/config model constants, enums, display helpers (shared with split modules) ===== */
 
 #define SOFIA_PROG_INBAND_NEVER 0
@@ -483,7 +510,7 @@ struct sofia_pvt {
 	unsigned int webrtc_video_answer_applied:1;  /* one-shot: vrtp DTLS/ICE already armed — do NOT re-arm on a re-INVITE */
 	unsigned int webrtc_video_bundle_only:1;     /* offer's m=video carried a=bundle-only (RFC 8843 §7.3.2) → MUST keep video port-0 reflected, cannot move out */
 	int webrtc_reject_m_count;
-	int webrtc_accepted_video_idx;           /* reject_m index of the accepted video — STEP 6 emits it real, the emit skips ONLY this entry; every OTHER m=video is port-0 reflected (1:1, RFC 3264 §6 count). -1 = none */
+	int webrtc_accepted_video_idx;           /* reject_m index of the accepted video — STEP 6 emits it real, the emit skips ONLY this entry; every OTHER m=video is port-0 reflected (Review HIGH 1:1, RFC 3264 §6 count). -1 = none */
 	unsigned int webrtc_reject_overflow:1;   /* >ARRAY_LEN(webrtc_reject_m) non-audio m= offered → emit fails closed (RFC 3264 §6: cannot drop m-lines) */
 	struct sofia_webrtc_reject_m {
 		char type_name[16];  /* offered m= media-type STRING (sofia m_type_name), echoed verbatim (RFC 3264 §6) */
@@ -491,6 +518,38 @@ struct sofia_pvt {
 		char fmt[24];        /* first m= format token */
 		char mid[64];        /* its a=mid (RFC 8843 — must appear in the answer too) */
 	} webrtc_reject_m[6];
+	/* Phase 2a WebRTC DataChannel (RFC 8831/8832) transport handle, NULL when this leg has no
+	 * negotiated m=application. An opaque ao2 object owned by sofia_datachannel.c (the usrsctp
+	 * AF_CONN association bundled on pvt->rtp's DTLS). A plain pointer — no #ifdef needed for the
+	 * pointer itself; sofia_dc_attach/detach are no-ops without usrsctp. Wired in Phase 3 (SDP). */
+	struct sofia_datachannel *dc;
+	/* Phase 3 WebRTC DataChannel SDP negotiation (RFC 8841 m=application). Mirrors the webrtc_video_*
+	 * fields: parsed at sofia_parse_sdp, emitted by sofia_generate_sdp. The m=application shares the
+	 * AUDIO BUNDLE ICE+DTLS transport (NO new transport) — only the SCTP layer is per-m=application.
+	 *   dc_offered:  the browser offered an m=application UDP/DTLS/SCTP webrtc-datachannel section.
+	 *   dc_accepted: gabpbx accepted it (datachannel=yes AND webrtc AND HAVE_USRSCTP AND in BUNDLE AND
+	 *                the audio WebRTC leg committed) → sofia_dc_attach ran, emit a REAL m=application;
+	 *                0 → port-0 reflect it via webrtc_reject_m (exactly like a declined m-line).
+	 *   dc_sctp_port: the offer's a=sctp-port (RFC 8841; browser default 5000). Passed to sofia_dc_attach.
+	 *   dc_max_message_size: the offer's a=max-message-size (RFC 8841; browser default 262144). 0 = unset.
+	 *   dc_mid: the offer's m=application a=mid, echoed in the answer + added to a=group:BUNDLE. */
+	unsigned int dc_offered:1;
+	unsigned int dc_accepted:1;
+	uint16_t dc_sctp_port;
+	unsigned int dc_max_message_size;
+	char dc_mid[64];
+	/* OFFER-side WebRTC DataChannel (we ORIGINATE the m=application to the far leg, e.g. the bridged
+	 * callee). DISTINCT from dc_offered/dc_accepted, which are INBOUND-answer-only (a peer offered US a
+	 * DC and we accepted). These two own the OUTBOUND offer:
+	 *   dc_offerer:       sofia_webrtc_provision_offer emitted an m=application in OUR outbound offer
+	 *                     (datachannel=yes peer + usrsctp); sofia_dc_attach already ran (usrsctp starts
+	 *                     before the offer leaves). Gates the m=application EMIT + the BUNDLE token +
+	 *                     the reject-loop skip alongside dc_accepted. Cleared if the far leg declines.
+	 *   dc_answer_applied: the far leg's ANSWER accepted our offered DC (its m=application has a nonzero
+	 *                     a=sctp-port AND our dc_mid is a token in its a=group:BUNDLE) → keep pvt->dc.
+	 *                     One-shot guard so a re-INVITE/duplicate 2xx does not re-apply. */
+	unsigned int dc_offerer:1;
+	unsigned int dc_answer_applied:1;
 };
 
 struct sofia_peer {
@@ -543,6 +602,7 @@ struct sofia_peer {
 	int max_contacts;
 	int encryption;                 /* SDES-SRTP per-peer toggle (0/1); default off; encryption=yes enables */
 	int webrtc;                     /* WebRTC per-peer toggle (0/1): DTLS-SRTP + ICE-lite + rtcp-mux; default off; webrtc=yes enables — A4 */
+	int datachannel;                /* WebRTC DataChannel per-peer toggle (0/1): accept the offered m=application (RFC 8841 SCTP) on the BUNDLE'd audio DTLS; default off; requires webrtc=yes + a usrsctp build (Phase 3). With it off the m=application is port-0 reflected exactly as today. */
 	int callingpres;                /* AST_PRES_* mask; per-peer default presentation (chan_sip parity); default AST_PRES_ALLOWED_USER_NUMBER_NOT_SCREENED (=0) */
 	int sendrpid;                   /* 0=none / 1=PAI / 2=RPID (chan_sip SIP_SENDRPID parity) */
 	int trustrpid;                  /* 0/1; trust inbound PAI/RPID (chan_sip SIP_TRUSTRPID parity) */
@@ -729,6 +789,7 @@ struct sofia_config {
 	int max_contacts;
 	int encryption;                   /* SDES-SRTP general default (0=off, 1=on); soft-zeroed at load if res_srtp absent */
 	int webrtc;                       /* WebRTC general default (0=off,1=on); per-peer webrtc= overrides */
+	int datachannel;                  /* WebRTC DataChannel general default (0=off,1=on); per-peer datachannel= overrides. Requires webrtc=yes + a usrsctp build to take effect (Phase 3). */
 	char default_srtpcipher[256];     /* srtpcipher: comma-separated cipher preference inherited by peers; empty = sdp_crypto.c default AES_CM_128_HMAC_SHA1_80 */
 	int srtp_per_suite_keys;          /* 0 = shared-key (one master_key across all suites in a multi-cipher offer) / 1 = per-suite-fresh-key (independent random key per suite — forensic key separation). [general]-only; no chan_sip equivalent. */
 	int force_invite_auth;            /* 0 = chan_sip parity (per-peer insecure=invite bypass active) / 1 = global lockdown: ALL inbound INVITEs require digest auth regardless of insecure=invite. [general]-only security override; logs NOTICE when overriding a peer. */
