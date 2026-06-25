@@ -369,7 +369,12 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 	sofia_cli_peer_line(&buf, "Transport", "%s", transport_str);
 	sofia_cli_peer_line(&buf, "Context", "%s", peer->context);
 	sofia_cli_peer_line(&buf, "Registered", "%s", AST_CLI_YESNO(peer->registered));
-	sofia_cli_peer_line(&buf, "Expires", "%ds", peer->expiresecs);
+	/* Expires (registration TTL) is meaningful ONLY when this peer takes part in registration: a
+	 * dynamic peer that registers TO us, or a register=> peer we register to. A static challenge-auth
+	 * trunk (host=<ip/fqdn>, no register=>) never registers either way, so a TTL there was misleading. */
+	if (peer->is_register_line || !strcasecmp(peer->host, "dynamic")) {
+		sofia_cli_peer_line(&buf, "Expires", "%ds", peer->expiresecs);
+	}
 	sofia_cli_peer_line(&buf, "Secret", "%s", ast_strlen_zero(peer->secret) ? "(none)" : "(set)");
 	if (peer->qualify) {
 		sofia_cli_peer_line(&buf, "Qualify", "yes, freq=%ds, timeout=%ds, status=%s",
