@@ -21,7 +21,7 @@ Existing Asterisk, Digium and third-party copyright notices and the GPLv2 terms 
 
 ## GABPBX 1.1.2 — the star is `chan_sofia`
 
-**`chan_sofia` is a complete, modern SIP channel driver built on the battle-tested [Sofia-SIP](https://github.com/freeswitch/sofia-sip) NUA stack — a true drop-in replacement for the aging `chan_sip`, with every `chan_sip` capability and a great deal more.** It is **feature-complete in release 1.1.2** and now adds **two-way WebRTC video**.
+**`chan_sofia` is a complete, modern SIP channel driver built on the battle-tested [Sofia-SIP](https://github.com/freeswitch/sofia-sip) NUA stack — a true drop-in replacement for the aging `chan_sip`, with every `chan_sip` capability and a great deal more.** It is **feature-complete in release 1.1.2** and now adds **two-way WebRTC video** and **browser-to-browser DataChannels**.
 
 Where `chan_sip` hand-rolled its own parser, `chan_sofia` rides a real SIP transaction state machine — the same library lineage that powers large-scale softswitches — and puts the PBX behavior on top. The result is a SIP driver that is at once **more capable, more secure, and dramatically more scalable** than the channel it replaces.
 
@@ -39,7 +39,7 @@ Your dial plans, your `sip show …` muscle memory, your `SIPpeers` / `SIPshowpe
 
 - **Drop-in for `chan_sip`** — same `SIP/<peer>` channel, same `sip show …` CLI, same `SIPpeers` AMI, same `sippeers` realtime family.
 - **Far beyond `chan_sip`** — SIP Outbound, Path, Service-Route, GRUU, PRACK/100rel, UPDATE, REFER transfer, MESSAGE, PUBLISH, presence/BLF, SHA-256 auth, and more.
-- **WebRTC ready** — browsers register and call over secure WebSocket with DTLS-SRTP, ICE-lite, rtcp-mux and BUNDLE, **two-way audio and two-way video**, with **no `pjproject` and no `libnice`** in the tree.
+- **WebRTC ready** — browsers register and call over secure WebSocket with DTLS-SRTP, ICE-lite, rtcp-mux and BUNDLE, **two-way audio, two-way video and relayed DataChannels**, with **no `pjproject` and no `libnice`** in the tree.
 - **Built for carrier scale** — a single Sofia event thread plus a small fixed I/O pool, O(1) hash tables, a bounded register pool under storms, and a lean high-throughput media engine.
 - **Exceptionally robust** — hardened and security-audited by the world's most advanced AI systems through a rigorous, multi-round adversarial correctness, concurrency and security review.
 
@@ -100,6 +100,7 @@ Every capability is enumerated below, grouped for scanning. Each is real and liv
 | **SIP over secure WebSocket (WSS / RFC 7118)** | Browsers register and call over SIP-over-WSS (and plain WS); in-dialog ACK/BYE route back over the exact accepted WebSocket connection. |
 | **WebRTC audio (browser-to-browser)** | A real two-way audio call between two WSS browsers, opt-in per peer with `webrtc=yes`. A `webrtc=yes` peer fails the call rather than fall back to insecure media. |
 | **Two-way WebRTC video (VP8/H.264)** | GABPBX both accepts a browser's offered video and offers video itself; video runs on its own transport (separate mid, port and DTLS association from audio). |
+| **WebRTC DataChannel relay (RFC 8831/8832/8841)** | Bridges WebRTC DataChannels back-to-back between two WebRTC legs — SCTP-over-DTLS bundled on the audio, a DCEP `OPEN`/`ACK` proxy and a PPID-preserving message relay. GABPBX both accepts an offered DataChannel and offers one to the bridged leg, so a `createDataChannel` between two browsers crosses end to end. Opt-in with `datachannel=yes` (needs a `usrsctp` build). |
 | **Opus with passthrough-correctness fixes** | Opus (RFC 7587, 48 kHz, stereo, `useinbandfec`) is offered and answered, and a both-Opus call relays with no transcoding (codec selection, 48 kHz clocking, and a smoother exemption for Opus's variable-size frames). |
 | **T.38 fax (UDPTL) with state machine** | Real-time T.38 over UDPTL with a 4-state negotiation machine, re-INVITE handling, `far-max-IFP` and a 5-second abort timeout; correctly suppressed inside WebRTC SDP. |
 | **Direct media (re-INVITE bridging) with safety gates** | `directmedia` (alias `canreinvite`) lets endpoints exchange RTP directly when safe; any SRTP/DTLS leg, NAT'd peer or ACL mismatch forces local relay. |
