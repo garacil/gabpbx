@@ -19,9 +19,9 @@ Existing Asterisk, Digium and third-party copyright notices and the GPLv2 terms 
 
 ---
 
-## GABPBX 1.1.2 — the star is `chan_sofia`
+## GABPBX 1.2 — the star is `chan_sofia`
 
-**`chan_sofia` is a complete, modern SIP channel driver built on the battle-tested [Sofia-SIP](https://github.com/freeswitch/sofia-sip) NUA stack — a true drop-in replacement for the aging `chan_sip`, with every `chan_sip` capability and a great deal more.** It is **feature-complete in release 1.1.2** and now adds **two-way WebRTC video** and **browser-to-browser DataChannels**.
+**`chan_sofia` is a complete, modern SIP channel driver built on the battle-tested [Sofia-SIP](https://github.com/freeswitch/sofia-sip) NUA stack — a true drop-in replacement for the aging `chan_sip`, with every `chan_sip` capability and a great deal more.** It is **feature-complete** and, in release **1.2**, **security-hardened** — with **two-way WebRTC video** and **browser-to-browser DataChannels**.
 
 Where `chan_sip` hand-rolled its own parser, `chan_sofia` rides a real SIP transaction state machine — the same library lineage that powers large-scale softswitches — and puts the PBX behavior on top. The result is a SIP driver that is at once **more capable, more secure, and dramatically more scalable** than the channel it replaces.
 
@@ -172,6 +172,36 @@ The result is a SIP driver whose resource use scales with **work**, not with **e
 That review repeatedly stressed the driver's reject paths, its lock ordering and lifetime management, and its authentication, transport-security and media-security gates — catching and closing defects that conventional testing rarely surfaces. The hardening is reflected throughout: validate-then-commit SDP that leaves an established call untouched when a re-INVITE fails any gate; fail-closed authentication, ACL and fingerprint checks; a documented single-owner concurrency model with one canonical lock order; and an anti-downgrade media posture in which encryption never silently falls back to plaintext.
 
 The outcome is a SIP channel you can put in front of the public internet and trust at scale.
+
+---
+
+## Standards & RFC compliance
+
+GABPBX 1.2 is a security-hardening release for `chan_sofia`. Every hardening gate below is anchored to the governing standard; the quoted clauses are the load-bearing normative text, verbatim.
+
+### SIP authentication
+- **Digest replay defense** — `qop=auth` nonce-count accounting is validated so a captured Authorization header cannot be replayed. RFC 2617 §3.2.2 (lines 657-659): *"if the same nc-value is seen twice, then the request is a replay."* RFC 7616 §3.4 (lines 536-539): *"to allow the server to detect request replays … if the same nc value is seen twice, then the request is a replay."*
+- **`uri=` bound to the Request-URI** — RFC 2617 §3.2.2.5 (lines 806-808): *"The authenticating server must assure that the resource designated by the 'uri' directive is the same as the resource specified in the Request-Line; if they are not, the server SHOULD return a 400 Bad Request error."* RFC 7616 §3.4 (lines 711-713).
+- **Out-of-dialog MESSAGE authenticated** — RFC 3428 §11 (lines 717-719): *"UAs that support the MESSAGE request MUST implement end-to-end authentication, body integrity, and body confidentiality mechanisms."*
+
+### WebRTC media security
+- **No cleartext media before DTLS** — RFC 8827 §6.5 (lines 832-834): *"Media traffic MUST NOT be sent over plain (unencrypted) RTP or RTCP."*
+- **Fingerprint is the trust anchor (fail-closed)** — RFC 5763 §5 (lines 436-437): *"The integrity of the certificate is ensured through the fingerprint attribute in the SDP."*
+- **Reject `a=setup:actpass` in an answer** — RFC 5763 §5 (lines 514-517): *"The answerer MUST use either a setup attribute value of setup:active or setup:passive."*
+
+### WebRTC DataChannel (SCTP-over-DTLS)
+- **DTLS-role stream parity** — RFC 8832 §6 (lines 322-324): *"If the side is acting as the DTLS client, it MUST choose an even stream identifier; if the side is acting as the DTLS server, it MUST choose an odd one."*
+- **Ordered until acknowledged** — RFC 8832 §6 (lines 354-360): *"before the DATA_CHANNEL_ACK message … all other messages containing user data … MUST be sent ordered."*
+- **SCTP restart handled distinctly** — RFC 6458 §6.1.1 (lines 2426-2437) / RFC 4960 §5.2.4 (lines 3818-3819).
+
+### SDP offer/answer
+- **Answer m-lines match the offer by order; reject with port 0** — RFC 3264 §6 (lines 468-472, 479-481): *"there MUST be a corresponding 'm=' line in the answer … matched up based on their order"*; *"To reject an offered stream, the port number … MUST be set to zero."* RFC 8829 §5.3.1 (lines 2402-2406).
+
+### SIP signaling robustness
+- **SUBSCRIBE expiry floor (423)** — RFC 6665 §4.2.1.1 (lines 959-964): the notifier *"MAY return a 423 (Interval Too Brief) error that contains a 'Min-Expires' header field."*
+- **rtcp-mux demux by payload type** — RFC 5761 §4 (lines 217-222).
+- **PUBLISH soft state; SIPS over TLS** — RFC 3903 §3 (lines 214-216); RFC 3261 §26.2.2 (lines 13366-13370) + §19.1.1 (lines 8485-8486): *"For sips:, it is TCP."*
+- **`;lr` loose-route detection** — RFC 3261 §19.1.1 (lines 8407-8411).
 
 ---
 
