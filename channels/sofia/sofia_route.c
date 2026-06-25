@@ -55,7 +55,26 @@ int sofia_route_serialize(sip_route_t const *list, char *buf, size_t len)
 			buf[0] = '\0';
 			return -1;
 		}
-		has_lr = (strcasestr(url_buf, ";lr") != NULL);
+		/* Detect ;lr as a proper URI PARAMETER, not a substring: per RFC 3261 §19.1.1/§25
+		 * uri-parameters = *( ";" uri-parameter), lr-param = "lr". So a real ;lr is ";lr"
+		 * terminated by ';' (next param), end-of-string, or '=' (degenerate ;lr=value). An
+		 * unanchored strcasestr false-positives on a ;lr-PREFIXED param name such as ";lru="
+		 * (RFC 3261 §16.12/§19.1.1, RFC 3608 §6, RFC 3327 §5.4) — that would skip the mandatory
+		 * ;lr and corrupt the route-set into strict routing. A param VALUE can never contain
+		 * ";lr" (';' is not a paramchar), so only the param-name + userinfo are valid vectors;
+		 * scanning each ";lr" occurrence and checking the byte that follows handles both. */
+		has_lr = 0;
+		{
+			const char *p = url_buf;
+			while ((p = strcasestr(p, ";lr")) != NULL) {
+				char after = p[3];	/* the byte right after ";lr" */
+				if (after == '\0' || after == ';' || after == '=') {
+					has_lr = 1;
+					break;
+				}
+				p += 3;	/* a longer param name (e.g. ";lru") — keep scanning */
+			}
+		}
 		n = snprintf(entry, sizeof(entry), "<%s%s>", url_buf, has_lr ? "" : ";lr");
 		if (n < 0 || (size_t)n >= sizeof(entry)) {
 			buf[0] = '\0';

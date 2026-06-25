@@ -68,6 +68,124 @@ static int sofia_sdp_cat(char *dst, size_t dstsize, const char *src)
 	return 0;
 }
 
+/*!
+ * \brief Append the accepted/offered WebRTC m=video section to \a buf (v1b/v1c, RFC 8843 §7).
+ *
+ * The m=video runs on pvt->vrtp's OWN non-BUNDLE transport: its own port + ICE-lite host candidate,
+ * fingerprint/setup, a=rtcp-mux, VP8/H264 rtpmap, a=mid + a=tls-id. NOT added to a=group:BUNDLE.
+ * Factored out of sofia_generate_sdp so the WebRTC answer can place this section at the video's OFFER
+ * slot (RFC 3264 §6 / RFC 8829 §5.3 m-line order). Byte-identical to the former inline STEP 6 block.
+ * \a overflow is OR'd with any truncation. The caller guarantees pvt->vrtp + the accept/offer gate.
+ */
+static void sofia_sdp_emit_webrtc_video(struct sofia_pvt *pvt, char *buf, size_t len,
+	const char *host, const char *sdp_family, char *tmp_buf, size_t tmp_buf_size, int *overflow)
+{
+	struct ast_rtp_engine_dtls *vdtls = ast_rtp_instance_get_dtls(pvt->vrtp);
+	struct ast_rtp_engine_ice *vice = ast_rtp_instance_get_ice(pvt->vrtp);
+	const char *vfp = vdtls ? vdtls->get_fingerprint(pvt->vrtp) : NULL;
+	const char *vufrag = vice ? vice->get_ufrag(pvt->vrtp) : NULL;
+	const char *vpwd = vice ? vice->get_password(pvt->vrtp) : NULL;
+	enum ast_rtp_dtls_setup vos = vdtls ? vdtls->get_setup(pvt->vrtp) : AST_RTP_DTLS_SETUP_PASSIVE;
+	const char *vss = (vos == AST_RTP_DTLS_SETUP_PASSIVE) ? "passive"
+		: (vos == AST_RTP_DTLS_SETUP_ACTPASS) ? "actpass" : "active";
+	struct ast_sockaddr vla;
+	int vport = 0;
+	char vpayload_buf[128] = "";
+	char vmap_buf[1536] = "";
+	int vfirst = 1;
+	format_t vf;
+	int vblen;
+
+	ast_rtp_instance_get_local_address(pvt->vrtp, &vla);
+	vport = ast_sockaddr_port(&vla);
+	/* VP8/H264 payload list + rtpmap from the negotiated video capability (90 kHz video clock). The PT
+	 * comes from vrtp's codec map: for the ANSWERER it is the BROWSER's offered PT (staged at commit,
+	 * RFC 3264 keeps it); for the OFFERER the map is empty so ast_rtp_codecs_payload_code falls back to
+	 * the static table (VP8=96, H264=99, rtp_engine.c:187/191). */
+	for (vf = 1; vf; vf <<= 1) {
+		int vpt;
+		const char *venc;
+		if (!(vf & pvt->capability) || !(vf & (AST_FORMAT_VP8 | AST_FORMAT_H264))) {
+			continue;
+		}
+		vpt = ast_rtp_codecs_payload_code(ast_rtp_instance_get_codecs(pvt->vrtp), 1, vf);
+		if (vpt < 0) {
+			continue;
+		}
+		venc = ast_rtp_lookup_mime_subtype2(1, vf, 0);
+		if (ast_strlen_zero(venc)) {
+			continue;
+		}
+		if (!vfirst) {
+			*overflow |= sofia_sdp_cat(vpayload_buf, sizeof(vpayload_buf), " ");
+		}
+		snprintf(tmp_buf, tmp_buf_size, "%d", vpt);
+		*overflow |= sofia_sdp_cat(vpayload_buf, sizeof(vpayload_buf), tmp_buf);
+		vfirst = 0;
+		if (snprintf(tmp_buf, tmp_buf_size, "a=rtpmap:%d %s/90000\r\n", vpt, venc) >= (int)tmp_buf_size) {
+			*overflow = 1;
+		} else {
+			*overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+		}
+	}
+	*overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), "a=sendrecv\r\n");
+	*overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), "a=rtcp-mux\r\n");
+	if (snprintf(tmp_buf, tmp_buf_size, "a=setup:%s\r\n", vss) >= (int)tmp_buf_size) {
+		*overflow = 1;
+	} else {
+		*overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+	}
+	if (vfp) {
+		if (snprintf(tmp_buf, tmp_buf_size, "a=fingerprint:sha-256 %s\r\n", vfp) >= (int)tmp_buf_size) {
+			*overflow = 1;
+		} else {
+			*overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+		}
+	}
+	*overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), "a=ice-lite\r\n");
+	if (vufrag) {
+		if (snprintf(tmp_buf, tmp_buf_size, "a=ice-ufrag:%s\r\n", vufrag) >= (int)tmp_buf_size) {
+			*overflow = 1;
+		} else {
+			*overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+		}
+	}
+	if (vpwd) {
+		if (snprintf(tmp_buf, tmp_buf_size, "a=ice-pwd:%s\r\n", vpwd) >= (int)tmp_buf_size) {
+			*overflow = 1;
+		} else {
+			*overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+		}
+	}
+	if (snprintf(tmp_buf, tmp_buf_size, "a=candidate:0 1 UDP 2130706431 %s %d typ host\r\n", host, vport) >= (int)tmp_buf_size) {
+		*overflow = 1;
+	} else {
+		*overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+	}
+	*overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), "a=end-of-candidates\r\n");
+	if (snprintf(tmp_buf, tmp_buf_size, "a=mid:%s\r\n",
+		!ast_strlen_zero(pvt->webrtc_video_mid) ? pvt->webrtc_video_mid : "1") >= (int)tmp_buf_size) {
+		*overflow = 1;
+	} else {
+		*overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+	}
+	if (!ast_strlen_zero(pvt->webrtc_video_tls_id)) {
+		if (snprintf(tmp_buf, tmp_buf_size, "a=tls-id:%s\r\n", pvt->webrtc_video_tls_id) >= (int)tmp_buf_size) {
+			*overflow = 1;
+		} else {
+			*overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+		}
+	}
+	vblen = strlen(buf);
+	if (snprintf(buf + vblen, len - vblen,
+			"m=video %d UDP/TLS/RTP/SAVPF %s\r\n"
+			"c=IN %s %s\r\n"
+			"%s",
+			vport, vpayload_buf, sdp_family, host, vmap_buf) >= (int)(len - vblen)) {
+		*overflow = 1;
+	}
+}
+
 char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 {
 	struct ast_sockaddr rtp_addr;
@@ -375,194 +493,159 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 			group_buf[0] = '\0';
 		}
 	}
+	/* The m=audio SECTION (m= line + its a= block + a=sendrecv), built into its own buffer so the WebRTC
+	 * answer can place it at the audio's OFFER slot when the offer order is non-canonical (RFC 3264 §6 /
+	 * RFC 8829 §5.3 — the answer mirrors the offer's m-line ORDER). For a non-WebRTC leg (and the common
+	 * audio-first WebRTC offer) it lands first, byte-identical to before. */
+	char audio_m_buf[sizeof(rtpmap_buf) + sizeof(payload_buf) + 128] = "";	/* holds the m=audio line + full payload list + rtpmap block + a=sendrecv */
+	if (snprintf(audio_m_buf, sizeof(audio_m_buf),
+		"m=audio %d %s %s\r\n"
+		"%s"
+		"a=sendrecv\r\n",
+		port,
+		pvt->is_webrtc ? "UDP/TLS/RTP/SAVPF"
+			: ((pvt->srtp && pvt->srtp->crypto) ? "RTP/SAVP" : "RTP/AVP"),
+		payload_buf, rtpmap_buf) >= (int)sizeof(audio_m_buf)) {	/* truncated audio SDP */
+		overflow = 1;
+	}
+
 	if (snprintf(buf, len,
 		"v=0\r\n"
 		"o=- %lu %lu IN %s %s\r\n"
 		"s=GABpbx\r\n"
 		"c=IN %s %s\r\n"
 		"t=0 0\r\n"
-		"%s"
-		"m=audio %d %s %s\r\n"
-		"%s"
-		"a=sendrecv\r\n",
+		"%s",
 		pvt->sess_id, pvt->sess_version,
 		sdp_family, host, sdp_family, host,
-		group_buf,
-		port,
-		pvt->is_webrtc ? "UDP/TLS/RTP/SAVPF"
-			: ((pvt->srtp && pvt->srtp->crypto) ? "RTP/SAVP" : "RTP/AVP"),
-		payload_buf, rtpmap_buf) >= (int)len) {	/* truncated audio SDP */
+		group_buf) >= (int)len) {	/* truncated session-level SDP */
 		overflow = 1;
 	}
 
-	/* v1b STEP 6 — emit the accepted non-BUNDLE m=video on pvt->vrtp's OWN transport (RFC 8843 §7): its
-	 * own port + ICE/fingerprint/setup/candidate, a=rtcp-mux, VP8/H264 rtpmap, a=mid + a=tls-id — but NOT
-	 * added to a=group:BUNDLE (the group stays audio-only). Placed right after m=audio so the answer
-	 * m-line order matches the standard browser offer (audio, video, [application]). Mirrors the audio a=
-	 * block above but reads pvt->vrtp's OWN credentials. */
-	if (pvt->is_webrtc && pvt->vrtp
+	/* WebRTC ANSWER m-line ORDER (RFC 3264 §6 / RFC 8829 §5.3): when we are ANSWERING a remote offer
+	 * (!webrtc_offerer — webrtc_offerer is set ONLY by sofia_webrtc_provision_offer on the OUTBOUND-offer
+	 * leg), emit ONE answer m-section per offer m-line, in the OFFER's ORDER, by absolute index. The
+	 * accept/reject decisions are UNCHANGED — only the ORDER is fixed so a strict UA (e.g. after a
+	 * renegotiation that reordered to audio,application,video) does not abort setRemoteDescription on an
+	 * m-line-order mismatch. For each offer slot 0..max:
+	 *   - audio slot (webrtc_audio_offer_idx)               → the real m=audio section (audio_m_buf)
+	 *   - the accepted video slot (webrtc_accepted_video_idx, if still accepted) → real m=video
+	 *   - the accepted DataChannel slot (dc_accepted mid match)                  → real m=application
+	 *   - every other offered slot                          → its port-0 reflection IN PLACE
+	 * The OFFER-build direction (webrtc_offerer) has NO remote offer to mirror — it uses the canonical
+	 * audio,[video],[application] layout below. The non-WebRTC leg also skips this loop. */
+	if (pvt->is_webrtc && !pvt->webrtc_offerer) {
+		int max_idx = pvt->webrtc_audio_offer_idx;
+		int slot;
+		int ri;
+		for (ri = 0; ri < pvt->webrtc_reject_m_count; ri++) {
+			if (pvt->webrtc_reject_m[ri].offer_idx > max_idx) {
+				max_idx = pvt->webrtc_reject_m[ri].offer_idx;
+			}
+		}
+		if (pvt->webrtc_reject_overflow) {
+			overflow = 1;	/* more non-audio m= offered than we can reflect → fail closed (RFC 3264 §6) */
+		}
+		/* Safety: an answer MUST always carry the m=audio (it is the accepted BUNDLE transport). If the
+		 * parse did not record an audio position this round (webrtc_audio_offer_idx < 0 — abnormal for an
+		 * answer, but never drop audio), emit it first so the slot loop only places the non-audio sections.
+		 * webrtc_audio_offer_idx >= 0 is the normal case (the answerer always parses the offer first). */
+		if (pvt->webrtc_audio_offer_idx < 0) {
+			int blen = strlen(buf);
+			if (snprintf(buf + blen, len - blen, "%s", audio_m_buf) >= (int)(len - blen)) {
+				overflow = 1;
+			}
+		}
+		for (slot = 0; slot <= max_idx; slot++) {
+			int blen;
+			/* AUDIO slot — the accepted, BUNDLE-tagged transport. */
+			if (slot == pvt->webrtc_audio_offer_idx) {
+				blen = strlen(buf);
+				if (snprintf(buf + blen, len - blen, "%s", audio_m_buf) >= (int)(len - blen)) {
+					overflow = 1;
+				}
+				continue;
+			}
+			/* Find the offered non-audio section that lives at THIS slot. */
+			ri = -1;
+			{
+				int j;
+				for (j = 0; j < pvt->webrtc_reject_m_count; j++) {
+					if (pvt->webrtc_reject_m[j].offer_idx == slot) {
+						ri = j;
+						break;
+					}
+				}
+			}
+			if (ri < 0) {
+				continue;	/* no section at this slot (e.g. the audio gap) — already handled */
+			}
+			/* ACCEPTED VIDEO at this slot → real m=video on pvt->vrtp's OWN transport (RFC 8843 §7). The
+			 * accepted-video gate is the SAME as the former STEP 6: webrtc_video_accepted (answerer); the
+			 * offerer-video branch never reaches here (this loop is !webrtc_offerer). */
+			if (pvt->vrtp && ri == pvt->webrtc_accepted_video_idx && pvt->webrtc_video_accepted) {
+				sofia_sdp_emit_webrtc_video(pvt, buf, len, host, sdp_family, tmp_buf, sizeof(tmp_buf), &overflow);
+				continue;
+			}
+			/* ACCEPTED DataChannel at this slot → real m=application (RFC 8841), shares the audio BUNDLE. */
+			if (pvt->dc_accepted && !ast_strlen_zero(pvt->dc_mid)
+					&& !ast_strlen_zero(pvt->webrtc_reject_m[ri].mid)
+					&& !strcmp(pvt->webrtc_reject_m[ri].mid, pvt->dc_mid)
+					&& pvt->webrtc_reject_m[ri].type_name[0]
+					&& !strcasecmp(pvt->webrtc_reject_m[ri].type_name, "application")) {
+				blen = strlen(buf);
+				if (snprintf(buf + blen, len - blen,
+						"m=application %d UDP/DTLS/SCTP webrtc-datachannel\r\n"
+						"c=IN %s %s\r\n"
+						"a=sctp-port:5000\r\n"
+						"a=max-message-size:262144\r\n"
+						"a=mid:%s\r\n",
+						port, sdp_family, host, pvt->dc_mid) >= (int)(len - blen)) {
+					overflow = 1;
+				}
+				continue;
+			}
+			/* OTHERWISE — port-0 reflect this offered section IN PLACE (RFC 3264 §6: declined m-line). */
+			{
+				struct sofia_webrtc_reject_m *r = &pvt->webrtc_reject_m[ri];
+				char mid_line[80] = "";
+				blen = strlen(buf);
+				if (!ast_strlen_zero(r->mid)) {
+					snprintf(mid_line, sizeof(mid_line), "a=mid:%s\r\n", r->mid);
+				}
+				if (snprintf(buf + blen, len - blen, "m=%s 0 %s %s\r\n%s",
+						r->type_name, r->proto, r->fmt, mid_line) >= (int)(len - blen)) {
+					overflow = 1;
+				}
+			}
+		}
+		goto webrtc_m_lines_done;	/* the WebRTC answer m-lines are fully emitted in offer order */
+	}
+
+	/* Audio section lands first (non-WebRTC leg, and the WebRTC OFFER-build direction below). */
+	{
+		int blen = strlen(buf);
+		if (snprintf(buf + blen, len - blen, "%s", audio_m_buf) >= (int)(len - blen)) {
+			overflow = 1;
+		}
+	}
+
+	/* WebRTC OFFER-build (webrtc_offerer): the canonical audio,[video],[application] layout (there is no
+	 * remote offer to mirror). The accepted/offered m=video on pvt->vrtp's OWN transport (RFC 8843 §7),
+	 * placed right after m=audio so it matches the standard browser order (audio, video, [application]).
+	 * Same accept/offer gate as the former inline STEP 6. */
+	if (pvt->is_webrtc && pvt->webrtc_offerer && pvt->vrtp
 			&& (pvt->webrtc_video_accepted
 				|| (pvt->webrtc_video_offerer && !pvt->webrtc_video_answer_applied))) {	/* v1c: answerer-accepted OR offerer-offered (mutually exclusive) */
-		struct ast_rtp_engine_dtls *vdtls = ast_rtp_instance_get_dtls(pvt->vrtp);
-		struct ast_rtp_engine_ice *vice = ast_rtp_instance_get_ice(pvt->vrtp);
-		const char *vfp = vdtls ? vdtls->get_fingerprint(pvt->vrtp) : NULL;
-		const char *vufrag = vice ? vice->get_ufrag(pvt->vrtp) : NULL;
-		const char *vpwd = vice ? vice->get_password(pvt->vrtp) : NULL;
-		enum ast_rtp_dtls_setup vos = vdtls ? vdtls->get_setup(pvt->vrtp) : AST_RTP_DTLS_SETUP_PASSIVE;
-		const char *vss = (vos == AST_RTP_DTLS_SETUP_PASSIVE) ? "passive"
-			: (vos == AST_RTP_DTLS_SETUP_ACTPASS) ? "actpass" : "active";
-		struct ast_sockaddr vla;
-		int vport = 0;
-		char vpayload_buf[128] = "";
-		char vmap_buf[1536] = "";
-		int vfirst = 1;
-		format_t vf;
-		int vblen;
-
-		ast_rtp_instance_get_local_address(pvt->vrtp, &vla);
-		vport = ast_sockaddr_port(&vla);
-		/* VP8/H264 payload list + rtpmap from the negotiated video capability (90 kHz video clock). The PT
-		 * comes from vrtp's codec map: for the ANSWERER it is the BROWSER's offered PT (staged at commit,
-		 * RFC 3264 keeps it); for the OFFERER the map is empty so ast_rtp_codecs_payload_code falls back to
-		 * the static table (VP8=96, H264=99, rtp_engine.c:187/191). */
-		for (vf = 1; vf; vf <<= 1) {
-			int vpt;
-			const char *venc;
-			if (!(vf & pvt->capability) || !(vf & (AST_FORMAT_VP8 | AST_FORMAT_H264))) {
-				continue;
-			}
-			vpt = ast_rtp_codecs_payload_code(ast_rtp_instance_get_codecs(pvt->vrtp), 1, vf);
-			if (vpt < 0) {
-				continue;
-			}
-			venc = ast_rtp_lookup_mime_subtype2(1, vf, 0);
-			if (ast_strlen_zero(venc)) {
-				continue;
-			}
-			if (!vfirst) {
-				overflow |= sofia_sdp_cat(vpayload_buf, sizeof(vpayload_buf), " ");
-			}
-			snprintf(tmp_buf, sizeof(tmp_buf), "%d", vpt);
-			overflow |= sofia_sdp_cat(vpayload_buf, sizeof(vpayload_buf), tmp_buf);
-			vfirst = 0;
-			if (snprintf(tmp_buf, sizeof(tmp_buf), "a=rtpmap:%d %s/90000\r\n", vpt, venc) >= (int)sizeof(tmp_buf)) {
-				overflow = 1;
-			} else {
-				overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
-			}
-		}
-		overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), "a=sendrecv\r\n");
-		overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), "a=rtcp-mux\r\n");
-		if (snprintf(tmp_buf, sizeof(tmp_buf), "a=setup:%s\r\n", vss) >= (int)sizeof(tmp_buf)) {
-			overflow = 1;
-		} else {
-			overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
-		}
-		if (vfp) {
-			if (snprintf(tmp_buf, sizeof(tmp_buf), "a=fingerprint:sha-256 %s\r\n", vfp) >= (int)sizeof(tmp_buf)) {
-				overflow = 1;
-			} else {
-				overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
-			}
-		}
-		overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), "a=ice-lite\r\n");
-		if (vufrag) {
-			if (snprintf(tmp_buf, sizeof(tmp_buf), "a=ice-ufrag:%s\r\n", vufrag) >= (int)sizeof(tmp_buf)) {
-				overflow = 1;
-			} else {
-				overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
-			}
-		}
-		if (vpwd) {
-			if (snprintf(tmp_buf, sizeof(tmp_buf), "a=ice-pwd:%s\r\n", vpwd) >= (int)sizeof(tmp_buf)) {
-				overflow = 1;
-			} else {
-				overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
-			}
-		}
-		if (snprintf(tmp_buf, sizeof(tmp_buf), "a=candidate:0 1 UDP 2130706431 %s %d typ host\r\n", host, vport) >= (int)sizeof(tmp_buf)) {
-			overflow = 1;
-		} else {
-			overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
-		}
-		overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), "a=end-of-candidates\r\n");
-		if (snprintf(tmp_buf, sizeof(tmp_buf), "a=mid:%s\r\n",
-			!ast_strlen_zero(pvt->webrtc_video_mid) ? pvt->webrtc_video_mid : "1") >= (int)sizeof(tmp_buf)) {
-			overflow = 1;
-		} else {
-			overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
-		}
-		if (!ast_strlen_zero(pvt->webrtc_video_tls_id)) {
-			if (snprintf(tmp_buf, sizeof(tmp_buf), "a=tls-id:%s\r\n", pvt->webrtc_video_tls_id) >= (int)sizeof(tmp_buf)) {
-				overflow = 1;
-			} else {
-				overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
-			}
-		}
-		vblen = strlen(buf);
-		if (snprintf(buf + vblen, len - vblen,
-				"m=video %d UDP/TLS/RTP/SAVPF %s\r\n"
-				"c=IN %s %s\r\n"
-				"%s",
-				vport, vpayload_buf, sdp_family, host, vmap_buf) >= (int)(len - vblen)) {
-			overflow = 1;
-		}
+		sofia_sdp_emit_webrtc_video(pvt, buf, len, host, sdp_family, tmp_buf, sizeof(tmp_buf), &overflow);
 	}
 
-	/* A6 multi-m: port-0 REFLECT the offered non-accepted m= sections (RFC 3264 §6) right AFTER the
-	 * audio (the accepted, tagged BUNDLE transport), in the offered order. Each: port 0, its media
-	 * type + transport proto + first format, and its a=mid echoed (RFC 8843) — but NOT added to the
-	 * answer's a=group:BUNDLE (only the accepted audio is bundled). Without this a browser audio+video+
-	 * datachannel offer gets fewer answer m= lines than it offered → m-line mismatch reject. (v1a: video
-	 * is reflected here too; video ACCEPTANCE lands next, which moves it out of this reject set.) */
-	if (pvt->is_webrtc && pvt->webrtc_reject_m_count > 0) {
-		int ri;
-		if (pvt->webrtc_reject_overflow) {
-			overflow = 1;	/* more non-audio m= sections offered than we can reflect → fail closed (RFC 3264 §6) */
-		}
-		for (ri = 0; ri < pvt->webrtc_reject_m_count; ri++) {
-			struct sofia_webrtc_reject_m *r = &pvt->webrtc_reject_m[ri];
-			char mid_line[80] = "";
-			int blen = strlen(buf);
-			if (pvt->webrtc_video_accepted && ri == pvt->webrtc_accepted_video_idx) {
-				/* The accepted video is emitted as a REAL m=video above (STEP 6) — skip
-				 * its port-0 reflection. If STEP 5 arming FAILED, webrtc_video_accepted is now 0, so we DO
-				 * emit the port-0 reflection here: exactly one m=video either way (RFC 3264 §6). */
-				continue;
-			}
-			/* Phase 3: an ACCEPTED m=application is emitted as a REAL section below (STEP DC) — skip its
-			 * port-0 reflection here (matched by its unique a=mid). If accept failed (dc_accepted 0) we DO
-			 * emit the port-0 reflection: exactly one m=application either way (RFC 3264 §6). */
-			if ((pvt->dc_accepted || pvt->dc_offerer) && !ast_strlen_zero(pvt->dc_mid) && !ast_strlen_zero(r->mid)
-					&& !strcmp(r->mid, pvt->dc_mid)
-					&& r->type_name && !strcasecmp(r->type_name, "application")) {
-				continue;
-			}
-			if (!ast_strlen_zero(r->mid)) {
-				snprintf(mid_line, sizeof(mid_line), "a=mid:%s\r\n", r->mid);
-			}
-			if (snprintf(buf + blen, len - blen, "m=%s 0 %s %s\r\n%s",
-					r->type_name, r->proto, r->fmt, mid_line) >= (int)(len - blen)) {
-				overflow = 1;
-			}
-		}
-	}
-
-	/* Phase 3 STEP DC — emit the ACCEPTED m=application as a REAL section (RFC 8841). It RIDES THE BUNDLE'd
-	 * AUDIO transport: the SAME port as m=audio (not a fresh port/socket; the actual SCTP runs over the
-	 * audio DTLS via usrsctp), so it carries NO own ICE/fingerprint/setup beyond the bundle tag. We emit
-	 *   m=application <audioport> UDP/DTLS/SCTP webrtc-datachannel
-	 *   c=IN <fam> <host>
-	 *   a=sctp-port:5000              (our SCTP port, RFC 8841 §5.1)
-	 *   a=max-message-size:262144    (our advertised cap, RFC 8841 §6; relay later caps to min)
-	 *   a=mid:<echo offer mid>       (must match the BUNDLE token added above)
-	 * NO a=setup/fingerprint/ICE on this section: when data is BUNDLEd those transport attrs live ONLY on
-	 * the tagged audio m-line (RFC 8829/JSEP §5.2.1); the browser reads our DTLS role from there. Our ODD
-	 * SCTP stream parity (we are the DTLS server) is derived at attach, not advertised here.
-	 * a=mid joins a=group:BUNDLE (emitted at session level above). Emitted both for an ACCEPTED inbound DC
-	 * (dc_accepted) and for an ORIGINATED outbound DC (dc_offerer) — both required HAVE_USRSCTP to be set
-	 * (the accept gate / provision_offer's attach are #ifdef'd), so a non-DC build never emits this. */
-	if (pvt->is_webrtc && (pvt->dc_accepted || pvt->dc_offerer) && !ast_strlen_zero(pvt->dc_mid)) {
+	/* WebRTC OFFER-build m=application (RFC 8841): the ORIGINATED outbound DataChannel (dc_offerer). It
+	 * RIDES THE BUNDLE'd audio transport (same port as m=audio; the SCTP runs over the audio DTLS via
+	 * usrsctp) with NO own ICE/fingerprint/setup. a=mid joins a=group:BUNDLE (session level above).
+	 * dc_offerer required HAVE_USRSCTP (provision_offer's attach is #ifdef'd) → a non-DC build never
+	 * emits this. (The answerer's dc_accepted m=application is emitted in the mirror loop above.) */
+	if (pvt->is_webrtc && pvt->webrtc_offerer && pvt->dc_offerer && !ast_strlen_zero(pvt->dc_mid)) {
 		int dblen = strlen(buf);
 		if (snprintf(buf + dblen, len - dblen,
 				"m=application %d UDP/DTLS/SCTP webrtc-datachannel\r\n"
@@ -574,6 +657,11 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 			overflow = 1;
 		}
 	}
+
+webrtc_m_lines_done:
+	/* (WebRTC ANSWER m-lines were emitted in offer order by the slot loop above; the OFFER-build leg uses
+	 * the canonical layout just above. The former inline STEP 6 (m=video) / A6 (port-0 rejects) / STEP DC
+	 * (m=application) blocks now live in those two paths — STEP 6 via sofia_sdp_emit_webrtc_video().) */
 
 	/* Video block — only when video capability present and vrtp allocated. SUPPRESSED on a WebRTC leg
 	 * (A4/A5 are AUDIO-ONLY): a plain RTP/AVP m=video in a WebRTC offer/answer (no a=mid/ice/fingerprint,
@@ -677,11 +765,14 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len)
 	}
 
 	/* T.38 fax UDPTL outbound emitter: m=image + a=T38Fax* (5 mandatory + 3 optional
-	 * bare-flag attrs, emitted only when the our_parms bit is set). Gated on udptl. */
+	 * bare-flag attrs, emitted only when the our_parms bit is set). Gated on udptl AND an ACTIVE t38_state
+	 * (!= DISABLED): a refused/failed T.38 leaves pvt->udptl allocated (we keep it, non-destructive), so
+	 * without the state gate a later re-INVITE / session-refresh would wrongly re-offer a live m=image.
+	 * chan_sip parity: it emits T.38 SDP only when p->udptl && state==T38_LOCAL_REINVITE (chan_sip.c:13222). */
 	/* SUPPRESSED on a WebRTC leg (A4/A5 audio-only): a plain m=image udptl t38 in a WebRTC SDP is the
 	 * same mixed-media 488 class as plain video — no mid/ICE/fingerprint/BUNDLE. T.38 fax
 	 * is never active on a browser audio call anyway; gate for completeness. */
-	if (!pvt->is_webrtc && pvt->udptl) {
+	if (!pvt->is_webrtc && pvt->udptl && pvt->t38_state != SOFIA_T38_DISABLED) {
 		struct ast_sockaddr udptl_local;
 		int t38vlen = strlen(buf);
 		const char *rate_mgmt_str;
@@ -1172,6 +1263,8 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	int t38_stage_fds5 = 0;			/* attach o->fds[5] = ast_udptl_fd(udptl) at commit (was_new only) */
 	int t38_stage_enter_reinvite = 0;	/* sofia_change_t38_state(PEER_REINVITE) + arm t38id at commit */
 	int t38_stage_withdraw = 0;		/* sofia_change_t38_state(DISABLED) + cancel t38id at commit */
+	int t38_stage_local_accept = 0;		/* outbound (LOCAL_REINVITE) answer accepted T.38 → ENABLED at commit (FIX 1b) */
+	int t38_stage_local_refuse = 0;		/* outbound (LOCAL_REINVITE) answer declined T.38 (no m=image) → DISABLED at commit */
 	/* The fax-redirect inputs are evaluated at COMMIT under the channel lock; only
 	 * the advance intent is staged here. */
 
@@ -1748,9 +1841,17 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 					}
 				} else if (sscanf(attrib, "t38faxmaxdatagram:%30u", &x) == 1 ||
 					   sscanf(attrib, "t38maxdatagram:%30u", &x) == 1) {
-					/* Apply per-peer override (chan_sip parity) */
-					if ((pvt->t38_maxdatagram > 0) && ((unsigned int)pvt->t38_maxdatagram > x)) {
-						x = (unsigned int)pvt->t38_maxdatagram;
+					/* FIX 2 — apply the per-peer maxdatagram override (chan_sip parity).
+					 * Read peer->t38_maxdatagram (the CONFIGURED value, set from
+					 * t38pt_udptl=...,maxdatagram=N at chan_sofia.c:2989/:14305), NOT the
+					 * never-written pvt->t38_maxdatagram (the pvt is ao2-zeroed → always 0
+					 * → this override branch was unreachable dead code). chan_sip copies
+					 * relatedpeer->t38_maxdatagram onto the dialog first (chan_sip.c:7610);
+					 * here we read the peer directly. The default sentinel (-1) and 0 both
+					 * leave the offered value untouched via the >0 guard. */
+					int peer_maxdatagram = pvt->peer ? pvt->peer->t38_maxdatagram : 0;
+					if ((peer_maxdatagram > 0) && ((unsigned int)peer_maxdatagram > x)) {
+						x = (unsigned int)peer_maxdatagram;
 					}
 					ast_udptl_set_far_max_datagram(pvt->udptl, x);
 				} else if (sscanf(attrib, "t38faxratemanagement:%255s", s) == 1) {
@@ -1774,6 +1875,17 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 				} else if (strncmp(attrib, "t38faxtranscodingjbig", 21) == 0) {
 					pvt->t38_their_parms.transcoding_jbig = 1;
 				}
+			}
+
+			/* FIX 3 — T38FaxMaxDatagram is OPTIONAL and commonly omitted. When the
+			 * offer/answer omits it, far_max_datagram stays at the -1 sentinel and
+			 * calculate_far_max_ifp (main/udptl.c) logs a warning and returns 0, which
+			 * propagates to res_fax as max_ifp==0 → T.38 is rejected/disabled + the
+			 * warning spams per offer. chan_sip defends identically (chan_sip.c:10196):
+			 * if no far max datagram was set, force the udptl DEFAULT_FAX_MAX_DATAGRAM
+			 * via set_far_max_datagram(..., 0). */
+			if (!ast_udptl_get_far_max_datagram(pvt->udptl)) {
+				ast_udptl_set_far_max_datagram(pvt->udptl, 0);	/* 0 → DEFAULT_FAX_MAX_DATAGRAM (400) */
 			}
 
 			/* LOAD-BEARING: read peer-advertised max_ifp (max_ifp==0 forces
@@ -1870,6 +1982,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	}
 	pvt->webrtc_reject_m_count = 0;
 	pvt->webrtc_accepted_video_idx = -1;	/* Review HIGH 1:1 — no accepted video recorded yet this parse */
+	pvt->webrtc_audio_offer_idx = -1;	/* no audio position recorded yet this parse (answer mirrors offer order, RFC 3264 §6) */
 	pvt->webrtc_reject_overflow = 0;
 	pvt->webrtc_video_offered = 0;
 	pvt->webrtc_video_mid[0] = '\0';
@@ -1912,11 +2025,20 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	pvt->dc_accepted = 0;
 	if (audio_webrtc_offered) {
 		sdp_media_t *mm;
-		for (mm = sdp->sdp_media; mm; mm = mm->m_next) {
+		int m_abs_idx = 0;	/* ABSOLUTE offer m-line index (counts EVERY section, incl. audio) so the answer
+					 * mirrors offer ORDER (RFC 3264 §6 / RFC 8829 §5.3). */
+		for (mm = sdp->sdp_media; mm; mm = mm->m_next, m_abs_idx++) {
 			sdp_attribute_t *ma;
 			const char *mid = "";
 			if (mm->m_type == sdp_media_audio) {
-				continue;	/* the audio section IS the accepted, tagged BUNDLE transport */
+				/* The audio section IS the accepted, tagged BUNDLE transport (emitted as the real m=audio).
+				 * Record its ABSOLUTE offer position so the emit can place it at the right slot when the
+				 * offer order is non-canonical (e.g. audio,application,video after renegotiation). The FIRST
+				 * audio wins (matching the parse above, which keys WebRTC off the first audio section). */
+				if (pvt->webrtc_audio_offer_idx < 0) {
+					pvt->webrtc_audio_offer_idx = m_abs_idx;
+				}
+				continue;
 			}
 			for (ma = mm->m_attributes; ma; ma = ma->a_next) {	/* its a=mid (RFC 8843) */
 				if (ma->a_name && su_casematch(ma->a_name, "mid") && ma->a_value) {
@@ -1988,6 +2110,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 				ast_copy_string(r->proto, mm->m_proto_name ? mm->m_proto_name : "RTP/AVP", sizeof(r->proto));
 				ast_copy_string(r->fmt, (mm->m_format && mm->m_format->l_text) ? mm->m_format->l_text : "0", sizeof(r->fmt));
 				ast_copy_string(r->mid, mid, sizeof(r->mid));
+				r->offer_idx = m_abs_idx;	/* ABSOLUTE offer position → answer mirrors offer order (RFC 3264 §6) */
 			} else {
 				pvt->webrtc_reject_overflow = 1;
 			}
@@ -1999,6 +2122,25 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	 * commit; mutually exclusive with t38_stage_enter_reinvite. */
 	if (!image_active_seen && pvt->t38_state >= SOFIA_T38_PEER_REINVITE) {
 		t38_stage_withdraw = 1;
+	}
+
+	/* FIX 1b — OUTBOUND (LOCAL_REINVITE) ANSWER-APPLY (RFC 3264 §8: the offerer applies
+	 * the answer). We sent a T.38 (m=image) offer and are now parsing the peer's ANSWER
+	 * (this body arrives via the directmedia/reinvite 2xx path, or an 18x preview). The
+	 * t38_stage_enter_reinvite gate above fires PEER_REINVITE only from DISABLED, and the
+	 * withdraw gate is >= PEER_REINVITE, so LOCAL_REINVITE (==1) falls through both —
+	 * decide its transition here, deferred to the channel-locked commit:
+	 *   - answer ACCEPTED T.38 (a live m=image leg) → ENABLED  (chan_sip.c:10202-10204:
+	 *     SDP_T38_ACCEPT && T38_LOCAL_REINVITE → change_t38_state(T38_ENABLED));
+	 *   - answer DECLINED T.38 (no/zeroed m=image) → DISABLED (queues AST_T38_REFUSED).
+	 * Mutually exclusive with enter_reinvite/withdraw (LOCAL_REINVITE never satisfies
+	 * their state gates). */
+	if (pvt->t38_state == SOFIA_T38_LOCAL_REINVITE) {
+		if (image_active_seen) {
+			t38_stage_local_accept = 1;
+		} else {
+			t38_stage_local_refuse = 1;
+		}
 	}
 
 	sdp_parser_free(parser);
@@ -2131,6 +2273,17 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 				wrtc.have_fingerprint, wrtc.have_setup, wrtc.have_ice_ufrag, wrtc.have_ice_pwd, wrtc.have_rtcp_mux);
 			goto sdp_reject;
 		}
+		/* RFC 5763 §5: the ANSWERER MUST use a=setup:active or :passive — NEVER actpass (the
+		 * offerer is actpass; only the answer fixes the concrete role). A non-conformant actpass
+		 * ANSWER would map (res_rtp_gabpbx.c gabpbx_dtls_set_setup, remote actpass -> our PASSIVE)
+		 * to leave BOTH ends DTLS server -> neither sends the ClientHello -> stalled handshake.
+		 * Treat it as a negotiation error and fail the media rather than silently going PASSIVE.
+		 * Conformant browsers always answer active, so real WebRTC is unaffected. */
+		if (wrtc.remote_setup == AST_RTP_DTLS_SETUP_ACTPASS) {
+			ast_log(LOG_NOTICE, "Sofia: SDP rejected — WebRTC ANSWER carried a=setup:actpass (RFC 5763 §5: the answerer MUST use active or passive) for peer '%s'\n",
+				pvt->peer ? pvt->peer->name : "<unknown>");
+			goto sdp_reject;
+		}
 		/* set_configuration was done on the offer side — do NOT re-run it. Apply the
 		 * remote params: fingerprint (trust), setup (maps remote→our concrete DTLS
 		 * role: browser answers active → we PASSIVE/server, RFC 5763 §5), remote ICE
@@ -2199,6 +2352,14 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 			 * SOFIA_DC_PEER_MAX_UNBOUNDED=explicit-0 → relay 262144 hard cap, NOT the 65536 default; else N). */
 #ifdef HAVE_USRSCTP
 			if (pvt->dc) {
+				/* DTLS-role/stream-parity fix (RFC 8832 §6): the DC attached in provision_offer while our
+				 * a=setup was still ACTPASS, so dc->dtls_is_server latched 0 (client/even). The answer's
+				 * set_setup above (line ~2139) just fixed our CONCRETE role (answer a=setup:active → we
+				 * PASSIVE = DTLS server = ODD parity, RFC 5763 §5). Recompute dc->dtls_is_server from the
+				 * now-concrete engine setup BEFORE any worker-lane SID allocation / inbound OPEN parity
+				 * check, else gabpbx would proxy OPENs on even streams the peer rejects AND flag every
+				 * legit peer OPEN as wrong-parity → the offerer-direction DataChannel silently fails. */
+				sofia_dc_set_dtls_role(pvt->dc);
 				sofia_dc_set_peer_max_msg(pvt->dc, pvt->dc_max_message_size);
 			}
 #endif
@@ -2233,6 +2394,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 		format_t agreed_v = video_offered_fmts & orig_capability & AST_FORMAT_VIDEO_MASK;
 		if (vdtls && vice && staged_video_valid
 				&& video_wrtc.have_fingerprint && video_wrtc.have_setup
+				&& video_wrtc.remote_setup != AST_RTP_DTLS_SETUP_ACTPASS	/* RFC 5763 §5: answerer MUST be active/passive, not actpass — a non-conformant actpass video answer would map to our PASSIVE → both DTLS server → stalled; drop video, keep audio */
 				&& video_wrtc.have_ice_ufrag && video_wrtc.have_ice_pwd && video_wrtc.have_rtcp_mux
 				&& agreed_v) {
 			int vi;
@@ -2520,7 +2682,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	 * sees the UDPTL fd) → arm/cancel t38id → snapshot fax-redirect inputs; THEN drop
 	 * the lock and run ast_exists_extension / FAXEXTEN / ast_async_goto (they take
 	 * their own locks). Advance and withdraw are mutually exclusive. */
-	if (staged_chosen_audio_valid || t38_stage_fds5 || t38_stage_enter_reinvite || t38_stage_withdraw || vrtp_stage_fds23 || audio_webrtc_offered) {	/* + audio_webrtc_offered so the WebRTC nativeformats/fds sync below is never skipped by an unusual parse with no chosen-audio side effect */
+	if (staged_chosen_audio_valid || t38_stage_fds5 || t38_stage_enter_reinvite || t38_stage_withdraw || t38_stage_local_accept || t38_stage_local_refuse || vrtp_stage_fds23 || audio_webrtc_offered) {	/* + audio_webrtc_offered so the WebRTC nativeformats/fds sync below is never skipped by an unusual parse with no chosen-audio side effect */
 		struct ast_channel *o = pvt->owner;
 		if (o) {
 			char fax_context[AST_MAX_CONTEXT] = "";
@@ -2593,6 +2755,17 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 						}
 						pvt->t38id = -1;
 					}
+				} else if (t38_stage_local_accept) {
+					/* FIX 1b: our outbound T.38 offer was ACCEPTED — the m=image answer
+					 * (their_parms + udptl peer + far_max_ifp) is committed above, so go
+					 * ENABLED (queues AST_T38_NEGOTIATED → ast_udptl_write opens, sofia_write
+					 * gate at chan_sofia.c). Frame AFTER the fds[5] attach. */
+					sofia_change_t38_state(pvt, SOFIA_T38_ENABLED);
+				} else if (t38_stage_local_refuse) {
+					/* FIX 1b: our outbound T.38 offer was DECLINED (no m=image in the
+					 * answer) — back to DISABLED (queues AST_T38_REFUSED so res_fax falls
+					 * back). chan_sip parity: change_t38_state(T38_DISABLED). */
+					sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
 				}
 			}
 			ast_channel_unlock(o);
@@ -2612,10 +2785,12 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 				}
 			}
 			ast_channel_unref(o);
-		} else if (t38_stage_withdraw) {
+		} else if (t38_stage_withdraw || t38_stage_local_refuse) {
 			/* No owner: sofia_change_t38_state would NO-OP (it does `chan = pvt->owner; if
 			 * (!chan) return;` before writing t38_state), leaving state stale at
-			 * PEER_REINVITE. Set DISABLED directly + cancel the t38id timer. */
+			 * PEER_REINVITE / LOCAL_REINVITE. Set DISABLED directly + cancel the t38id
+			 * timer. (t38_stage_local_accept needs a channel to go ENABLED; with no owner
+			 * the call is tearing down — the destructor cleans up.) */
 			pvt->t38_state = SOFIA_T38_DISABLED;
 			if (pvt->t38id != -1 && sofia_sched) {
 				if (ast_sched_thread_del(sofia_sched, pvt->t38id) == 0) {

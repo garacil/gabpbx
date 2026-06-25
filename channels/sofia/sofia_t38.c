@@ -156,13 +156,36 @@ void sofia_change_t38_state(struct sofia_pvt *pvt, int new_state)
 
 /* T.38 control dispatcher for the sofia_indicate AST_CONTROL_T38_PARAMETERS case
  * (app_fax/res_fax requests). max_ifp==0 is a rejection gate → DISABLED; version
- * is MIN-clamped. Updates state/parameters only; the actual reINVITE/SDP is on
- * the existing response path. */
+ * is MIN-clamped.
+ *
+ * RETURN: <0 = error; 0 = handled, nothing further; >0 (1) = the caller must SEND
+ * an outbound (LOCAL_REINVITE) T.38 re-INVITE — sofia_indicate marshals
+ * sofia_directmedia_reinvite_root onto sofia_thread, which builds the m=image
+ * offer (sofia_generate_sdp gates on pvt->udptl) and fires nua_invite. For the
+ * inbound (PEER_REINVITE) path the SDP answer is on the existing response path
+ * (unchanged). Runs under the CHANNEL lock (core tech->indicate), so the lazy
+ * udptl create + the pvt->owner->fds[5] attach below are safe; pvt->udptl is also
+ * read by the channel thread (sofia_read/write) under that same channel lock. */
 int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_control_t38_parameters *parameters)
 {
 	int res = 0;
 
-	if (!pvt || !pvt->peer || !pvt->peer->t38pt_udptl || !pvt->udptl) {
+	/* t38pt_udptl must be enabled on the peer; pvt->udptl may still be NULL on a
+	 * gabpbx-ORIGINATED upgrade (no inbound m=image has lazy-created it yet) — the
+	 * LOCAL_REINVITE branch below creates it (chan_sip's create_addr_from_peer /
+	 * reqprep T.38 setup parity, chan_sip.c:7604). */
+	if (!pvt || !pvt->peer || !pvt->peer->t38pt_udptl) {
+		return -1;
+	}
+	/* Every path except the outbound-originate one dereferences pvt->udptl; only the
+	 * LOCAL_REINVITE originate (max_ifp>0, state DISABLED) tolerates a NULL udptl. */
+	if (!pvt->udptl
+	    && !(parameters->request_response == AST_T38_REQUEST_NEGOTIATE
+	         && parameters->max_ifp != 0
+	         && pvt->t38_state == SOFIA_T38_DISABLED)
+	    && !(parameters->request_response == AST_T38_NEGOTIATED
+	         && parameters->max_ifp != 0
+	         && pvt->t38_state == SOFIA_T38_DISABLED)) {
 		return -1;
 	}
 
@@ -206,11 +229,49 @@ int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_contr
 			ast_udptl_set_local_max_ifp(pvt->udptl, pvt->t38_our_parms.max_ifp);
 			sofia_change_t38_state(pvt, SOFIA_T38_ENABLED);
 		} else if (pvt->t38_state != SOFIA_T38_ENABLED) {
-			/* app_fax requests outbound T.38 (voice → fax); records LOCAL_REINVITE,
-			 * the SIP reINVITE is sent elsewhere. */
+			/* app_fax/res_fax (SendFAX/ReceiveFAX/fax gateway) requests an outbound
+			 * T.38 upgrade (voice → fax). Originating side: lazy-create the UDPTL
+			 * session (no inbound m=image ever did), record LOCAL_REINVITE, and signal
+			 * the caller (sofia_indicate) to actually SEND the m=image re-INVITE offer
+			 * — chan_sip parity (SIP_NEEDREINVITE → transmit_reinvite_with_sdp,
+			 * chan_sip.c:21030; UDPTL setup chan_sip.c:7604). */
+			if (!pvt->udptl) {
+				struct ast_channel *chan = pvt->owner;	/* channel lock held by tech->indicate */
+				struct ast_sockaddr bindaddr;
+				ast_sockaddr_parse(&bindaddr, sofia_cfg.bindaddr, 0);
+				pvt->udptl = ast_udptl_new_with_bindaddr(NULL, NULL, 0, &bindaddr);
+				if (!pvt->udptl) {
+					ast_log(LOG_WARNING, "Sofia: failed to allocate UDPTL session for outbound T.38 on '%s' — refusing\n",
+						chan ? chan->name : "<no-owner>");
+					sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);	/* queues AST_T38_REFUSED */
+					return -1;
+				}
+				/* Local EC scheme from the peer config (SOFIA_T38_EC_* → UDPTL_*),
+				 * mirroring the inbound emit. Default FEC matches peer_alloc. */
+				switch (pvt->peer->t38_ec_mode) {
+				case SOFIA_T38_EC_REDUNDANCY:
+					ast_udptl_set_error_correction_scheme(pvt->udptl, UDPTL_ERROR_CORRECTION_REDUNDANCY);
+					break;
+				case SOFIA_T38_EC_NONE:
+					ast_udptl_set_error_correction_scheme(pvt->udptl, UDPTL_ERROR_CORRECTION_NONE);
+					break;
+				case SOFIA_T38_EC_FEC:
+				default:
+					ast_udptl_set_error_correction_scheme(pvt->udptl, UDPTL_ERROR_CORRECTION_FEC);
+					break;
+				}
+				/* Wire fds[5] + tag now (channel lock held by tech->indicate; owner ==
+				 * chan), mirroring the inbound t38_stage_fds5 attach so we can RX the
+				 * answer's IFP once T.38 is ENABLED. */
+				if (chan) {
+					ast_udptl_set_tag(pvt->udptl, "%s", chan->name);
+					chan->fds[5] = ast_udptl_fd(pvt->udptl);
+				}
+			}
 			pvt->t38_our_parms = *parameters;
 			ast_udptl_set_local_max_ifp(pvt->udptl, pvt->t38_our_parms.max_ifp);
 			sofia_change_t38_state(pvt, SOFIA_T38_LOCAL_REINVITE);
+			res = 1;	/* tell sofia_indicate to dispatch the outbound re-INVITE */
 		}
 		break;
 	case AST_T38_TERMINATED:

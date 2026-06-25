@@ -683,13 +683,35 @@ int sofia_subscribe_on_notify(nua_handle_t *nh, nua_t *nua, sip_t const *sip)
 		return 0;
 	}
 	if (!(sub = mwisub_find_by_nh(nh))) {
-		/* Our sentinel but no live sub — still consume it (200-OK + return). */
-		nua_respond(nh, SIP_200_OK, NUTAG_WITH_THIS(nua), TAG_END());
+		/* Our sentinel but no live sub — still consume it. Only an actual NOTIFY request gets a
+		 * response; a synthetic event (sip == NULL) has no server transaction to answer. */
+		if (sip) {
+			nua_respond(nh, SIP_200_OK, NUTAG_WITH_THIS(nua), TAG_END());
+		}
+		return 1;
+	}
+
+	/* HIGH: a SYNTHETIC nua_i_notify (sip == NULL) — sofia-sip emits this with substate=terminated +
+	 * nua_dialog_usage_remove on teardown (nua_subnotref.c), e.g. Timer-N timeout / refresh failure.
+	 * There is NO incoming request to answer: NUTAG_WITH_THIS on a no-server-transaction event would
+	 * trigger a spurious nua_i_error 500. RFC 6665 §3.1.4/§4.1.3 require clearing subscription state on
+	 * termination — clear the lamp and tear the dead sub down (full removal via mwisub_teardown: best-effort nua_unsubscribe - a no-op here since the
+	 * usage is already gone). Do NOT nua_respond. mwisub_teardown unlinks (drops the container ref);
+	 * then drop our find_by_nh +1. A later mwisub_start_one (reload / re-REGISTER) recreates it.
+	 * (Mirrors sofia_eventsub_on_notify's synthetic-terminate handling.) */
+	if (!sip) {
+		mwisub_inject(sub, 0, 0, " (synthetic terminate)");
+		if (sofia_debug) {
+			ast_verbose("Sofia MWI-SUBSCRIBE: peer '%s' synthetic terminate (no NOTIFY request) — torn down\n",
+				sub->peername);
+		}
+		mwisub_teardown(sub, 0);
+		ao2_ref(sub, -1);
 		return 1;
 	}
 
 	/* Verify Event: message-summary. */
-	if (!sip || !sip->sip_event || ast_strlen_zero(sip->sip_event->o_type)
+	if (!sip->sip_event || ast_strlen_zero(sip->sip_event->o_type)
 		|| strcasecmp(sip->sip_event->o_type, "message-summary")) {
 		nua_respond(nh, SIP_200_OK, NUTAG_WITH_THIS(nua), TAG_END());
 		ao2_ref(sub, -1);

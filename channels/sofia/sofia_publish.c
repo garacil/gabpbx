@@ -161,6 +161,10 @@ static void sofia_publication_send(struct sofia_publication *pub, int removing)
 	pub->next_send = 0;		/* consumed — the response (or a state change) reschedules it */
 	pub->version++;
 	pub->laststate = state;
+	pub->auth_attempts = 0;		/* fresh send: reset the reactive-auth budget so a prior transient 401/407
+					 * exhaust never pre-fails this attempt (FIX 2; mirrors sofia_subscribe.c:251
+					 * which resets auth_tries on every SUBSCRIBE). The 401/407 handler bounds the
+					 * retries WITHIN this single send. */
 
 	snprintf(expires_str, sizeof(expires_str), "%d", removing ? 0 : pub->expires);
 
@@ -232,8 +236,20 @@ void sofia_publication_handle_response(int status, char const *phrase,
 			ao2_ref(pub, -1);
 			return;
 		}
-		ast_log(LOG_WARNING, "Sofia PUBLISH: auth failed for '%s' (%d %s)\n", pub->key, status, phrase);
+		/* Auth exhausted (or no usable credentials). Do NOT leave a permanent zombie: next_send was
+		 * cleared by sofia_publication_send, so without a reschedule this presentity would be stuck
+		 * forever (next_send=0) and any later state change would still find a maxed auth_attempts. Reset
+		 * the budget and schedule a backoff retry — a transient auth failure (server reboot, password
+		 * rotation, race) must self-heal; RFC 3903 §3 PUBLISH is soft-state needing refresh (FIX 2). */
+		ast_log(LOG_WARNING, "Sofia PUBLISH: auth failed for '%s' (%d %s) — backing off, will retry\n",
+			pub->key, status, phrase);
 		pub->in_flight = 0;
+		pub->auth_attempts = 0;
+		if (!pub->terminated) {
+			sofia_publication_schedule(pub, 60, 30);	/* longer backoff than transient errors (auth is
+									 * likely a config/credential issue) — avoids a hot
+									 * 401 loop while still self-healing */
+		}
 		ao2_ref(pub, -1);
 		return;
 	}
@@ -360,6 +376,51 @@ static void sofia_publish_server_hostport(char *host, size_t hlen, int *port)
 	sofia_split_hostport_from_uri(p, host, hlen, port);	/* IPv6-aware host + port extraction */
 }
 
+/* Does publish_server demand a secure (TLS) hop? RFC 3261 §26.2.2/§19.1.1: a `sips:` Request-URI
+ * mandates TLS on every hop to the target domain — "UDP is not a valid transport for SIPS". Treat an
+ * explicit `;transport=tls` on the configured publish_server the same way. Either => the PUBLISH must
+ * go out over TLS; we MUST NOT silently downgrade a sips:/tls server to cleartext UDP. */
+static int sofia_publish_server_is_secure(void)
+{
+	const char *p = sofia_cfg.publish_server;
+
+	if (ast_strlen_zero(p)) {
+		return 0;
+	}
+	if (!strncasecmp(p, "sips:", 5)) {
+		return 1;					/* SIPS scheme — TLS mandated each hop */
+	}
+	if (strcasestr(p, ";transport=tls")) {
+		return 1;					/* explicit secure transport on the server URI */
+	}
+	return 0;
+}
+
+/* Resolve the transport to append to the PUBLISH R-URI, honoring SIPS security (FIX 1). When
+ * publish_server is sips: (or carries ;transport=tls) the hop MUST be TLS (RFC 3261 §26.2.2: "UDP is
+ * not a valid transport for SIPS"). A configured publish_transport that contradicts a secure server
+ * (e.g. udp/ws on a sips: server) is REFUSED in favor of the secure transport, with a WARN — never a
+ * silent sips:->udp cleartext downgrade. For a non-secure server the configured publish_transport is
+ * used verbatim (empty -> "udp", so existing plaintext configs stay byte-identical). The returned
+ * token feeds the established sofia_uri_append_transport pattern (a no-op for udp/empty/unknown). */
+static const char *sofia_publish_effective_transport(void)
+{
+	const char *cfg = sofia_cfg.publish_transport[0] ? sofia_cfg.publish_transport : "udp";
+
+	if (sofia_publish_server_is_secure()) {
+		/* SIPS/tls server: TLS is mandatory. wss is also TLS-protected (DTLS/TLS over WebSocket),
+		 * so an explicit secure WebSocket transport is honored; anything else is forced to tls. */
+		if (!strcasecmp(cfg, "tls") || !strcasecmp(cfg, "wss")) {
+			return cfg;				/* already a secure transport — keep operator's choice */
+		}
+		ast_log(LOG_WARNING, "Sofia PUBLISH: publish_server '%s' requires TLS (SIPS/transport=tls), "
+			"but publish_transport='%s' is not secure — forcing transport=tls (refusing a "
+			"cleartext downgrade; RFC 3261 26.2.2)\n", sofia_cfg.publish_server, cfg);
+		return "tls";
+	}
+	return cfg;						/* non-secure server — operator's transport verbatim */
+}
+
 /* Create a publication for a publish=yes peer + send the initial PUBLISH (sofia_thread). */
 /* Is this presentity entity already published? The same bare extension in two contexts maps to
  * ONE ESC presentity (sip:exten@domain); two publications would clobber each other's ETag and
@@ -458,9 +519,11 @@ static void sofia_publication_create_one(struct sofia_peer *peer, const char *ex
 		}
 		/* Same defect class as the INVITE/REGISTER/SUBSCRIBE R-URI: a bare sip:exten@host:port makes
 		 * sofia-sip default to UDP, so a tls/tcp/ws/wss ESC was reached over UDP. Append ;transport=
-		 * for [general] publish_transport (no-op for udp/empty, so existing configs stay byte-identical). */
+		 * for the EFFECTIVE transport (no-op for udp/empty, so existing configs stay byte-identical).
+		 * sofia_publish_effective_transport FORCES tls when publish_server is sips:/transport=tls so a
+		 * secure server is never silently downgraded to cleartext UDP (FIX 1; RFC 3261 §26.2.2). */
 		sofia_uri_append_transport(pub->target, sizeof(pub->target),
-			sofia_cfg.publish_transport[0] ? sofia_cfg.publish_transport : "udp");
+			sofia_publish_effective_transport());
 	}
 	pub->nh = nua_handle(sofia_nua, SOFIA_PUBLICATION_HMAGIC,
 		NUTAG_URL(pub->target),

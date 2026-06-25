@@ -348,6 +348,8 @@ static void ast_rtp_update_source(struct ast_rtp_instance *instance);
 static void ast_rtp_change_source(struct ast_rtp_instance *instance);
 static int ast_rtp_write(struct ast_rtp_instance *instance, struct ast_frame *frame);
 static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtcp);
+/* WebRTC FIX 1: parse one already-unprotected RTCP datagram (shared by ast_rtcp_read + the rtcp-mux demux). */
+static struct ast_frame *ast_rtcp_interpret(struct ast_rtp_instance *instance, unsigned int *rtcpheader, int res, struct ast_sockaddr *addrp);
 static void ast_rtp_prop_set(struct ast_rtp_instance *instance, enum ast_rtp_property property, int value);
 static int ast_rtp_fd(struct ast_rtp_instance *instance, int rtcp);
 static void ast_rtp_remote_address_set(struct ast_rtp_instance *instance, struct ast_sockaddr *addr);
@@ -1121,7 +1123,15 @@ static void dtls_srtp_finish_negotiation(struct ast_rtp_instance *instance, stru
 		rtp->dtls_failure = 1;
 		return;
 	}
-	if (rtp->dtls_cfg.verify & (AST_RTP_DTLS_VERIFY_FINGERPRINT | AST_RTP_DTLS_VERIFY_CERTIFICATE)) {
+	/* Fail CLOSED: for DTLS-SRTP the SDP a=fingerprint is the SOLE trust anchor for the peer's
+	 * (typically self-signed) cert (RFC 8827 §6.5, RFC 5763 §5), so whenever a remote fingerprint
+	 * was carried in the SDP it MUST match — do the memcmp regardless of the verify bitmask. The
+	 * old gate skipped the comparison when verify == AST_RTP_DTLS_VERIFY_NONE (rtp_engine.h:412),
+	 * installing SRTP keys against an UNVERIFIED peer (latent fail-OPEN). The working WebRTC
+	 * handshake (all chan_sofia callers set verify=FINGERPRINT and store a remote fingerprint) is
+	 * unchanged: it already entered this block and the validated peer still matches and passes. */
+	if ((rtp->dtls_cfg.verify & (AST_RTP_DTLS_VERIFY_FINGERPRINT | AST_RTP_DTLS_VERIFY_CERTIFICATE))
+		|| rtp->remote_fingerprint_len) {
 		unsigned char fp[EVP_MAX_MD_SIZE];
 		unsigned int n;
 		const EVP_MD *md = (rtp->remote_hash == AST_RTP_DTLS_HASH_SHA1) ? EVP_sha1() : EVP_sha256();
@@ -1782,8 +1792,29 @@ read_again:
 		}
 		if (first >= 20 && first <= 63) {
 			/* DTLS record — feed OpenSSL under the SAME ao2_lock the A1 wrappers take
-			 * (lock order channel->pvt->instance->peer; we are already below pvt here). */
+			 * (lock order channel->pvt->instance->peer; we are already below pvt here).
+			 *
+			 * FIX 2 (RFC 5763 §6.7.1 — DTLS rides the ICE-validated pair). When ICE is in use
+			 * (ice_active: the lite responder is armed), gate the record on the source matching
+			 * the ICE-validated peer (rtp->ice_peer, latched by ice_handle_stun on each
+			 * MESSAGE-INTEGRITY-authenticated check — our analogue of upstream's
+			 * ice_media_started gate; NOTE this is a single selected-pair LATCH of the latest authenticated STUN source, NOT upstream's full active-remote-candidate list — sufficient for the current ICE-lite latch-always single-live-tuple model; a valid-tuple ring would be the stricter form, res_rtp_asterisk.c). Until a
+			 * STUN check has validated a peer ice_peer is null → drop (mirrors upstream's "ICE
+			 * not completed yet"). This closes a pre-validation DoS: an attacker who can deliver
+			 * UDP to our advertised host candidate could otherwise (a) prematurely commit our
+			 * DTLS role to PASSIVE before the SDP answer, and (b) inject a record that drives a
+			 * fatal SSL error tearing down an active call. Dropping (read next datagram) — NOT
+			 * failing the read — preserves the call. The post-handshake fingerprint memcmp still
+			 * blocks MITM; this adds the pre-validation gate. The normal handshake from the
+			 * validated peer is unaffected: ice_handle_stun latches ice_peer (and fires the
+			 * handshake) on the same authenticated source the DTLS records then come from. When
+			 * ICE is not in use (plain non-WebRTC DTLS, ice_active == 0) the gate is skipped, so
+			 * that path is byte-for-byte unchanged. */
 			int dres;
+			if (rtp->ice_active &&
+				(ast_sockaddr_isnull(&rtp->ice_peer) || ast_sockaddr_cmp(&rtp->ice_peer, sa))) {
+				goto read_again;
+			}
 			ao2_lock(instance);
 			dres = dtls_srtp_handle_record(instance, rtp, buf, len);
 			ao2_unlock(instance);
@@ -1800,16 +1831,50 @@ read_again:
 			goto read_again;
 		}
 		/* 128-191 is RTP OR, under rtcp-mux (WebRTC always mandates it), muxed (S)RTCP on the same
-		 * socket. SRTP-unprotect would FAIL on an SRTCP packet and return -1 → ast_rtp_read would hang
-		 * the call up (the browser sends RTCP RR every ~5s). RFC 5761 §4: an RTCP packet's type (byte 1,
-		 * with the marker bit masked) is in 64-95 (RTP forbids those PTs); the 8-byte SRTCP header incl.
-		 * the PT is in the clear. Drop muxed RTCP for v1 (audio still flows; proper SRTCP unprotect +
-		 * ast_rtcp_read processing is a follow-up). Gated by the rtp->dtls.ssl outer condition, so
-		 * non-WebRTC RTP is byte-for-byte unaffected. */
+		 * socket. RFC 5761 §4: an RTCP packet's type (byte 1, with the marker bit masked) is in 64-95
+		 * (RTP forbids those PTs); the 8-byte SRTCP header incl. the PT is in the clear.
+		 *
+		 * FIX 1: process inbound muxed (S)RTCP instead of dropping it (previously dropped for v1, which
+		 * starved ast_rtp_get_stat of remote SR/RR and ignored inbound RTCP BYE/feedback — relevant now
+		 * that video ships). When the DTLS-SRTP context is EXISTING, SRTCP-unprotect the datagram in place
+		 * (rtcp=1 → SRTCP profile) and feed the cleartext compound packet into the shared RTCP parser
+		 * (ast_rtcp_interpret), the exact same code path the standalone RTCP socket uses. FAIL-SAFE: if the
+		 * unprotect fails (auth/replay) drop THAT datagram only (goto read_again) — never -1, which would
+		 * hang the call up. While DTLS is still NEW there is no SRTCP context yet, so keep dropping. The
+		 * parser needs rtp->rtcp (it accounts into it); if RTCP was never set up on this instance, drop.
+		 * Plain non-DTLS RTP never reaches here (outer rtp->dtls.ssl gate), so it is byte-for-byte
+		 * unaffected, and the SRTP/SRTCP unprotect is the same res_srtp entry point used elsewhere. */
 		if (len >= 2 && (((unsigned char *) buf)[1] & 0x7f) >= 64 && (((unsigned char *) buf)[1] & 0x7f) <= 95) {
+			struct ast_srtp *rtcp_srtp;
+			int rtcp_len = len;
+
+			if (rtp->dtls.connection != AST_RTP_DTLS_CONNECTION_EXISTING || !rtp->rtcp) {
+				/* No SRTCP key yet (DTLS still handshaking) or no RTCP accounting context: drop. */
+				goto read_again;
+			}
+			rtcp_srtp = ast_rtp_instance_get_srtp(instance);
+			if (res_srtp && rtcp_srtp
+				&& res_srtp->unprotect(rtcp_srtp, buf, &rtcp_len, 1) < 0) {
+				/* SRTCP unprotect failed for this datagram (auth/replay) — drop it, keep the call. */
+				goto read_again;
+			}
+			ao2_lock(instance);
+			ast_rtcp_interpret(instance, (unsigned int *) buf, rtcp_len, sa);
+			ao2_unlock(instance);
 			goto read_again;
 		}
-		/* else 128-191 RTP → fall through to the unchanged SRTP path. */
+		/* WebRTC: never ACCEPT media before DTLS-SRTP is established. While the connection is NEW there is
+		 * no SRTP context yet, so the res_srtp/unprotect guard below short-circuits and this 128-191 RTP
+		 * datagram would be surfaced as PLAIN cleartext media (RFC 8827 §6.5: media MUST NOT be sent/received
+		 * over plain unencrypted RTP/RTCP). STUN (first<=3) and DTLS records (first 20-63) are handled and
+		 * looped above, so they never reach here; only the RTP/SRTP media class is dropped pre-establishment.
+		 * connection flips to EXISTING on handshake completion + SRTP install (dtls_srtp_finish_negotiation).
+		 * Gated by the rtp->dtls.ssl outer condition, so non-WebRTC RTP is byte-for-byte unaffected. Mirrors
+		 * the outbound CONNECTION_NEW guard in __rtp_sendto. */
+		if (rtp->dtls.connection == AST_RTP_DTLS_CONNECTION_NEW) {
+			goto read_again;
+		}
+		/* else 128-191 RTP, DTLS established → fall through to the unchanged SRTP path. */
 	}
 
 	/* The demux may have installed SRTP on the handshake-completing record (MED5): re-fetch the srtp
@@ -3252,12 +3317,10 @@ static struct ast_frame *process_cn_rfc3389(struct ast_rtp_instance *instance, u
 
 static struct ast_frame *ast_rtcp_read(struct ast_rtp_instance *instance)
 {
-	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
 	struct ast_sockaddr addr;
 	unsigned int rtcpdata[8192 + AST_FRIENDLY_OFFSET];
 	unsigned int *rtcpheader = (unsigned int *)(rtcpdata + AST_FRIENDLY_OFFSET);
-	int res, packetwords, position = 0;
-	struct ast_frame *f = &ast_null_frame;
+	int res;
 
 	/* Read in RTCP data from the socket */
 	if ((res = rtcp_recvfrom(instance, rtcpdata + AST_FRIENDLY_OFFSET,
@@ -3270,6 +3333,32 @@ static struct ast_frame *ast_rtcp_read(struct ast_rtp_instance *instance)
 		}
 		return &ast_null_frame;
 	}
+
+	return ast_rtcp_interpret(instance, rtcpheader, res, &addr);
+}
+
+/*!
+ * \brief Parse and process one (already-received, cleartext) RTCP datagram.
+ *
+ * The packet parsing/stats accounting that used to live inside ast_rtcp_read was split out here so it
+ * can be driven from two callers with byte-identical behaviour:
+ *   1. ast_rtcp_read() — the classic standalone-RTCP-socket path (plain RTP/RTCP, unchanged).
+ *   2. the WebRTC rtcp-mux demux in __rtp_recvfrom() — muxed (S)RTCP that arrived on the RTP socket and
+ *      has already been SRTCP-unprotected in place (RFC 5761). Before this split the muxed class was
+ *      silently dropped, so a WebRTC leg never processed remote SR/RR (ast_rtp_get_stat starved) nor an
+ *      inbound RTCP BYE. Feeding the unprotected buffer here reuses the exact same parser.
+ *
+ * \param instance   the RTP instance (caller holds whatever lock the original caller held)
+ * \param rtcpheader pointer to the start of the cleartext RTCP compound packet
+ * \param res        its length in bytes
+ * \param addr       the source address of the datagram
+ */
+static struct ast_frame *ast_rtcp_interpret(struct ast_rtp_instance *instance, unsigned int *rtcpheader, int res, struct ast_sockaddr *addrp)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	struct ast_sockaddr addr = *addrp;
+	int packetwords, position = 0;
+	struct ast_frame *f = &ast_null_frame;
 
 	packetwords = res / 4;
 

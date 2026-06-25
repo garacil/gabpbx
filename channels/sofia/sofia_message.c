@@ -139,7 +139,9 @@ static void sofia_message_deliver_inbound(nua_t *nua, nua_handle_t *nh, sip_t co
 		from_user = sip->sip_from->a_url->url_user;
 	}
 
-	/* Resolve the sender peer (NULL = guest); snapshot its message_context + name. */
+	/* Resolve the sender peer (NULL = guest); snapshot its message_context + name.
+	 * The ref is held across the digest gate below (the verifier reads peer fields),
+	 * then released. */
 	peer = from_user ? sofia_find_peer(from_user) : NULL;
 	if (peer) {
 		ast_mutex_lock(&peer->lock);
@@ -148,7 +150,6 @@ static void sofia_message_deliver_inbound(nua_t *nua, nua_handle_t *nh, sip_t co
 		}
 		ast_copy_string(peername, peer->name, sizeof(peername));
 		ast_mutex_unlock(&peer->lock);
-		ao2_ref(peer, -1);
 	}
 
 	/* Context: peer override else [general]; both empty -> messaging OFF (405). */
@@ -156,8 +157,29 @@ static void sofia_message_deliver_inbound(nua_t *nua, nua_handle_t *nh, sip_t co
 		ast_copy_string(context, sofia_cfg.message_context, sizeof(context));
 	}
 	if (ast_strlen_zero(context)) {
+		if (peer) {
+			ao2_ref(peer, -1);
+		}
 		sofia_message_respond_and_reap(nua, nh, 405, "Method Not Allowed");
 		return;
+	}
+
+	/* DIGEST GATE (RFC 3428): a matched, credentialed sender must pass the SAME
+	 * challenge/verify as INVITE before the From-user is trusted as the peer and
+	 * routed to the dialplan — without this an attacker who only knows a peer name
+	 * could inject messages under that identity. The helper emits the 401/4xx and
+	 * returns nonzero; we reap the out-of-dialog handle (sofia_verify_digest_auth
+	 * does not destroy it) and stop. An unmatched (guest) sender is NOT challenged
+	 * here and still falls to the allowguest policy below. */
+	if (peer && sofia_message_authenticate(peer, nua, nh, sip)) {
+		ao2_ref(peer, -1);
+		if (nua_handle_magic(nh) == NULL) {
+			nua_handle_destroy(nh);	/* reap fresh out-of-dialog handle (the 401/4xx is already sent) */
+		}
+		return;
+	}
+	if (peer) {
+		ao2_ref(peer, -1);
 	}
 
 	/* Known-peer policy: reject anonymous senders when guests are disallowed. */

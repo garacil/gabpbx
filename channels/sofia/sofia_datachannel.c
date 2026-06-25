@@ -328,8 +328,18 @@ static void sofia_dc_destructor(void *obj)
 	 * and abort-closed/deregistered the socket. This is a belt-and-braces net for an attach that
 	 * failed mid-setup and dropped its only ref without going through detach. NULL pvt first (so a
 	 * stray output cb resolves NULL and drops), then ABORT-close so no draining-association timer
-	 * outlives this destruction to fire the output cb against freed memory. */
+	 * outlives this destruction to fire the output cb against freed memory.
+	 *
+	 * Guard the NULL store with ao2_lock(dc) for the same reason as detach STEP (b): on the
+	 * failed-attach path the socket may still be open + the token still registered when the ref hits
+	 * 0, so a usrsctp timer-driven output cb (which holds NO ao2 ref by design) could be in flight.
+	 * The lock makes the store / the cb's dc->pvt read race-free and orders the NULL publication
+	 * before this path's abort-close (which then fences usrsctp's timer thread via the TCB lock).
+	 * Only the dc lock is held across the bare store — no usrsctp call inside — so no dc-lock ->
+	 * usrsctp-lock inversion (same ABBA proof as sofia_dc_sctp_output). */
+	ao2_lock(dc);
 	dc->pvt = NULL;
+	ao2_unlock(dc);
 	if (dc->sctp_sock) {
 		sofia_dc_abort_close(dc->sctp_sock);
 		dc->sctp_sock = NULL;
@@ -524,8 +534,12 @@ void sofia_dc_set_pvt(struct sofia_datachannel *dc, struct sofia_pvt *pvt)
 	 * runs, with the cb_data (the dc pointer) carried along unchanged — so NO cb re-registration is
 	 * needed. We only repoint the raw back-ref so the output cb + the worker lane resolve dc->pvt to
 	 * the surviving master leg. A single aligned-pointer store; the caller holds master->lock and the
-	 * call is not yet media-active, so no RX/output is in flight against the old pvt. */
+	 * call is not yet media-active, so no RX/output is in flight against the old pvt. Take ao2_lock(dc)
+	 * for the bare store anyway (the SAME publication lock the output cb + detach +
+	 * get_bridged use) so ALL dc->pvt writes/reads share one lock — cheap, and codifies the invariant. */
+	ao2_lock(dc);
 	dc->pvt = pvt;
+	ao2_unlock(dc);
 }
 
 void sofia_dc_set_peer_max_msg(struct sofia_datachannel *dc, unsigned int max)
@@ -542,6 +556,43 @@ void sofia_dc_set_peer_max_msg(struct sofia_datachannel *dc, unsigned int max)
 	 * sofia_dc_set_pvt: peer_max_msg is an aligned uint32_t, the caller runs on the sofia thread and the
 	 * relay reads it on the worker lane — aligned-store atomicity guarantees no torn value. */
 	dc->peer_max_msg = max;
+}
+
+void sofia_dc_set_dtls_role(struct sofia_datachannel *dc)
+{
+	struct ast_rtp_engine_dtls *dtls;
+	struct sofia_pvt *pvt;
+
+	if (!dc) {
+		return;
+	}
+	/* OFFERER role-latch fix (RFC 8832 §6): at attach time the OFFERER's DTLS role is still ACTPASS
+	 * (we offer a=setup:actpass), so dc->dtls_is_server latched 0 = client = EVEN stream parity. The
+	 * far leg's ANSWER then FIXES our concrete role (answer a=setup:active -> set_setup maps us to
+	 * PASSIVE = DTLS SERVER = ODD parity, RFC 5763 §5). Without recomputing here, alloc_local_sid
+	 * (sofia_dc_alloc_local_sid) would still pick EVEN streams the peer rejects, and the inbound OPEN
+	 * parity check (sofia_dc_handle_dcep) would flag every legit peer OPEN as wrong-parity -> the
+	 * offerer-direction DataChannel silently fails. Re-derive dc->dtls_is_server from the engine's NOW-
+	 * concrete setup (the SAME derivation as attach: PASSIVE == server == odd) so both the SID allocation
+	 * and the parity check use the corrected role. Must be called AFTER set_setup applied the answer and
+	 * BEFORE any worker-lane SID alloc / OPEN parity check (the relay only runs once media is up).
+	 *
+	 * Read dc->pvt AND write the dtls_is_server bitfield UNDER ao2_lock(dc) - the SAME publication lock
+	 * the output cb / set_pvt / detach use for dc->pvt (this was the only dc->pvt
+	 * reader outside that lock, and a bitfield store is a non-atomic read-modify-write that could tear
+	 * vs a concurrent set_pvt/detach). Nests dc-lock -> instance-lock (get_setup), the SAME order as
+	 * sofia_dc_sctp_output, so no new ABBA. */
+	ao2_lock(dc);
+	pvt = dc->pvt;
+	if (pvt && pvt->rtp) {
+		dtls = ast_rtp_instance_get_dtls(pvt->rtp);
+		if (dtls && dtls->get_setup) {
+			dc->dtls_is_server = (dtls->get_setup(pvt->rtp) == AST_RTP_DTLS_SETUP_PASSIVE) ? 1 : 0;
+			ast_debug(2, "Sofia: DataChannel DTLS role recomputed from answer -> %s (%s stream parity)\n",
+				dc->dtls_is_server ? "server" : "client", dc->dtls_is_server ? "odd" : "even");
+		}
+	}
+	ao2_unlock(dc);
 }
 
 /* ----- detach lane-drain barrier ----- */
@@ -595,12 +646,26 @@ void sofia_dc_detach(struct sofia_datachannel *dc)
 
 	/* STEP (b) (teardown-UAF fix): NULL the raw back-ref IMMEDIATELY, BEFORE
 	 * any usrsctp close/deregister. The output cb (sofia_dc_sctp_output) and sofia_dc_get_bridged_dc
-	 * both read dc->pvt ONCE and bail on NULL — so a synchronous output cb (e.g. from a final flush)
-	 * OR a late timer-driven output cb (the confirmed ~4-min teardown core) now observes NULL and
-	 * drops instead of dereferencing a pvt that may already be freed. This single store is the BELT;
-	 * the abort-close in STEP (d) is the braces. Must precede the close so no window exists where the
-	 * socket is alive but pvt is stale. */
+	 * both read dc->pvt and bail on NULL — so a synchronous output cb (e.g. from a final flush) OR a
+	 * late timer-driven output cb (the confirmed ~4-min teardown core) now observes NULL and drops
+	 * instead of dereferencing a pvt that may already be freed.
+	 *
+	 * Take ao2_lock(dc) around this store (residual-window fix): the output cb reads
+	 * dc->pvt — and writes over pvt->rtp — under the SAME ao2_lock(dc) (see sofia_dc_sctp_output's
+	 * header proof). Without the lock the store here and the cb's read were an unsynchronized data
+	 * race (UB; no publication barrier), so a TIMER-thread cb could observe a stale non-NULL dc->pvt
+	 * AFTER this point and write over a pvt->rtp the destructor is about to free. Under the lock the
+	 * NULL is published with a happens-before edge: any cb that acquires the lock AFTER this store
+	 * sees NULL and bails, and any cb already inside its critical section finishes its dtls write on
+	 * the still-live rtp (the abort-close in STEP (d) then waits out usrsctp's own timer thread via
+	 * the TCB lock) BEFORE we release the lock here. We take ONLY the dc lock around the bare store
+	 * (NO usrsctp call inside) — so detach never nests dc-lock -> usrsctp-lock, which would invert
+	 * the cb's usrsctp-lock -> dc-lock order; no ABBA (full proof in sofia_dc_sctp_output). This
+	 * single guarded store is the BELT; the abort-close in STEP (d) is the braces. Must precede the
+	 * close so no window exists where the socket is alive but pvt is stale. */
+	ao2_lock(dc);
 	dc->pvt = NULL;
+	ao2_unlock(dc);
 
 	/* STEP (c): DRAIN the shared worker lane NOW, WHILE
 	 * dc->sctp_sock is STILL OPEN (before STEP (d) closes/deregisters it).
@@ -764,7 +829,47 @@ static int sofia_dc_rx_task(void *data)
  * invokes this for a registered address, so `addr` is a live dc here; we still guard NULL pvt/rtp
  * (a fork-steal repoints pvt; a torn-down leg may transiently have a NULL rtp). We do not take an
  * ao2 ref: detach deregisters the token (and closes the socket) so usrsctp will not call us with a
- * freed token. ast_rtp_instance_dtls_write_appdata takes its own instance lock internally.
+ * freed token.
+ *
+ * --- THE TEARDOWN-UAF FENCE (residual window fix) ---
+ * This cb runs on TWO threads: (1) the usrsctp INTERNAL TIMER thread (usrsctp_init spawns it —
+ * user_sctp_timer_iterate -> sctp_handle_tick -> sctp_timeout_handler -> sctp_chunk_output ->
+ * sctp_lowlevel_chunk_output, under the usrsctp TCB lock, sctp_output.c:4130/5040), and (2) the
+ * worker lane synchronously inside usrsctp_sendv/usrsctp_conninput. Either way it derefs dc->pvt
+ * then pvt->rtp then writes over pvt->rtp's DTLS.
+ *
+ * The RESIDUAL race the audit confirmed: a TIMER-thread cb that reads a NON-NULL dc->pvt the instant
+ * BEFORE sofia_dc_detach NULLs it, then proceeds to ast_rtp_instance_dtls_write_appdata(pvt->rtp)
+ * while the pvt destructor (chan_sofia.c:1820, AFTER detach returns) frees pvt->rtp == UAF. The
+ * abort-close in detach STEP (d) fences the TCB-lock chunk-output path (usrsctp_close ->
+ * sctp_inpcb_free takes the same TCB lock, so it BLOCKS until any in-flight chunk-output cb releases
+ * it — sctp_pcb.c SCTP_TCB_LOCK(asoc) before sctp_free_assoc), but the bare `dc->pvt = NULL` store
+ * and this bare `pvt = dc->pvt` read were an UNSYNCHRONIZED data race (UB; no publication barrier),
+ * so this cb could observe a stale non-NULL dc->pvt and act on it.
+ *
+ * THE FIX: take ao2_lock(dc) around BOTH the dc->pvt read AND the dtls write here, and (in detach,
+ * STEP (b)) around the dc->pvt = NULL store. This makes the read/write race-free and gives a strict
+ * happens-before: once detach has published dc->pvt = NULL under the lock, every cb that later
+ * acquires the lock observes NULL and bails. Holding the lock across the dtls write means a cb that
+ * DID snapshot a non-NULL pvt completes its write BEFORE it releases the lock — and detach's STEP (b)
+ * store cannot interleave; combined with the abort-close fence (which still bounds the cb's lifetime
+ * before usrsctp_close returns, hence before the destructor frees rtp), no cb is ever mid-write when
+ * rtp is freed. The lock is the BELT (publication ordering + no torn read); the abort-close is the
+ * BRACES (lifetime fence). Both are required.
+ *
+ * ABBA / lock-order proof (load-bearing): the ONLY nesting introduced here is
+ *   [usrsctp TCB lock, held by usrsctp on entry] -> ao2_lock(dc) -> ao2_lock(instance)
+ * (the instance lock is taken INSIDE ast_rtp_instance_dtls_write_appdata). Detach NEVER takes the dc
+ * lock then a usrsctp lock: STEP (b) takes ao2_lock(dc) ONLY around the bare NULL store and releases
+ * it BEFORE the abort-close in STEP (d), so detach's order is {ao2_lock(dc) alone} ... then
+ * {usrsctp TCB lock alone, via usrsctp_close, NO dc lock held}. No thread ever takes dc-lock then a
+ * usrsctp lock, and no thread takes instance-lock then dc-lock (the engine RX cb holds the instance
+ * lock but takes no dc lock). Hence no cycle: the dc lock can never deadlock against the usrsctp TCB
+ * lock or the instance lock. All dc->pvt publish/read sites take ao2_lock(dc) as the single
+ * publication lock: the output cb, detach's NULL store, the destructor, sofia_dc_set_pvt, and the
+ * sofia_dc_get_bridged_dc snapshot - the last releases it BEFORE the channel/pvt locks in
+ * sofia_dc_pair_bridged, so none nests a foreign lock under dc. (detach's own pre-NULL reads run on
+ * the teardown thread while pvt/rtp are still live and race no writer.)
  *
  * \retval 0 always (usrsctp treats nonzero as a fatal transport error; a dropped packet retransmits).
  */
@@ -779,12 +884,19 @@ static int sofia_dc_sctp_output(void *addr, void *buf, size_t len, uint8_t tos, 
 	if (!dc) {
 		return 0;
 	}
+
+	/* Hold ao2_lock(dc) across the dc->pvt read AND the dtls write (see the header proof). detach
+	 * STEP (b) NULLs dc->pvt under this same lock, so we either see the live pvt and finish the write
+	 * before detach can publish NULL, or we see NULL (detach already ran) and bail — never a torn or
+	 * stale pointer, and never a write racing the rtp free. */
+	ao2_lock(dc);
 	pvt = dc->pvt;
 	if (!pvt || !pvt->rtp) {
+		ao2_unlock(dc);
 		return 0;
 	}
-
 	ast_rtp_instance_dtls_write_appdata(pvt->rtp, buf, len);
+	ao2_unlock(dc);
 	return 0;
 }
 
@@ -986,7 +1098,9 @@ static struct sofia_datachannel *sofia_dc_get_bridged_dc(struct sofia_datachanne
 	 * the sofia thread; a single read here avoids observing a torn old/new value mid-relay). The
 	 * steal repoints — it does not free the old pvt synchronously — so a stale-but-valid pvt at
 	 * worst routes to a leg being torn down → sofia_dc_pair_bridged returns NULL → drop. */
+	ao2_lock(self_dc);
 	self_pvt = self_dc->pvt;
+	ao2_unlock(self_dc);
 	if (!self_pvt) {
 		return NULL;
 	}
@@ -1406,10 +1520,20 @@ static void sofia_dc_relay_user(struct sofia_datachannel *dc, uint16_t sid, uint
 		far_reliability = near_st->reliability_param;
 	}
 
-	/* PPID-preserving relay (51->51, 53->53, 56->56, 57->57). The empty-message PPIDs carry a
-	 * single zero byte on the wire (RFC 8831 §6.6); pass datalen through unchanged. */
-	sofia_dc_send_on(far_dc, far_sid, ppid, sofia_dc_type_ordered(far_type), far_type,
-		far_reliability, data, datalen);
+	/* RFC 8832 §6: before the DATA_CHANNEL_ACK (or any message) is seen on the far channel, EVERY
+	 * user message MUST be sent ORDERED regardless of the negotiated ordering. gabpbx originates the
+	 * far OPEN (sofia_dc_send_on), so this opening-side rule binds the relay too. far_st->acked is
+	 * maintained at OPEN/ACK time but was never read here — honor it now: force ordered until the
+	 * far ACK has arrived. (If the far stream vanished, far_st is NULL → default ordered, the safe
+	 * choice.) The negotiated unordered bit takes over only AFTER the ack. */
+	{
+		int far_ordered = sofia_dc_type_ordered(far_type) || !far_st || !far_st->acked;
+
+		/* PPID-preserving relay (51->51, 53->53, 56->56, 57->57). The empty-message PPIDs carry a
+		 * single zero byte on the wire (RFC 8831 §6.6); pass datalen through unchanged. */
+		sofia_dc_send_on(far_dc, far_sid, ppid, far_ordered, far_type,
+			far_reliability, data, datalen);
+	}
 
 	ao2_ref(far_dc, -1);
 }
@@ -1452,9 +1576,24 @@ static void sofia_dc_handle_assoc_change(struct sofia_datachannel *dc,
 		ast_debug(2, "Sofia: DataChannel association UP (out=%u in=%u streams)\n",
 			sac->sac_outbound_streams, sac->sac_inbound_streams);
 		break;
+	case SCTP_RESTART:
+		/* SCTP_RESTART is a DISTINCT state from COMM_UP/COMM_LOST (RFC 6458 §6.1.1, RFC 4960 §5.2.4):
+		 * the peer restarted the association — it is UP AGAIN, NOT lost and NOT a fresh COMM_UP. No
+		 * COMM_UP follows a restart, so routing it through the DOWN branch (associated=0) would leave
+		 * associated PERMANENTLY 0 with no re-up path → every later sofia_dc_proxy_open bails on
+		 * !far_dc->associated and the whole DC relay wedges. Keep associated=1, refresh the (possibly
+		 * RENEGOTIATED) stream counts from THIS event, and drop the now-stale A:sid<->B:sid mappings: a
+		 * restart re-initializes all SCTP streams (RFC 4960 §5.2.4), so the old stream table is invalid.
+		 * After the drop the browser re-OPENs its channels and sofia_dc_proxy_open re-pairs them. */
+		dc->associated = 1;
+		dc->out_streams = sac->sac_outbound_streams;
+		dc->in_streams = sac->sac_inbound_streams;
+		ast_debug(2, "Sofia: DataChannel association RESTART (out=%u in=%u streams) — UP again, dropping %u stale streams\n",
+			sac->sac_outbound_streams, sac->sac_inbound_streams, dc->n_streams);
+		sofia_dc_drop_all_streams(dc);
+		break;
 	case SCTP_COMM_LOST:
 	case SCTP_SHUTDOWN_COMP:
-	case SCTP_RESTART:
 	case SCTP_CANT_STR_ASSOC:
 		ast_debug(2, "Sofia: DataChannel association DOWN (state=%u) — dropping %u streams\n",
 			sac->sac_state, dc->n_streams);

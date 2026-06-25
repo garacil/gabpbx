@@ -96,6 +96,21 @@ struct sofia_datachannel *sofia_dc_attach(struct sofia_pvt *pvt, uint16_t sctp_p
 void sofia_dc_set_peer_max_msg(struct sofia_datachannel *dc, unsigned int max);
 
 /*!
+ * \brief Recompute a live DataChannel's DTLS role (→ DCEP stream parity) from the engine's NOW-concrete
+ *        a=setup, AFTER the answer fixed it (RFC 8832 §6: DTLS client = even streams, server = odd).
+ * \param dc the handle (may be NULL — no-op).
+ * \note The OFFERER attaches the DC in provision_offer while our a=setup is still ACTPASS, so dtls_is_server
+ *       latches 0 (client/even). The peer's ANSWER then fixes our concrete role (answer a=setup:active →
+ *       set_setup maps us to PASSIVE = DTLS server = ODD parity, RFC 5763 §5). Call this from the offerer
+ *       DC answer-apply path AFTER dtls->set_setup() applied the answer and BEFORE any worker-lane SID
+ *       allocation / inbound OPEN parity check, so sofia_dc_alloc_local_sid + the OPEN parity check both
+ *       use the corrected role. Without it gabpbx proxies OPENs on even streams the peer rejects AND flags
+ *       every legit peer OPEN as wrong-parity → the offerer-direction DataChannel silently fails. A single
+ *       1-bit store, done UNDER ao2_lock(dc) - the same publication lock the output cb / set_pvt / detach use for dc->pvt (the relay reads the role on the worker lane after answer-apply).
+ */
+void sofia_dc_set_dtls_role(struct sofia_datachannel *dc);
+
+/*!
  * \brief Repoint a DataChannel's raw pvt back-ref to a new owning pvt (WebRTC fork-steal).
  *        The DC is bound to the engine *instance* (cb on pvt->rtp), which is itself stolen
  *        master<-child, so NOTHING is re-registered — we only move the back-ref + the cb_data so the
@@ -140,6 +155,7 @@ static inline void sofia_dc_set_peer_max_msg(struct sofia_datachannel *dc, unsig
 {
 	(void)dc; (void)max;
 }
+static inline void sofia_dc_set_dtls_role(struct sofia_datachannel *dc) { (void)dc; }
 static inline void sofia_dc_set_pvt(struct sofia_datachannel *dc, struct sofia_pvt *pvt)
 {
 	(void)dc; (void)pvt;

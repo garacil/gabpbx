@@ -295,6 +295,7 @@ static const char *sofia_pick_auth_username(sip_t const *sip,
 		const char *fallback_user, char *buf, size_t len);
 
 struct sofia_peer;
+struct sofia_pvt; /* fwd decl — sofia_send_auth_challenge below threads a pvt* to pin (deferred-reject race fence) */
 enum sofia_auth_result {
 	SOFIA_AUTH_OK = 0,
 	SOFIA_AUTH_CHALLENGE = 1,    /* helper emitted 401; caller short-circuits */
@@ -310,7 +311,78 @@ static const char *sofia_get_realm_for_dialog(sip_t const *sip, char *buf, size_
 
 static void sofia_emit_timing_equalized_reject(void);
 static void sofia_send_auth_challenge(nua_t *nua, nua_handle_t *nh, sip_t const *sip,
-		const char *realm, const char *method, const char *reason);
+		const char *realm, const char *method, const char *reason,
+		struct sofia_pvt *pvt_ref, int reap_handle_on_fire);
+static void sofia_emit_auth_challenge(nua_t *nua, nua_handle_t *nh,
+		const char *realm, const char *nonce, int stale);
+
+/* ===================================================================
+ *  Async timing-equalized reject (anti-enumeration jitter, NON-blocking)
+ *
+ *  The reject jitter (401 auth-fail vs 403 ACL-deny vs unknown-peer) used to be a
+ *  blocking usleep(10-50ms) on the single sofia_thread, so a reject flood parked the
+ *  dispatcher and capped signalling at ~33 req/s (a self-DoS timing oracle). Instead we
+ *  keep the cheap deterministic dummy-SHA work but defer the actual response with a
+ *  ONE-SHOT su_timer armed on su_root_task(sofia_root) (the SAME pattern as
+ *  sofia_presence.c / sofia_transfer.c). The timer fires ON sofia_thread, so the
+ *  nua_respond() inside the callback obeys sofia-sip's same-thread-as-create contract.
+ *
+ *  Lifetime/lock-order: every armed ctx is on g_delay_reject_list, guarded by that
+ *  AST_LIST_HEAD_STATIC's own lock. The list lock is NEVER held across a nua_* call:
+ *  the callback unlinks under the lock, releases it, THEN does nua_respond/AMI/unref/free;
+ *  the scheduler builds+arms the timer first and only takes the lock to insert. The ctx
+ *  pins its nua_handle_t with nua_handle_ref() so the handle cannot vanish before the
+ *  timer fires; unref happens in the callback (or in the unload sweep). On module unload
+ *  the sofia_thread teardown (after su_root_run returns, before nua_destroy) cancels +
+ *  destroys every pending timer and frees its ctx, so a firing timer can never deref freed
+ *  code/handles.
+ * =================================================================== */
+#define SOFIA_DELAY_REJECT_MAX        512   /* global hard cap of in-flight delayed rejects */
+#define SOFIA_DELAY_REJECT_PER_SRC    12    /* soft per-source-addr cap (anti single-source hog) */
+
+enum sofia_delay_reject_kind {
+	SOFIA_DELAY_REJECT_401_CHALLENGE = 0,   /* unknown-peer 401 + WWW-Authenticate + AMI AuthFailure */
+	SOFIA_DELAY_REJECT_403_FORBIDDEN = 1,   /* INVITE ACL-deny 403 */
+};
+
+struct sofia_delay_reject_ctx {
+	enum sofia_delay_reject_kind kind;
+	nua_t *nua;                  /* the NUA agent (for NUTAG_WITH_THIS); not refcounted, outlives the timer */
+	nua_handle_t *nh;            /* pinned via nua_handle_ref() at schedule, unref at fire/sweep */
+	su_timer_t *timer;           /* the armed one-shot; the callback destroys its OWN fired timer */
+	/* Residual-race fences (HIGH): nua_handle_ref pins the handle MEMORY but NOT
+	 * the NTA incoming server request, so destroying the fresh pvt/handle right after scheduling
+	 * dispatches nua_handle_destroy -> nta_incoming_destroy, which auto-sends an immediate 500 that
+	 * races ahead of (and usually preempts) our 10-50ms timer. These two fields make the deferred
+	 * cleanup happen AFTER we send, on every emit path: */
+	struct sofia_pvt *pvt_ref;   /* INVITE paths: an extra ao2 ref (NULL unless set) holding the pvt
+	                              * — and thus the bound handle + its NTA server request — alive until
+	                              * we emit; dropped at fire/immediate/failure/unload. */
+	int reap_handle_on_fire;     /* unbound-SUBSCRIBE paths: reap the orphaned (UNBOUND) server handle
+	                              * AFTER we emit the deferred 401 (sofia_subscribe_reject_reap), so the
+	                              * timer wins the race against nta_incoming_destroy's immediate 500. */
+	/* 401 path snapshot (sip_t* is freed after the event callback returns — copy everything): */
+	char realm[128];
+	char nonce[64];
+	char method[32];
+	char reason[64];
+	char src_addr[80];           /* RemoteAddr for the AMI AuthFailure event */
+	AST_LIST_ENTRY(sofia_delay_reject_ctx) list;
+};
+
+/* Pending armed-reject list; the head's built-in lock guards the list AND the counters.
+ * It is the ONLY lock for this subsystem and is never held across any nua_* call. */
+static AST_LIST_HEAD_STATIC(g_delay_reject_list, sofia_delay_reject_ctx);
+static int g_delay_reject_count;     /* in-flight pending count (guarded by g_delay_reject_list lock) */
+
+static void sofia_delay_reject_schedule(enum sofia_delay_reject_kind kind,
+		nua_t *nua, nua_handle_t *nh,
+		const char *realm, const char *nonce,
+		const char *method, const char *reason,
+		const struct ast_sockaddr *src,
+		struct sofia_pvt *pvt_ref, int reap_handle_on_fire);
+static void sofia_delay_reject_shutdown(void);
+static void sofia_subscribe_reject_reap(nua_handle_t *nh);
 
 
 
@@ -554,11 +626,26 @@ static void sofia_build_register_uri(struct sofia_peer *peer, char *out, size_t 
  * messages when peer has nat=force_rport (or comedia). Without it sofia-sip
  * routes the 2xx-ACK/BYE to the dialog remote_target (the Contact's unroutable
  * private LAN IP for a NAT'd phone) and it never arrives. peer->src_addr = the
- * registered public source. Returns 1 if filled, 0 if no NAT routing needed. */
+ * registered public source. Returns 1 if filled, 0 if no NAT routing needed.
+ *
+ * Locking: nat/src_addr/port/reg_transport are mutated UNDER peer->lock by the
+ * REGISTER handler (sofia_process_register_update) and the dnsmgr callback
+ * (sofia_on_dns_update_peer). Called off sofia_thread from the call/hangup paths,
+ * so a lock-free read could tear the ~136-byte src_addr / reg_transport against a
+ * concurrent re-REGISTER or DNS update and build a malformed NUTAG_PROXY. Snapshot
+ * the fields under peer->lock into locals, then build off-lock — mirroring the
+ * sibling sofia_pvt_build_nat_target_url which snapshots under the contact lock.
+ * peer->lock is recursive, so the one caller already holding it (sofia presence
+ * SUBSCRIBE NOTIFY path) re-enters safely. const cast: the fields are logically
+ * mutable, only the lock acquisition needs a non-const pointer. */
 static int sofia_build_nat_proxy_url_from_peer(const struct sofia_peer *peer,
                                                 char *buf, size_t len)
 {
 	char host_buf[80];
+	struct ast_sockaddr src;
+	char reg_transport[8];
+	int nat;
+	int peer_port;
 	int port;
 
 	if (!peer || !buf || len < 16) {
@@ -566,32 +653,39 @@ static int sofia_build_nat_proxy_url_from_peer(const struct sofia_peer *peer,
 	}
 	buf[0] = '\0';
 
+	ast_mutex_lock(&((struct sofia_peer *)peer)->lock);
+	nat = peer->nat;
+	src = peer->src_addr;
+	peer_port = peer->port;
+	ast_copy_string(reg_transport, peer->reg_transport, sizeof(reg_transport));
+	ast_mutex_unlock(&((struct sofia_peer *)peer)->lock);
+
 	/* WS/WSS: a WebSocket client always registers a placeholder Contact host (SIP.js .invalid / TEST-NET,
 	 * RFC 7118 §8.1) and is reachable ONLY over its accepted WSS connection — so in-dialog ACK/BYE MUST be
 	 * proxy-routed to its real registered source (peer->src_addr) over WSS, exactly like a NAT'd phone, even
 	 * without an explicit nat=force_rport. Otherwise the BYE goes to the unroutable placeholder and the UA
 	 * never tears down (caller stuck "call in progress"). */
-	if (!(peer->nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA))
-			&& strcasecmp(peer->reg_transport, "ws")
-			&& strcasecmp(peer->reg_transport, "wss")) {
+	if (!(nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA))
+			&& strcasecmp(reg_transport, "ws")
+			&& strcasecmp(reg_transport, "wss")) {
 		return 0;
 	}
-	if (ast_sockaddr_isnull(&peer->src_addr)) {
+	if (ast_sockaddr_isnull(&src)) {
 		return 0;
 	}
 
-	port = ast_sockaddr_port(&peer->src_addr);
+	port = ast_sockaddr_port(&src);
 	if (!port) {
-		port = peer->port ? peer->port : 5060;
+		port = peer_port ? peer_port : 5060;
 	}
 
 	snprintf(buf, len, "sip:%s:%d",
-		sofia_uri_format_host(ast_sockaddr_stringify_host(&peer->src_addr),
+		sofia_uri_format_host(ast_sockaddr_stringify_host(&src),
 			host_buf, sizeof(host_buf)),
 		port);
 	/* Route the proxy over the registered transport, else sofia-sip opens a fresh
 	 * UDP flow and the in-dialog request is lost. */
-	sofia_uri_append_transport(buf, len, peer->reg_transport);
+	sofia_uri_append_transport(buf, len, reg_transport);
 	return 1;
 }
 
@@ -1109,7 +1203,18 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	master->sess_id = child->sess_id;
 	master->sess_version = child->sess_version;
 
-	/* Set master's active contact from the winner child's ruri. */
+	/* Set master's active contact from the winner child's ruri (RFC 3261 §12.2.1.1 /
+	 * §16.12: in-dialog BYE/ACK must route to the actual 2xx target). In a
+	 * 1->2-contact REGISTER-vs-call race the master may carry a STALE request-time
+	 * active_contact (sofia_request_call selected a single live contact before the
+	 * REGISTER added the second and pushed us onto the fork path). sofia_pvt_set_active_contact
+	 * short-circuits when already-set, so without clearing first the winner's contact
+	 * is dropped and the in-dialog BYE/ACK (sofia_pvt_build_nat_target_url reads
+	 * pvt->active_contact) + per-contact active_calls/busy_on_active accounting stay
+	 * charged to the wrong (stale) contact — a NAT/WSS peer then never gets the BYE
+	 * (zombie leg until RTP timeout). REPLACE: clear the stale one (decrements its
+	 * active_calls) so the winner's set takes. Under master->lock; the clear/set only
+	 * touch the contact ao2 lock (leaf), consistent with the lock order. */
 	if (master->peer && !ast_strlen_zero(child->ruri)) {
 		const char *at = strchr(child->ruri, '@');
 		if (at) {
@@ -1118,6 +1223,7 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 			sofia_split_hostport_from_uri(at + 1, rhost, sizeof(rhost), &rport);	/* IPv6-aware */
 			struct sofia_contact *contact = sofia_peer_find_contact_by_host_port(master->peer, rhost, rport);
 			if (contact) {
+				sofia_pvt_clear_active_contact(master);	/* drop any stale request-time contact so the winner's set takes */
 				sofia_pvt_set_active_contact(master, contact);
 				ao2_ref(contact, -1);
 			}
@@ -3093,7 +3199,25 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 	if (ast_strlen_zero(peer->defaultuser)) ast_string_field_set(peer, defaultuser, peer->name);
 }
 
-static struct sofia_peer *sofia_find_peer_realtime(const char *name)
+/* Build a realtime peer from the DB WITHOUT linking it into the peers container.
+ * Runs entirely OUTSIDE ao2_lock(peers): the file's locking invariant (~:104-105)
+ * forbids holding a lock across the blocking realtime DB query (ast_load_realtime).
+ * The peers container lock is the single global gate for EVERY inbound INVITE/
+ * REGISTER/SUBSCRIBE/OPTIONS + devicestate query, so holding it across the DB query
+ * lets a slow/hung realtime DB stall ALL peer lookups (remotely amplifiable by
+ * flooding lookups for non-cached usernames).
+ *
+ * PARSE-ONLY (FIX2 rework): this builder performs the realtime DB/sipregs PARSE and
+ * nothing else. It takes NO extra refs and registers NO global side effects — no
+ * dnsmgr setup (which would take an EXTRA peer ref that pins the refcount and stops
+ * the destructor from running, see the reload rule ~:15468-15475), no
+ * dynamic_exclude_static append to the global contact_ha, no allowsubscribe flip,
+ * no dialplan hint. Those side effects MUST run only AFTER the peer wins ao2_link,
+ * in the same link-first order the config path uses (~:14590-14625) — done by the
+ * caller sofia_find_peer below. That way a double-build-dedup LOSER or an ao2_link
+ * OOM has NOTHING to unwind: a plain ao2_ref(built,-1) takes the refcount to 0 and
+ * the destructor fully frees this parse-only build. */
+static struct sofia_peer *sofia_find_peer_realtime_build(const char *name)
 {
 	struct ast_variable *var;
 	struct sofia_peer *peer;
@@ -3123,43 +3247,6 @@ static struct sofia_peer *sofia_find_peer_realtime(const char *name)
 	}
 
 	peer->is_realtime = 1;
-	/* Publish FIRST, side-effects after (link-first): sofia_find_peer holds
-	 * ao2_lock(peers) across the build so concurrent same-name builds are already
-	 * serialised. On ao2_link OOM nothing is created yet → no orphan to unwind. */
-	if (!ao2_link(peers, peer)) {
-		sofia_peer_drain_mwi(peer);
-		ao2_ref(peer, -1);
-		return NULL;
-	}
-
-	/* These side-effects run AFTER ao2_link (link-first) so an OOM leaves no orphan. */
-	sofia_create_peer_hint(peer, "realtime");
-	sofia_dnsmgr_setup_peer(peer);
-
-	/* dynamic_exclude_static [general] (chan_sip parity). */
-	if (sofia_cfg.dynamic_exclude_static && !ast_strlen_zero(peer->host)
-			&& strcasecmp(peer->host, "dynamic")) {
-		struct ast_sockaddr static_addr;
-		if (ast_sockaddr_parse(&static_addr, peer->host, 0)) {
-			int ha_error = 0;
-			ast_rwlock_wrlock(&sofia_contactha_lock);
-			sofia_cfg.contact_ha = ast_append_ha("deny",
-				ast_sockaddr_stringify_addr(&static_addr),
-				sofia_cfg.contact_ha, &ha_error);
-			ast_rwlock_unlock(&sofia_contactha_lock);
-			if (ha_error) {
-				ast_log(LOG_ERROR,
-					"Sofia: dynamic_exclude_static — bad addr for realtime static peer '%s' (%s)\n",
-					peer->name, peer->host);
-			}
-		}
-	}
-
-	/* If this runtime-added realtime peer allows subscribe, flip the global derived
-	 * flag (one-way, chan_sip parity). Already-TRUE short-circuits cheaply. */
-	if (peer->allowsubscribe) {
-		sofia_cfg.allowsubscribe = 1;
-	}
 
 	return peer;
 }
@@ -3192,40 +3279,119 @@ static int peer_cmp_fn(void *obj, void *arg, int flags)
 struct sofia_peer *sofia_find_peer(const char *name)
 {
 	struct sofia_peer *found = NULL;
+	struct sofia_peer *built = NULL;	/* my fresh unlinked realtime build (NULL on cache hit / no realtime) */
+	int built_realtime = 0;	/* set when THIS call linked a NEW realtime peer -> create its hint after unlock */
+	struct sofia_peer_key key = { .name = name };
 
-	/* Atomically check the in-memory cache and, on miss, build via realtime —
-	 * BOTH under ao2_lock(peers) so two concurrent misses for the same name
-	 * cannot both run sofia_find_peer_realtime and link duplicate peers (ao2_link
-	 * does not refuse duplicates by name, so callers enforce uniqueness here).
-	 *
-	 * Holding the lock through the realtime DB query briefly serialises cache-miss
-	 * work; the alternative (optimistic build + post-lock dup-check) would need the
-	 * same serialisation anyway. Cache hits (the common case) never take the
-	 * realtime path. ao2 container locks are recursive, so helpers invoked under
-	 * the lock (sofia_create_peer_hint, sofia_dnsmgr_setup_peer) that re-enter ao2
-	 * on the same container do not deadlock. */
+	/* Fast path: cache hit under the peers lock. The container lock is the single
+	 * global gate for EVERY inbound INVITE/REGISTER/SUBSCRIBE/OPTIONS + devicestate
+	 * query, so it MUST NOT be held across the realtime DB query or the DNS lookup
+	 * (file invariant ~:104-105) — a slow/hung DB or resolver would otherwise stall
+	 * ALL peer lookups, remotely amplifiable by flooding non-cached usernames. */
 	ao2_lock(peers);
-
-	{
-		struct sofia_peer_key key = { .name = name };
-
-		found = ao2_find(peers, &key, OBJ_POINTER);
-	}
+	found = ao2_find(peers, &key, OBJ_POINTER);
+	ao2_unlock(peers);
 
 	if (found) {
-		ao2_unlock(peers);
 		return found;
 	}
 
-	if (ast_check_realtime("sippeers")) {
-		found = sofia_find_peer_realtime(name);
-		if (found) {
-			if (sofia_debug)
-				ast_verbose("Sofia: Peer '%s' found via realtime\n", name);
+	if (!ast_check_realtime("sippeers")) {
+		return NULL;
+	}
+
+	/* Cache miss: build the realtime peer WITHOUT the container lock (the blocking realtime DB
+	 * query happens here, off the global gate). PARSE-ONLY: DNS + the dnsmgr ref + the global
+	 * contact_ha rule + allowsubscribe all run POST-LINK below, so a lost-race/OOM build has
+	 * nothing to unwind. */
+	built = sofia_find_peer_realtime_build(name);
+	if (!built) {
+		return NULL;
+	}
+
+	/* Re-take the lock ONLY for the brief re-find / link. Concurrent-double-build
+	 * race: another thread may have built+linked a same-named peer while we were
+	 * unlocked (ao2_link does not refuse duplicates by name, so we dedup here). If
+	 * one is now present, DROP our fresh build and use theirs; else link ours. */
+	ao2_lock(peers);
+	found = ao2_find(peers, &key, OBJ_POINTER);
+	if (found) {
+		/* Lost the double-build race — discard our fresh build and use theirs. The build
+		 * is PARSE-ONLY (no dnsmgr ref, no global ACL/allowsubscribe side effect — those
+		 * are deferred until AFTER ao2_link below), so there is NOTHING to unwind: this
+		 * single ao2_ref(built,-1) drives the refcount to 0 and the destructor frees it. */
+		ao2_unlock(peers);
+		sofia_peer_drain_mwi(built);
+		ao2_ref(built, -1);
+		return found;
+	}
+	if (!ao2_link(peers, built)) {
+		/* OOM on link — nothing published, no side effect registered yet (the dnsmgr ref,
+		 * the contact_ha deny rule and allowsubscribe all run only after a SUCCESSFUL link
+		 * below). Nothing to unwind: this ao2_ref(built,-1) takes the refcount to 0. */
+		ao2_unlock(peers);
+		sofia_peer_drain_mwi(built);
+		ao2_ref(built, -1);
+		return NULL;
+	}
+	ao2_unlock(peers);
+
+	/* We linked it: 'built' carries the +1 ref we return; the container holds its own
+	 * +1 from ao2_link. */
+	found = built;
+	built_realtime = 1;	/* fresh link: create the hint below, after the peers lock is dropped */
+	if (sofia_debug) {
+		ast_verbose("Sofia: Peer '%s' found via realtime\n", name);
+	}
+
+	/* Side effects run LINK-FIRST (mirrors the config path ~:14590-14625): only after a
+	 * successful ao2_link, and only on the fresh-link path (cache hits + double-build
+	 * losers never re-run them). Order = hint -> dnsmgr -> dynamic_exclude_static, the
+	 * same order the config path uses. The peer is already ao2_link'd and 'found' holds a
+	 * +1 ref, so it is alive throughout. Because these are deferred to AFTER the link, a
+	 * losing/OOM build above carried NONE of them and was freed by a plain ao2_ref(-1).
+	 *
+	 * (1) Dialplan hint — ABBA fix (P1, preserved): created OUTSIDE ao2_lock(peers).
+	 * sofia_create_peer_hint takes conlock (find_or_create + add_extension); doing it
+	 * under the peers lock would invert against the dialplan-merge conlock->peers leg. */
+	if (built_realtime) {
+		sofia_create_peer_hint(found, "realtime");
+
+		/* (2) DNS for host=<hostname> peers — synchronous, MUST stay outside the peers
+		 * lock. Takes an EXTRA peer ref pinned until the reload sweep's ast_dnsmgr_release
+		 * (~:15468-15475); registering it only here (post-link) is exactly why a losing
+		 * build had nothing to unwind. Idempotent; sets peer->src_addr / peer->dnsmgr. */
+		sofia_dnsmgr_setup_peer(found);
+
+		/* (3) dynamic_exclude_static [general] (chan_sip parity): a static-IP realtime
+		 * peer appends a deny rule to the GLOBAL contact_ha so later REGISTERs from that
+		 * address are rejected. Deferred here so a lost-race build never leaves a stale
+		 * global deny rule behind. The append takes only the LEAF sofia_contactha_lock. */
+		if (sofia_cfg.dynamic_exclude_static && !ast_strlen_zero(found->host)
+				&& strcasecmp(found->host, "dynamic")) {
+			struct ast_sockaddr static_addr;
+			if (ast_sockaddr_parse(&static_addr, found->host, 0)) {
+				int ha_error = 0;
+				ast_rwlock_wrlock(&sofia_contactha_lock);
+				sofia_cfg.contact_ha = ast_append_ha("deny",
+					ast_sockaddr_stringify_addr(&static_addr),
+					sofia_cfg.contact_ha, &ha_error);
+				ast_rwlock_unlock(&sofia_contactha_lock);
+				if (ha_error) {
+					ast_log(LOG_ERROR,
+						"Sofia: dynamic_exclude_static — bad addr for realtime static peer '%s' (%s)\n",
+						found->name, found->host);
+				}
+			}
+		}
+
+		/* (4) allowsubscribe: if this runtime-added realtime peer allows subscribe, flip
+		 * the global derived flag (one-way, chan_sip parity). Already-TRUE short-circuits. */
+		if (found->allowsubscribe) {
+			sofia_cfg.allowsubscribe = 1;
 		}
 	}
 
-	ao2_unlock(peers);
 	return found;
 }
 
@@ -3264,18 +3430,31 @@ static struct sofia_peer *sofia_find_peer_by_ip(const struct ast_sockaddr *src)
 	i = ao2_iterator_init(peers, 0);
 	while ((peer = ao2_iterator_next(&i))) {
 		struct ast_sockaddr parsed;
+		struct ast_sockaddr snap_src;
+		struct ast_sockaddr snap_defaddr;
+		char snap_host[MAXHOSTNAMELEN];
 		const struct ast_sockaddr *candidate = NULL;
-		if (!ast_sockaddr_isnull(&peer->src_addr)) {
-			candidate = &peer->src_addr;
-		} else if (!ast_strlen_zero(peer->host)
-		           && strcasecmp(peer->host, "dynamic")
-		           && ast_sockaddr_parse(&parsed, peer->host, PARSE_PORT_FORBID)) {
+		/* src_addr/host/defaddr are rewritten under peer->lock by the dnsmgr callback
+		 * (sofia_on_dns_update_peer) off the res_dnsmgr thread and by the reload writer;
+		 * snapshot ALL THREE under peer->lock before the compare so this IP-trunk-
+		 * identification path (which gates insecure=invite) can't read a torn ast_sockaddr
+		 * nor a freed host stringfield mid-update. */
+		ast_mutex_lock(&peer->lock);
+		snap_src = peer->src_addr;
+		snap_defaddr = peer->defaddr;
+		ast_copy_string(snap_host, peer->host, sizeof(snap_host));
+		ast_mutex_unlock(&peer->lock);
+		if (!ast_sockaddr_isnull(&snap_src)) {
+			candidate = &snap_src;
+		} else if (!ast_strlen_zero(snap_host)
+		           && strcasecmp(snap_host, "dynamic")
+		           && ast_sockaddr_parse(&parsed, snap_host, PARSE_PORT_FORBID)) {
 			/* Static host=<ip-literal> peers never get src_addr populated
 			 * (sofia_dnsmgr_setup_peer returns early at its IP-literal pre-check),
 			 * so parse it on-the-fly here. */
 			candidate = &parsed;
-		} else if (!ast_sockaddr_isnull(&peer->defaddr)) {
-			candidate = &peer->defaddr;
+		} else if (!ast_sockaddr_isnull(&snap_defaddr)) {
+			candidate = &snap_defaddr;
 		}
 		if (candidate && !ast_sockaddr_cmp_addr(candidate, src)) {
 			found = peer;
@@ -4633,8 +4812,25 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 				datalen, sizeof(struct ast_control_t38_parameters));
 			return -1;
 		}
-		if (sofia_interpret_t38_parameters(pvt, (const struct ast_control_t38_parameters *)data) < 0) {
-			return -1;
+		{
+			/* >0 = the dispatcher recorded LOCAL_REINVITE and we must SEND the outbound
+			 * T.38 (m=image) re-INVITE. Reuse the directmedia re-INVITE marshaling: it
+			 * runs sofia_send_reinvite on sofia_thread under pvt->lock (the re-INVITE
+			 * must NOT run on the bridge/channel thread), and sofia_generate_sdp now
+			 * emits m=image because pvt->udptl is set. The LOCAL_REINVITE → ENABLED
+			 * transition happens when the answer's m=image is parsed (sofia_parse_sdp
+			 * commit). */
+			int t38_rc = sofia_interpret_t38_parameters(pvt, (const struct ast_control_t38_parameters *)data);
+			if (t38_rc < 0) {
+				return -1;
+			}
+			if (t38_rc > 0) {
+				ao2_ref(pvt, +1);	/* dispatch ref; sofia_directmedia_reinvite_root drops it */
+				if (sofia_dispatch_to_root_thread(sofia_directmedia_reinvite_root, pvt) < 0) {
+					ao2_ref(pvt, -1);
+					ast_log(LOG_WARNING, "Sofia: failed to dispatch outbound T.38 re-INVITE on '%s'\n", ast->name);
+				}
+			}
 		}
 		break;
 	default:
@@ -4939,8 +5135,9 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 			/* NAT in-dialog routing override: for a NATed peer the 200-OK Contact
 			 * carries a LAN IP, so sofia's auto ACK/BYE would be unroutable.
 			 * NUTAG_PROXY pins dialog messages to peer->src_addr (the helper also
-			 * appends reg_transport so TCP/TLS doesn't default to UDP). Lock-free:
-			 * nat/src_addr/port/reg_transport are fixed members. */
+			 * appends reg_transport so TCP/TLS doesn't default to UDP). The helper
+			 * snapshots nat/src_addr/port/reg_transport under peer->lock itself —
+			 * those fields are rewritten under peer->lock by REGISTER/dnsmgr. */
 			char proxy_url[128] = "";
 			sofia_build_nat_proxy_url_from_peer(peer, proxy_url, sizeof(proxy_url));
 			if (sofia_nua) {
@@ -5554,10 +5751,22 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 						ast_sockaddr_stringify(&src), caller_peer->name);
 					/* Timing-equalize the ACL-deny vs auth-401-slow path, else
 					 * ACL-403-fast is a peer-existence oracle defeating
-					 * alwaysauthreject. */
+					 * alwaysauthreject. The cheap dummy HMAC runs INLINE; the 403
+					 * itself is deferred 10-50ms ASYNCHRONOUSLY (NON-blocking — the
+					 * dispatcher is not parked). We snapshot nh/nua and pin the handle
+					 * inside the scheduler, so we can drop OUR caller_peer/pvt refs and
+					 * return immediately; the timer sends the 403 on sofia_thread.
+					 *
+					 * RESIDUAL-RACE FENCE: nua_handle_ref pins the handle MEMORY but not
+					 * its NTA server request, so our ao2_ref(pvt,-1) below would run the
+					 * destructor -> nua_handle_destroy -> nta_incoming_destroy auto-500,
+					 * racing ahead of our timer. Pass `pvt` as pvt_ref so the scheduler
+					 * takes an ADDITIONAL ao2 ref keeping the pvt (and thus the bound
+					 * handle + its server request) alive until the 403 is queued; that
+					 * extra ref is dropped at fire/immediate/failure/unload. */
 					sofia_emit_timing_equalized_reject();
-					nua_respond(nh, SIP_403_FORBIDDEN,
-						NUTAG_WITH_THIS(nua), TAG_END());
+					sofia_delay_reject_schedule(SOFIA_DELAY_REJECT_403_FORBIDDEN,
+						nua, nh, NULL, NULL, NULL, NULL, &src, pvt, 0);
 					ao2_ref(caller_peer, -1);
 					ao2_ref(pvt, -1);
 					return;
@@ -5625,6 +5834,23 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 				pvt->peer->name, addr_buf);
 			auth_required = 0;
 		}
+		/* No credential at all (neither secret nor md5secret) -> accept without auth,
+		 * matching the REGISTER (chan_sofia.c:8597) and SUBSCRIBE (chan_sofia.c:10053)
+		 * guards. Without this short-circuit a credential-less peer's INVITE still ran
+		 * through sofia_verify_digest_auth and logged/behaved as 'authenticated' — net
+		 * access is identical (the documented no-secret behavior), but the digest path's
+		 * accounting is misleading. md5secret IS a credential, so a md5secret-only peer
+		 * still takes the digest path below. Cosmetic/consistency — no privilege boundary
+		 * crossed. */
+		if (auth_required
+				&& ast_strlen_zero(pvt->peer->secret)
+				&& ast_strlen_zero(pvt->peer->md5secret)) {
+			if (sofia_debug) {
+				ast_verbose("Sofia: INVITE from peer '%s' accepted without auth — "
+					"no secret/md5secret configured\n", pvt->peer->name);
+			}
+			auth_required = 0;
+		}
 		if (auth_required) {
 			char realm_buf[MAXHOSTNAMELEN];
 			const char *realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
@@ -5641,10 +5867,17 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		}
 	} else if (sofia_cfg.alwaysauthreject) {
 		/* Unknown peer: challenge (fresh nonce + timing-equalized) so the response
-		 * is indistinguishable from known-peer-bad-password (RFC 3261 §22.4). */
+		 * is indistinguishable from known-peer-bad-password (RFC 3261 §22.4).
+		 *
+		 * RESIDUAL-RACE FENCE: nh is bound to this fresh pvt, so our ao2_ref(pvt,-1)
+		 * below would run the destructor -> nua_handle_destroy -> nta_incoming_destroy
+		 * auto-500, racing ahead of the deferred 401 timer. Pass `pvt` as pvt_ref so the
+		 * scheduler takes an ADDITIONAL ao2 ref pinning the pvt (and its bound handle +
+		 * NTA server request) until the 401 is queued; dropped at fire/immediate/failure/
+		 * unload. No reap flag — the handle is BOUND, the pvt owns its destruction. */
 		char realm_buf[MAXHOSTNAMELEN];
 		const char *realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
-		sofia_send_auth_challenge(nua, nh, sip, realm, "INVITE", "UnknownPeer");
+		sofia_send_auth_challenge(nua, nh, sip, realm, "INVITE", "UnknownPeer", pvt, 0);
 		ao2_ref(pvt, -1);
 		return;
 	} else if (!sofia_cfg.allowguest) {
@@ -6319,8 +6552,16 @@ void sofia_get_source_addr(sip_t const *sip, struct ast_sockaddr *addr)
 	if (via->v_received) {
 		const char *src_port = via->v_rport ? via->v_rport : via->v_port;
 		char addr_str[256];
-		snprintf(addr_str, sizeof(addr_str), "%s:%s",
-			via->v_received, src_port ? src_port : "5060");
+		/* IPv6 literals MUST be bracketed before ast_sockaddr_parse (RFC 3261 §19.1.2 /
+		 * RFC 5952): an unbracketed "fe80::1:5060" is ambiguous (the colons run together),
+		 * yielding a wrong/empty addr that corrupts the blacklist key + host= ACL match. */
+		if (strchr(via->v_received, ':')) {
+			snprintf(addr_str, sizeof(addr_str), "[%s]:%s",
+				via->v_received, src_port ? src_port : "5060");
+		} else {
+			snprintf(addr_str, sizeof(addr_str), "%s:%s",
+				via->v_received, src_port ? src_port : "5060");
+		}
 		ast_sockaddr_parse(addr, addr_str, 0);
 		if (sofia_debug)
 			ast_verbose("Sofia: source addr (via received): %s\n", addr_str);
@@ -6330,7 +6571,12 @@ void sofia_get_source_addr(sip_t const *sip, struct ast_sockaddr *addr)
 		char addr_str[256];
 		if (!host)
 			return;
-		snprintf(addr_str, sizeof(addr_str), "%s:%s", host, port ? port : "5060");
+		/* Same IPv6 bracketing for the Via host branch. */
+		if (strchr(host, ':')) {
+			snprintf(addr_str, sizeof(addr_str), "[%s]:%s", host, port ? port : "5060");
+		} else {
+			snprintf(addr_str, sizeof(addr_str), "%s:%s", host, port ? port : "5060");
+		}
 		ast_sockaddr_parse(addr, addr_str, 0);
 		if (sofia_debug)
 			ast_verbose("Sofia: source addr (via host): %s\n", addr_str);
@@ -7058,6 +7304,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	const char *auth_algorithm;
 	int using_qop;
 	unsigned int new_nc = 0;
+	int nc_replay = 0;	/* set in the qop nonce block; read AFTER the digest verify (deferred nc-replay: rotate only on a valid-but-replayed nc) */
 	int algorithm = SOFIA_DIGEST_MD5;  /* RFC 2617 backward-compat default */
 	int hash_len_hex;
 	char expected_hash[65];  /* SHA-256 (64 hex + null); MD5 uses 32+null */
@@ -7152,6 +7399,33 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		return SOFIA_AUTH_REJECT;
 	}
 
+	/* digest-uri MUST agree with the Request-URI (RFC 2617 §3.2.2.5 / RFC 7616 §3.4.4).
+	 * The uri= directive is folded into H(A2), so a credential captured for one target
+	 * cannot be replayed at another only if the SERVER also verifies the binding. Compare
+	 * the client's uri= against the actual Request-URI structurally (scheme/user/host/port,
+	 * default-port + case aware via url_cmp) — tolerant of URI params/ordering the proxy may
+	 * have rewritten, strict on the identity that binds the credential to the target. */
+	if (sip && sip->sip_request && sip->sip_request->rq_url) {
+		su_home_t uhome[1] = { SU_HOME_INIT(uhome) };
+		url_t *client_uri = url_make(uhome, auth_uri);
+		int uri_mismatch = (!client_uri || url_cmp(client_uri, sip->sip_request->rq_url) != 0);
+		su_home_deinit(uhome);
+		if (uri_mismatch) {
+			char ruri_str[256] = "";
+			su_home_t rhome[1] = { SU_HOME_INIT(rhome) };
+			char *rs = url_as_string(rhome, sip->sip_request->rq_url);
+			if (rs) {
+				ast_copy_string(ruri_str, rs, sizeof(ruri_str));
+			}
+			su_home_deinit(rhome);
+			nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
+			ast_verbose("Sofia: %s auth rejected for '%s' - digest uri='%s' does not match Request-URI '%s'\n",
+				method, peer->name, auth_uri, ruri_str);
+			sofia_blacklist_add_sip(sip, "digest uri mismatch");
+			return SOFIA_AUTH_REJECT;
+		}
+	}
+
 	/* Realm mismatch → 401-stale (RFC 2617 §3.2.1, byte-exact; missing realm = mismatch).
 	 * Cross-realm replay prevention. */
 	if (!auth_realm || strcmp(auth_realm, realm) != 0) {
@@ -7231,25 +7505,30 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 			|| (peer->nonce_issued_at && (now_nr - peer->nonce_issued_at) > ttl_nr);
 		int nonce_matches = (auth_nonce && !ast_strlen_zero(peer->nonce)
 			&& !strcmp(auth_nonce, peer->nonce));
-		/* nc-replay = qop + same live nonce + a non-advancing nc — BUT a TRUE replay only if the cnonce
-		 * ALSO repeats. RFC 2617 §3.2.2: the cnonce SHOULD be fresh per request and the digest binds it, so
-		 * a legit REGISTER refresh (the client restarts at nc=1 with a NEW cnonce, having no idea the server
-		 * silently reused the nonce) is NOT a replay; only a byte-identical (nonce,nc,cnonce) resend is.
-		 * Without the cnonce test, the reused per-peer nonce + carried last_nc rejected nearly every
-		 * refresh's first authed attempt as a false replay → spurious 401 stale=true + extra round-trip.
-		 * (registration-path fix.) */
-		int nc_replay = (using_qop && nonce_matches && new_nc <= peer->last_nc
-			&& auth_cnonce && !ast_strlen_zero(peer->last_cnonce)
-			&& !strcmp(auth_cnonce, peer->last_cnonce));
+		/* nc-replay = qop + same live nonce + a NON-advancing nc (new_nc <= last_nc), independent
+		 * of the cnonce. RFC 2617 §3.2.2 / RFC 7616 §3.4: the server MUST track the nonce-count and
+		 * "if the same nc-value is seen twice, then the request is a replay" — the count alone is the
+		 * monotonic anti-replay gate, and a captured Authorization with a different cnonce but an
+		 * equal/lower nc is exactly the replay this must catch. (An earlier cnonce-also-repeats test
+		 * was too weak: swapping the cnonce slipped a replayed low nc straight through to verify.)
+		 *
+		 * A nc-replay is NOT acted on HERE: rotating the nonce before verifying the digest would let
+		 * anyone who merely learned the current nonce force nonce-rotation / 401-stale churn with a
+		 * bogus Authorization (no secret) - a spoof/self-DoS. So we only FLAG it now
+		 * and defer the response to AFTER the digest verify below: a VALID-but-replayed nc rotates +
+		 * 401-stale (a legit refresh re-auths once), an INVALID response 403s WITHOUT rotating. Either
+		 * way an equal/older nc is NEVER accepted and an unauthenticated request can never churn the
+		 * nonce. nonce_dead (the server's own TTL) is not attacker-steerable, so it re-challenges early. */
+		nc_replay = (using_qop && nonce_matches && new_nc <= peer->last_nc);
 
-		if (nonce_dead || nc_replay) {
+		if (nonce_dead) {
 			char fresh_nonce[64];
 			sofia_regen_nonce_locked(peer, fresh_nonce, sizeof(fresh_nonce));
 			ast_mutex_unlock(&peer->lock);
 			sofia_emit_auth_challenge(nua, nh, realm, fresh_nonce, 1);
 			if (sofia_debug) {
-				ast_verbose("Sofia: %s auth challenge for '%s' - %s; fresh nonce=%s\n",
-					method, peer->name, nc_replay ? "nc-replay" : "stale/expired", fresh_nonce);
+				ast_verbose("Sofia: %s auth challenge for '%s' - stale/expired; fresh nonce=%s\n",
+					method, peer->name, fresh_nonce);
 			}
 			return SOFIA_AUTH_CHALLENGE;
 		}
@@ -7324,20 +7603,75 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		return SOFIA_AUTH_REJECT;
 	}
 
+	/* nc-replay (deferred from the qop block): the response is VALID but nc <= last_nc, i.e. a legit
+	 * refresh restarting at nc=1 or a captured valid resend. Rotate to a fresh nonce + 401-stale
+	 * instead of accepting; a legit client re-auths once, a replayer cannot answer the new challenge.
+	 * Reached ONLY after a valid digest, so a bogus response can never get here to churn the nonce.
+	 * (verify-before-rotate. RFC 2617 3.2.2: equal/older nc == replay.) */
+	if (nc_replay) {
+		char fresh_nonce[64];
+		sofia_regen_nonce_locked(peer, fresh_nonce, sizeof(fresh_nonce));
+		ast_mutex_unlock(&peer->lock);
+		sofia_emit_auth_challenge(nua, nh, realm, fresh_nonce, 1);
+		if (sofia_debug) {
+			ast_verbose("Sofia: %s auth for '%s' - valid but nc-replay; rotated nonce=%s\n",
+				method, peer->name, fresh_nonce);
+		}
+		return SOFIA_AUTH_CHALLENGE;
+	}
+
 	/* Auth success — commit nonce/nc state under lock.
 	 * RFC 2617 (qop=auth): keep nonce, advance last_nc.
 	 * RFC 2069 (no qop): clear nonce (single-use). */
 	if (using_qop) {
 		peer->last_nc = new_nc;
-		/* Remember this request's cnonce so the next nc-replay test can tell a legit refresh (fresh cnonce)
-		 * from a byte-identical resend (same cnonce). auth_cnonce is guaranteed present under qop. */
-		ast_copy_string(peer->last_cnonce, S_OR(auth_cnonce, ""), sizeof(peer->last_cnonce));
 	} else {
 		ast_string_field_set(peer, nonce, "");
 	}
 	ast_mutex_unlock(&peer->lock);
 
 	return SOFIA_AUTH_OK;
+}
+
+/* Out-of-dialog MESSAGE digest gate (RFC 3428): a MESSAGE from a configured, credentialed
+ * peer must pass the SAME challenge/verify as INVITE before reaching the dialplan — otherwise
+ * the From-user is trusted unauthenticated. Exported for sofia_message.c (the static verifier
+ * + enum stay private to this TU).
+ *
+ *   peer == NULL  -> guest sender; nothing to authenticate here (caller applies allowguest).
+ *   peer w/o creds -> nothing to verify; proceed.
+ *   peer w/ creds  -> challenge/verify; on non-OK the 401/4xx is already emitted.
+ *
+ * Returns 0 = proceed (authenticated or no creds); nonzero = a response was sent, STOP
+ * (caller must reap the out-of-dialog handle). The pbx_authorization fallback mirrors the
+ * INVITE path (RFC 3261 §22). */
+int sofia_message_authenticate(struct sofia_peer *peer, nua_t *nua, nua_handle_t *nh,
+		sip_t const *sip)
+{
+	char realm_buf[MAXHOSTNAMELEN];
+	const char *realm;
+	sip_authorization_t const *au;
+	enum sofia_auth_result auth_res;
+	int has_creds;
+
+	if (!peer) {
+		return 0;	/* guest: caller's allowguest policy decides */
+	}
+
+	ast_mutex_lock(&peer->lock);
+	has_creds = !ast_strlen_zero(peer->secret) || !ast_strlen_zero(peer->md5secret);
+	ast_mutex_unlock(&peer->lock);
+
+	if (!has_creds) {
+		return 0;	/* peer matched but has no shared secret to verify against */
+	}
+
+	realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
+	au = sip->sip_authorization
+		? sip->sip_authorization
+		: (sip_authorization_t const *)sip->sip_proxy_authorization;
+	auth_res = sofia_verify_digest_auth(peer, nua, nh, sip, au, "MESSAGE", realm);
+	return (auth_res == SOFIA_AUTH_OK) ? 0 : 1;
 }
 
 /* Caller must hold peer->lock. Generates a fresh nonce (via
@@ -7348,7 +7682,7 @@ static void sofia_regen_nonce_locked(struct sofia_peer *peer, char *out_buf, siz
 	ast_string_field_set(peer, nonce, out_buf);
 	peer->nonce_issued_at = time(NULL);
 	peer->last_nc = 0;
-	peer->last_cnonce[0] = '\0';	/* a fresh nonce starts a fresh nc/cnonce counting window */
+	peer->last_cnonce[0] = '\0';	/* reset the nc window; last_cnonce is RESERVED (no longer consulted), kept cleared */
 }
 
 /* domainsasrealm (chan_sip parity): when set + domain_list non-empty, check the
@@ -7385,20 +7719,18 @@ static const char *sofia_get_realm_for_dialog(sip_t const *sip, char *buf, size_
 	return sofia_cfg.realm[0] ? sofia_cfg.realm : "gabpbx";
 }
 
-/* Timing-equalized reject: inject dummy HMAC computation + a jitter delay
- * before emitting a reject, mitigating username-enumeration via a timing oracle
- * across the auth-fail / ACL-deny / unknown-peer paths. Used uniformly at every
- * reject callsite (sofia_send_auth_challenge unknown-peer + the ACL-deny paths).
+/* Timing-equalized reject: inject dummy HMAC computation, mitigating
+ * username-enumeration via a timing oracle across the auth-fail / ACL-deny /
+ * unknown-peer paths. The cheap, deterministic SHA work runs INLINE on
+ * sofia_thread; the 10-50ms jitter delay that masks residual timing variance is
+ * now done ASYNCHRONOUSLY (see sofia_delay_reject_schedule) so the dispatcher is
+ * never parked — a reject flood no longer self-DoSes signalling.
  *
  * Dummy work: 3× SHA-256 hashes matching the real auth-fail path
  * (sofia_compute_a1_hash + a2 + final response); the volatile sink prevents
- * dead-code elimination. Jitter: 10-50ms randomized.
- *
- * NOTE: the usleep blocks the single sofia_thread, so under a reject-flood DoS
- * throughput is limited to ~33 rejects/sec — the sample config recommends
- * pairing with fail2ban / firewall rate-limiting. (The AMI AuthFailure event is
- * emitted by the callers; GabPBX has no EVENT_FLAG_SECURITY, so EVENT_FLAG_SYSTEM
- * is used, matching the other chan_sofia AMI events.) */
+ * dead-code elimination. (The AMI AuthFailure event is emitted on the 401 path;
+ * GabPBX has no EVENT_FLAG_SECURITY, so EVENT_FLAG_SYSTEM is used, matching the
+ * other chan_sofia AMI events.) */
 static void sofia_emit_timing_equalized_reject(void)
 {
 	char dummy_a1[256];
@@ -7421,9 +7753,264 @@ static void sofia_emit_timing_equalized_reject(void)
 	sofia_sha256_hash(dummy_hash3, dummy_resp);
 	sink = dummy_hash1[0] ^ dummy_hash2[0] ^ dummy_hash3[0];  /* prevent compiler DCE */
 	(void)sink;
+}
 
-	/* Jitter delay 10-50ms randomized — masks residual timing variance. */
-	usleep((useconds_t)(10000 + (ast_random() % 40000)));
+/* Emit the AMI AuthFailure for an unknown-peer 401 (from snapshotted ctx fields). */
+static void sofia_delay_reject_emit_authfailure(const struct sofia_delay_reject_ctx *ctx)
+{
+	manager_event(EVENT_FLAG_SYSTEM, "AuthFailure",
+		"Peer: SIP/UNKNOWN\r\n"
+		"Method: %s\r\n"
+		"Reason: %s\r\n"
+		"RemoteAddr: %s\r\n"
+		"ChannelType: SIP\r\n",
+		ctx->method[0] ? ctx->method : "UNKNOWN",
+		ctx->reason[0] ? ctx->reason : "UnknownPeer",
+		ctx->src_addr);
+}
+
+/* Emit the final response NOW (no delay). Runs ON sofia_thread (both the timer-fire
+ * path and the overload/failure immediate path). Does NOT touch the pending list or
+ * the nua_handle ref — the caller owns that bookkeeping. */
+static void sofia_delay_reject_emit_now(const struct sofia_delay_reject_ctx *ctx)
+{
+	if (ctx->kind == SOFIA_DELAY_REJECT_401_CHALLENGE) {
+		sofia_emit_auth_challenge(ctx->nua, ctx->nh, ctx->realm, ctx->nonce, 0);
+		sofia_delay_reject_emit_authfailure(ctx);
+	} else {
+		nua_respond(ctx->nh, SIP_403_FORBIDDEN,
+			NUTAG_WITH_THIS(ctx->nua), TAG_END());
+	}
+}
+
+/* Deferred-cleanup fence (the residual-race fix). Runs ON sofia_thread AFTER the final
+ * 401/403 has been queued (emit-first ordering). Drops the optional pvt pin and reaps the
+ * optional unbound SUBSCRIBE handle. ORDER matters:
+ *   1) emit (done by the caller, BEFORE this) so nua_respond queues the final response,
+ *   2) ao2_ref(pvt_ref,-1) — releasing the pvt may run its destructor which dispatches
+ *      nua_handle_destroy -> nta_incoming_destroy; but the final response is already queued,
+ *      so the auto-500 is suppressed (the request is answered),
+ *   3) sofia_subscribe_reject_reap(nh) for the unbound-handle case — same reasoning: the
+ *      deferred 401 is queued first, so reaping no longer races an immediate 500 ahead of us.
+ * Both fields are no-ops when unset, so every emit path (timer/immediate/failure/unload) can
+ * call this uniformly. The nh unref (the original handle pin) is NOT done here — callers do
+ * it after, since the unload sweep never reaps (it emits nothing). */
+static void sofia_delay_reject_deferred_cleanup(struct sofia_delay_reject_ctx *ctx)
+{
+	if (ctx->pvt_ref) {
+		ao2_ref(ctx->pvt_ref, -1);
+		ctx->pvt_ref = NULL;
+	}
+	if (ctx->reap_handle_on_fire) {
+		ctx->reap_handle_on_fire = 0;
+		sofia_subscribe_reject_reap(ctx->nh);
+	}
+}
+
+/* One-shot su_timer callback — fires ON sofia_thread (the su_root task), 10-50ms after
+ * scheduling. Unlink the ctx under the list lock (lock NOT held across any nua_* call),
+ * then emit the final 401/403 + AMI FIRST, then run the deferred cleanup (drop the pvt pin /
+ * reap the unbound handle AFTER the response is queued — the residual-race fence), destroy our
+ * OWN fired timer, drop the pinned handle ref, and free the ctx. Mirrors
+ * sofia_transfer_timeout's self-destroy discipline. */
+static void sofia_delay_reject_fire(su_root_magic_t *magic, su_timer_t *t, su_timer_arg_t *arg)
+{
+	struct sofia_delay_reject_ctx *ctx = (struct sofia_delay_reject_ctx *)arg;
+
+	(void)magic;
+	if (!ctx) {
+		return;
+	}
+
+	/* Unlink first (so the unload sweep cannot also touch this ctx), drop the
+	 * global counter, then release the lock BEFORE any nua_* op. */
+	AST_LIST_LOCK(&g_delay_reject_list);
+	AST_LIST_REMOVE(&g_delay_reject_list, ctx, list);
+	if (g_delay_reject_count > 0) {
+		g_delay_reject_count--;
+	}
+	AST_LIST_UNLOCK(&g_delay_reject_list);
+
+	sofia_delay_reject_emit_now(ctx);          /* 1) emit 401/403 FIRST */
+	sofia_delay_reject_deferred_cleanup(ctx);  /* 2) THEN drop pvt_ref / 3) reap unbound handle */
+
+	su_timer_destroy(t);          /* our own just-fired timer */
+	nua_handle_unref(ctx->nh);    /* release the pin taken at schedule */
+	ast_free(ctx);
+}
+
+/* Schedule an async delayed reject (the timing-equalized jitter, NON-blocking). Runs ON
+ * sofia_thread (every callsite is inside a nua event handler). The dummy SHA work has
+ * already run inline at the callsite.
+ *
+ * Overload FUSE: a global hard cap (SOFIA_DELAY_REJECT_MAX) plus a soft per-source cap
+ * bounds in-flight timers; on exceed -> emit IMMEDIATELY (no delay), trading the timing
+ * oracle for availability (the blacklist path still applies). FAILURE POLICY: if ctx
+ * alloc / nua_handle_ref / su_timer_create / su_timer_set fails -> emit IMMEDIATELY +
+ * WARN; NEVER fall back to a blocking sleep.
+ *
+ * src is the request source addr (for the per-source fuse + the 401 AMI RemoteAddr). */
+static void sofia_delay_reject_schedule(enum sofia_delay_reject_kind kind,
+		nua_t *nua, nua_handle_t *nh,
+		const char *realm, const char *nonce,
+		const char *method, const char *reason,
+		const struct ast_sockaddr *src,
+		struct sofia_pvt *pvt_ref, int reap_handle_on_fire)
+{
+	struct sofia_delay_reject_ctx *ctx;
+	struct sofia_delay_reject_ctx *iter;
+	su_duration_t delay_ms;
+	int over_cap = 0;
+	int per_src = 0;
+	char src_buf[80] = "";
+
+	if (src) {
+		ast_copy_string(src_buf, ast_sockaddr_stringify(src), sizeof(src_buf));
+	}
+
+	/* Take the scheduler-owned +1 on the pvt pin NOW, before ANY path that runs deferred_cleanup:
+	 * the caller drops its OWN ref right after we return, so THIS ref is what keeps the pvt + its
+	 * bound handle + NTA server request alive until we emit. Every deferred_cleanup path (timer fire,
+	 * overcap, alloc/ref/timer failure, unload) drops exactly this one ref. (Without it the
+	 * doc claimed this ref but the code never took it = a dangling raw pointer / under-unref UAF.) */
+	if (pvt_ref) {
+		ao2_ref(pvt_ref, +1);
+	}
+
+	/* Build the ctx snapshot first (off-lock). On alloc failure -> emit immediately, then run
+	 * the same deferred cleanup (drop the caller's pvt pin / reap the unbound handle) so neither
+	 * the pvt ref nor the reap is leaked/skipped on this path. The stack ctx carries pvt_ref +
+	 * reap_handle_on_fire so the shared cleanup helper does the right thing. */
+	ctx = ast_calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		struct sofia_delay_reject_ctx stackctx = { 0 };
+		ast_log(LOG_WARNING, "Sofia: delayed-reject ctx alloc failed — emitting %s immediately\n",
+			kind == SOFIA_DELAY_REJECT_401_CHALLENGE ? "401" : "403");
+		stackctx.kind = kind;
+		stackctx.nua = nua;
+		stackctx.nh = nh;
+		stackctx.pvt_ref = pvt_ref;
+		stackctx.reap_handle_on_fire = reap_handle_on_fire;
+		if (realm)  ast_copy_string(stackctx.realm, realm, sizeof(stackctx.realm));
+		if (nonce)  ast_copy_string(stackctx.nonce, nonce, sizeof(stackctx.nonce));
+		if (method) ast_copy_string(stackctx.method, method, sizeof(stackctx.method));
+		if (reason) ast_copy_string(stackctx.reason, reason, sizeof(stackctx.reason));
+		ast_copy_string(stackctx.src_addr, src_buf, sizeof(stackctx.src_addr));
+		sofia_delay_reject_emit_now(&stackctx);
+		sofia_delay_reject_deferred_cleanup(&stackctx);
+		return;
+	}
+	ctx->kind = kind;
+	ctx->nua = nua;
+	ctx->nh = nh;
+	ctx->pvt_ref = pvt_ref;
+	ctx->reap_handle_on_fire = reap_handle_on_fire;
+	if (realm)  ast_copy_string(ctx->realm, realm, sizeof(ctx->realm));
+	if (nonce)  ast_copy_string(ctx->nonce, nonce, sizeof(ctx->nonce));
+	if (method) ast_copy_string(ctx->method, method, sizeof(ctx->method));
+	if (reason) ast_copy_string(ctx->reason, reason, sizeof(ctx->reason));
+	ast_copy_string(ctx->src_addr, src_buf, sizeof(ctx->src_addr));
+
+	/* FUSE check under the list lock (counters guarded by it). No nua_* under this lock. */
+	AST_LIST_LOCK(&g_delay_reject_list);
+	if (g_delay_reject_count >= SOFIA_DELAY_REJECT_MAX) {
+		over_cap = 1;
+	} else if (src_buf[0]) {
+		AST_LIST_TRAVERSE(&g_delay_reject_list, iter, list) {
+			if (!strcmp(iter->src_addr, src_buf) && ++per_src >= SOFIA_DELAY_REJECT_PER_SRC) {
+				over_cap = 1;
+				break;
+			}
+		}
+	}
+	AST_LIST_UNLOCK(&g_delay_reject_list);
+
+	if (over_cap) {
+		/* Overload: prefer availability over the timing oracle — respond now, then run the
+		 * deferred cleanup (drop pvt_ref / reap the unbound handle), same as the timer would. */
+		sofia_delay_reject_emit_now(ctx);
+		sofia_delay_reject_deferred_cleanup(ctx);
+		ast_free(ctx);
+		return;
+	}
+
+	/* Pin the handle so it cannot vanish before the timer fires. */
+	if (!nua_handle_ref(nh)) {
+		ast_log(LOG_WARNING, "Sofia: delayed-reject nua_handle_ref failed — emitting immediately\n");
+		sofia_delay_reject_emit_now(ctx);
+		sofia_delay_reject_deferred_cleanup(ctx);
+		ast_free(ctx);
+		return;
+	}
+
+	/* Jitter 10-50ms = 10 + random(0..39) ms, matching the former blocking sleep window. */
+	delay_ms = (su_duration_t)(10 + (ast_random() % 40));
+	ctx->timer = su_timer_create(su_root_task(sofia_root), delay_ms);
+	if (!ctx->timer) {
+		ast_log(LOG_WARNING, "Sofia: delayed-reject su_timer_create failed — emitting immediately\n");
+		sofia_delay_reject_emit_now(ctx);
+		sofia_delay_reject_deferred_cleanup(ctx);
+		nua_handle_unref(nh);
+		ast_free(ctx);
+		return;
+	}
+
+	/* Publish into the pending list BEFORE arming so a same-thread fire (su_root is
+	 * single-threaded, so the timer can only fire after we return, but keep the
+	 * invariant tight) always finds the ctx linked. */
+	AST_LIST_LOCK(&g_delay_reject_list);
+	AST_LIST_INSERT_HEAD(&g_delay_reject_list, ctx, list);
+	g_delay_reject_count++;
+	AST_LIST_UNLOCK(&g_delay_reject_list);
+
+	if (su_timer_set(ctx->timer, sofia_delay_reject_fire, ctx) < 0) {
+		ast_log(LOG_WARNING, "Sofia: delayed-reject su_timer_set failed — emitting immediately\n");
+		AST_LIST_LOCK(&g_delay_reject_list);
+		AST_LIST_REMOVE(&g_delay_reject_list, ctx, list);
+		if (g_delay_reject_count > 0) {
+			g_delay_reject_count--;
+		}
+		AST_LIST_UNLOCK(&g_delay_reject_list);
+		su_timer_destroy(ctx->timer);
+		sofia_delay_reject_emit_now(ctx);
+		sofia_delay_reject_deferred_cleanup(ctx);
+		nua_handle_unref(nh);
+		ast_free(ctx);
+		return;
+	}
+	/* Armed: the timer callback (sofia_delay_reject_fire) now owns the ctx, the handle
+	 * ref and the timer; it will respond, unref, destroy + free in 10-50ms. */
+}
+
+/* Cancel + destroy every pending delayed-reject timer and free its ctx. MUST run on
+ * sofia_thread (the su_root task) during module teardown, BEFORE nua_destroy /
+ * su_root_destroy, so a firing timer can never deref freed code or a destroyed handle.
+ * We do NOT emit the deferred responses (the stack is going away). The list lock is held
+ * only to detach the batch; su_timer_destroy + nua_handle_unref + free run off-lock. */
+static void sofia_delay_reject_shutdown(void)
+{
+	struct sofia_delay_reject_ctx *ctx;
+
+	for (;;) {
+		AST_LIST_LOCK(&g_delay_reject_list);
+		ctx = AST_LIST_REMOVE_HEAD(&g_delay_reject_list, list);
+		if (ctx && g_delay_reject_count > 0) {
+			g_delay_reject_count--;
+		}
+		AST_LIST_UNLOCK(&g_delay_reject_list);
+		if (!ctx) {
+			break;
+		}
+		if (ctx->timer) {
+			su_timer_destroy(ctx->timer);   /* cancels the pending one-shot */
+		}
+		/* Same deferred cleanup as a fire, minus the (suppressed) emit: drop the pvt pin and
+		 * reap the unbound handle so we never leak the pvt ref nor orphan the server handle on
+		 * the teardown path. Runs on sofia_thread BEFORE nua_destroy, so reap is safe here. */
+		sofia_delay_reject_deferred_cleanup(ctx);
+		nua_handle_unref(ctx->nh);
+		ast_free(ctx);
+	}
 }
 
 /* WWW-Authenticate header-injection prevention: validate nonce/realm before
@@ -7442,15 +8029,27 @@ static int sofia_auth_str_safe(const char *s)
 	return 1;
 }
 
+/* Shared 401 challenge helper (INVITE / REGISTER / SUBSCRIBE). Each caller threads its OWN
+ * correct deferred cleanup through into the scheduler so the timer can win the race against
+ * nta_incoming_destroy's auto-500 (the residual-race fix):
+ *   - pvt_ref          : INVITE unknown-peer path — an extra ao2 ref on the fresh pvt to pin
+ *                        the bound handle + its NTA server request until we emit; the caller
+ *                        MUST NOT have dropped its OWN ref expecting destruction yet (it does so
+ *                        after this returns), this is an ADDITIONAL pin the scheduler owns.
+ *   - reap_handle_on_fire : SUBSCRIBE unknown-peer path — the server handle is UNBOUND (no pvt),
+ *                        so instead of pinning we reap it (sofia_subscribe_reject_reap) AFTER the
+ *                        deferred 401 is queued. The SUBSCRIBE callers MUST NOT reap immediately.
+ *   - REGISTER         : passes NULL + 0 — its handle is neither pvt-bound here nor reaped, so it
+ *                        is unaffected (the destructor/auto-reap machinery does not apply). */
 static void sofia_send_auth_challenge(nua_t *nua, nua_handle_t *nh, sip_t const *sip,
-		const char *realm, const char *method, const char *reason)
+		const char *realm, const char *method, const char *reason,
+		struct sofia_pvt *pvt_ref, int reap_handle_on_fire)
 {
 	/* Real fresh nonce (not a literal "empty" placeholder) so an attacker cannot
 	 * distinguish unknown-peer from known-peer responses, plus the same
 	 * algorithm offer as sofia_verify_digest_auth. */
 	char fresh_nonce[64];
 	struct ast_sockaddr src;
-	char addr_buf[80];
 
 	sofia_secure_nonce_gen(fresh_nonce, sizeof(fresh_nonce));
 
@@ -7458,33 +8057,39 @@ static void sofia_send_auth_challenge(nua_t *nua, nua_handle_t *nh, sip_t const 
 	 * charset before emission (realm is operator-config, nonce is hex-only by
 	 * construction). */
 	if (!sofia_auth_str_safe(realm) || !sofia_auth_str_safe(fresh_nonce)) {
+		struct sofia_delay_reject_ctx tmp = { 0 };
 		ast_log(LOG_WARNING, "Sofia: refusing to emit auth challenge — "
 			"unsafe characters in realm or nonce (defense-in-depth)\n");
 		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR,
 			NUTAG_WITH_THIS(nua), TAG_END());
+		/* This early return never reaches the scheduler, so we must still run the caller's
+		 * deferred cleanup HERE (after the explicit 500 is queued): drop the pvt pin / reap the
+		 * unbound handle, else the pvt ref leaks or the handle is orphaned. */
+		tmp.nh = nh;
+		/* No scheduler ref was taken here (we bypassed the scheduler), and the 500 was emitted
+		 * SYNCHRONOUSLY above while the caller still owns pvt - so do NOT drop a pvt ref here (the
+		 * caller drops its own after we return). Keep only the unbound-SUBSCRIBE reap. */
+		tmp.pvt_ref = NULL;
+		tmp.reap_handle_on_fire = reap_handle_on_fire;
+		sofia_delay_reject_deferred_cleanup(&tmp);
 		return;
 	}
 
-	/* Timing-equalization: dummy HMAC + jitter to match known-peer-bad-password
-	 * timing across all unknown-peer callsites. */
+	/* Timing-equalization: the cheap deterministic dummy HMAC runs INLINE here to
+	 * match known-peer-bad-password compute cost across all unknown-peer callsites. */
 	sofia_emit_timing_equalized_reject();
 
-	/* Unknown-peer challenge — same global offer as everyone else; the
-	 * auth_algorithms selection (MD5 first) is applied inside the helper. */
-	sofia_emit_auth_challenge(nua, nh, realm, fresh_nonce, 0);
-
 	sofia_get_source_addr(sip, &src);
-	ast_copy_string(addr_buf, ast_sockaddr_stringify(&src), sizeof(addr_buf));
 
-	manager_event(EVENT_FLAG_SYSTEM, "AuthFailure",
-		"Peer: SIP/UNKNOWN\r\n"
-		"Method: %s\r\n"
-		"Reason: %s\r\n"
-		"RemoteAddr: %s\r\n"
-		"ChannelType: SIP\r\n",
-		method ? method : "UNKNOWN",
-		reason ? reason : "UnknownPeer",
-		addr_buf);
+	/* The 10-50ms jitter + the actual 401 challenge + the AMI AuthFailure are deferred
+	 * ASYNCHRONOUSLY onto a su_timer (NON-blocking — the dispatcher is not parked). The
+	 * challenge is rebuilt in the timer callback from the snapshotted realm+nonce (same
+	 * global MD5/SHA-256 offer as everyone else, applied inside sofia_emit_auth_challenge).
+	 * Under overload (fuse tripped) or scheduling failure, it is emitted immediately. */
+	sofia_delay_reject_schedule(SOFIA_DELAY_REJECT_401_CHALLENGE,
+		nua, nh, realm, fresh_nonce,
+		method ? method : "UNKNOWN", reason ? reason : "UnknownPeer", &src,
+		pvt_ref, reap_handle_on_fire);
 }
 
 /* Emits a SubscribeRejected AMI event at every gate-rejected SUBSCRIBE (global
@@ -7591,7 +8196,9 @@ static int sofia_check_lockuseragent(nua_t *nua, nua_handle_t *nh,
 	{
 		char realm_buf[MAXHOSTNAMELEN];
 		realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
-		sofia_send_auth_challenge(nua, nh, sip, realm, "REGISTER", "UserAgentMismatch");
+		/* REGISTER: no pvt pin and no reap — the REGISTER server handle is neither
+		 * pvt-bound here nor reaped by us, so it is unaffected by the residual-race fence. */
+		sofia_send_auth_challenge(nua, nh, sip, realm, "REGISTER", "UserAgentMismatch", NULL, 0);
 	}
 
 	sofia_get_source_addr(sip, &src);
@@ -7968,7 +8575,8 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 	peer = sofia_find_peer(user);
 	if (!peer) {
 		if (sofia_cfg.alwaysauthreject) {
-			sofia_send_auth_challenge(nua, nh, sip, realm, "REGISTER", "UnknownPeer");
+			/* REGISTER: no pvt pin / no reap — unaffected by the residual-race fence. */
+			sofia_send_auth_challenge(nua, nh, sip, realm, "REGISTER", "UnknownPeer", NULL, 0);
 			ast_verbose("Sofia: REGISTER from unknown peer '%s' — 401 challenge (alwaysauthreject)\n", user);
 		} else {
 			nua_respond(nh, SIP_403_FORBIDDEN, TAG_END());
@@ -9027,13 +9635,60 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 
 	switch (event) {
 	case SOFIA_INC_CALL_LIMIT:
-	case SOFIA_INC_CALL_RINGING:
-		if (peer->call_limit > 0 && peer->inUse >= peer->call_limit) {
+	case SOFIA_INC_CALL_RINGING: {
+		/* SNAPSHOT IDIOM (UAF/TOCTOU fix). The OUTBOUND path (sofia_call -> SOFIA_INC_CALL_RINGING)
+		 * runs OFF sofia_thread, so a concurrent reload writer (ast_string_field_set under peer->lock)
+		 * can free peer->context / peer->accountcode mid-read = UAF, and the bare peer->inUse limit
+		 * test was an unlocked TOCTOU vs the increment below. Fix: (1) snapshot the freeable fields +
+		 * src_addr + the int knobs under peer->lock into locals; (2) take the limit DECISION atomically
+		 * with the increment under ao2_lock(peer) (the same lock the counters live under). The two
+		 * locks are NOT co-held (peer->lock then released, then ao2_lock) — no new lock-order edge. */
+		char l_name[80];
+		char l_context[AST_MAX_CONTEXT];
+		char l_accountcode[256];	/* UNBOUNDED stringfield -> >=256 (SNAPSHOT IDIOM); emit value verbatim, no truncation */
+		char l_address[64] = "";
+		int l_call_limit;
+		int l_busy_level;
+		int inUse_snap, inRinging_snap;
+		int rejected = 0;
+
+		ast_mutex_lock(&peer->lock);
+		ast_copy_string(l_name, peer->name, sizeof(l_name));
+		ast_copy_string(l_context, peer->context, sizeof(l_context));
+		ast_copy_string(l_accountcode, S_OR(peer->accountcode, ""), sizeof(l_accountcode));
+		if (!ast_sockaddr_isnull(&peer->src_addr)) {
+			ast_copy_string(l_address, ast_sockaddr_stringify(&peer->src_addr), sizeof(l_address));
+		}
+		l_call_limit = peer->call_limit;
+		l_busy_level = peer->busy_level;
+		ast_mutex_unlock(&peer->lock);
+
+		/* Decision + increment under ONE critical section: read inUse and (if allowed) bump it
+		 * atomically so a parallel call cannot slip past the limit between the test and the bump. */
+		ast_mutex_lock(&pvt->lock);
+		ao2_lock(peer);
+		if (l_call_limit > 0 && peer->inUse >= l_call_limit) {
+			rejected = 1;
+		} else {
+			if (event == SOFIA_INC_CALL_RINGING && !pvt->ring_inc_done) {
+				peer->inRinging++;
+				pvt->ring_inc_done = 1;
+			}
+			if (!pvt->call_inc_done) {
+				peer->inUse++;
+				pvt->call_inc_done = 1;
+			}
+		}
+		inUse_snap = peer->inUse;
+		inRinging_snap = peer->inRinging;
+		ao2_unlock(peer);
+		ast_mutex_unlock(&pvt->lock);
+
+		if (rejected) {
 			ast_log(LOG_NOTICE, "Call %s peer '%s' rejected due to usage limit of %d\n",
 				(event == SOFIA_INC_CALL_RINGING) ? "to" : "from",
-				peer->name, peer->call_limit);
-
-			/* Emit peer->accountcode actual value (chan_sip parity). */
+				l_name, l_call_limit);
+			/* Emit peer->accountcode actual value (chan_sip parity) — all from the snapshot. */
 			manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
 				"ChannelType: SIP\r\n"
 				"Peer: SIP/%s\r\n"
@@ -9046,32 +9701,16 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 				"RingingCalls: %d\r\n"
 				"CallLimit: %d\r\n"
 				"Event: CALL_REJECTED\r\n",
-				peer->name,
-				!ast_sockaddr_isnull(&peer->src_addr) ? ast_sockaddr_stringify(&peer->src_addr) : "",
-				peer->context,
-				S_OR(peer->accountcode, ""),
-				peer->inUse, peer->inRinging, peer->call_limit);
+				l_name, l_address, l_context, l_accountcode,
+				inUse_snap, inRinging_snap, l_call_limit);
 			return -1;
 		}
-
-		ast_mutex_lock(&pvt->lock);
-		ao2_lock(peer);
-		if (event == SOFIA_INC_CALL_RINGING && !pvt->ring_inc_done) {
-			peer->inRinging++;
-			pvt->ring_inc_done = 1;
-		}
-		if (!pvt->call_inc_done) {
-			peer->inUse++;
-			pvt->call_inc_done = 1;
-		}
-		ao2_unlock(peer);
-		ast_mutex_unlock(&pvt->lock);
 
 		/* Emit peer->accountcode actual value (chan_sip parity).
 		 * Gated on call_limit/busy_level: this AMI emit previously only ran for
 		 * limited peers (the early-return guarded it); keep it that way now that the
-		 * early-return is gone, so non-limit peers don't newly emit it. */
-		if (peer->call_limit || peer->busy_level) {
+		 * early-return is gone, so non-limit peers don't newly emit it. All from the snapshot. */
+		if (l_call_limit || l_busy_level) {
 			manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
 				"ChannelType: SIP\r\n"
 				"Peer: SIP/%s\r\n"
@@ -9084,14 +9723,12 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 				"RingingCalls: %d\r\n"
 				"CallLimit: %d\r\n"
 				"Event: %s\r\n",
-				peer->name,
-				!ast_sockaddr_isnull(&peer->src_addr) ? ast_sockaddr_stringify(&peer->src_addr) : "",
-				peer->context,
-				S_OR(peer->accountcode, ""),
-				peer->inUse, peer->inRinging, peer->call_limit,
+				l_name, l_address, l_context, l_accountcode,
+				inUse_snap, inRinging_snap, l_call_limit,
 				event == SOFIA_INC_CALL_RINGING ? "INC_CALL_RINGING" : "INC_CALL_LIMIT");
 		}
 		break;
+	}
 
 	case SOFIA_DEC_CALL_LIMIT:
 		ast_mutex_lock(&pvt->lock);
@@ -9387,13 +10024,35 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 			char realm_buf[MAXHOSTNAMELEN];
 			const char *realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
 			ast_log(LOG_NOTICE, "Sofia MWI: SUBSCRIBE for unknown peer '%s' — 401 challenge (alwaysauthreject)\n", to_user);
-			sofia_send_auth_challenge(nua, nh, sip, realm, "SUBSCRIBE", "UnknownPeer");
+			/* RESIDUAL-RACE FENCE: nh is UNBOUND (no pvt). Reaping it NOW (the old code)
+			 * dispatches nua_handle_destroy -> nta_incoming_destroy auto-500, racing ahead of
+			 * the deferred 401 timer. Defer the reap: pass reap_handle_on_fire=1 so the timer
+			 * emits the 401 FIRST, then reaps. The immediate reap below is taken ONLY on the
+			 * 404 branch. */
+			sofia_send_auth_challenge(nua, nh, sip, realm, "SUBSCRIBE", "UnknownPeer", NULL, 1);
 		} else {
 			ast_log(LOG_NOTICE, "Sofia MWI: SUBSCRIBE for unknown peer '%s' — 404\n", to_user);
 			nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
+			sofia_subscribe_reject_reap(nh);	/* immediate reap — 404 branch (no deferred 401) */
 		}
-		sofia_subscribe_reject_reap(nh);	/* reap on both the 401-challenge and the 404 branch */
 		return;
+	}
+
+	/* Per-peer source-IP ACL, BEFORE the allowsubscribe/digest gates (chan_sip parity, chan_sip.c
+	 * :17020 applies peer->ha unconditionally before auth). REGISTER (peer->ha @8084) and INVITE
+	 * (caller_peer->ha @5549) apply the same gate; without it a credential-less peer is watchable by
+	 * spoofing the To/From user-part from a denied IP. RFC 6665. */
+	if (peer->ha) {
+		struct ast_sockaddr src;
+		sofia_get_source_addr(sip, &src);
+		if (ast_apply_ha(peer->ha, &src) != AST_SENSE_ALLOW) {
+			ast_log(LOG_NOTICE, "Sofia MWI: SUBSCRIBE for peer '%s' rejected by peer ACL\n",
+				peer->name);
+			nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
+			ao2_ref(peer, -1);
+			sofia_subscribe_reject_reap(nh);	/* reap the challenge handle */
+			return;
+		}
 	}
 
 	/* allowsubscribe=no gate (chan_sip parity). The "403 Forbidden (policy)" string is
@@ -9594,13 +10253,34 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		if (sofia_cfg.alwaysauthreject) {
 			char realm_buf[MAXHOSTNAMELEN];
 			const char *realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
-			sofia_send_auth_challenge(nua, nh, sip, realm, "SUBSCRIBE", "UnknownPeer");
+			/* RESIDUAL-RACE FENCE: nh is UNBOUND. Defer the reap (reap_handle_on_fire=1) so the
+			 * timer emits the 401 FIRST, then reaps — else an immediate reap dispatches
+			 * nta_incoming_destroy's auto-500 ahead of our deferred 401. The immediate reap below
+			 * is taken ONLY on the 404 branch. */
+			sofia_send_auth_challenge(nua, nh, sip, realm, "SUBSCRIBE", "UnknownPeer", NULL, 1);
 		} else {
 			ast_log(LOG_NOTICE, "Sofia presence: SUBSCRIBE from unknown peer '%s' — 404\n", from_user);
 			nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
+			sofia_subscribe_reject_reap(nh);	/* immediate reap — 404 branch (no deferred 401) */
 		}
-		sofia_subscribe_reject_reap(nh);	/* reap on both the 401-challenge and the 404 branch */
 		return;
+	}
+
+	/* Per-peer source-IP ACL, BEFORE the allowsubscribe/digest gates (chan_sip parity, chan_sip.c
+	 * :17020 applies peer->ha unconditionally before auth). REGISTER (peer->ha @8084) and INVITE
+	 * (caller_peer->ha @5549) apply the same gate; without it a credential-less peer is watchable by
+	 * spoofing the From user-part from a denied IP. RFC 6665. */
+	if (peer->ha) {
+		struct ast_sockaddr ha_src;
+		sofia_get_source_addr(sip, &ha_src);
+		if (ast_apply_ha(peer->ha, &ha_src) != AST_SENSE_ALLOW) {
+			ast_log(LOG_NOTICE, "Sofia presence: SUBSCRIBE from peer '%s' rejected by peer ACL\n",
+				peer->name);
+			nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
+			ao2_ref(peer, -1);
+			sofia_subscribe_reject_reap(nh);	/* reap the challenge handle */
+			return;
+		}
 	}
 
 	if (!peer->allowsubscribe) {
@@ -9673,6 +10353,27 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		expires = SOFIA_PRESENCE_DEFAULT_EXPIRY;
 	} else {
 		expires = (int) sip->sip_expires->ex_delta;
+	}
+
+	/* Min-Expires floor (RFC 6665 §4.2.1: the notifier MAY return 423 Interval Too Brief).
+	 * Mirrors the REGISTER path (sofia_check_register_expiry) so an authenticated watcher
+	 * requesting Expires:1 can't force ~1 Hz re-auth + re-NOTIFY + AMI churn. Reuse the
+	 * operator's configured registration floor (sofia_cfg.min_expiry) for a single, consistent
+	 * knob. expires <= 0 is the unsubscribe path below — never floored. */
+	if (expires > 0 && expires < sofia_cfg.min_expiry) {
+		char min_str[16];
+		snprintf(min_str, sizeof(min_str), "%d", sofia_cfg.min_expiry);
+		nua_respond(nh, 423, "Interval Too Brief",
+			SIPTAG_MIN_EXPIRES_STR(min_str),
+			NUTAG_WITH_THIS(nua),
+			TAG_END());
+		sofia_subscribe_reject_reap(nh);	/* reap the challenge handle (MWI discipline) */
+		if (sofia_debug) {
+			ast_verbose("Sofia presence: SUBSCRIBE Expires:%d below min %d — 423 Interval Too Brief "
+				"(watcher SIP/%s -> %s@%s)\n",
+				expires, sofia_cfg.min_expiry, l_peername, to_user, l_context);
+		}
+		return;
 	}
 
 	/* Replace/terminate any existing subscription for this key. */
@@ -9936,8 +10637,15 @@ static void sofia_process_notify(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op)
 {
 	struct ast_channel *bridged = NULL;
-	const char *bridgepeer_name = NULL;
 	struct ast_channel *self;
+	/* BRIDGEPEER is a channel name (<= AST_CHANNEL_NAME); linkedid is a uniqueid (name +
+	 * suffix). Copy both UNDER the self lock into locals (mirrors the twin
+	 * sofia_dc_pair_bridged ~:10695-10741): their backing store (channel var storage /
+	 * the linkedid string field) is only stable while self is locked, and Methods 2/3 run
+	 * AFTER we unlock self — a post-unlock read of self->linkedid / BRIDGEPEER would race
+	 * a concurrent masquerade/rename freeing it. */
+	char bridgepeer_copy[AST_CHANNEL_NAME];
+	char linkedid_copy[AST_CHANNEL_NAME + 64];
 
 	if (!op) {
 		return NULL;
@@ -9956,10 +10664,40 @@ struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op)
 		return NULL;
 	}
 
-	/* Method 1: _bridge pointer (borrowed → take a ref) */
+	/* WITH self LOCKED do ONLY the lock-internal work — Method 1 (the ast_bridged_channel
+	 * contract) and copying BRIDGEPEER + linkedid into locals for Methods 2/3.
+	 *
+	 * Method 1: _bridge pointer (borrowed → take a ref).
+	 * ast_bridged_channel() contract (channel.h:2318-2327): off the owning thread
+	 * (this runs on sofia_thread via sofia_process_refer, and on the rtp_glue path)
+	 * 'self' MUST be locked BEFORE the call and stay locked WHILE the borrowed result
+	 * is used — channel.c reads self->_bridge then derefs bridged->tech, and a
+	 * concurrent masquerade/hangup can repoint/free self->_bridge between the read and
+	 * our use (torn-pointer/UAF on a blind/attended REFER). So lock self, +1-ref the
+	 * borrowed _bridge under the lock (the ref then keeps it alive independently),
+	 * then unlock — mirroring the twin sofia_dc_pair_bridged Method 1. Channel locks
+	 * are recursive, so a caller already holding self's lock (sofia_get_rtp_peer) is
+	 * safe; self is the top of the lock order (no pvt/peer lock is held here). */
+	bridgepeer_copy[0] = '\0';
+	linkedid_copy[0] = '\0';
+	ast_channel_lock(self);
 	bridged = ast_bridged_channel(self);
 	if (bridged) {
 		ast_channel_ref(bridged);
+	} else {
+		/* Method 1 missed: COPY the inputs Methods 2/3 need so they can run OFF the self
+		 * lock (Method 2 takes the channels CONTAINER lock — channel.h:1319-1322 mandates
+		 * container-before-channel, so it must NOT run under a channel lock). */
+		const char *bridgepeer_name = pbx_builtin_getvar_helper(self, "BRIDGEPEER");
+		if (!ast_strlen_zero(bridgepeer_name)) {
+			ast_copy_string(bridgepeer_copy, bridgepeer_name, sizeof(bridgepeer_copy));
+		}
+		if (self->linkedid) {
+			ast_copy_string(linkedid_copy, self->linkedid, sizeof(linkedid_copy));
+		}
+	}
+	ast_channel_unlock(self);
+	if (bridged) {
 		if (sofia_debug) {
 			ast_verbose("Sofia: bridged-finder method 1 (_bridge): %s\n", bridged->name);
 		}
@@ -9968,32 +10706,32 @@ struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op)
 	}
 
 	/* Method 2: BRIDGEPEER channel-var (ast_channel_get_by_name_prefix already +1's
-	 * it — KEEP that ref and hand it to the caller). */
-	bridgepeer_name = pbx_builtin_getvar_helper(self, "BRIDGEPEER");
-	if (bridgepeer_name && !ast_strlen_zero(bridgepeer_name)) {
-		bridged = ast_channel_get_by_name_prefix(bridgepeer_name, strlen(bridgepeer_name));
+	 * it — KEEP that ref and hand it to the caller). Run OFF the self lock (it takes the
+	 * channels container lock) against the COPY taken above. */
+	if (!ast_strlen_zero(bridgepeer_copy)) {
+		bridged = ast_channel_get_by_name_prefix(bridgepeer_copy, strlen(bridgepeer_copy));
 		if (bridged) {
 			if (sofia_debug) {
 				ast_verbose("Sofia: bridged-finder method 2 (BRIDGEPEER=%s): %s\n",
-					bridgepeer_name, bridged->name);
+					bridgepeer_copy, bridged->name);
 			}
 			ast_channel_unref(self);
 			return bridged;	/* already +1 */
 		}
 	}
 
-	/* Method 3: dialogs linkedid walk (sibling Sofia leg). Read+ref each sibling's
-	 * owner under its pvt->lock (its sofia_hangup nulls p->owner then frees it). */
-	{
+	/* Method 3: dialogs linkedid walk (sibling Sofia leg). Self is unlocked; compare
+	 * against the COPIED linkedid. Read+ref each sibling's owner under its pvt->lock
+	 * (its sofia_hangup nulls p->owner then frees it). */
+	if (!ast_strlen_zero(linkedid_copy)) {
 		struct ao2_iterator it = ao2_iterator_init(dialogs, 0);
 		struct sofia_pvt *p;
-		const char *my_linkedid = self->linkedid;
 		while ((p = ao2_iterator_next(&it))) {
-			if (p != op && my_linkedid) {
+			if (p != op) {
 				struct ast_channel *po;
 				ast_mutex_lock(&p->lock);
 				po = p->owner;
-				if (po && po->linkedid && !strcmp(po->linkedid, my_linkedid)) {
+				if (po && po->linkedid && !strcmp(po->linkedid, linkedid_copy)) {
 					bridged = ast_channel_ref(po);
 				}
 				ast_mutex_unlock(&p->lock);
@@ -10002,7 +10740,7 @@ struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op)
 			if (bridged) {
 				if (sofia_debug) {
 					ast_verbose("Sofia: bridged-finder method 3 (linkedid=%s): %s\n",
-						my_linkedid, bridged->name);
+						linkedid_copy, bridged->name);
 				}
 				break;
 			}
@@ -10295,21 +11033,44 @@ static struct sofia_pvt *sofia_pvt_ref_if_linked(nua_hmagic_t *hmagic);
 static struct ast_channel *sofia_ref_bridged_channel(struct ast_channel *owner)
 {
 	struct ast_channel *bridged = NULL;
-	const char *bridgepeer_name = NULL;
+	/* BRIDGEPEER is a channel name (<= AST_CHANNEL_NAME). Copy it UNDER the owner lock —
+	 * its backing store (channel var storage) is only stable while owner is locked, and
+	 * the get_by_name_prefix lookup runs AFTER we unlock. */
+	char bridgepeer_copy[AST_CHANNEL_NAME];
 
 	if (!owner) {
 		return NULL;
 	}
 
+	/* ast_bridged_channel() contract (channel.h:2318-2327): this runs OFF the owning
+	 * thread (sofia_thread, via sofia_local_attended_transfer ~:11018-11019), so 'owner'
+	 * MUST be locked BEFORE the call and stay locked WHILE the borrowed _bridge result is
+	 * used. Lock owner, +1-ref the borrowed _bridge under the lock (the ref then keeps it
+	 * alive independently), and copy BRIDGEPEER into a local for the post-unlock lookup —
+	 * mirroring the twin sofia_dc_pair_bridged + sofia_find_bridged_channel Method 1.
+	 * 'owner' is the top of the lock order; the caller already released its pvt->lock
+	 * before calling this (~:11003/:11010). */
+	bridgepeer_copy[0] = '\0';
+	ast_channel_lock(owner);
 	bridged = ast_bridged_channel(owner);
 	if (bridged) {
 		ast_channel_ref(bridged);
+	} else {
+		const char *bridgepeer_name = pbx_builtin_getvar_helper(owner, "BRIDGEPEER");
+		if (!ast_strlen_zero(bridgepeer_name)) {
+			ast_copy_string(bridgepeer_copy, bridgepeer_name, sizeof(bridgepeer_copy));
+		}
+	}
+	ast_channel_unlock(owner);
+	if (bridged) {
 		return bridged;
 	}
 
-	bridgepeer_name = pbx_builtin_getvar_helper(owner, "BRIDGEPEER");
-	if (!ast_strlen_zero(bridgepeer_name)) {
-		bridged = ast_channel_get_by_name_prefix(bridgepeer_name, strlen(bridgepeer_name));
+	/* BRIDGEPEER fallback: run OFF the owner lock (ast_channel_get_by_name_prefix takes
+	 * the channels container lock — channel.h:1319-1322 mandates container-before-channel)
+	 * against the copy. It already +1's the result. */
+	if (!ast_strlen_zero(bridgepeer_copy)) {
+		bridged = ast_channel_get_by_name_prefix(bridgepeer_copy, strlen(bridgepeer_copy));
 	}
 
 	return bridged;
@@ -10630,6 +11391,24 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 		 * dialplan and lets outbound INVITE generation carry future remote-Replaces
 		 * support. */
 	}
+
+		/* chan_sip parity (get_refer_info, chan_sip.c:16799): a BLIND transfer must
+		 * gate the Refer-To against the dialplan before redirecting — `attendedtransfer
+		 * || ast_exists_extension(...)`. Attended (incl. the remote-attended fallback that
+		 * reaches here) always passes; a blind REFER to a non-existent extension is refused
+		 * with a terminal failure NOTIFY instead of ast_async_goto'ing the transferee into a
+		 * dead context. Same priority-1 form used throughout this file (chan_sip.c:16799). */
+		if (!is_attended
+				&& !ast_exists_extension(NULL, op->context, refer_to, 1, NULL)) {
+			ast_log(LOG_WARNING, "Sofia: Blind REFER to non-existent extension %s@%s — refusing transfer\n",
+				refer_to, op->context);
+			/* RFC 3515: terminal failure NOTIFY (404) so the transferer's UA learns the
+			 * transfer was rejected; tear the transferer leg down (failure path). */
+			sofia_send_refer_notify(op, "404 Not Found", 1);
+			ast_queue_hangup(owner);
+			ast_channel_unref(owner);
+			return;
+		}
 
 		/* Blind transfer + remote attended-transfer fallback: redirect the transferee
 		 * (held leg) to the Refer-To extension via ast_async_goto.
@@ -11054,8 +11833,23 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	case nua_i_publish:
 	case nua_i_prack:
 	case nua_i_ack:
-		if (sofia_blacklist_check_sip(sip)) {
-			return;
+		/* Shared-NAT self-DoS fix: EXEMPT in-dialog requests from the blacklist drop. The gate is
+		 * IP-only (sofia_blacklist_check_sip), so behind a shared/carrier NAT one abuser drives the
+		 * public IP to the block threshold and then co-located LEGIT phones' in-dialog BYE/CANCEL/ACK
+		 * get dropped -> hung channels leaking call slots. A request that resolves to an EXISTING live
+		 * dialog (hmagic links into the dialogs container) is, by definition, on an already-established
+		 * call we accepted — never a brute-force vector — so let it through. Out-of-dialog / new
+		 * transactions (REGISTER, fresh INVITE [NULL hmagic], out-of-dialog SUBSCRIBE/MESSAGE/OPTIONS/
+		 * PUBLISH, peer-magic events) do NOT resolve to a dialog and stay fully gated. Runs on
+		 * sofia_thread (single dispatcher), so this find+release cannot race a concurrent hangup, and
+		 * the teardown-guard switch below re-finds the ref it needs. */
+		{
+			struct sofia_pvt *indialog = sofia_pvt_ref_if_linked(hmagic);
+			if (indialog) {
+				ao2_ref(indialog, -1);	/* exempt: in-dialog request on a live call */
+			} else if (sofia_blacklist_check_sip(sip)) {
+				return;
+			}
 		}
 		break;
 	default:
@@ -11512,6 +12306,13 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			if (rejected) {
 				/* Peer refused; revert to PBX relay. */
 				memset(&pvt->redirip, 0, sizeof(pvt->redirip));
+				/* FIX 1: a REFUSED/timed-out outbound T.38 (LOCAL_REINVITE) re-INVITE
+				 * must not leave T.38 stuck — transition to DISABLED so res_fax gets
+				 * AST_T38_REFUSED and falls back (chan_sip parity). Channel lock held
+				 * here (re-acquire loop above), so sofia_change_t38_state is safe. */
+				if (owner && pvt->t38_state == SOFIA_T38_LOCAL_REINVITE) {
+					sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
+				}
 			} else if (has_sdp) {
 				sdp_rc = sofia_parse_sdp(pvt, sip);
 			}
@@ -11563,7 +12364,14 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				if (owner) ast_channel_ref(owner);
 				ast_mutex_unlock(&pvt->lock);
 				if (sip && sip->sip_payload && sip->sip_payload->pl_data) {
+					/* FIX 4: hold the channel lock across the parse (mirrors the
+					 * directmedia 2xx + inbound re-INVITE paths) so the lazy udptl
+					 * create + T.38 setters don't race the channel-thread readers
+					 * (sofia_read/write/get_udptl). Recursive mutex → the parse commit
+					 * re-locking the same channel is safe. */
+					if (owner) ast_channel_lock(owner);
 					sofia_parse_sdp(pvt, sip);
+					if (owner) ast_channel_unlock(owner);
 				}
 				if (owner) {
 					ast_queue_control(owner, AST_CONTROL_RINGING);
@@ -11577,7 +12385,10 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				if (owner) ast_channel_ref(owner);
 				ast_mutex_unlock(&pvt->lock);
 				if (sip && sip->sip_payload && sip->sip_payload->pl_data) {
+					/* FIX 4: channel lock across the parse (see status==180). */
+					if (owner) ast_channel_lock(owner);
 					sofia_parse_sdp(pvt, sip);
+					if (owner) ast_channel_unlock(owner);
 				}
 				if (owner) {
 					ast_queue_control(owner, AST_CONTROL_PROGRESS);
@@ -11615,7 +12426,15 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 
 				int sdp_rc = 0;
 				if (sip && sip->sip_payload && sip->sip_payload->pl_data) {
+					/* FIX 4: hold the channel lock across the parse (mirrors the
+					 * directmedia 2xx + inbound re-INVITE paths) so the lazy udptl
+					 * create + T.38 setters (and the FIX 1b LOCAL_REINVITE → ENABLED
+					 * commit) don't race the channel-thread readers
+					 * (sofia_read/write/get_udptl). owner is non-NULL here (orphan guard
+					 * above). Recursive mutex → the parse commit re-locking is safe. */
+					ast_channel_lock(owner);
 					sdp_rc = sofia_parse_sdp(pvt, sip);
+					ast_channel_unlock(owner);
 				}
 				/* The final 2xx may carry Diversion (downstream redirect). */
 				sofia_change_redirecting_info(pvt, owner, sip);
@@ -12132,6 +12951,12 @@ static void *sofia_thread_func(void *data)
 	sofia_eventsub_start();
 
 	su_root_run(sofia_root);
+
+	/* Async timing-equalized rejects: cancel + destroy every still-pending one-shot
+	 * timer and free its ctx (dropping the pinned nua_handle ref) BEFORE nua_destroy /
+	 * su_root_destroy below, so a firing timer can never deref freed code or a destroyed
+	 * handle. Runs on THIS thread (the su_root task), matching the timer's fire thread. */
+	sofia_delay_reject_shutdown();
 
 	sofia_presence_stop();
 
@@ -14750,17 +15575,47 @@ static int sofia_peer_mark_cb(void *obj, void *arg, int flags)
 	return 0;
 }
 
+/* Deferred dialplan-hint removal node. ABBA fix (see sofia_peer_sweep_cb): the sweep runs UNDER the
+ * peers ao2-container lock, but sofia_remove_peer_hints -> ast_context_remove_extension takes conlock,
+ * giving peers->conlock. The reverse leg (dialplan merge wrlock_contexts -> ast_extension_state2 ->
+ * sofia_devicestate -> ao2_find(peers)) is conlock->peers, so removing the hint inside the callback is
+ * an ABBA deadlock. The callback instead COLLECTS bounded copies of each swept peer's hint spec into
+ * this list, and the caller drains it AFTER the container lock is released. */
+struct sofia_swept_hint {
+	AST_LIST_ENTRY(sofia_swept_hint) list;
+	char regexten[256];		/* a multi-token regexten SPEC — matches the 256 the splitter uses */
+	char subscribecontext[AST_MAX_CONTEXT];
+};
+AST_LIST_HEAD_NOLOCK(sofia_swept_hint_list, sofia_swept_hint);
+
 static int sofia_peer_sweep_cb(void *obj, void *arg, int flags)
 {
 	struct sofia_peer *peer = obj;
+	struct sofia_swept_hint_list *hints = arg;	/* deferred hint-removal accumulator (may be NULL) */
 	if (!peer->_reload_marked || peer->is_realtime) {
 		return 0;
 	}
 	/* Drain MWI before the final unref so the destructor's drain can't resurrect the peer. */
 	sofia_peer_drain_mwi(peer);
-	/* Drop our own dialplan hint (registrar matches sofia_create_peer_hint). */
-	if (!ast_strlen_zero(peer->subscribecontext) && !ast_strlen_zero(peer->regexten)) {
-		sofia_remove_peer_hints(peer->regexten, peer->subscribecontext, "sofia_config_peer");
+	/* ABBA fix: do NOT remove the dialplan hint here — we run UNDER the peers container lock and
+	 * sofia_remove_peer_hints takes conlock (peers->conlock inverts the dialplan-merge conlock->peers
+	 * leg). Snapshot the hint spec into the caller's list; the caller removes it after the container
+	 * lock is dropped. (registrar matches sofia_create_peer_hint = "sofia_config_peer".) */
+	if (hints && !ast_strlen_zero(peer->subscribecontext) && !ast_strlen_zero(peer->regexten)) {
+		struct sofia_swept_hint *h = ast_calloc(1, sizeof(*h));
+		if (h) {
+			ast_copy_string(h->regexten, peer->regexten, sizeof(h->regexten));
+			ast_copy_string(h->subscribecontext, peer->subscribecontext, sizeof(h->subscribecontext));
+			AST_LIST_INSERT_HEAD(hints, h, list);
+		} else {
+			/* OOM: do NOT remove the hint here - that takes conlock UNDER the peers lock, the exact
+			 * peers->conlock ABBA this fix removes. Log + leave the stale BLF hint;
+			 * the next reload / CLI cleanup reaps it. A leaked hint is strictly better than reintroducing
+			 * the deadlock on the OOM path. */
+			ast_log(LOG_WARNING, "Sofia: OOM deferring hint removal for swept peer '%s' (exten %s@%s); "
+				"stale BLF hint left for the next reload\n",
+				peer->name, peer->regexten, peer->subscribecontext);
+		}
 	}
 	/* Release dnsmgr + drop its +1 ref FIRST, else the destructor never runs (its ref pins
 	 * refcount >= 1 after ao2_unlink). ast_dnsmgr_release is synchronous (waits for in-flight
@@ -14955,9 +15810,21 @@ static void sofia_reload_worker(void *data)
 			goto signal_done;
 		}
 
-		/* Sweep peers that disappeared from sofia.conf. */
-		ao2_callback(peers, OBJ_NODATA | OBJ_UNLINK | OBJ_MULTIPLE,
-			sofia_peer_sweep_cb, NULL);
+		/* Sweep peers that disappeared from sofia.conf. ABBA fix: the sweep callback runs UNDER the
+		 * peers container lock and CANNOT remove dialplan hints there (conlock inversion). It collects
+		 * each swept peer's hint spec into swept_hints; we drain that list (removing the hints) AFTER
+		 * ao2_callback returns and the container lock is released. */
+		{
+			struct sofia_swept_hint_list swept_hints = AST_LIST_HEAD_NOLOCK_INIT_VALUE;
+			struct sofia_swept_hint *h;
+			ao2_callback(peers, OBJ_NODATA | OBJ_UNLINK | OBJ_MULTIPLE,
+				sofia_peer_sweep_cb, &swept_hints);
+			/* Container lock released — now safe to take conlock (peers no longer held). */
+			while ((h = AST_LIST_REMOVE_HEAD(&swept_hints, list))) {
+				sofia_remove_peer_hints(h->regexten, h->subscribecontext, "sofia_config_peer");
+				ast_free(h);
+			}
+		}
 
 		/* Outbound-PUBLISH reconcile: add/remove/rebuild publications to match the new config. */
 		sofia_publications_reconcile(

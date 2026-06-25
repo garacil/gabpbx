@@ -207,6 +207,10 @@ int sofia_sdp_extract_hold(sip_t const *sip, su_home_t *home);
 
 struct sofia_peer *sofia_find_peer(const char *name);
 struct sofia_peer *sofia_find_peer_cached(const char *name);	/* cache-only: no realtime fallback */
+/* Out-of-dialog MESSAGE digest gate (RFC 3428): challenge/verify a credentialed peer with the
+ * SAME path as INVITE before dialplan. peer NULL or creds-less -> 0 (proceed; caller's allowguest
+ * applies for guests). Returns 0 = proceed, nonzero = 401/4xx already sent, STOP + reap the handle. */
+int sofia_message_authenticate(struct sofia_peer *peer, nua_t *nua, nua_handle_t *nh, sip_t const *sip);
 /* Normalize peer/[general] outboundproxy into a "sip:HOST[:PORT];lr" Route; buf empty if none.
  * Caller MUST hold peer->lock. Shared by REGISTER + the outbound MWI SUBSCRIBE (sofia_subscribe.c). */
 void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len);
@@ -511,12 +515,14 @@ struct sofia_pvt {
 	unsigned int webrtc_video_bundle_only:1;     /* offer's m=video carried a=bundle-only (RFC 8843 §7.3.2) → MUST keep video port-0 reflected, cannot move out */
 	int webrtc_reject_m_count;
 	int webrtc_accepted_video_idx;           /* reject_m index of the accepted video — STEP 6 emits it real, the emit skips ONLY this entry; every OTHER m=video is port-0 reflected (Review HIGH 1:1, RFC 3264 §6 count). -1 = none */
+	int webrtc_audio_offer_idx;              /* ABSOLUTE position of the m=audio in the offer's m= list (0-based). The answer MUST mirror offer m-line ORDER (RFC 3264 §6 / RFC 8829 §5.3): the emit walks offer slots 0..N and places audio at THIS index, every non-audio section at its webrtc_reject_m[].offer_idx. -1 = no audio offered */
 	unsigned int webrtc_reject_overflow:1;   /* >ARRAY_LEN(webrtc_reject_m) non-audio m= offered → emit fails closed (RFC 3264 §6: cannot drop m-lines) */
 	struct sofia_webrtc_reject_m {
 		char type_name[16];  /* offered m= media-type STRING (sofia m_type_name), echoed verbatim (RFC 3264 §6) */
 		char proto[40];      /* m= transport proto-name (a port-0 reflect keeps it; RFC 3264) */
 		char fmt[24];        /* first m= format token */
 		char mid[64];        /* its a=mid (RFC 8843 — must appear in the answer too) */
+		int offer_idx;       /* ABSOLUTE position of THIS section in the offer's m= list (0-based), so the answer mirrors offer order (RFC 3264 §6 / RFC 8829 §5.3) */
 	} webrtc_reject_m[6];
 	/* Phase 2a WebRTC DataChannel (RFC 8831/8832) transport handle, NULL when this leg has no
 	 * negotiated m=application. An opaque ao2 object owned by sofia_datachannel.c (the usrsctp
@@ -651,7 +657,7 @@ struct sofia_peer {
 	struct ast_dnsmgr_entry *dnsmgr; /* async DNS-tracking handle for peers with host=hostname; NULL when host is an IP-literal or dnsmgr disabled. Callback updates peer->src_addr on DNS change. Lifecycle (UAF-safe): ao2_bump(peer) at registration for a callback-safe ref; release-then-unref BEFORE refcount hits 0 at reload-sweep; defensive ast_dnsmgr_release in the destructor. */
 	struct ast_ha *directmediaha;   /* cross-leg direct-media ACL (chan_sip parity): at sofia_get_rtp_peer, the BRIDGE PARTNER's directmediaha is tested against THIS leg's RTP remote addr — "peer X directmediadeny=Y/24" refuses direct media when the other leg's endpoint is in Y/24. Per-peer only. */
 	unsigned int last_nc;
-	char last_cnonce[128];          /* last accepted qop cnonce (RFC 2617 §3.2.2). The nc-replay check rejects only a byte-identical (nonce,nc,cnonce) resend, so a periodic REGISTER refresh restarting at nc=1 with a FRESH cnonce is NOT mistaken for a replay (without this, the reused per-peer nonce + carried last_nc made nearly every refresh's first authed attempt a false replay → spurious 401 stale=true). Cleared on nonce regen. */
+	char last_cnonce[128];          /* RESERVED. The nc-replay check is now strict per-nonce monotonic and cnonce-INDEPENDENT (RFC 2617 §3.2.2; a valid-but-replayed nc rotates the nonce verify-first, see sofia_verify_digest_auth), so this field is no longer consulted by the auth path; retained to avoid a struct-layout change. Cleared on nonce regen. */
 	time_t nonce_issued_at;
 	int insecure;
 	int transport;
