@@ -611,10 +611,11 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 
 	sofia_cli_peer_section(&buf, "Registration");
 	sofia_cli_peer_line(&buf, "Source", "%s", source_str);
-	/* Outbound register state — only meaningful for a register target. */
-	if (!ast_strlen_zero(peer->secret)
-		&& !ast_strlen_zero(peer->host)
-		&& strcasecmp(peer->host, "dynamic") != 0) {
+	/* Outbound register state — ONLY for an explicit register=> peer (is_register_line), matching
+	 * sofia_do_register's opt-in gate. A static challenge-auth trunk (secret only for outbound digest
+	 * auth, e.g. a carrier or SBC challenge-auth trunk) is NOT a register target and must not show register
+	 * scaffolding — showing it falsely implied the peer was registering. */
+	if (peer->is_register_line) {
 		sofia_cli_peer_line(&buf, "Outbound reg", "target=%s:%d expiry=%lds attempts=%d",
 			peer->host, peer->port,
 			peer->reg_expiry > 0 ? (long)(peer->reg_expiry - time(NULL)) : 0,
