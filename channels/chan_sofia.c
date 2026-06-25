@@ -535,6 +535,21 @@ const char *sofia_transport_name(int transport)
 	}
 }
 
+/* Build the outbound-REGISTER request URI (and the matching To/From URI) for a peer:
+ * sip:defaultuser@host:port plus the peer's configured ;transport= so a tls/tcp/ws/wss
+ * trunk's REGISTER routes over that transport instead of sofia-sip's default UDP. The
+ * append helper is a no-op for udp/empty/unknown, so plain UDP peers stay byte-identical.
+ * Mirrors the INVITE path (sofia_uri_append_transport + sofia_transport_name). Caller
+ * serializes peer->host/port/defaultuser/transport (peer->lock or the load/reg thread). */
+static void sofia_build_register_uri(struct sofia_peer *peer, char *out, size_t len)
+{
+	char hbuf[80];	/* IPv6-bracket-wrap (RFC 3261 §19.1.2); helper is idempotent */
+
+	snprintf(out, len, "sip:%s@%s:%d", peer->defaultuser,
+		sofia_uri_format_host(peer->host, hbuf, sizeof(hbuf)), peer->port);
+	sofia_uri_append_transport(out, len, sofia_transport_name(peer->transport));
+}
+
 /* Build a NAT-traversal proxy URL from peer->src_addr for outbound in-dialog
  * messages when peer has nat=force_rport (or comedia). Without it sofia-sip
  * routes the 2xx-ACK/BYE to the dialog remote_target (the Contact's unroutable
@@ -11226,6 +11241,16 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 
 				ast_mutex_lock(&peer->lock);
 
+				/* Outbound REGISTER is opt-in: only a [general] `register =>` line
+				 * sets is_register_line. A static challenge-auth trunk (secret + static
+				 * host, NO register=>) must NOT re-REGISTER on a 401/407 — refuse here so
+				 * a spurious challenge can't drive an auth loop. */
+				if (!peer->is_register_line) {
+					ast_mutex_unlock(&peer->lock);
+					ao2_ref(peer, -1);
+					break;
+				}
+
 				/* registerattempts (chan_sip parity): at the cap, give up the
 				 * auth-challenge re-register to prevent runaway auth storms. */
 				if (sofia_cfg.register_attempts > 0 && peer->reg_attempts >= sofia_cfg.register_attempts) {
@@ -11247,13 +11272,8 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 						peer->defaultuser, peer->secret, proxy_creds, sizeof(proxy_creds)) == 0) {
 					have_proxy = 1;
 				}
-				/* Bracket-wrap an IPv6 host literal (RFC 3261 §19.1.2). Idempotent. */
-				{
-					char hbuf[80];
-					snprintf(uri, sizeof(uri), "sip:%s@%s:%d", peer->defaultuser,
-						sofia_uri_format_host(peer->host, hbuf, sizeof(hbuf)),
-						peer->port);
-				}
+				/* sip:user@host:port + ;transport= for tls/tcp/ws/wss (UDP no-op). */
+				sofia_build_register_uri(peer, uri, sizeof(uri));
 
 				ast_verbose("Sofia: Responding to auth challenge for %s\n", peer->name);
 
@@ -12694,6 +12714,19 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 					v->value);
 				sofia_cfg.publish_format = SOFIA_SUB_DIALOG_INFO;
 			}
+		} else if (!strcasecmp(v->name, "publish_transport")) {
+			/* ;transport= appended to the PUBLISH R-URI so a tls/tcp/ws/wss ESC is reached over that
+			 * transport (sofia-sip otherwise defaults a bare sip:exten@host:port R-URI to UDP). Validate
+			 * against the same tokens as a peer's transport=; invalid -> udp + warn. udp = no-op. */
+			if (!strcasecmp(v->value, "udp") || !strcasecmp(v->value, "tcp")
+					|| !strcasecmp(v->value, "tls") || !strcasecmp(v->value, "ws")
+					|| !strcasecmp(v->value, "wss")) {
+				ast_copy_string(sofia_cfg.publish_transport, v->value, sizeof(sofia_cfg.publish_transport));
+			} else {
+				ast_log(LOG_WARNING, "Sofia: invalid publish_transport '%s' (use udp|tcp|tls|ws|wss); using udp\n",
+					v->value);
+				ast_copy_string(sofia_cfg.publish_transport, "udp", sizeof(sofia_cfg.publish_transport));
+			}
 		} else if (!strcasecmp(v->name, "wsbindaddr")) {
 			ast_copy_string(sofia_cfg.wsbindaddr, v->value, sizeof(sofia_cfg.wsbindaddr));
 		} else if (!strcasecmp(v->name, "wsbindport")) {
@@ -13980,6 +14013,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.publish_username[0] = '\0';
 	sofia_cfg.publish_password[0] = '\0';
 	sofia_cfg.publish_format = SOFIA_SUB_DIALOG_INFO;
+	sofia_cfg.publish_transport[0] = '\0';	/* empty -> udp at use (no-op append), so existing configs stay byte-identical */
 	sofia_cfg.busy_on_active = 0;
 	sofia_cfg.max_contacts = 6;
 	sofia_cfg.encryption = 0;
@@ -14267,18 +14301,16 @@ static void *sofia_reg_thread_func(void *data)
 			 * values the response handler / reload write under it (nh / reg_expiry /
 			 * reg_attempts / secret / host). */
 			ast_mutex_lock(&peer->lock);
-			if (peer->nh && peer->reg_expiry > 0 &&
+			if (peer->is_register_line &&
+			    peer->nh && peer->reg_expiry > 0 &&
 			    !ast_strlen_zero(peer->secret) &&
 			    strcasecmp(peer->host, "dynamic") != 0 &&
 			    /* attempt-cap: skip when register_attempts > 0 and the cap is reached. */
 			    (sofia_cfg.register_attempts == 0 || peer->reg_attempts < sofia_cfg.register_attempts) &&
 			    now >= peer->reg_expiry) {
 				char uri[256];
-				char hbuf[80];	/* bracket-wrap IPv6 host */
-				snprintf(uri, sizeof(uri), "sip:%s@%s:%d",
-					peer->defaultuser,
-					sofia_uri_format_host(peer->host, hbuf, sizeof(hbuf)),
-					peer->port);
+				/* sip:user@host:port + ;transport= (UDP no-op); opt-in via is_register_line. */
+				sofia_build_register_uri(peer, uri, sizeof(uri));
 				if (sofia_debug)
 					ast_verbose("Sofia: Re-registering %s\n", uri);
 				/* RFC 3261 §20.22 outbound REGISTER refresh. */
@@ -14323,10 +14355,9 @@ static void *sofia_reg_thread_func(void *data)
  * sofia_thread). */
 static void sofia_peer_recreate_register_handle(struct sofia_peer *peer)
 {
-	char uri[256], route_buf[256], hbuf[80], instance_feature[120];
+	char uri[256], route_buf[256], instance_feature[120];
 
-	snprintf(uri, sizeof(uri), "sip:%s@%s:%d", peer->defaultuser,
-		sofia_uri_format_host(peer->host, hbuf, sizeof(hbuf)), peer->port);
+	sofia_build_register_uri(peer, uri, sizeof(uri));
 	sofia_format_outboundproxy(peer, route_buf, sizeof(route_buf));
 	sofia_build_instance_feature(peer, instance_feature, sizeof(instance_feature), peer->sip_outbound);
 
@@ -14355,15 +14386,15 @@ static void sofia_do_register(void)
 	i = ao2_iterator_init(peers, 0);
 	while ((peer = ao2_iterator_next(&i))) {
 		if (peer->type == SOFIA_TYPE_FRIEND || peer->type == SOFIA_TYPE_PEER) {
-			if (!ast_strlen_zero(peer->secret) &&
+			/* Outbound REGISTER is opt-in: ONLY a [general] `register =>` line sets
+			 * is_register_line. A static challenge-auth trunk (secret + static host but
+			 * NO register=> line) is a UAS-style peer — it must NOT be sent a REGISTER. */
+			if (peer->is_register_line &&
+			    !ast_strlen_zero(peer->secret) &&
 			    !ast_strlen_zero(peer->host) &&
 			    strcasecmp(peer->host, "dynamic") != 0) {
-				char hbuf[80];	/* bracket-wrap IPv6 host */
-
-				snprintf(uri, sizeof(uri), "sip:%s@%s:%d",
-					peer->defaultuser,
-					sofia_uri_format_host(peer->host, hbuf, sizeof(hbuf)),
-					peer->port);
+				/* sip:user@host:port + ;transport= for tls/tcp/ws/wss (UDP no-op). */
+				sofia_build_register_uri(peer, uri, sizeof(uri));
 
 				/* Detach+destroy any stale handle and create a fresh one carrying the current
 				 * GRUU/SIP-Outbound advertisement tags — single source of truth for the tag set,
@@ -14909,10 +14940,12 @@ static void sofia_reload_worker(void *data)
 	{
 		char pub_server_was[sizeof(sofia_cfg.publish_server)];
 		char pub_domain_was[sizeof(sofia_cfg.publish_domain)];
+		char pub_transport_was[sizeof(sofia_cfg.publish_transport)];
 		int pub_expires_was = sofia_cfg.publish_expires;
 		enum sofia_sub_format pub_format_was = sofia_cfg.publish_format;
 		ast_copy_string(pub_server_was, sofia_cfg.publish_server, sizeof(pub_server_was));
 		ast_copy_string(pub_domain_was, sofia_cfg.publish_domain, sizeof(pub_domain_was));
+		ast_copy_string(pub_transport_was, sofia_cfg.publish_transport, sizeof(pub_transport_was));
 
 		if (sofia_apply_config(cfg) < 0) {
 			/* Don't sweep — a partial parse could remove live peers it didn't reach. */
@@ -14931,6 +14964,9 @@ static void sofia_reload_worker(void *data)
 			strcmp(pub_server_was, sofia_cfg.publish_server) != 0
 			|| strcmp(pub_domain_was, sofia_cfg.publish_domain) != 0
 			|| pub_expires_was != sofia_cfg.publish_expires
+			/* a publish_transport change must rebuild: the transport is baked into pub->target's R-URI
+			 * (built once at publication-create), so an existing pub->nh keeps the old transport otherwise. */
+			|| strcmp(pub_transport_was, sofia_cfg.publish_transport) != 0
 			/* a format change must full-rebuild: RFC 3903 keys ESC state by Event package + ETag, so
 			 * we teardown the old (old Event + old ETag) and re-PUBLISH fresh with no If-Match. */
 			|| pub_format_was != sofia_cfg.publish_format);

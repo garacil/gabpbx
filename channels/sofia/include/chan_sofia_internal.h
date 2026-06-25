@@ -879,6 +879,7 @@ struct sofia_config {
 	char publish_username[80]; /* digest credentials for the central server (401/407) */
 	char publish_password[80];
 	enum sofia_sub_format publish_format; /* outbound PUBLISH body: SOFIA_SUB_DIALOG_INFO (default) or SOFIA_SUB_PIDF; [general] publish_format=dialog-info|pidf */
+	char publish_transport[8]; /* [general] publish_transport=udp|tcp|tls|ws|wss: ;transport= appended to the PUBLISH R-URI so a tls/tcp/ws/wss ESC is reached over that transport (sofia-sip otherwise defaults bare R-URIs to UDP). Empty/udp = no-op (byte-identical). */
 	char wsbindaddr[64];
 	int  wsbindport;         /* 0 = disabled; common: 5066 */
 	char wssbindaddr[64];

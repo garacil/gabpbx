@@ -456,6 +456,11 @@ static void sofia_publication_create_one(struct sofia_peer *peer, const char *ex
 		} else {
 			snprintf(pub->target, sizeof(pub->target), "sip:%s@%s", exten, domain);
 		}
+		/* Same defect class as the INVITE/REGISTER/SUBSCRIBE R-URI: a bare sip:exten@host:port makes
+		 * sofia-sip default to UDP, so a tls/tcp/ws/wss ESC was reached over UDP. Append ;transport=
+		 * for [general] publish_transport (no-op for udp/empty, so existing configs stay byte-identical). */
+		sofia_uri_append_transport(pub->target, sizeof(pub->target),
+			sofia_cfg.publish_transport[0] ? sofia_cfg.publish_transport : "udp");
 	}
 	pub->nh = nua_handle(sofia_nua, SOFIA_PUBLICATION_HMAGIC,
 		NUTAG_URL(pub->target),
@@ -604,8 +609,8 @@ static void sofia_publication_sweep(su_root_magic_t *magic, su_timer_t *t, su_ti
 }
 
 /* Reconcile the publication set with the just-applied config on `sip reload` (sofia_thread, which owns
- * publications, so teardown is UAF-safe). config_changed = publish_server/domain/expires differs from
- * before the reload (the target/entity/TTL formula changed for every pub). */
+ * publications, so teardown is UAF-safe). config_changed = publish_server/domain/expires/transport/format
+ * differs from before the reload (the target/entity/TTL/R-URI-transport formula changed for every pub). */
 void sofia_publications_reconcile(int config_changed)
 {
 	struct ao2_iterator it, pit;

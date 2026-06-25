@@ -187,6 +187,12 @@ static int evsub_build_target(struct sofia_peer *peer, char *target, size_t tlen
 	}
 	n = snprintf(target, tlen, "sip:%s@%s:%d", S_OR(peer->defaultuser, peer->name),
 		sofia_uri_format_host(peer->host, hbuf, sizeof(hbuf)), peer->port);
+	/* Same defect class as the INVITE/REGISTER R-URI: a bare sip:user@host:port makes sofia-sip
+	 * default to UDP, so a tls/tcp/ws/wss peer's SUBSCRIBE went out UDP. Append ;transport= for the
+	 * peer's configured transport (no-op for udp/empty, so UDP peers stay byte-identical). These
+	 * startup/reconcile watchers target static-host / register-line peers, so peer->transport is the
+	 * correct immediate value; done under the SAME peer->lock the snapshot already holds. */
+	sofia_uri_append_transport(target, tlen, sofia_transport_name(peer->transport));
 	if (route && rlen) {
 		sofia_format_outboundproxy(peer, route, rlen);
 	}
