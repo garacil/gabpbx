@@ -7286,10 +7286,17 @@ static int sofia_compute_a1_hash(struct sofia_peer *peer, const char *realm,
 		return 0;
 	}
 
-	/* DYNAMIC buffer so a long name+realm (domainsasrealm) can never truncate the
-	 * secret — a fixed buffer would hash MD5("name:realm:") = auth bypass. On OOM
-	 * propagate -1 so the caller rejects (500), never a predictable hash. */
-	if (ast_asprintf(&a1_pre, "%s:%s:%s", peer->name, realm, peer->secret) < 0 || !a1_pre) {
+	/* DYNAMIC buffer so a long user+realm (domainsasrealm) can never truncate the
+	 * secret — a fixed buffer would hash MD5("user:realm:") = auth bypass. On OOM
+	 * propagate -1 so the caller rejects (500), never a predictable hash.
+	 * A1 = unq(username):unq(realm):passwd (RFC 2617 §3.2.2.2 / RFC 7616 §3.4.2): the digest
+	 * username is the peer's CONFIGURED username (defaultuser — set by `username=`/`defaultuser=`,
+	 * falling back to the section name), NOT the section name, so a peer whose section name differs
+	 * from its auth username (username= set to a value other than the section name) verifies. The caller required
+	 * the Authorization username == this value (anti-impersonation), so name and value agree. */
+	if (ast_asprintf(&a1_pre, "%s:%s:%s",
+			!ast_strlen_zero(peer->defaultuser) ? peer->defaultuser : peer->name,
+			realm, peer->secret) < 0 || !a1_pre) {
 		ast_free(a1_pre);
 		return -1;
 	}
@@ -7414,6 +7421,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	char auth_cnonce_buf[128] = "";
 	char auth_qop_buf[32] = "";
 	char auth_algorithm_buf[32] = "";
+	char auth_username_buf[128] = "";
 	const char *auth_realm;
 	const char *auth_nonce;
 	const char *auth_response;
@@ -7422,6 +7430,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	const char *auth_cnonce;
 	const char *auth_qop;
 	const char *auth_algorithm;
+	const char *auth_username;
 	int using_qop;
 	unsigned int new_nc = 0;
 	int nc_replay = 0;	/* set in the qop nonce block; read AFTER the digest verify (deferred nc-replay: rotate only on a valid-but-replayed nc) */
@@ -7474,6 +7483,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	auth_cnonce    = sofia_au_get_unq(au, "cnonce",    auth_cnonce_buf,    sizeof(auth_cnonce_buf));
 	auth_qop       = sofia_au_get_unq(au, "qop",       auth_qop_buf,       sizeof(auth_qop_buf));
 	auth_algorithm = sofia_au_get_unq(au, "algorithm", auth_algorithm_buf, sizeof(auth_algorithm_buf));
+	auth_username  = sofia_au_get_unq(au, "username",  auth_username_buf,  sizeof(auth_username_buf));
 
 		/* Anti-downgrade (RFC 7616 §3.3, case-insensitive): accept ONLY an offered
 		 * algorithm; missing algorithm= implies MD5, rejected 400 if MD5 not offered. */
@@ -7621,6 +7631,34 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	}
 
 	ast_mutex_lock(&peer->lock);
+
+	/* RFC 2617 §3.2.2.2 / RFC 7616 §3.4.2: HA1 = unq(username):realm:passwd, where username is the
+	 * one in the Authorization header. Require it to equal the peer's CONFIGURED digest username
+	 * (defaultuser — what `username=`/`defaultuser=` set, falling back to the section name) BEFORE
+	 * computing/accepting any HA1 (incl. md5secret), so a peer matched by From/IP/To cannot
+	 * authenticate as a different username with this peer's secret (anti-impersonation). The username
+	 * is not a secret -> plain compare; a missing username is a malformed digest (400). */
+	{
+		const char *expected_user = !ast_strlen_zero(peer->defaultuser) ? peer->defaultuser : peer->name;
+		if (!auth_username || strcmp(auth_username, expected_user) != 0) {
+			char snap_name[80], snap_exp[128];
+			int missing = !auth_username;
+			ast_copy_string(snap_name, peer->name, sizeof(snap_name));
+			ast_copy_string(snap_exp, expected_user, sizeof(snap_exp));
+			ast_mutex_unlock(&peer->lock);
+			if (missing) {
+				nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
+				ast_verbose("Sofia: %s auth rejected for '%s' - username= missing\n", method, snap_name);
+				sofia_blacklist_add_sip(sip, "digest missing username");
+			} else {
+				nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
+				ast_verbose("Sofia: %s auth rejected for '%s' - username '%s' != configured '%s'\n",
+					method, snap_name, auth_username, snap_exp);
+				sofia_blacklist_add_sip(sip, "digest username mismatch");
+			}
+			return SOFIA_AUTH_REJECT;
+		}
+	}
 
 	/* ROTATE the nonce only when dead (empty/expired) or a qop nc-replay against
 	 * the MATCHING nonce. A NON-matching nonce is re-challenged with the existing
