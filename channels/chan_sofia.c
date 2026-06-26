@@ -7428,6 +7428,13 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	int algorithm = SOFIA_DIGEST_MD5;  /* RFC 2617 backward-compat default */
 	int hash_len_hex;
 	char expected_hash[65];  /* SHA-256 (64 hex + null); MD5 uses 32+null */
+	/* REGISTER is an idempotent re-bind: phones legitimately resend nc=00000001 on every refresh
+	 * (chan_sip tolerated this; common multi-vendor phone behavior — nearly every REGISTER sends nc=1).
+	 * Exempt REGISTER from the nc-replay nonce rotation so a VALID digest is never 401-stale-looped.
+	 * Strict nc-replay is KEPT for non-idempotent methods (INVITE/MESSAGE/...) where a replay has
+	 * real effect (duplicate call/message). RFC 2617 §nonce-reuse is server policy w/ interop cost;
+	 * stale=true (RFC 7616 §3.3) is for a STALE nonce, never a live nonce + valid REGISTER digest. */
+	int register_method = method && !strcasecmp(method, "REGISTER");
 
 	/* No Authorization header: challenge. Offer MD5 first (legacy compat), then SHA-256 (RFC 7616). */
 	if (!au) {
@@ -7639,7 +7646,10 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		 * 401-stale (a legit refresh re-auths once), an INVALID response 403s WITHOUT rotating. Either
 		 * way an equal/older nc is NEVER accepted and an unauthenticated request can never churn the
 		 * nonce. nonce_dead (the server's own TTL) is not attacker-steerable, so it re-challenges early. */
-		nc_replay = (using_qop && nonce_matches && new_nc <= peer->last_nc);
+		/* REGISTER (idempotent) is exempt: a non-advancing nc on a valid REGISTER is a phone's
+		 * normal nc=1 refresh, not a replay — see the register_method note at the top. Non-idempotent
+		 * methods still flag + rotate below. (Default; a strict_nc_register knob can re-arm REGISTER.) */
+		nc_replay = (using_qop && nonce_matches && new_nc <= peer->last_nc && !register_method);
 
 		if (nonce_dead) {
 			char fresh_nonce[64];
@@ -7744,7 +7754,13 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	 * RFC 2617 (qop=auth): keep nonce, advance last_nc.
 	 * RFC 2069 (no qop): clear nonce (single-use). */
 	if (using_qop) {
-		peer->last_nc = new_nc;
+		/* Advance-only max: peer->last_nc is per-peer and SHARED across methods, so a REGISTER's
+		 * nc=1 must never LOWER it — else a replayed INVITE/MESSAGE with a higher nc would slip the
+		 * nc-replay gate. Monotonic max keeps non-idempotent replay protection intact while letting
+		 * REGISTER refreshes (exempted above) commit without churning the nonce. */
+		if (new_nc > peer->last_nc) {
+			peer->last_nc = new_nc;
+		}
 	} else {
 		ast_string_field_set(peer, nonce, "");
 	}
