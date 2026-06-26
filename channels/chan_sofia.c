@@ -3466,6 +3466,120 @@ static struct sofia_peer *sofia_find_peer_by_ip(const struct ast_sockaddr *src)
 	return found;
 }
 
+/* Minimal negative-cache for the realtime-by-IP fallback below: a tiny fixed ring of
+ * recently-missed source IPs so an inbound-INVITE flood from unknown IPs cannot hammer
+ * the realtime database backend (each distinct source IP is otherwise a fresh DB query).
+ * Short TTL so a stale miss self-heals once a peer is added in realtime (no explicit
+ * reload-clear in v1). */
+#define SOFIA_RTLOOKUP_NEG_SIZE 32
+#define SOFIA_RTLOOKUP_NEG_TTL  10   /* seconds a missed source IP stays suppressed */
+static struct { char ip[48]; time_t ts; } sofia_rtlookup_neg[SOFIA_RTLOOKUP_NEG_SIZE];
+AST_MUTEX_DEFINE_STATIC(sofia_rtlookup_neg_lock);
+
+static int sofia_rtlookup_neg_check(const char *ip)
+{
+	time_t now = time(NULL);
+	int i, hit = 0;
+	ast_mutex_lock(&sofia_rtlookup_neg_lock);
+	for (i = 0; i < SOFIA_RTLOOKUP_NEG_SIZE; i++) {
+		if (sofia_rtlookup_neg[i].ts && (now - sofia_rtlookup_neg[i].ts) < SOFIA_RTLOOKUP_NEG_TTL
+				&& !strcmp(sofia_rtlookup_neg[i].ip, ip)) {
+			hit = 1;
+			break;
+		}
+	}
+	ast_mutex_unlock(&sofia_rtlookup_neg_lock);
+	return hit;
+}
+
+static void sofia_rtlookup_neg_add(const char *ip)
+{
+	time_t now = time(NULL), oldest = now + 1;
+	int i, slot = 0;
+	ast_mutex_lock(&sofia_rtlookup_neg_lock);
+	for (i = 0; i < SOFIA_RTLOOKUP_NEG_SIZE; i++) {
+		if (!sofia_rtlookup_neg[i].ts || (now - sofia_rtlookup_neg[i].ts) >= SOFIA_RTLOOKUP_NEG_TTL) {
+			slot = i;   /* empty/expired slot — reuse it */
+			break;
+		}
+		if (sofia_rtlookup_neg[i].ts < oldest) {
+			oldest = sofia_rtlookup_neg[i].ts;
+			slot = i;   /* else evict the oldest */
+		}
+	}
+	ast_copy_string(sofia_rtlookup_neg[slot].ip, ip, sizeof(sofia_rtlookup_neg[slot].ip));
+	sofia_rtlookup_neg[slot].ts = now;
+	ast_mutex_unlock(&sofia_rtlookup_neg_lock);
+}
+
+/* Realtime IP-trunk fallback — chan_sip realtime_peer_by_addr parity (channels/chan_sip.c:5504).
+ * An inbound INVITE from a type=peer host=<ip> realtime trunk carries the caller-ID (NOT the peer
+ * name) in From, so sofia_find_peer(cid) and the in-memory sofia_find_peer_by_ip both miss while the
+ * trunk is not yet cached → alwaysauthreject 401s a legitimate trunk. Resolve the peer NAME from the
+ * DB by source IP+port, then hand off to sofia_find_peer() which performs the proven build/link/cache
+ * (so EVERY subsequent INVITE resolves in memory via sofia_find_peer_by_ip). Synchronous like the
+ * by-name realtime path and likewise OFF the peers lock (the lock-across-DB invariant ~:104-105); a
+ * short negative-cache bounds an unknown-IP flood against the realtime database backend. */
+static struct sofia_peer *sofia_find_peer_realtime_by_addr(const struct ast_sockaddr *src)
+{
+	struct ast_variable *var, *v;
+	const char *name = NULL;
+	char ipbuf[48], portbuf[8], namebuf[80];
+
+	if (!src || ast_sockaddr_isnull(src) || !ast_check_realtime("sippeers")) {
+		return NULL;
+	}
+	ast_copy_string(ipbuf, ast_sockaddr_stringify_addr(src), sizeof(ipbuf));
+	ast_copy_string(portbuf, ast_sockaddr_stringify_port(src), sizeof(portbuf));
+
+	if (sofia_rtlookup_neg_check(ipbuf)) {
+		return NULL;
+	}
+
+	/* chan_sip realtime_peer_by_addr parity (channels/chan_sip.c:5512-5532), 4 steps:
+	 *   1) static host  + exact source port    2) registered ipaddr + exact source port
+	 *   3) static host  + insecure~port         4) registered ipaddr + insecure~port
+	 * Steps 3-4 cover insecure=port trunks whose DB port column is empty or differs from the
+	 * inbound source port (some realtime IP-trunks have an empty port column). The realtime
+	 * driver turns a field name that contains a space into a bare SQL operator
+	 * (res_config_pgsql.c:872), so "insecure LIKE","%port%" yields  insecure LIKE '%port%'  in the
+	 * WHERE — one ast_load_realtime, no multientry. No wide insecure sipregs scan
+	 * (chan_sip.c:5355-5405): that is the DoS-amplifiable path we deliberately omit. */
+	var = ast_load_realtime("sippeers", "host", ipbuf, "port", portbuf, SENTINEL);
+	if (!var) {
+		var = ast_load_realtime("sippeers", "ipaddr", ipbuf, "port", portbuf, SENTINEL);
+	}
+	if (!var) {
+		var = ast_load_realtime("sippeers", "host", ipbuf, "insecure LIKE", "%port%", SENTINEL);
+	}
+	if (!var) {
+		var = ast_load_realtime("sippeers", "ipaddr", ipbuf, "insecure LIKE", "%port%", SENTINEL);
+	}
+	if (!var) {
+		sofia_rtlookup_neg_add(ipbuf);
+		return NULL;
+	}
+
+	for (v = var; v; v = v->next) {
+		if (!strcasecmp(v->name, "name")) {
+			name = v->value;
+			break;
+		}
+	}
+	if (ast_strlen_zero(name)) {
+		ast_variables_destroy(var);
+		sofia_rtlookup_neg_add(ipbuf);
+		return NULL;
+	}
+	ast_copy_string(namebuf, name, sizeof(namebuf));
+	ast_variables_destroy(var);
+
+	/* Hand off to the proven by-name path: it re-loads, builds, links and caches the peer (with the
+	 * dnsmgr/hint/allowsubscribe side effects in the correct link-first order). NULL is fine — the
+	 * caller then falls through to the existing unknown-peer handling. */
+	return sofia_find_peer(namebuf);
+}
+
 /* ast_rtp_glue plumbing; direct-media re-INVITE guarded by reinvite_pending. */
 
 static enum ast_rtp_glue_result sofia_get_rtp_peer(struct ast_channel *chan,
@@ -5741,6 +5855,12 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			struct ast_sockaddr src;
 			sofia_get_source_addr(sip, &src);
 			caller_peer = sofia_find_peer_by_ip(&src);
+			if (!caller_peer) {
+				/* Not cached in memory: resolve a not-yet-loaded realtime IP-trunk by its
+				 * source IP+port (chan_sip realtime_peer_by_addr parity) so insecure=invite
+				 * trunks defined only in realtime can place inbound calls. */
+				caller_peer = sofia_find_peer_realtime_by_addr(&src);
+			}
 		}
 		if (caller_peer) {
 			if (caller_peer->ha) {
