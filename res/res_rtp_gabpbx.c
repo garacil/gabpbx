@@ -324,7 +324,7 @@ struct rtp_red {
 	struct ast_frame t140red;   /*!< Redundant t140*/
 	unsigned char pt[AST_RED_MAX_GENERATION];  /*!< Payload types for redundancy data */
 	unsigned char ts[AST_RED_MAX_GENERATION]; /*!< Time stamps */
-	unsigned char len[AST_RED_MAX_GENERATION]; /*!< length of each generation */
+	unsigned short len[AST_RED_MAX_GENERATION]; /*!< length of each generation (RFC 2198 10-bit block length) */
 	int num_gen; /*!< Number of generations */
 	int schedid; /*!< Timer id */
 	int ti; /*!< How long to buffer data before send */
@@ -1123,21 +1123,20 @@ static void dtls_srtp_finish_negotiation(struct ast_rtp_instance *instance, stru
 		rtp->dtls_failure = 1;
 		return;
 	}
-	/* Fail CLOSED: for DTLS-SRTP the SDP a=fingerprint is the SOLE trust anchor for the peer's
-	 * (typically self-signed) cert (RFC 8827 §6.5, RFC 5763 §5), so whenever a remote fingerprint
-	 * was carried in the SDP it MUST match — do the memcmp regardless of the verify bitmask. The
-	 * old gate skipped the comparison when verify == AST_RTP_DTLS_VERIFY_NONE (rtp_engine.h:412),
-	 * installing SRTP keys against an UNVERIFIED peer (latent fail-OPEN). The working WebRTC
-	 * handshake (all chan_sofia callers set verify=FINGERPRINT and store a remote fingerprint) is
-	 * unchanged: it already entered this block and the validated peer still matches and passes. */
-	if ((rtp->dtls_cfg.verify & (AST_RTP_DTLS_VERIFY_FINGERPRINT | AST_RTP_DTLS_VERIFY_CERTIFICATE))
-		|| rtp->remote_fingerprint_len) {
+	/* Fail CLOSED, UNCONDITIONALLY: for DTLS-SRTP the SDP a=fingerprint is the SOLE trust anchor for
+	 * the peer's (typically self-signed) cert (RFC 8827 §6.5, RFC 5763 §5), so the comparison MUST run
+	 * on every DTLS-SRTP session regardless of the verify bitmask. The earlier gate
+	 * `(verify & (FINGERPRINT|CERTIFICATE)) || remote_fingerprint_len` still skipped the check when
+	 * verify == AST_RTP_DTLS_VERIFY_NONE (rtp_engine.h:412) AND no fingerprint was stored, installing
+	 * SRTP keys against an UNVERIFIED peer (latent fail-OPEN). All chan_sofia callers set
+	 * verify=FINGERPRINT and store a remote fingerprint, so the working WebRTC handshake is unchanged. */
+	{
 		unsigned char fp[EVP_MAX_MD_SIZE];
 		unsigned int n;
 		const EVP_MD *md = (rtp->remote_hash == AST_RTP_DTLS_HASH_SHA1) ? EVP_sha1() : EVP_sha256();
 
 		if (!rtp->remote_fingerprint_len) {
-			ast_log(LOG_WARNING, "DTLS verify required but no remote fingerprint stored for RTP instance '%p'\n", instance);
+			ast_log(LOG_WARNING, "DTLS-SRTP refused: no remote a=fingerprint stored for RTP instance '%p' — refusing to key an unverified peer\n", instance);
 			X509_free(cert);
 			rtp->dtls_failure = 1;
 			return;
@@ -2846,10 +2845,16 @@ static struct ast_frame *red_t140_to_red(struct rtp_red *red) {
 		red->len[i] = red->len[i+1];
 	red->len[i] = red->t140.datalen;
 
-	/* write each generation length in red header */
+	/* Write each generation length into its RED block header as the RFC 2198 10-bit field
+	 * (rfc2198.txt:247): the low 8 bits go in byte 3, the high 2 bits in the low 2 bits of byte 2
+	 * (preserving byte 2's high 6 bits, which carry the timestamp offset). Accumulate the FULL length,
+	 * not the truncated low byte, so the primary-data offset stays correct for blocks > 255 bytes. */
 	len = red->hdrlen;
-	for (i = 0; i < red->num_gen; i++)
-		len += data[i*4+3] = red->len[i];
+	for (i = 0; i < red->num_gen; i++) {
+		data[i * 4 + 3] = red->len[i] & 0xFF;
+		data[i * 4 + 2] = (data[i * 4 + 2] & 0xFC) | ((red->len[i] >> 8) & 0x03);
+		len += red->len[i];
+	}
 
 	/* add primary data to buffer */
 	memcpy(&data[len], red->t140.data.ptr, red->t140.datalen);
@@ -3070,6 +3075,32 @@ static struct ast_frame *create_dtmf_frame(struct ast_rtp_instance *instance, en
 	return &rtp->f;
 }
 
+/*! \brief Prepend \a count U+FFFD missing-text markers (3 bytes each) into a T.140 frame's leading
+ * headroom (AST_FRIENDLY_OFFSET, frame.h:217) instead of tail-growing. A tail memmove on a max-size
+ * (8192-byte) packet would write past rtp->rawdata into the following struct field. RFC 4103 §5.3
+ * (rfc4103.txt:464-477) calls for one missing-text marker per missing T140block; the U+FFFD (EF BF BD)
+ * byte sequence itself is the established convention (ITU-T T.140 Addendum 1), not specified by RFC
+ * 4103. No-op when there is not enough headroom. */
+static void rtp_t140_prepend_markers(struct ast_frame *f, int count)
+{
+	unsigned char *p;
+	int need = count * 3;
+	int i;
+
+	if (count <= 0 || f->offset < need) {
+		return;
+	}
+	f->data.ptr = (unsigned char *) f->data.ptr - need;
+	f->offset -= need;
+	f->datalen += need;
+	p = f->data.ptr;
+	for (i = 0; i < count; i++) {
+		*p++ = 0xEF;
+		*p++ = 0xBF;
+		*p++ = 0xBD;
+	}
+}
+
 static void process_dtmf_rfc2833(struct ast_rtp_instance *instance, unsigned char *data, int len, unsigned int seqno, unsigned int timestamp, struct ast_sockaddr *addr, int payloadtype, int mark, struct frame_list *frames)
 {
 	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
@@ -3079,6 +3110,12 @@ static void process_dtmf_rfc2833(struct ast_rtp_instance *instance, unsigned cha
 	struct ast_frame *f = NULL;
 
 	ast_rtp_instance_get_remote_address(instance, &remote_address);
+
+	/* RFC 4733 §2.3: the telephone-event payload is a fixed 4 octets; a shorter body would make the
+	 * three ntohl() reads below run past the packet (mirrors the guard in process_dtmf_cisco). */
+	if (len < 4) {
+		return;
+	}
 
 	/* Figure out event, event end, and samples */
 	event = ntohl(*((unsigned int *)(data)));
@@ -3362,6 +3399,13 @@ static struct ast_frame *ast_rtcp_interpret(struct ast_rtp_instance *instance, u
 
 	packetwords = res / 4;
 
+	if (res & 3) {
+		/* RTCP packets are 32-bit word aligned (RFC 3550 §6.4); a non-aligned datagram is malformed. */
+		if (option_debug || rtpdebug)
+			ast_log(LOG_DEBUG, "RTCP not 32-bit aligned (%d bytes), dropping\n", res);
+		return &ast_null_frame;
+	}
+
 	if (ast_rtp_instance_get_prop(instance, AST_RTP_PROPERTY_NAT)) {
 		/* Send to whoever sent to us */
 		if (ast_sockaddr_cmp(&rtp->rtcp->them, &addr)) {
@@ -3387,9 +3431,28 @@ static struct ast_frame *ast_rtcp_interpret(struct ast_rtp_instance *instance, u
 		rc = (length & 0x1f000000) >> 24;
 		length &= 0xffff;
 
-		if ((i + length) > packetwords) {
+		/* RFC 3550 §6.4.1: the length field is the packet size in 32-bit words MINUS ONE (including the
+		 * header word), so the packet spans words [position, position+length] and the next one starts at
+		 * position+length+1 — that boundary must fit the datagram. length<1 is malformed (no SSRC). */
+		if (length < 1 || (position + length + 1) > packetwords) {
 			if (option_debug || rtpdebug)
 				ast_log(LOG_DEBUG, "RTCP Read too short\n");
+			return &ast_null_frame;
+		}
+
+		/* Per-type structural length: the declared length MUST cover the rc reception report blocks
+		 * (6 words each, RFC 3550 §6.4) that the SR/RR paths below dereference. Without this a small
+		 * length with rc>=1 reads report-block words past the packet — an uninitialised-stack / OOB
+		 * read leaked via the RTCPReceived AMI event. SR = header+ssrc+5 sender-info + 6*rc words;
+		 * RR = header+ssrc + 6*rc words; length is words-1. */
+		if (pt == RTCP_PT_SR && length < (unsigned int) (6 + 6 * rc)) {
+			if (option_debug || rtpdebug)
+				ast_log(LOG_DEBUG, "RTCP SR length %u too short for rc=%d\n", length, rc);
+			return &ast_null_frame;
+		}
+		if (pt == RTCP_PT_RR && length < (unsigned int) (1 + 6 * rc)) {
+			if (option_debug || rtpdebug)
+				ast_log(LOG_DEBUG, "RTCP RR length %u too short for rc=%d\n", length, rc);
 			return &ast_null_frame;
 		}
 
@@ -3969,60 +4032,83 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 	rtp->f.offset = hdrlen + AST_FRIENDLY_OFFSET;
 	rtp->f.seqno = seqno;
 
-	if (rtp->f.subclass.codec == AST_FORMAT_T140 && (int)seqno - (prev_seqno+1) > 0 && (int)seqno - (prev_seqno+1) < 10) {
-		unsigned char *data = rtp->f.data.ptr;
-
-		memmove(rtp->f.data.ptr+3, rtp->f.data.ptr, rtp->f.datalen);
-		rtp->f.datalen +=3;
-		*data++ = 0xEF;
-		*data++ = 0xBF;
-		*data = 0xBD;
+	if (rtp->f.subclass.codec == AST_FORMAT_T140 && (int)seqno - (prev_seqno + 1) > 0 && (int)seqno - (prev_seqno + 1) < 10) {
+		/* Mark the gap of lost T.140 packets. RFC 4103 §5.3 (rfc4103.txt:464-477) calls for one
+		 * missing-text marker per missing T140block; prepend them into the frame's leading headroom
+		 * rather than tail-growing with memmove, which on a max-size packet would write 3 bytes past
+		 * rtp->rawdata into the next struct field. */
+		rtp_t140_prepend_markers(&rtp->f, (int)seqno - (prev_seqno + 1));
 	}
 
 	if (rtp->f.subclass.codec == AST_FORMAT_T140RED) {
+		/* RFC 2198 redundancy parse for RFC 4103 T.140 text. The previous code located the primary
+		 * header with memchr() and read each block length from a single byte (data[x*4+3]); both are
+		 * non-conformant. RFC 2198 (rfc2198.txt:218-248) defines each redundant header as 4 bytes
+		 * (F bit, 7-bit PT, 14-bit timestamp offset, 10-bit block length) walked by the F bit and
+		 * terminated by a 1-byte primary header (F=0, rfc2198.txt:290-306). We walk by the F bit, read
+		 * the full 10-bit length, and bound every offset by datalen — the old paths over-read a crafted
+		 * RED packet and the diff>num_gen branch's `len -= 3` underflowed datalen / wrote before the
+		 * buffer when there were no redundant generations. */
 		unsigned char *data = rtp->f.data.ptr;
-		unsigned char *header_end;
-		int num_generations;
-		int header_length;
-		int len;
-		int diff =(int)seqno - (prev_seqno+1); /* if diff = 0, no drop*/
-		int x;
+		int datalen = rtp->f.datalen;
+		int diff = (int) seqno - (prev_seqno + 1);	/* 0 = in order, >0 = gap, <0 = out of order */
+		int gen_len[AST_RED_MAX_GENERATION];
+		int num_gen = 0;
+		int red_total = 0;	/* total bytes of the redundant data blocks (before the primary) */
+		int hdr_len = 0, skip, x;
 
 		rtp->f.subclass.codec = AST_FORMAT_T140;
-		header_end = memchr(data, ((*data) & 0x7f), rtp->f.datalen);
-		if (header_end == NULL) {
+
+		/* Walk the redundant block headers (F bit set), reading the 10-bit block length. */
+		while (hdr_len < datalen && (data[hdr_len] & 0x80)) {
+			if (num_gen >= AST_RED_MAX_GENERATION || hdr_len + 4 > datalen) {
+				return AST_LIST_FIRST(&frames) ? AST_LIST_FIRST(&frames) : &ast_null_frame;
+			}
+			gen_len[num_gen] = ((data[hdr_len + 2] & 0x03) << 8) | data[hdr_len + 3];
+			red_total += gen_len[num_gen];
+			num_gen++;
+			hdr_len += 4;
+		}
+		if (hdr_len >= datalen) {	/* the 1-byte primary (F=0) header must follow */
 			return AST_LIST_FIRST(&frames) ? AST_LIST_FIRST(&frames) : &ast_null_frame;
 		}
-		header_end++;
+		hdr_len += 1;
 
-		header_length = header_end - data;
-		num_generations = header_length / 4;
-		len = header_length;
+		/* All headers + every redundant data block must fit, leaving the primary block. */
+		if (hdr_len + red_total > datalen) {
+			return AST_LIST_FIRST(&frames) ? AST_LIST_FIRST(&frames) : &ast_null_frame;
+		}
 
-		if (!diff) {
-			for (x = 0; x < num_generations; x++)
-				len += data[x * 4 + 3];
-
-			if (!(rtp->f.datalen - len))
+		if (diff <= 0) {
+			/* In order (diff==0) or out-of-order/duplicate (diff<0): deliver only the primary block.
+			 * RFC 4103 §4.2 (rfc4103.txt:351-382) infers loss from sequence gaps, so an out-of-order
+			 * packet carries no recoverable new text; never index past the generations (the old
+			 * num_gen-diff loop over-read for diff<0). */
+			skip = hdr_len + red_total;
+			if (skip >= datalen) {	/* empty primary, nothing to deliver */
 				return AST_LIST_FIRST(&frames) ? AST_LIST_FIRST(&frames) : &ast_null_frame;
-
-			rtp->f.data.ptr += len;
-			rtp->f.datalen -= len;
-		} else if (diff > num_generations && diff < 10) {
-			len -= 3;
-			rtp->f.data.ptr += len;
-			rtp->f.datalen -= len;
-
-			data = rtp->f.data.ptr;
-			*data++ = 0xEF;
-			*data++ = 0xBF;
-			*data = 0xBD;
+			}
+		} else if (diff <= num_gen) {
+			/* 1<=diff<=generations: the redundant generation covering the lost text is present;
+			 * deliver from it through the primary (generations are age-ordered, most recent last,
+			 * rfc4103.txt:361-374) by skipping the headers and the older redundant blocks. */
+			skip = hdr_len;
+			for (x = 0; x < num_gen - diff; x++) {
+				skip += gen_len[x];
+			}
 		} else {
-			for ( x = 0; x < num_generations - diff; x++)
-				len += data[x * 4 + 3];
+			/* diff>generations: the gap exceeds what the redundancy can recover. Deliver every
+			 * redundant generation + the primary (skip only the headers) and prepend a missing-text
+			 * marker per unrecoverable older packet (RFC 4103 §5.3). */
+			skip = hdr_len;
+		}
 
-			rtp->f.data.ptr += len;
-			rtp->f.datalen -= len;
+		rtp->f.data.ptr = (unsigned char *) rtp->f.data.ptr + skip;
+		rtp->f.datalen = datalen - skip;
+		rtp->f.offset += skip;	/* keep the headroom invariant so a marker prepend below sizes from old+skip */
+
+		if (diff > num_gen && diff < 10) {
+			rtp_t140_prepend_markers(&rtp->f, diff - num_gen);
 		}
 	}
 

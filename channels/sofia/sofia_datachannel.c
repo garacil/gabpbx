@@ -373,6 +373,7 @@ struct sofia_datachannel *sofia_dc_attach(struct sofia_pvt *pvt, uint16_t sctp_p
 		SCTP_SEND_FAILED_EVENT, SCTP_SHUTDOWN_EVENT,
 	};
 	uint32_t nodelay = 1;
+	uint32_t rcvbuf = SOFIA_DC_HARD_MAX_MSG * 4u;	/* inbound reassembly ceiling, see SO_RCVBUF below */
 	unsigned int i;
 	struct ast_rtp_engine_dtls *dtls;
 
@@ -473,6 +474,15 @@ struct sofia_datachannel *sofia_dc_attach(struct sofia_pvt *pvt, uint16_t sctp_p
 	/* Nagle off — datachannel signaling is small + latency-sensitive. */
 	if (usrsctp_setsockopt(s, IPPROTO_SCTP, SCTP_NODELAY, &nodelay, sizeof(nodelay)) < 0) {
 		ast_log(LOG_WARNING, "Sofia: DataChannel SCTP_NODELAY failed: %s\n", strerror(errno));
+	}
+
+	/* SO_RCVBUF: bound the inbound reassembly queue. A hostile post-DTLS peer can otherwise inflate
+	 * usrsctp's receive buffer with large interleaved partial messages (the relay only caps the forward
+	 * direction). Ceil at 4x our hard message ceiling (262144) so several in-flight max-size messages
+	 * fit while the queue stays bounded in-module. Tolerate failure (non-fatal — the recv-cb still
+	 * enforces the per-message ceiling). */
+	if (usrsctp_setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+		ast_log(LOG_WARNING, "Sofia: DataChannel SO_RCVBUF failed: %s\n", strerror(errno));
 	}
 
 	/* Non-blocking: usrsctp_connect returns EINPROGRESS and the association comes up
@@ -1726,6 +1736,18 @@ static int sofia_dc_sctp_recv_cb(struct socket *sock, union sctp_sockstore addr,
 
 	ppid = ntohl(rcv.rcv_ppid);
 	sid = rcv.rcv_sid;
+
+	/* Inbound message-size ceiling. usrsctp reassembles before delivery here, so a peer that exceeds
+	 * our advertised a=max-message-size (262144) has already consumed the reassembly queue — drop it +
+	 * reset the offending stream so a hostile peer cannot keep pushing oversized messages. Enforced
+	 * in-module on RECEIVE; the relay's forward cap only bounds the send direction. */
+	if (datalen > SOFIA_DC_HARD_MAX_MSG) {
+		ast_log(LOG_NOTICE, "Sofia: DataChannel inbound message %zu > max %u on sid=%u — drop + reset\n",
+			datalen, SOFIA_DC_HARD_MAX_MSG, sid);
+		sofia_dc_reset_stream(dc, sid);
+		free(data);
+		return 1;
+	}
 
 	switch (ppid) {
 	case SOFIA_DC_PPID_DCEP:

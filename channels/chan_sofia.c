@@ -8204,6 +8204,13 @@ static int sofia_check_lockuseragent(nua_t *nua, nua_handle_t *nh,
 	sofia_get_source_addr(sip, &src);
 	ast_copy_string(addr_buf, ast_sockaddr_stringify(&src), sizeof(addr_buf));
 
+	/* current_ua is the raw inbound User-Agent header — copy into a mutable buffer
+	 * and drop CR/LF/control chars before it reaches manager_event (which does no
+	 * embedded-CRLF stripping) so a stray CR/LF can't inject forged AMI lines. */
+	char ua_buf[256];
+	ast_copy_string(ua_buf, current_ua ? current_ua : "", sizeof(ua_buf));
+	sofia_quoted_name_sanitize(ua_buf);
+
 	manager_event(EVENT_FLAG_SYSTEM, "LockUserAgentReject",
 		"Peer: SIP/%s\r\n"
 		"MatchPolicy: %s\r\n"
@@ -8216,7 +8223,7 @@ static int sofia_check_lockuseragent(nua_t *nua, nua_handle_t *nh,
 		prefix_mode ? "prefix-list" : "strict-anchor",
 		peer->locked_user_agent,
 		prefix_mode ? peer->lockuseragent_prefixes : "",
-		current_ua ? current_ua : "",
+		ua_buf,
 		addr_buf);
 
 	if (prefix_mode) {
