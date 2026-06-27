@@ -38,6 +38,7 @@ struct sofia_blacklist_entry {
 };
 
 static struct ao2_container *sofia_blacklist;
+struct ao2_container *sofia_blacklist_container(void) { return sofia_blacklist; }
 static int sofia_blacklist_max = SOFIA_BLACKLIST_MAX_DEFAULT;
 static int sofia_blacklist_count = SOFIA_BLACKLIST_COUNT_DEFAULT;
 static int sofia_blacklist_ttl = SOFIA_BLACKLIST_TTL_DEFAULT;
@@ -408,6 +409,7 @@ int sofia_blacklist_init(void)
 {
 	sofia_blacklist = ao2_container_alloc(SOFIA_BLACKLIST_BUCKETS,
 		sofia_blacklist_hash_fn, sofia_blacklist_cmp_fn);
+	ao2_container_register("sofia/blacklist", sofia_blacklist);
 	return sofia_blacklist ? 0 : -1;
 }
 /* Release the blacklist container. */

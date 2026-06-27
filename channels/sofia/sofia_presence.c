@@ -48,6 +48,7 @@
  * re-SUBSCRIBE on a fresh dialog REPLACES the prior sub instead of leaking a watcher. */
 
 struct ao2_container *presence_subs;	/* keyed by subkey; created in load_module */
+struct ao2_container *sofia_presence_container(void) { return presence_subs; }
 static su_timer_t *presence_expiry_timer;	/* recurring sweep on sofia_thread (see load) */
 
 /* dispatch carrier: state-change cb (device_state thread) -> sofia_thread */
@@ -479,6 +480,7 @@ static void sofia_presence_expiry_sweep(su_root_magic_t *magic, su_timer_t *t, s
 int sofia_presence_init(void)
 {
 	presence_subs = ao2_container_alloc(MAX_PRESENCE_SUB_BUCKETS, presence_sub_hash_fn, presence_sub_cmp_fn);
+	ao2_container_register("sofia/presence", presence_subs);
 	return presence_subs ? 0 : -1;
 }
 

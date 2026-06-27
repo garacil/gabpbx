@@ -954,6 +954,8 @@ static void container_destruct(void *_c)
 	struct ao2_container *c = _c;
 	int i;
 
+	ao2_container_unregister(c);
+
 	__ao2_callback(c, OBJ_UNLINK, cd_cb, NULL);
 
 	for (i = 0; i < c->n_buckets; i++) {
@@ -974,6 +976,8 @@ static void container_destruct_debug(void *_c)
 	struct ao2_container *c = _c;
 	int i;
 
+	ao2_container_unregister(c);
+
 	__ao2_callback_debug(c, OBJ_UNLINK, cd_cb_debug, NULL, "container_destruct_debug called", __FILE__, __LINE__, __PRETTY_FUNCTION__);
 
 	for (i = 0; i < c->n_buckets; i++) {
@@ -987,6 +991,48 @@ static void container_destruct_debug(void *_c)
 #ifdef AO2_DEBUG
 	ast_atomic_fetchadd_int(&ao2.total_containers, -1);
 #endif
+}
+
+void ao2_container_stats(struct ao2_container *c, struct ao2_container_stats *stats)
+{
+	int i;
+	double e, chi = 0.0;
+
+	memset(stats, 0, sizeof(*stats));
+	if (!c) {
+		return;
+	}
+
+	ao2_lock(c);
+	stats->n_buckets = c->n_buckets;
+	stats->elements = c->elements;
+	e = c->n_buckets ? (double) c->elements / c->n_buckets : 0.0;
+	for (i = 0; i < c->n_buckets; i++) {
+		struct bucket_entry *cur;
+		int depth = 0;
+
+		AST_LIST_TRAVERSE(&c->buckets[i], cur, entry) {
+			depth++;
+		}
+		if (depth) {
+			stats->occupied++;
+			if (depth > stats->max_chain) {
+				stats->max_chain = depth;
+			}
+		}
+		if (e > 0.0) {
+			double d = depth - e;
+			chi += d * d / e;
+		}
+	}
+	ao2_unlock(c);
+
+	stats->collisions = stats->elements - stats->occupied;
+	if (stats->collisions < 0) {
+		stats->collisions = 0;
+	}
+	stats->load = e;
+	stats->chi2_df = (stats->n_buckets > 1 && e > 0.0) ? chi / (stats->n_buckets - 1) : 0.0;
 }
 
 #ifdef AO2_DEBUG
@@ -1122,11 +1168,93 @@ static struct ast_cli_entry cli_astobj2[] = {
 };
 #endif /* AO2_DEBUG */
 
+/* --- ao2 container introspection registry (always compiled) -----------------
+ * A weak-reference registry so `core show ao2` can list hash containers with
+ * usage + collision stats regardless of which modules are loaded. The container
+ * destructor auto-unregisters (see container_destruct), so there is never a
+ * dangling pointer: a destroy blocks on the registry WRLOCK while the CLI holds
+ * the RDLOCK, and the registry takes no ao2 ref so it does not leak containers. */
+struct ao2_reg_entry {
+	struct ao2_container *c;
+	AST_RWLIST_ENTRY(ao2_reg_entry) list;
+	char name[80];
+};
+static AST_RWLIST_HEAD_STATIC(ao2_reg_list, ao2_reg_entry);
+
+void ao2_container_register(const char *name, struct ao2_container *c)
+{
+	struct ao2_reg_entry *e;
+
+	if (!name || !c || !(e = ast_calloc(1, sizeof(*e)))) {
+		return;
+	}
+	snprintf(e->name, sizeof(e->name), "%s", name);
+	e->c = c;
+	AST_RWLIST_WRLOCK(&ao2_reg_list);
+	AST_RWLIST_INSERT_TAIL(&ao2_reg_list, e, list);
+	AST_RWLIST_UNLOCK(&ao2_reg_list);
+}
+
+void ao2_container_unregister(struct ao2_container *c)
+{
+	struct ao2_reg_entry *e;
+
+	if (!c) {
+		return;
+	}
+	AST_RWLIST_WRLOCK(&ao2_reg_list);
+	AST_RWLIST_TRAVERSE_SAFE_BEGIN(&ao2_reg_list, e, list) {
+		if (e->c == c) {
+			AST_RWLIST_REMOVE_CURRENT(list);
+			ast_free(e);
+		}
+	}
+	AST_RWLIST_TRAVERSE_SAFE_END;
+	AST_RWLIST_UNLOCK(&ao2_reg_list);
+}
+
+static char *handle_ao2_show(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct ao2_reg_entry *re;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "core show ao2";
+		e->usage =
+			"Usage: core show ao2\n"
+			"       List registered ao2 hash containers with usage and collision\n"
+			"       distribution: buckets, entries, load factor, occupied buckets,\n"
+			"       longest chain, collisions (entries-occupied), chi2/df (~1.0 ideal).\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	ast_cli(a->fd, "%-22s %8s %8s %7s %9s %9s %11s %8s\n",
+		"Container", "buckets", "entries", "load", "occupied", "maxchain", "collisions", "chi2/df");
+	AST_RWLIST_RDLOCK(&ao2_reg_list);
+	AST_RWLIST_TRAVERSE(&ao2_reg_list, re, list) {
+		struct ao2_container_stats st;
+
+		ao2_container_stats(re->c, &st);
+		ast_cli(a->fd, "%-22s %8d %8d %7.2f %9d %9d %11d %8.3f\n",
+			re->name, st.n_buckets, st.elements, st.load,
+			st.occupied, st.max_chain, st.collisions, st.chi2_df);
+	}
+	AST_RWLIST_UNLOCK(&ao2_reg_list);
+	return CLI_SUCCESS;
+}
+
+static struct ast_cli_entry cli_ao2_registry[] = {
+	AST_CLI_DEFINE(handle_ao2_show, "Show ao2 hash container usage and collisions"),
+};
+
 int astobj2_init(void)
 {
 #ifdef AO2_DEBUG
 	ast_cli_register_multiple(cli_astobj2, ARRAY_LEN(cli_astobj2));
 #endif
+	ast_cli_register_multiple(cli_ao2_registry, ARRAY_LEN(cli_ao2_registry));
 
 	return 0;
 }

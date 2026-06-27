@@ -74,6 +74,7 @@ struct sofia_publication {
 #define MAX_PUBLICATION_BUCKETS 10007			/* prime; one entry per publish=yes peer — sized for
 							 * large deployments (~5000-10000 users, load factor <=1) */
 static struct ao2_container *publications;	/* keyed by key; created in load_module */
+struct ao2_container *sofia_publications_container(void) { return publications; }
 static su_timer_t *publication_refresh_timer;	/* recurring refresh sweep on sofia_thread */
 static void sofia_publication_teardown(struct sofia_publication *pub);	/* fwd: defined after create */
 static void sofia_publication_schedule(struct sofia_publication *pub, int base, int span);	/* fwd */
@@ -896,6 +897,7 @@ char *sofia_cli_show_publications(struct ast_cli_entry *e, int cmd, struct ast_c
 int sofia_publications_init(void)
 {
 	publications = ao2_container_alloc(MAX_PUBLICATION_BUCKETS, publication_hash_fn, publication_cmp_fn);
+	ao2_container_register("sofia/publications", publications);
 	return publications ? 0 : -1;
 }
 /* Release the publications container. */

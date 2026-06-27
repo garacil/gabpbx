@@ -963,4 +963,13 @@ struct sofia_config {
 
 extern struct sofia_config sofia_cfg;
 
+/* ao2 hash-table introspection: each split module exposes its container so
+ * `sip show hashstats` (in chan_sofia.c) can report usage + collisions. */
+struct ao2_container;
+struct ao2_container *sofia_blacklist_container(void);
+struct ao2_container *sofia_eventsub_container(void);
+struct ao2_container *sofia_publications_container(void);
+struct ao2_container *sofia_presence_container(void);
+struct ao2_container *sofia_mwisubs_container(void);
+
 #endif /* CHAN_SOFIA_INTERNAL_H */

@@ -82,6 +82,7 @@ struct sofia_evsub {
 
 #define MAX_EVENTSUB_BUCKETS 563	/* prime; one entry per subscribe_event=... peer */
 static struct ao2_container *evsubs;	/* keyed by peername; created in sofia_eventsub_init */
+struct ao2_container *sofia_eventsub_container(void) { return evsubs; }
 
 static int evsub_hash_fn(const void *obj, int flags)
 {
@@ -754,6 +755,7 @@ void sofia_eventsub_on_peer_gone(const char *peername)
 int sofia_eventsub_init(void)
 {
 	evsubs = ao2_container_alloc(MAX_EVENTSUB_BUCKETS, evsub_hash_fn, evsub_cmp_fn);
+	ao2_container_register("sofia/eventsub", evsubs);
 	return evsubs ? 0 : -1;
 }
 

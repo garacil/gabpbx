@@ -89,6 +89,7 @@ struct sofia_mwisub {
 
 #define MAX_MWISUB_BUCKETS 563		/* prime; one entry per mwi_subscribe=... peer (trunks are few) */
 static struct ao2_container *mwisubs;	/* keyed by peername; created in sofia_subscribe_init */
+struct ao2_container *sofia_mwisubs_container(void) { return mwisubs; }
 
 /* ao2 hash: on the peer name. */
 static int mwisub_hash_fn(const void *obj, int flags)
@@ -789,6 +790,7 @@ void sofia_subscribe_on_peer_gone(const char *peername)
 int sofia_subscribe_init(void)
 {
 	mwisubs = ao2_container_alloc(MAX_MWISUB_BUCKETS, mwisub_hash_fn, mwisub_cmp_fn);
+	ao2_container_register("sofia/mwisubs", mwisubs);
 	return mwisubs ? 0 : -1;
 }
 

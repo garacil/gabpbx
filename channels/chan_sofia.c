@@ -13440,8 +13440,59 @@ int sofia_debug_match(const char *peer_name, const char *src_ip)
  * side-effects are deferred AFTER the unlock. LOCAL clear only (no de-REGISTER sent); realtime DB binding
  * untouched. */
 
+/* `sip show hashstats` — ao2 hash-table usage + collision distribution for the chan_sofia
+ * containers, so the live hash spread (buckets/load/maxchain/collisions/chi2) can be inspected
+ * (e.g. to confirm the ast_str_hash distribution on real data). Read-only diagnostic:
+ * ao2_container_stats() walks each container's buckets under its own lock when invoked. */
+static char *sofia_cli_show_hashstats(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct {
+		const char *name;
+		struct ao2_container *c;
+	} tbls[] = {
+		{ "peers",        peers },
+		{ "dialogs",      dialogs },
+		{ "blacklist",    sofia_blacklist_container() },
+		{ "eventsub",     sofia_eventsub_container() },
+		{ "publications", sofia_publications_container() },
+		{ "presence",     sofia_presence_container() },
+		{ "mwisubs",      sofia_mwisubs_container() },
+	};
+	int i;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "sip show hashstats";
+		e->usage =
+			"Usage: sip show hashstats\n"
+			"       Show chan_sofia ao2 hash-table usage and collision distribution:\n"
+			"       buckets, entries, load factor, occupied buckets, longest chain,\n"
+			"       collisions (entries-occupied), and chi2/df (~1.0 = ideal spread).\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	ast_cli(a->fd, "%-14s %8s %8s %7s %9s %9s %11s %8s\n",
+		"Table", "buckets", "entries", "load", "occupied", "maxchain", "collisions", "chi2/df");
+	for (i = 0; i < (int) ARRAY_LEN(tbls); i++) {
+		struct ao2_container_stats st;
+
+		if (!tbls[i].c) {
+			ast_cli(a->fd, "%-14s %8s\n", tbls[i].name, "(inactive)");
+			continue;
+		}
+		ao2_container_stats(tbls[i].c, &st);
+		ast_cli(a->fd, "%-14s %8d %8d %7.2f %9d %9d %11d %8.3f\n",
+			tbls[i].name, st.n_buckets, st.elements, st.load,
+			st.occupied, st.max_chain, st.collisions, st.chi2_df);
+	}
+	return CLI_SUCCESS;
+}
+
 static struct ast_cli_entry cli_sofia[] = {
 	AST_CLI_DEFINE(sofia_cli_show_peers, "List Sofia-SIP peers"),
+	AST_CLI_DEFINE(sofia_cli_show_hashstats, "Show ao2 hash-table usage and collisions"),
 	AST_CLI_DEFINE(sofia_cli_show_registry, "List outbound SIP trunk registrations"),
 	AST_CLI_DEFINE(sofia_cli_show_publications, "List outbound PUBLISH presentities"),
 	AST_CLI_DEFINE(sofia_cli_unregister, "Force-expire a SIP peer's inbound registration"),
@@ -16100,12 +16151,14 @@ static int load_module(void)
 		rc = AST_MODULE_LOAD_FAILURE;
 		goto err_cleanup;
 	}
+	ao2_container_register("sofia/peers", peers);
 	dialogs = ao2_container_alloc(MAX_DIALOG_BUCKETS, dialog_hash_fn, dialog_cmp_fn);
 	if (!dialogs) {
 		ast_log(LOG_ERROR, "Unable to create Sofia dialogs container\n");
 		rc = AST_MODULE_LOAD_FAILURE;
 		goto err_cleanup;
 	}
+	ao2_container_register("sofia/dialogs", dialogs);
 	if (sofia_blacklist_init()) {
 		ast_log(LOG_ERROR, "Unable to create Sofia blacklist container\n");
 		rc = AST_MODULE_LOAD_FAILURE;

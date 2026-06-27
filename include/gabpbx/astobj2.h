@@ -736,6 +736,43 @@ struct ao2_container *__ao2_container_alloc_debug(const unsigned int n_buckets,
  */
 int ao2_container_count(struct ao2_container *c);
 
+/*!
+ * \brief Hash-table usage and collision statistics for a container.
+ */
+struct ao2_container_stats {
+	int n_buckets;     /*!< number of hash buckets */
+	int elements;      /*!< number of stored objects */
+	int occupied;      /*!< buckets holding at least one object */
+	int max_chain;     /*!< longest single-bucket chain */
+	int collisions;    /*!< elements - occupied (objects sharing a bucket) */
+	double load;       /*!< elements / n_buckets */
+	double chi2_df;    /*!< chi-square / degrees of freedom (~1.0 = ideal spread) */
+};
+
+/*!
+ * \brief Compute hash-table usage/collision stats for a container.
+ *
+ * Walks every bucket under the container lock. O(n_buckets + elements); meant
+ * for on-demand diagnostics (e.g. a CLI), not hot paths.
+ */
+void ao2_container_stats(struct ao2_container *c, struct ao2_container_stats *stats);
+
+/*!
+ * \brief Register a container under a name for `core show ao2` introspection.
+ *
+ * The registry keeps a WEAK reference (no ao2 ref); the container's destructor
+ * auto-unregisters, so callers register once at creation and never need to
+ * unregister explicitly.
+ */
+void ao2_container_register(const char *name, struct ao2_container *c);
+
+/*!
+ * \brief Remove a container from the introspection registry.
+ *
+ * Called automatically by the container destructor; rarely needed by callers.
+ */
+void ao2_container_unregister(struct ao2_container *c);
+
 /*@} */
 
 /*! \name Object Management
