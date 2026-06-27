@@ -6453,6 +6453,20 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		struct sofia_peer *caller_peer = NULL;
 		if (cid_num[0]) {
 			caller_peer = sofia_find_peer(cid_num);
+			/* chan_sip FINDUSERS-then-FINDPEERS parity (chan_sip.c:16990-16997): only a type=user/friend
+			 * may be identified by the From-user NAME. A type=peer whose name collides with the caller-ID
+			 * (an inbound IP-trunk INVITE whose From-user equals a local extension that is itself a
+			 * type=peer) must NOT match by name; it would steal
+			 * the call and trigger a digest challenge the trunk can't answer. Drop it so the source-IP
+			 * lookup below identifies the real sender (chan_sip matches peers by IP, users by name). */
+			if (caller_peer && !(caller_peer->type & SOFIA_TYPE_USER)) {
+				if (sofia_debug) {
+					ast_verbose("Sofia: INVITE From-user '%s' matched a type=peer (not a user); discarding for source-IP match\n",
+						cid_num);
+				}
+				ao2_ref(caller_peer, -1);
+				caller_peer = NULL;
+			}
 		}
 		if (!caller_peer) {
 			/* From-username lookup failed → fall back to source-IP match so
