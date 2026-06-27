@@ -108,8 +108,17 @@ srvlookup=yes
 ;
 ; --- TLS / WS / WSS listeners (T36) — optional ---
 ; tlsbindaddr  = 0.0.0.0
-; tlsbindport  = 5061                         ; non-zero enables TLS listener
-; tlscertfile  = /etc/gabpbx/keys             ; DIR containing agent.pem (combined cert+key); alias: tlscertdir
+; tlsbindport  = 5061                         ; non-zero sets the TLS listener port
+; tlsenable    = yes                          ; explicit on/off for the TLS listener (default yes).
+;                                              ; tlsenable=no disables TLS even if tlsbindport is set
+;                                              ; (chan_sip parity). Same idea: wsenable, wssenable.
+; tlscertfile  = /etc/gabpbx/keys             ; cert DIR, OR the real cert+key FILE (alias: tlscertdir).
+;                                              ; If it names a FILE (e.g. /etc/gabpbx/keys/gabpbx.pem),
+;                                              ; chan_sofia uses its directory and soft-links the name
+;                                              ; sofia-sip expects (agent.pem) to that file - so you can
+;                                              ; point straight at a cert managed by an external tool
+;                                              ; without renaming it.
+; tlscafile    = /etc/gabpbx/keys/ca.crt       ; optional real CA file; soft-linked to <dir>/cafile.pem.
 ;
 ; TLS hardening (TLS listener only — opt-in; each unset knob keeps the sofia-sip default, no change):
 ; tls_min_version  = 1.2                       ; minimum TLS version 1.0|1.1|1.2|1.3 (enables that and
@@ -131,18 +140,25 @@ srvlookup=yes
 ; tls_min_version / tls_ciphers / tls_verify_depth needs `systemctl restart gabpbx` (a `sip reload` refuses with
 ; "listener config changed").
 ;
-; ws-binding for browser SIP UAs (no TLS)
+; ws-binding for browser SIP UAs (no TLS; no cert needed)
 ; wsbindaddr   = 0.0.0.0
-; wsbindport   = 5066                         ; non-zero enables WS listener
+; wsbindport   = 5066                         ; non-zero sets the WS listener port
+; wsenable     = yes                          ; explicit on/off for the WS listener (default yes)
 ;
 ; wss-binding (recommended for production browser UAs; reuses tlscertfile)
 ; wssbindaddr  = 0.0.0.0
-; wssbindport  = 7443                         ; non-zero enables WSS listener
+; wssbindport  = 7443                         ; non-zero sets the WSS listener port
+; wssenable    = yes                          ; explicit on/off for the WSS listener (default yes)
 ;
-; NOTE: TLS expects agent.pem (combined cert+key) + cafile.pem (CA cert) in tlscertfile dir.
-; WSS additionally needs wss.pem + ca-bundle.crt — chan_sofia AUTO-LINKS these from
-; agent.pem + cafile.pem at startup when wssbindport is set, so operators only manage
-; the two TLS files. Generate self-signed for testing:
+; NOTE: TLS expects agent.pem (combined cert+key) + cafile.pem (CA cert) in the tlscertfile dir;
+; WSS additionally needs wss.pem + ca-bundle.crt. chan_sofia AUTO-LINKS the missing names at
+; startup: agent.pem -> tlscertfile (if it is a file), cafile.pem -> tlscafile, wss.pem -> agent.pem,
+; ca-bundle.crt -> cafile.pem (soft links, created only if missing, never overwriting your files).
+; So you only manage the real cert + CA; chan_sofia bridges them to the names sofia-sip opens.
+; IMMUNITY: if a configured TLS/WSS listener has NO usable certificate, chan_sofia logs an ERROR and
+; DISABLES only that listener (UDP/TCP/WS keep serving and the module still loads) instead of failing
+; the whole driver. Set tlsenable=no / wssenable=no to silence the warning on a box with no cert.
+; Generate self-signed for testing:
 ;   openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=mypbx"
 ;   cat cert.pem key.pem > /etc/gabpbx/keys/agent.pem
 ;   cp cert.pem /etc/gabpbx/keys/cafile.pem

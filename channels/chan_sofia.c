@@ -119,6 +119,7 @@
 #include <stdlib.h>
 #include <regex.h>  /* regcomp/regexec for `like <pattern>` in sip prune realtime CLI */
 #include <unistd.h>
+#include <sys/stat.h>		/* stat()/S_ISDIR: resolve tlscertfile dir-vs-file for the cert-dir aliasing */
 #include <fcntl.h>
 #include <errno.h>
 #include <openssl/sha.h>  /* RFC 7616 SHA-256 digest auth: libcrypto's SHA256() — core SHA256* symbols are not exported to modules */
@@ -13561,6 +13562,8 @@ static void *sofia_thread_func(void *data)
 		char tls_url[128] = "";
 		char ws_url[128]  = "";
 		char wss_url[128] = "";
+		char cert_dir[256] = "";	/* the DIRECTORY handed to sofia-sip (NUTAG_CERTIFICATE_DIR); derived
+						 * from tlscertfile (its dirname when tlscertfile names a file). */
 		int needs_cert;
 
 		/* IPv6 bind: bracket-wrap an IPv6 host (RFC 3261 §19.1.2); IPv4/hostnames/`*`
@@ -13571,7 +13574,7 @@ static void *sofia_thread_func(void *data)
 				ast_strlen_zero(sofia_cfg.bindaddr) ? "*" : sofia_cfg.bindaddr,
 				hbuf_udp, sizeof(hbuf_udp)),
 			sofia_cfg.bindport);
-		if (sofia_cfg.tlsbindport > 0) {
+		if (sofia_cfg.tls_enable && sofia_cfg.tlsbindport > 0) {
 			/* Explicit transport=tls forces TLS-only: without it, sips: enumerates
 			 * both TLS+WSS on the same port and the WSS bind fails. */
 			snprintf(tls_url, sizeof(tls_url), "sips:%s:%d;transport=tls",
@@ -13580,14 +13583,14 @@ static void *sofia_thread_func(void *data)
 					hbuf_tls, sizeof(hbuf_tls)),
 				sofia_cfg.tlsbindport);
 		}
-		if (sofia_cfg.wsbindport > 0) {
+		if (sofia_cfg.ws_enable && sofia_cfg.wsbindport > 0) {
 			snprintf(ws_url, sizeof(ws_url), "sip:%s:%d;transport=ws",
 				sofia_uri_format_host(
 					ast_strlen_zero(sofia_cfg.wsbindaddr) ? "*" : sofia_cfg.wsbindaddr,
 					hbuf_ws, sizeof(hbuf_ws)),
 				sofia_cfg.wsbindport);
 		}
-		if (sofia_cfg.wssbindport > 0) {
+		if (sofia_cfg.wss_enable && sofia_cfg.wssbindport > 0) {
 			snprintf(wss_url, sizeof(wss_url), "sips:%s:%d;transport=wss",
 				sofia_uri_format_host(
 					ast_strlen_zero(sofia_cfg.wssbindaddr) ? "*" : sofia_cfg.wssbindaddr,
@@ -13595,36 +13598,136 @@ static void *sofia_thread_func(void *data)
 				sofia_cfg.wssbindport);
 		}
 
-		needs_cert = (tls_url[0] || wss_url[0]);
-
-		/* WSS needs WSS-named cert files (wss.pem + ca-bundle.crt per
-		 * tport_type_ws.c:357-376); TLS uses agent.pem + cafile.pem. Auto-alias the
-		 * missing WSS files from the TLS ones. Idempotent. */
-		if (sofia_cfg.wssbindport > 0 && !ast_strlen_zero(sofia_cfg.tlscertfile)) {
-			char wss_pem[512], ca_bundle[512], agent[512], cafile[512];
-			snprintf(wss_pem,   sizeof(wss_pem),   "%s/wss.pem",       sofia_cfg.tlscertfile);
-			snprintf(ca_bundle, sizeof(ca_bundle), "%s/ca-bundle.crt", sofia_cfg.tlscertfile);
-			snprintf(agent,     sizeof(agent),     "%s/agent.pem",     sofia_cfg.tlscertfile);
-			snprintf(cafile,    sizeof(cafile),    "%s/cafile.pem",    sofia_cfg.tlscertfile);
-			if (access(wss_pem, R_OK) != 0 && access(agent, R_OK) == 0) {
-				if (link(agent, wss_pem) != 0 && symlink(agent, wss_pem) != 0) {
-					ast_log(LOG_WARNING, "Sofia: could not create %s from %s — WSS may fail\n",
-						wss_pem, agent);
+		/* Cert-dir resolution + sofia-name aliasing (external cert-manager integration).
+		 * sofia-sip opens FIXED filenames inside a cert DIRECTORY (NUTAG_CERTIFICATE_DIR):
+		 * agent.pem + cafile.pem for TLS (tport_type_tls.c:226-233); wss.pem, or
+		 * wss.key+wss.crt + ca-bundle.crt, for WSS (tport_type_ws.c:357-376). An external cert
+		 * manager names the real files differently (e.g. <host>.pem / gabpbx.pem / ca.crt), so:
+		 *   - tlscertfile may be the cert DIR or the real cert+key FILE; cert_dir = its dirname when
+		 *     it is a regular file, else tlscertfile as-is.
+		 *   - when a sofia-expected name is missing in cert_dir, soft-link it to the real file the
+		 *     operator configured (agent.pem -> tlscertfile, cafile.pem -> tlscafile), then derive the
+		 *     WSS names from the TLS ones (wss.pem -> agent.pem, ca-bundle.crt -> cafile.pem).
+		 * Idempotent; only creates a MISSING name, never renames/overwrites the manager's own files. */
+		if (!ast_strlen_zero(sofia_cfg.tlscertfile)) {
+			struct stat st;
+			const char *real_cert = NULL;
+			ast_copy_string(cert_dir, sofia_cfg.tlscertfile, sizeof(cert_dir));
+			if (stat(sofia_cfg.tlscertfile, &st) == 0 && !S_ISDIR(st.st_mode)) {
+				/* tlscertfile is the real cert FILE: agent.pem links to it; cert_dir = its dirname. */
+				char *slash = strrchr(cert_dir, '/');
+				real_cert = sofia_cfg.tlscertfile;
+				if (slash == cert_dir) {
+					cert_dir[1] = '\0';			/* file directly under "/" */
+				} else if (slash) {
+					*slash = '\0';
+				} else {
+					ast_copy_string(cert_dir, ".", sizeof(cert_dir));	/* bare filename -> CWD */
 				}
 			}
-			if (access(ca_bundle, R_OK) != 0 && access(cafile, R_OK) == 0) {
-				if (link(cafile, ca_bundle) != 0 && symlink(cafile, ca_bundle) != 0) {
-					ast_log(LOG_WARNING, "Sofia: could not create %s from %s — WSS may fail\n",
-						ca_bundle, cafile);
+
+			/* Only materialize aliases when a cert-bearing listener is actually effective. */
+			if (tls_url[0] || wss_url[0]) {
+				char agent[600], cafile[600], wss_pem[600], ca_bundle[600];
+				snprintf(agent,     sizeof(agent),     "%s/agent.pem",     cert_dir);
+				snprintf(cafile,    sizeof(cafile),    "%s/cafile.pem",    cert_dir);
+				snprintf(wss_pem,   sizeof(wss_pem),   "%s/wss.pem",       cert_dir);
+				snprintf(ca_bundle, sizeof(ca_bundle), "%s/ca-bundle.crt", cert_dir);
+				/* agent.pem -> the real cert+key file (only when tlscertfile named a file). */
+				if (real_cert && access(agent, R_OK) != 0) {
+					if (symlink(real_cert, agent) != 0) {
+						ast_log(LOG_WARNING, "Sofia: could not soft-link %s -> %s (%s); TLS/WSS may be disabled\n",
+							agent, real_cert, strerror(errno));
+					} else {
+						ast_log(LOG_NOTICE, "Sofia: soft-linked %s -> %s for sofia-sip\n", agent, real_cert);
+					}
+				}
+				/* cafile.pem -> the real CA file (tlscafile). */
+				if (!ast_strlen_zero(sofia_cfg.tlscafile) && access(cafile, R_OK) != 0) {
+					if (symlink(sofia_cfg.tlscafile, cafile) != 0) {
+						ast_log(LOG_WARNING, "Sofia: could not soft-link %s -> %s (%s); TLS verify/WSS may be disabled\n",
+							cafile, sofia_cfg.tlscafile, strerror(errno));
+					} else {
+						ast_log(LOG_NOTICE, "Sofia: soft-linked %s -> %s for sofia-sip\n", cafile, sofia_cfg.tlscafile);
+					}
+				}
+				/* WSS names from the TLS ones (only when the WSS listener is effective). */
+				if (wss_url[0]) {
+					if (access(wss_pem, R_OK) != 0 && access(agent, R_OK) == 0
+							&& symlink(agent, wss_pem) != 0) {
+						ast_log(LOG_WARNING, "Sofia: could not soft-link %s -> %s (%s); WSS may fail\n",
+							wss_pem, agent, strerror(errno));
+					}
+					if (access(ca_bundle, R_OK) != 0 && access(cafile, R_OK) == 0
+							&& symlink(cafile, ca_bundle) != 0) {
+						ast_log(LOG_WARNING, "Sofia: could not soft-link %s -> %s (%s); WSS may fail\n",
+							ca_bundle, cafile, strerror(errno));
+					}
 				}
 			}
 		}
+
+		/* Cert-availability immunity (chan_sip.c:30207-30224 parity): a TLS/WSS listener whose
+		 * certificate material is absent or unreadable makes sofia-sip's primary transport init
+		 * return -1, so nua_create() returns NULL and the WHOLE driver fails to load (UDP
+		 * included). Pre-validate the exact files sofia-sip will open under the resolved cert dir
+		 * (cert_dir, passed as NUTAG_CERTIFICATE_DIR); if a secure listener has no
+		 * usable cert, log an ERROR and DROP only that listener so UDP/TCP/WS keep serving. An
+		 * empty tlscertfile is treated as "no cert" here (raw sofia-sip would fall back to
+		 * $HOME/.sip/auth, never what an operator wants for a system service).
+		 * TLS (tport_type_tls.c:226-233): key=agent.pem|tls.pem AND CA=cafile.pem|tls.pem.
+		 * WSS (tport_type_ws.c:357-371): wss.pem, OR wss.key+wss.crt+ca-bundle.crt. */
+		if (tls_url[0]) {
+			const char *dir = cert_dir;
+			char p[512];
+			int key_ok = 0, ca_ok = 0;
+			if (!ast_strlen_zero(dir)) {
+				snprintf(p, sizeof(p), "%s/agent.pem", dir); key_ok = (access(p, R_OK) == 0);
+				if (!key_ok) { snprintf(p, sizeof(p), "%s/tls.pem", dir); key_ok = (access(p, R_OK) == 0); }
+				snprintf(p, sizeof(p), "%s/cafile.pem", dir); ca_ok = (access(p, R_OK) == 0);
+				if (!ca_ok) { snprintf(p, sizeof(p), "%s/tls.pem", dir); ca_ok = (access(p, R_OK) == 0); }
+			}
+			if (!(key_ok && ca_ok)) {
+				ast_log(LOG_ERROR, "Sofia: TLS listener configured (tlsbindport=%d) but no usable certificate in '%s' "
+					"(need agent.pem or tls.pem, plus cafile.pem or tls.pem); disabling the TLS listener "
+					"(set tlsenable=no to silence). UDP/TCP/WS keep serving.\n",
+					sofia_cfg.tlsbindport, ast_strlen_zero(dir) ? "(tlscertfile unset)" : dir);
+				tls_url[0] = '\0';
+			}
+		}
+		if (wss_url[0]) {
+			const char *dir = cert_dir;
+			char p[512];
+			int wss_ok = 0;
+			if (!ast_strlen_zero(dir)) {
+				snprintf(p, sizeof(p), "%s/wss.pem", dir);
+				wss_ok = (access(p, R_OK) == 0);
+				if (!wss_ok) {
+					char k[512], c[512];
+					snprintf(k, sizeof(k), "%s/wss.key", dir);
+					snprintf(c, sizeof(c), "%s/wss.crt", dir);
+					snprintf(p, sizeof(p), "%s/ca-bundle.crt", dir);
+					wss_ok = (access(k, R_OK) == 0 && access(c, R_OK) == 0 && access(p, R_OK) == 0);
+				}
+			}
+			if (!wss_ok) {
+				ast_log(LOG_ERROR, "Sofia: WSS listener configured (wssbindport=%d) but no usable certificate in '%s' "
+					"(need wss.pem, or wss.key+wss.crt+ca-bundle.crt); disabling the WSS listener "
+					"(set wssenable=no to silence). UDP/TCP/WS keep serving.\n",
+					sofia_cfg.wssbindport, ast_strlen_zero(dir) ? "(tlscertfile unset)" : dir);
+				wss_url[0] = '\0';
+			}
+		}
+
+		/* Recompute AFTER any degrade so NUTAG_CERTIFICATE_DIR + the TLS hardening tags are only
+		 * applied when a cert-bearing listener actually survives. */
+		needs_cert = (tls_url[0] || wss_url[0]);
 
 		ast_debug(1, "Creating NUA: udp=%s tls=%s ws=%s wss=%s cert_dir=%s\n",
 			udp_url, tls_url[0] ? tls_url : "(none)",
 			ws_url[0] ? ws_url : "(none)",
 			wss_url[0] ? wss_url : "(none)",
-			needs_cert ? sofia_cfg.tlscertfile : "(none)");
+			needs_cert ? cert_dir : "(none)");
 
 		/* Warn on pingpong-without-keepalive: it is silently ignored (pingpong is only
 		 * applied alongside keepalive below). */
@@ -13647,8 +13750,8 @@ static void *sofia_thread_func(void *data)
 			TAG_IF(tls_url[0], NUTAG_SIPS_URL(tls_url)),
 			TAG_IF(ws_url[0],  NUTAG_WS_URL(ws_url)),
 			TAG_IF(wss_url[0], NUTAG_WSS_URL(wss_url)),
-			TAG_IF(needs_cert && !ast_strlen_zero(sofia_cfg.tlscertfile),
-				NUTAG_CERTIFICATE_DIR(sofia_cfg.tlscertfile)),
+			TAG_IF(needs_cert && !ast_strlen_zero(cert_dir),
+				NUTAG_CERTIFICATE_DIR(cert_dir)),
 			/* Opt-in peer-cert verification (default OFF = sofia-sip TPTLS_VERIFY_NONE).
 			 * tlsverify=yes verifies the outbound server cert chain+subject+date against
 			 * tlscertfile — closes the accept-any-cert MITM hole on the outbound TLS transport
@@ -14342,8 +14445,16 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			ast_copy_string(sofia_cfg.tlsbindaddr, v->value, sizeof(sofia_cfg.tlsbindaddr));
 		} else if (!strcasecmp(v->name, "tlsbindport")) {
 			sofia_cfg.tlsbindport = atoi(v->value);
+		} else if (!strcasecmp(v->name, "tlsenable")) {
+			/* Explicit opt-out for the TLS listener; honored even when tlsbindport>0 (chan_sip parity,
+			 * chan_sip.c:120). Default ON in the compiled defaults above. */
+			sofia_cfg.tls_enable = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "tlscertfile") || !strcasecmp(v->name, "tlscertdir")) {
 			ast_copy_string(sofia_cfg.tlscertfile, v->value, sizeof(sofia_cfg.tlscertfile));
+		} else if (!strcasecmp(v->name, "tlscafile")) {
+			/* Optional real CA file; soft-linked to <certdir>/cafile.pem at NUA create so sofia-sip
+			 * (which opens the fixed name cafile.pem) finds it without renaming cert-server files. */
+			ast_copy_string(sofia_cfg.tlscafile, v->value, sizeof(sofia_cfg.tlscafile));
 		} else if (!strcasecmp(v->name, "tlsverify") || !strcasecmp(v->name, "tlsverifyserver")) {
 			/* Opt-in TLS peer-cert verification (default OFF): validate the server cert chain +
 			 * subject against the configured CA material (tlscertfile dir). */
@@ -14421,10 +14532,16 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			ast_copy_string(sofia_cfg.wsbindaddr, v->value, sizeof(sofia_cfg.wsbindaddr));
 		} else if (!strcasecmp(v->name, "wsbindport")) {
 			sofia_cfg.wsbindport = atoi(v->value);
+		} else if (!strcasecmp(v->name, "wsenable")) {
+			/* Explicit opt-out for the plaintext WS listener (honored even when wsbindport>0). */
+			sofia_cfg.ws_enable = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "wssbindaddr")) {
 			ast_copy_string(sofia_cfg.wssbindaddr, v->value, sizeof(sofia_cfg.wssbindaddr));
 		} else if (!strcasecmp(v->name, "wssbindport")) {
 			sofia_cfg.wssbindport = atoi(v->value);
+		} else if (!strcasecmp(v->name, "wssenable")) {
+			/* Explicit opt-out for the secure WSS listener (honored even when wssbindport>0). */
+			sofia_cfg.wss_enable = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "context")) {
 			ast_copy_string(sofia_cfg.context, v->value, sizeof(sofia_cfg.context));
 		} else if (!strcasecmp(v->name, "realm")) {
@@ -15657,6 +15774,14 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.tls_ciphers[0] = '\0';
 	sofia_cfg.tls_min_version[0] = '\0';
 	sofia_cfg.tls_verify_depth = 0;
+	/* Transport enable flags default ON (1): a listener is built when (enable && bindport>0), so a
+	 * config that only sets the bindports keeps its current behavior; tlsenable/wsenable/wssenable=no
+	 * is the explicit opt-out (honored even when the bindport is set). chan_sip parity. */
+	sofia_cfg.tls_enable = 1;
+	sofia_cfg.ws_enable = 1;
+	sofia_cfg.wss_enable = 1;
+	/* Optional real CA file (soft-linked to <certdir>/cafile.pem at NUA create); empty by default. */
+	sofia_cfg.tlscafile[0] = '\0';
 	/* outbound PUBLISH (RFC 3903) off by default (publish_server empty = feature OFF). */
 	sofia_cfg.publish_server[0] = '\0';
 	sofia_cfg.publish_expires = 0;
@@ -16181,11 +16306,15 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 		int bindport;
 		char tlsbindaddr[64];
 		int tlsbindport;
+		int tls_enable;		/* tlsenable=; a change forces a listener recreate (gate baked into nua_create) */
 		char tlscertfile[256];
+		char tlscafile[256];	/* a change forces a listener recreate (cafile.pem alias rebuilt at NUA create) */
 		char wsbindaddr[64];
 		int wsbindport;
+		int ws_enable;		/* wsenable=; a change forces a listener recreate */
 		char wssbindaddr[64];
 		int wssbindport;
+		int wss_enable;		/* wssenable=; a change forces a listener recreate */
 		int tlsverify;
 		int tlsverifyclient;	/* mTLS toggle; a change forces a listener recreate */
 		char tls_ciphers[256];	/* a change forces a listener recreate (TLS ctx built at listener create) */
@@ -16211,11 +16340,15 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 	s.bindport = DEFAULT_SIP_PORT;
 	s.tlsbindaddr[0] = '\0';
 	s.tlsbindport = 0;
+	s.tls_enable = 1;
 	s.tlscertfile[0] = '\0';
+	s.tlscafile[0] = '\0';
 	s.wsbindaddr[0] = '\0';
 	s.wsbindport = 0;
+	s.ws_enable = 1;
 	s.wssbindaddr[0] = '\0';
 	s.wssbindport = 0;
+	s.wss_enable = 1;
 	s.tlsverify = 0;
 	s.tlsverifyclient = 0;
 	s.tls_ciphers[0] = '\0';
@@ -16263,8 +16396,12 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 			ast_copy_string(s.tlsbindaddr, v->value, sizeof(s.tlsbindaddr));
 		} else if (!strcasecmp(v->name, "tlsbindport")) {
 			s.tlsbindport = atoi(v->value);
+		} else if (!strcasecmp(v->name, "tlsenable")) {
+			s.tls_enable = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "tlscertfile") || !strcasecmp(v->name, "tlscertdir")) {
 			ast_copy_string(s.tlscertfile, v->value, sizeof(s.tlscertfile));
+		} else if (!strcasecmp(v->name, "tlscafile")) {
+			ast_copy_string(s.tlscafile, v->value, sizeof(s.tlscafile));
 		} else if (!strcasecmp(v->name, "tcp_keepalive")) {
 			s.tcp_keepalive_ms = sofia_cfg_seconds_to_ms(v->value);
 		} else if (!strcasecmp(v->name, "tcp_pingpong")) {
@@ -16286,10 +16423,14 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 			ast_copy_string(s.wsbindaddr, v->value, sizeof(s.wsbindaddr));
 		} else if (!strcasecmp(v->name, "wsbindport")) {
 			s.wsbindport = atoi(v->value);
+		} else if (!strcasecmp(v->name, "wsenable")) {
+			s.ws_enable = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "wssbindaddr")) {
 			ast_copy_string(s.wssbindaddr, v->value, sizeof(s.wssbindaddr));
 		} else if (!strcasecmp(v->name, "wssbindport")) {
 			s.wssbindport = atoi(v->value);
+		} else if (!strcasecmp(v->name, "wssenable")) {
+			s.wss_enable = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "t1min")) {
 			int v_int = 0;
 			if (sscanf(v->value, "%30d", &v_int) != 1 || v_int < 10) {
@@ -16354,11 +16495,15 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 	SOFIA_LISTENER_CMP_INT(bindport, "bindport");
 	SOFIA_LISTENER_CMP_STR(tlsbindaddr, "tlsbindaddr");
 	SOFIA_LISTENER_CMP_INT(tlsbindport, "tlsbindport");
+	SOFIA_LISTENER_CMP_INT(tls_enable, "tlsenable");
 	SOFIA_LISTENER_CMP_STR(tlscertfile, "tlscertfile");
+	SOFIA_LISTENER_CMP_STR(tlscafile, "tlscafile");
 	SOFIA_LISTENER_CMP_STR(wsbindaddr, "wsbindaddr");
 	SOFIA_LISTENER_CMP_INT(wsbindport, "wsbindport");
+	SOFIA_LISTENER_CMP_INT(ws_enable, "wsenable");
 	SOFIA_LISTENER_CMP_STR(wssbindaddr, "wssbindaddr");
 	SOFIA_LISTENER_CMP_INT(wssbindport, "wssbindport");
+	SOFIA_LISTENER_CMP_INT(wss_enable, "wssenable");
 	SOFIA_LISTENER_CMP_INT(tcp_keepalive_ms, "tcp_keepalive");
 	SOFIA_LISTENER_CMP_INT(tcp_pingpong_ms, "tcp_pingpong");
 	/* scratch field names diverge here (s.timer_t1 vs sofia_cfg.default_timer_t1). */

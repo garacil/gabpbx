@@ -868,7 +868,15 @@ struct sofia_config {
 	/* T36: optional TLS / WS / WSS listeners */
 	char tlsbindaddr[64];
 	int  tlsbindport;        /* 0 = disabled; common: 5061 */
-	char tlscertfile[256];   /* directory containing agent.pem (combined cert+key) */
+	int  tls_enable;         /* tlsenable= (default 1): explicit opt-out. The TLS listener is built only
+	                          * when (tls_enable && tlsbindport>0). chan_sip parity (chan_sip.c:120,30106). */
+	char tlscertfile[256];   /* cert DIR, OR the real cert+key FILE. When it names a regular file,
+	                          * chan_sofia derives the dir (dirname) and soft-links the sofia-expected
+	                          * name agent.pem -> that file, so the operator can point at the host cert
+	                          * (e.g. .../gabpbx.pem, CN=<host>) without renaming cert-server files. */
+	char tlscafile[256];     /* optional real CA file. When set, chan_sofia soft-links cafile.pem -> it
+	                          * inside the cert dir (sofia-sip opens <dir>/cafile.pem). Empty = rely on a
+	                          * cafile.pem already present in the dir. */
 	int  tlsverify;          /* verify the peer (server) cert chain on the TLS transport (default 0
 	                          * = OFF, sofia-sip default; opt-in, requires a CA bundle). WSS builds
 	                          * its own SSL_CTX and is NOT governed by this. */
@@ -899,8 +907,12 @@ struct sofia_config {
 	char publish_transport[8]; /* [general] publish_transport=udp|tcp|tls|ws|wss: ;transport= appended to the PUBLISH R-URI so a tls/tcp/ws/wss ESC is reached over that transport (sofia-sip otherwise defaults bare R-URIs to UDP). Empty/udp = no-op (byte-identical). */
 	char wsbindaddr[64];
 	int  wsbindport;         /* 0 = disabled; common: 5066 */
+	int  ws_enable;          /* wsenable= (default 1): explicit opt-out for the plaintext WebSocket
+	                          * listener; built only when (ws_enable && wsbindport>0). No cert needed. */
 	char wssbindaddr[64];
 	int  wssbindport;        /* 0 = disabled; common: 7443 */
+	int  wss_enable;         /* wssenable= (default 1): explicit opt-out for the secure WebSocket
+	                          * listener; built only when (wss_enable && wssbindport>0). Needs a cert. */
 	/* MWI message-summary defaults (RFC 3842). */
 	char mwi_from[80];        /* From header used in MWI NOTIFY; empty -> peer->fromdomain or sofia_cfg.realm fallback */
 	char notifymime[80];      /* Content-Type for MWI NOTIFY body; default "application/simple-message-summary" */
