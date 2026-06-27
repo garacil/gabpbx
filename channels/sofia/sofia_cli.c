@@ -1100,6 +1100,7 @@ char *sofia_cli_prune_realtime(struct ast_cli_entry *e, int cmd, struct ast_cli_
 				/* Drain MWI before the final unref so the destructor's drain can't resurrect the
 				 * peer via a concurrent mwi_event_cb. */
 				sofia_peer_drain_mwi(pi);
+				sofia_peer_ipport_unindex(pi);	/* B: unindex BEFORE unlink (the index pins a peer ref) */
 				ao2_unlink(peers, pi);
 				pruned++;
 				ao2_ref(pi, -1);
@@ -1140,6 +1141,7 @@ char *sofia_cli_prune_realtime(struct ast_cli_entry *e, int cmd, struct ast_cli_
 					}
 					/* Drain MWI subscriptions before the final unref (see the multi-prune branch). */
 					sofia_peer_drain_mwi(peer);
+					sofia_peer_ipport_unindex(peer);	/* B: unindex BEFORE unlink */
 					ao2_unlink(peers, peer);
 					ast_cli(a->fd, "Peer '%s' pruned.\n", name);
 				}
@@ -1316,6 +1318,7 @@ char *sofia_cli_unregister(struct ast_cli_entry *e, int cmd, struct ast_cli_args
 	ast_mutex_unlock(&peer->lock);
 
 	if (did_clear) {
+		sofia_peer_ipport_reindex(peer);	/* B: src_addr cleared above → re-key (drops the now-stale index entry) */
 		/* Side-effects AFTER the unlock — same path natural expiry uses (regexten cleanup + AMI
 		 * PeerStatus Unregistered + devstate/BLF). sip=NULL safe: the emit_unregister branch never derefs it. */
 		struct sofia_register_update upd = { 0 };

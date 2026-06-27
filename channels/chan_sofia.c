@@ -258,7 +258,11 @@ static int sofia_timert1_set;
 int sofia_srtp_per_suite_keys;
 
 struct ao2_container *peers;
+/* B: O(1) by-IP+port index of cached peers (perf). Immutable entries (struct sofia_peer_ipport), each
+ * holding a +1 peer ref, keyed by IP+port. Lock order: NEVER hold ao2_lock(peers) while touching it. */
+static struct ao2_container *peers_by_ipport;
 static struct ao2_container *dialogs;
+static struct sofia_peer *sofia_peer_ref_if_linked(struct sofia_peer *target);	/* fwd: +1 ref iff still linked in `peers` */
 
 /* Accessor for the dialogs container so split modules (e.g. sofia_history.c's CLI handlers) can
  * iterate live dialogs without the container leaving this translation unit's ownership. */
@@ -2415,6 +2419,7 @@ static void sofia_on_dns_update_peer(struct ast_sockaddr *old, struct ast_sockad
 	ast_mutex_lock(&peer->lock);
 	memcpy(&peer->src_addr, new, sizeof(peer->src_addr));
 	ast_mutex_unlock(&peer->lock);
+	sofia_peer_ipport_reindex(peer);	/* B: re-key on the freshly resolved address (peer->lock released) */
 
 	ast_verbose("Sofia: dnsmgr — peer '%s' resolved %s -> %s\n",
 		peer->name, old_buf, new_buf);
@@ -2441,7 +2446,9 @@ static void sofia_dnsmgr_setup_peer(struct sofia_peer *peer)
 	/* IP-literal: no DNS, but seed peer->src_addr so IP match + SDP c= work (else
 	 * static host=<ip> trunks → 401 + no audio). */
 	if (ast_sockaddr_parse(&probe, peer->host, PARSE_PORT_FORBID)) {
+		ast_mutex_lock(&peer->lock);		/* the by-IP index snapshots src_addr under peer->lock */
 		ast_sockaddr_copy(&peer->src_addr, &probe);
+		ast_mutex_unlock(&peer->lock);
 		return;
 	}
 	/* Bump the peer ref for callback-safe access; reload-sweep drops it after
@@ -3546,6 +3553,196 @@ static int peer_cmp_fn(void *obj, void *arg, int flags)
 	return strcasecmp(peer->name, match->name) ? 0 : (CMP_MATCH | CMP_STOP);
 }
 
+/* ===== B: O(1) by-IP+port peer index (peers_by_ipport) =====
+ * The NAME-hashed `peers` container makes a by-IP lookup an O(N) scan; with ~10k cached peers that runs
+ * on every inbound by-IP INVITE. This index makes the COMMON case (a peer whose source IP+port matches a
+ * registered/configured key) O(1); wildcard (insecure=port), connection-oriented and port-drift cases
+ * MISS and fall through to the existing ranked O(N) scan in sofia_find_peer_by_ip (so correctness is
+ * unchanged). Entries are IMMUTABLE (key in the entry, +1 peer ref); a peer address change is
+ * unindex(old)+index(new). HARD invariant: never hold ao2_lock(peers) while touching this index. */
+struct sofia_peer_ipport {
+	struct ast_sockaddr key;	/* IP+port */
+	struct sofia_peer *peer;	/* +1 ref, released by peer_ipport_destructor */
+};
+
+/* Serializes reindex/unindex so a REGISTER (sofia_thread) and a dnsmgr callback (res_dnsmgr thread)
+ * can't interleave into a duplicate/orphan entry. Held ONLY around the index mutation. */
+AST_MUTEX_DEFINE_STATIC(peers_ipport_lock);
+
+static int peer_ipport_hash_fn(const void *obj, int flags)
+{
+	const struct sofia_peer_ipport *e = obj;
+	/* Hash canonical "IP:port" so 10 phones behind ONE NAT IP land in DISTINCT buckets (true O(1)). */
+	return ast_str_hash(ast_sockaddr_stringify(&e->key));
+}
+
+static int peer_ipport_cmp_fn(void *obj, void *arg, int flags)
+{
+	const struct sofia_peer_ipport *e = obj, *match = arg;
+
+	if (ast_sockaddr_cmp(&e->key, &match->key)) {	/* full IP+port compare */
+		return 0;
+	}
+	/* A non-NULL match->peer narrows to that peer's own entry (exact removal); NULL matches any. */
+	if (match->peer && e->peer != match->peer) {
+		return 0;
+	}
+	return CMP_MATCH | CMP_STOP;
+}
+
+static void peer_ipport_destructor(void *obj)
+{
+	struct sofia_peer_ipport *e = obj;
+
+	if (e->peer) {
+		ao2_ref(e->peer, -1);
+	}
+}
+
+/* Indexable IP+port key for a peer (CALLER HOLDS peer->lock). Same candidate precedence as the ranked
+ * scan: src_addr, else static IP-literal host, else defaddr; port = candidate's, else peer->port.
+ * Returns 1 if indexable (concrete IP + non-zero port), else 0 (the peer is served by the O(N) fallback). */
+static int sofia_peer_ipport_make_key_locked(struct sofia_peer *peer, struct ast_sockaddr *key)
+{
+	struct ast_sockaddr parsed;
+	int port;
+
+	ast_sockaddr_setnull(key);
+	if (!ast_sockaddr_isnull(&peer->src_addr)) {
+		ast_sockaddr_copy(key, &peer->src_addr);
+	} else if (!ast_strlen_zero(peer->host) && strcasecmp(peer->host, "dynamic")
+			&& ast_sockaddr_parse(&parsed, peer->host, PARSE_PORT_FORBID)) {
+		ast_sockaddr_copy(key, &parsed);
+	} else if (!ast_sockaddr_isnull(&peer->defaddr)) {
+		ast_sockaddr_copy(key, &peer->defaddr);
+	} else {
+		return 0;
+	}
+	port = ast_sockaddr_port(key);
+	if (!port) {
+		port = peer->port;
+		ast_sockaddr_set_port(key, port);
+	}
+	return port != 0;
+}
+
+/* Sync peers_by_ipport with the peer's CURRENT key: drop the old entry (if the key changed or vanished)
+ * and add the new one. Idempotent + serialized. Caller must NOT hold ao2_lock(peers) or peer->lock.
+ * Call at every stabilization point (post-link, post-REGISTER, post-dnsmgr, post-reload). */
+void sofia_peer_ipport_reindex(struct sofia_peer *peer)
+{
+	struct ast_sockaddr newkey;
+	struct sofia_peer_ipport srch;
+	int want, was;
+
+	if (!peers_by_ipport || !peer) {
+		return;
+	}
+	ast_mutex_lock(&peers_ipport_lock);
+	ast_mutex_lock(&peer->lock);
+	want = sofia_peer_ipport_make_key_locked(peer, &newkey);
+	was = peer->ipport_indexed;
+	if (was && want && !ast_sockaddr_cmp(&peer->ipport_key, &newkey)) {
+		ast_mutex_unlock(&peer->lock);			/* unchanged */
+		ast_mutex_unlock(&peers_ipport_lock);
+		return;
+	}
+	ast_sockaddr_copy(&srch.key, &peer->ipport_key);	/* OLD key (for removal) */
+	srch.peer = peer;
+	peer->ipport_indexed = 0;
+	if (want) {
+		ast_sockaddr_copy(&peer->ipport_key, &newkey);
+	} else {
+		ast_sockaddr_setnull(&peer->ipport_key);
+	}
+	ast_mutex_unlock(&peer->lock);
+
+	if (was) {
+		ao2_find(peers_by_ipport, &srch, OBJ_POINTER | OBJ_UNLINK | OBJ_NODATA);	/* drop old (+ its peer ref) */
+	}
+	if (want) {
+		struct sofia_peer_ipport *e = ao2_alloc(sizeof(*e), peer_ipport_destructor);
+		if (e) {
+			ast_sockaddr_copy(&e->key, &newkey);
+			ao2_ref(peer, +1);
+			e->peer = peer;
+			if (ao2_link(peers_by_ipport, e)) {
+				ast_mutex_lock(&peer->lock);
+				peer->ipport_indexed = 1;	/* mark indexed ONLY on a successful link */
+				ast_mutex_unlock(&peer->lock);
+			} else {
+				/* OOM link: leave ipport_indexed = 0 so the NEXT reindex retries (no false indexed
+				 * state that the unchanged-key fast-return would then skip forever). */
+				ast_log(LOG_WARNING, "Sofia: peers_by_ipport link failed for '%s' — by-IP lookup uses the O(N) scan\n",
+					peer->name);
+			}
+			ao2_ref(e, -1);					/* drop our alloc ref (frees e + the manual peer +1 on link-fail) */
+		}
+	}
+	ast_mutex_unlock(&peers_ipport_lock);
+}
+
+/* Remove the peer's index entry (if any). MUST run BEFORE ao2_unlink(peers, peer) / destroy: the entry
+ * pins a peer ref, so a missed unindex leaks the peer (its destructor never runs). */
+void sofia_peer_ipport_unindex(struct sofia_peer *peer)
+{
+	struct sofia_peer_ipport srch;
+
+	if (!peers_by_ipport || !peer) {
+		return;
+	}
+	ast_mutex_lock(&peers_ipport_lock);
+	ast_mutex_lock(&peer->lock);
+	if (!peer->ipport_indexed) {
+		ast_mutex_unlock(&peer->lock);
+		ast_mutex_unlock(&peers_ipport_lock);
+		return;
+	}
+	ast_sockaddr_copy(&srch.key, &peer->ipport_key);
+	srch.peer = peer;
+	peer->ipport_indexed = 0;
+	ast_sockaddr_setnull(&peer->ipport_key);
+	ast_mutex_unlock(&peer->lock);
+	ao2_find(peers_by_ipport, &srch, OBJ_POINTER | OBJ_UNLINK | OBJ_NODATA);
+	ast_mutex_unlock(&peers_ipport_lock);
+}
+
+/* O(1) lookup. The index hands back a candidate; we take a SAFE +1 ref iff the peer is still linked in
+ * `peers` (sofia_peer_ref_if_linked) and REVALIDATE its live key still equals `src` under peer->lock —
+ * so a stale entry (missed reindex / race) is non-routing and the caller falls back to the O(N) scan.
+ * Returns +1-reffed peer or NULL. Caller must NOT hold ao2_lock(peers). */
+static struct sofia_peer *sofia_peer_ipport_lookup(const struct ast_sockaddr *src)
+{
+	struct sofia_peer_ipport srch, *e;
+	struct sofia_peer *peer, *live;
+	struct ast_sockaddr curkey;
+	int ok;
+
+	if (!peers_by_ipport || !src || ast_sockaddr_isnull(src)) {
+		return NULL;
+	}
+	ast_sockaddr_copy(&srch.key, src);
+	srch.peer = NULL;					/* any peer at this IP+port */
+	e = ao2_find(peers_by_ipport, &srch, OBJ_POINTER);
+	if (!e) {
+		return NULL;
+	}
+	peer = e->peer;
+	live = sofia_peer_ref_if_linked(peer);			/* +1 iff still in `peers` */
+	ao2_ref(e, -1);
+	if (!live) {
+		return NULL;
+	}
+	ast_mutex_lock(&live->lock);
+	ok = sofia_peer_ipport_make_key_locked(live, &curkey) && !ast_sockaddr_cmp(&curkey, src);
+	ast_mutex_unlock(&live->lock);
+	if (!ok) {
+		ao2_ref(live, -1);				/* stale → O(N) fallback */
+		return NULL;
+	}
+	return live;
+}
+
 static struct sofia_peer *sofia_find_peer_impl(const char *name, struct ast_variable *prevar)
 {
 	struct sofia_peer *found = NULL;
@@ -3660,6 +3857,9 @@ static struct sofia_peer *sofia_find_peer_impl(const char *name, struct ast_vari
 		if (found->allowsubscribe) {
 			sofia_cfg.allowsubscribe = 1;
 		}
+		/* B: index the freshly-linked peer by IP+port (dnsmgr set src_addr above); peers lock already
+		 * released. Idempotent. Cache-hit / lost-race paths returned earlier (already indexed). */
+		sofia_peer_ipport_reindex(found);
 	}
 
 	return found;
@@ -3707,6 +3907,13 @@ static struct sofia_peer *sofia_find_peer_by_ip(const struct ast_sockaddr *src)
 
 	if (!src || ast_sockaddr_isnull(src)) {
 		return NULL;
+	}
+
+	/* B: O(1) by-IP+port fast path. A hit (revalidated under peer->lock) returns immediately; any miss —
+	 * wildcard insecure=port, connection-oriented, port drift, or an unindexed/stale entry — falls
+	 * through to the ranked O(N) scan below (unchanged correctness). */
+	if ((found = sofia_peer_ipport_lookup(src))) {
+		return found;
 	}
 
 	i = ao2_iterator_init(peers, 0);
@@ -9224,6 +9431,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		ast_mutex_lock(&peer->lock);
 		int rc = sofia_update_peer_contacts(peer, sip, expires, &reg_update);
 		ast_mutex_unlock(&peer->lock);
+		sofia_peer_ipport_reindex(peer);	/* B: re-key on the REGISTER's learned src_addr (lock released; cheap when unchanged) */
 		if (rc == -4) {	/* Path serialization overflow -> reject; never bind without the route vector (RFC 3327). */
 			nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
 			ao2_ref(peer, -1);
@@ -9324,6 +9532,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			ast_mutex_lock(&peer->lock);
 			int rc = sofia_update_peer_contacts(peer, sip, expires, &reg_update);
 			ast_mutex_unlock(&peer->lock);
+			sofia_peer_ipport_reindex(peer);	/* B: re-key on the REGISTER's learned src_addr (lock released; cheap when unchanged) */
 			if (rc == -4) {	/* Path serialization overflow -> reject; never bind without the route vector (RFC 3327). */
 				nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
 				ao2_ref(peer, -1);
@@ -13850,6 +14059,7 @@ static char *sofia_cli_show_hashstats(struct ast_cli_entry *e, int cmd, struct a
 		struct ao2_container *c;
 	} tbls[] = {
 		{ "peers",        peers },
+		{ "peers_by_ip",  peers_by_ipport },	/* B: the O(1) by-IP+port index */
 		{ "dialogs",      dialogs },
 		{ "blacklist",    sofia_blacklist_container() },
 		{ "eventsub",     sofia_eventsub_container() },
@@ -13996,7 +14206,10 @@ static void sofia_parse_register_line(const char *value)
 			} else {
 				ast_verbose("Sofia: register=> peer '%s' created (target %s:%d)\n",
 					user, host, port);
+				sofia_peer_ipport_reindex(peer);	/* B: index by host:port (parity with the O(N) scan) */
 			}
+		} else {
+			sofia_peer_ipport_reindex(peer);	/* B: existing register-line peer re-keyed after a reload target change */
 		}
 		ao2_ref(peer, -1);
 	}
@@ -15350,6 +15563,7 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 	sofia_create_peer_hint(peer, "config");
 
 	sofia_dnsmgr_setup_peer(peer);
+	sofia_peer_ipport_reindex(peer);	/* B: index by IP+port after the config build (covers reload re-key) */
 
 	/* dynamic_exclude_static: a static-IP peer appends a deny rule to the global contact_ha so
 	 * later REGISTERs from that address are rejected. */
@@ -16412,6 +16626,20 @@ static void sofia_reload_worker(void *data)
 		{
 			struct sofia_swept_hint_list swept_hints = AST_LIST_HEAD_NOLOCK_INIT_VALUE;
 			struct sofia_swept_hint *h;
+			/* B: unindex the marked peers from peers_by_ipport BEFORE the OBJ_UNLINK sweep, via an
+			 * iterator (whose body does NOT hold the peers lock) so we never index while holding peers.
+			 * A missed unindex would leak the peer (the entry pins a +1 ref). */
+			{
+				struct ao2_iterator si = ao2_iterator_init(peers, 0);
+				struct sofia_peer *sp;
+				while ((sp = ao2_iterator_next(&si))) {
+					if (sp->_reload_marked && !sp->is_realtime) {
+						sofia_peer_ipport_unindex(sp);
+					}
+					ao2_ref(sp, -1);
+				}
+				ao2_iterator_destroy(&si);
+			}
 			ao2_callback(peers, OBJ_NODATA | OBJ_UNLINK | OBJ_MULTIPLE,
 				sofia_peer_sweep_cb, &swept_hints);
 			/* Container lock released — now safe to take conlock (peers no longer held). */
@@ -16515,6 +16743,9 @@ static int load_module(void)
 		goto err_cleanup;
 	}
 	ao2_container_register("sofia/peers", peers);
+	/* B: the O(1) by-IP+port index (perf). Non-fatal if it fails — the lookup just no-ops and every
+	 * by-IP lookup uses the O(N) ranked scan. */
+	peers_by_ipport = ao2_container_alloc(MAX_PEER_BUCKETS, peer_ipport_hash_fn, peer_ipport_cmp_fn);
 	dialogs = ao2_container_alloc(MAX_DIALOG_BUCKETS, dialog_hash_fn, dialog_cmp_fn);
 	if (!dialogs) {
 		ast_log(LOG_ERROR, "Unable to create Sofia dialogs container\n");
@@ -16709,6 +16940,12 @@ err_cleanup:
 	if (dialogs) {
 		ao2_ref(dialogs, -1);
 		dialogs = NULL;
+	}
+	if (peers_by_ipport) {
+		/* B: drop the index FIRST — each entry holds a +1 peer ref; releasing them before the peers
+		 * container lets the peer dnsmgr-release + ref-drop below free the peers cleanly. */
+		ao2_ref(peers_by_ipport, -1);
+		peers_by_ipport = NULL;
 	}
 	if (peers) {
 		/* Release every peer's dnsmgr handle + its +1 ref BEFORE dropping the container ref,

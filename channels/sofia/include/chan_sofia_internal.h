@@ -292,6 +292,11 @@ extern char sofia_debug_filter[64];
 int sofia_debug_match(const char *peer_name, const char *src_ip);
 int sofia_reload_request_sync(char *errmsg, size_t errmsglen, int timeout_ms);
 void sofia_peer_drain_mwi(struct sofia_peer *peer);
+/* B perf index (peers_by_ipport): keep the O(1) by-IP+port index in sync. reindex at every peer-address
+ * stabilization point (link/REGISTER/dnsmgr/reload); unindex BEFORE every ao2_unlink(peers,peer)/destroy
+ * (the index pins a peer ref, so a missed unindex leaks the peer). Both serialized + lock-safe. */
+void sofia_peer_ipport_reindex(struct sofia_peer *peer);
+void sofia_peer_ipport_unindex(struct sofia_peer *peer);
 void sofia_emit_register_side_effects(struct sofia_peer *peer, sip_t const *sip, const struct sofia_register_update *update);
 
 #define SOFIA_PRESENCE_DEFAULT_EXPIRY 3600	/* used when the SUBSCRIBE omits Expires */
@@ -692,6 +697,11 @@ struct sofia_peer {
 	 * TCP/TLS-registered phone don't silently default to UDP. "udp"/empty -> no
 	 * param emitted (UDP fleet byte-identical); ws/wss stored but not yet in RURIs. */
 	char reg_transport[8];
+	/* B perf index (peers_by_ipport): the last IP+port key under which this peer is currently indexed,
+	 * and whether it is. Maintained ONLY by the serialized sofia_peer_ipport_reindex/_unindex, so a peer
+	 * address change is unindex(old key) + index(new key). */
+	struct ast_sockaddr ipport_key;
+	int ipport_indexed;
 	/* SDP video bandwidth ceiling emitted as media-level b=CT:%d (RFC 4566 §5.8),
 	 * video media only (chan_sip parity). Default 384 kbps from default_maxcallbitrate;
 	 * set maxcallbitrate=0 to suppress the b=CT line. */
