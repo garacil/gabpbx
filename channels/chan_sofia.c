@@ -689,6 +689,62 @@ static int sofia_build_nat_proxy_url_from_peer(const struct sofia_peer *peer,
 	return 1;
 }
 
+/* Build a NAT-traversal proxy URL from a SPECIFIC contact's learned source (c->src_addr), for the
+ * initial outbound INVITE to that contact (single-live + fork paths). chan_sip parity: keep the
+ * (private) Contact in the Request-URI and route the PACKET to the public rport source via
+ * NUTAG_PROXY (sofia-sip routes the initial request to the default proxy regardless of the R-URI).
+ * Returns 1 if filled, 0 if no NAT routing override is needed (not NAT/ws-wss, src unknown, or src
+ * already == the Contact host:port). Snapshots the refresh-mutable contact fields under ao2_lock(c)
+ * and the peer nat flag under peer->lock, mirroring the sibling helpers. */
+static int sofia_build_contact_proxy_url(const struct sofia_peer *peer, struct sofia_contact *c,
+                                         char *buf, size_t len)
+{
+	char host_buf[80];
+	struct ast_sockaddr src;
+	char transport[8];
+	char chost[80];
+	int cport, nat, port;
+
+	if (!peer || !c || !buf || len < 16) {
+		return 0;
+	}
+	buf[0] = '\0';
+
+	ast_mutex_lock(&((struct sofia_peer *)peer)->lock);
+	nat = peer->nat;
+	ast_mutex_unlock(&((struct sofia_peer *)peer)->lock);
+
+	ao2_lock(c);
+	src = c->src_addr;
+	ast_copy_string(transport, c->transport, sizeof(transport));
+	ast_copy_string(chost, c->host, sizeof(chost));
+	cport = c->port;
+	ao2_unlock(c);
+
+	/* Only for a NAT peer (force_rport/comedia) or a WebSocket contact; src must be learned. */
+	if (!(nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA))
+			&& strcasecmp(transport, "ws") && strcasecmp(transport, "wss")) {
+		return 0;
+	}
+	if (ast_sockaddr_isnull(&src)) {
+		return 0;
+	}
+	/* No override if the learned source already equals the Contact host:port (no NAT rewrite). */
+	if (cport == ast_sockaddr_port(&src)
+			&& !strcasecmp(chost, ast_sockaddr_stringify_host(&src))) {
+		return 0;
+	}
+	port = ast_sockaddr_port(&src);
+	if (!port) {
+		port = cport ? cport : 5060;
+	}
+	snprintf(buf, len, "sip:%s:%d",
+		sofia_uri_format_host(ast_sockaddr_stringify_host(&src), host_buf, sizeof(host_buf)),
+		port);
+	sofia_uri_append_transport(buf, len, transport);
+	return 1;
+}
+
 static int sofia_pvt_build_nat_target_url(struct sofia_pvt *pvt, char *buf, size_t len)
 {
 	struct ast_sockaddr src;
@@ -2651,6 +2707,217 @@ void sofia_remove_peer_hints(const char *regexten, const char *subscribecontext,
 	}
 }
 
+/* Parse an insecure= value into SOFIA_INSECURE_* flags — chan_sip set_insecure_flags parity
+ * (channels/chan_sip.c:28047): comma-separated, ORDER-INDEPENDENT + case-insensitive, with a
+ * per-token whitespace trim so "port,invite", "invite,port", "port, invite" and "very" all parse.
+ * "no"/false/"" → 0. Replaces the old exact-string match that silently yielded insecure=0 for any
+ * non-canonical ordering/spacing (losing the insecure=invite auth bypass + insecure=port IP match). */
+static int sofia_parse_insecure(const char *value)
+{
+	char buf[64];
+	char *word, *next;
+	int flags = 0;
+
+	if (ast_strlen_zero(value) || ast_false(value)) {
+		return 0;
+	}
+	ast_copy_string(buf, value, sizeof(buf));
+	next = buf;
+	while ((word = strsep(&next, ","))) {
+		word = ast_strip(word);
+		if (!strcasecmp(word, "port")) {
+			flags |= SOFIA_INSECURE_PORT;
+		} else if (!strcasecmp(word, "invite")) {
+			flags |= SOFIA_INSECURE_INVITE;
+		} else if (!strcasecmp(word, "very")) {
+			flags |= SOFIA_INSECURE_PORT | SOFIA_INSECURE_INVITE;	/* legacy "very" alias */
+		} else if (!ast_strlen_zero(word)) {
+			ast_log(LOG_WARNING, "Sofia: unknown insecure mode '%s'\n", word);
+		}
+	}
+	return flags;
+}
+
+/* Parse sendrpid= into chan_sofia's int model (0=none / 1=PAI / 2=RPID, consumed by sofia_add_rpid).
+ * chan_sip parity (chan_sip.c:28125-28133): "pai"→PAI, "rpid"→RPID, any ast_true alias→RPID, else off. */
+static int sofia_parse_sendrpid(const char *value)
+{
+	char buf[24];
+	char *t;
+
+	if (ast_strlen_zero(value)) {
+		return 0;
+	}
+	ast_copy_string(buf, value, sizeof(buf));
+	t = ast_strip(buf);	/* trim BEFORE compare so " pai " / " yes " (padded realtime/config) are honored */
+	if (!strcasecmp(t, "pai")) {
+		return 1;
+	}
+	if (!strcasecmp(t, "rpid")) {
+		return 2;
+	}
+	if (ast_true(t)) {
+		return 2;	/* yes/true/on/1/y/t → Remote-Party-ID (chan_sip ast_true→RPID) */
+	}
+	return 0;
+}
+
+/* Parse directmedia= (and the canreinvite alias) into chan_sofia's plain enable int. chan_sip parity
+ * (chan_sip.c:28177-28201): ast_true→enable, ast_false→disable, else the keyword tokens
+ * update/nonat/outgoing each ENABLE direct media. chan_sofia has no nonat/outgoing/update sub-mode
+ * (directmedia is a plain enable gate, chan_sofia.c sofia_get_rtp_peer), so all three keywords map to
+ * enable=1 — do NOT invent sub-flags; unknown tokens warn. */
+static int sofia_parse_directmedia(const char *value)
+{
+	char buf[64];
+	char *word, *next, *val;
+	int enabled = 0;
+
+	if (ast_strlen_zero(value)) {
+		return 0;
+	}
+	ast_copy_string(buf, value, sizeof(buf));
+	val = ast_strip(buf);	/* trim BEFORE ast_true/ast_false so " yes " / " no " are honored */
+	if (ast_true(val)) {
+		return 1;
+	}
+	if (ast_false(val)) {
+		return 0;
+	}
+	next = val;
+	while ((word = strsep(&next, ","))) {
+		word = ast_strip(word);
+		if (!strcasecmp(word, "update") || !strcasecmp(word, "nonat")
+				|| !strcasecmp(word, "outgoing")) {
+			enabled = 1;
+		} else if (!ast_strlen_zero(word)) {
+			ast_log(LOG_WARNING, "Sofia: unknown directmedia mode '%s'\n", word);
+		}
+	}
+	return enabled;
+}
+
+/* Parse nat= into chan_sofia's SOFIA_NAT_* bitmask. chan_sip parity (chan_sip.c:28163-28176): default
+ * force_rport; "no"/false→0; "yes"→force_rport+comedia; "comedia"→comedia. Adapted + immune:
+ * comma-tokenized (force_rport/rport/comedia in ANY order, whitespace-trimmed) per chan_sofia's
+ * documented "nat=force_rport,comedia"; an unrecognized value defaults to FORCE_RPORT (chan_sip's
+ * safety posture — never silently 0/no-NAT on a typo). */
+static int sofia_parse_nat(const char *value)
+{
+	char buf[64];
+	char *word, *next, *val;
+	int flags = 0, seen = 0;
+
+	if (ast_strlen_zero(value)) {
+		return SOFIA_NAT_FORCE_RPORT;	/* unset → chan_sip default */
+	}
+	ast_copy_string(buf, value, sizeof(buf));
+	val = ast_strip(buf);	/* trim BEFORE ast_false/"yes" so " no " / " yes " are honored */
+	if (ast_false(val)) {
+		return 0;	/* "no"/false → no NAT */
+	}
+	if (!strcasecmp(val, "yes")) {
+		return SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA;
+	}
+	next = val;
+	while ((word = strsep(&next, ","))) {
+		word = ast_strip(word);
+		if (!strcasecmp(word, "force_rport") || !strcasecmp(word, "rport")) {
+			flags |= SOFIA_NAT_FORCE_RPORT;
+			seen = 1;
+		} else if (!strcasecmp(word, "comedia")) {
+			flags |= SOFIA_NAT_COMEDIA;
+			seen = 1;
+		} else if (!ast_strlen_zero(word)) {
+			ast_log(LOG_WARNING, "Sofia: unknown nat mode '%s'\n", word);
+		}
+	}
+	return seen ? flags : SOFIA_NAT_FORCE_RPORT;	/* typo/unknown → force_rport, not 0 */
+}
+
+/* Parse transport= into a single SOFIA_TRANSPORT_* (the peer's outbound default = first listed token,
+ * chan_sip parity chan_sip.c:28720+). Immune: whitespace-trimmed (ast_strip) so "transport= tls" /
+ * "tls , udp" no longer silently downgrade to UDP. Exact match after trim (chan_sofia supports ws/wss;
+ * reject garbage prefixes). Unknown/"udp" → UDP. Shared by peer transport= and publish_transport=. */
+static int sofia_parse_transport(const char *value)
+{
+	char buf[24];
+	char *first, *comma, *t;
+
+	if (ast_strlen_zero(value)) {
+		return SOFIA_TRANSPORT_UDP;
+	}
+	ast_copy_string(buf, value, sizeof(buf));
+	first = buf;
+	if ((comma = strchr(first, ','))) {
+		*comma = '\0';	/* first listed transport = the outbound default */
+	}
+	t = ast_strip(first);
+	if (!strcasecmp(t, "tls")) {
+		return SOFIA_TRANSPORT_TLS;
+	}
+	if (!strcasecmp(t, "tcp")) {
+		return SOFIA_TRANSPORT_TCP;
+	}
+	if (!strcasecmp(t, "ws")) {
+		return SOFIA_TRANSPORT_WS;
+	}
+	if (!strcasecmp(t, "wss")) {
+		return SOFIA_TRANSPORT_WSS;
+	}
+	return SOFIA_TRANSPORT_UDP;	/* "udp" + unknown → UDP */
+}
+
+/* Parse dtmfmode= into SOFIA_DTMF_*. chan_sip parity (chan_sip.c:28146-28162): rfc2833/inband/info/
+ * shortinfo/auto (case-insensitive); an unknown value warns and falls back to rfc2833 (not a silent
+ * no-op). Whitespace-trimmed for immunity. */
+static int sofia_parse_dtmfmode(const char *value)
+{
+	char buf[24];
+	char *t;
+
+	if (ast_strlen_zero(value)) {
+		return SOFIA_DTMF_RFC2833;
+	}
+	ast_copy_string(buf, value, sizeof(buf));
+	t = ast_strip(buf);
+	if (!strcasecmp(t, "rfc2833")) {
+		return SOFIA_DTMF_RFC2833;
+	}
+	if (!strcasecmp(t, "inband")) {
+		return SOFIA_DTMF_INBAND;
+	}
+	if (!strcasecmp(t, "info")) {
+		return SOFIA_DTMF_INFO;
+	}
+	if (!strcasecmp(t, "shortinfo")) {
+		return SOFIA_DTMF_SHORTINFO;
+	}
+	if (!strcasecmp(t, "auto")) {
+		return SOFIA_DTMF_AUTO;
+	}
+	ast_log(LOG_WARNING, "Sofia: unknown dtmf mode '%s', using rfc2833\n", value);
+	return SOFIA_DTMF_RFC2833;
+}
+
+/* Parse callingpres= into an AST presentation int. chan_sip parity (chan_sip.c:28891-28894): a named
+ * value via ast_parse_caller_presentation, else a raw numeric (atoi) fallback. Whitespace-trimmed for
+ * immunity (" prohib " must not fail the lookup and silently fall to atoi=0 = allowed). */
+static int sofia_parse_callingpres(const char *value)
+{
+	char buf[64];
+	char *t;
+	int p;
+
+	if (ast_strlen_zero(value)) {
+		return AST_PRES_ALLOWED_USER_NUMBER_NOT_SCREENED;
+	}
+	ast_copy_string(buf, value, sizeof(buf));
+	t = ast_strip(buf);
+	p = ast_parse_caller_presentation(t);
+	return (p < 0) ? atoi(t) : p;	/* numeric fallback, chan_sip parity */
+}
+
 /* Install a PRIORITY_HINT extension per regexten token (ext1[@ctx]&ext2[@ctx]...) tracking peer
  * presence via DEVICE_STATE("SIP/<name>"). Splits on '&' with optional per-token @context (default
  * subscribecontext) — same grammar as the regcontext routing + outbound PUBLISH, so BLF, REGISTER
@@ -2712,6 +2979,11 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 {
 	/* Unique __SIPADDHEADERpre%2d= var name per header= entry. */
 	int headercount = 0;
+	/* C (NAT realtime parity): capture the registration source (sipregs ipaddr/port) to restore
+	 * peer->src_addr after the loop, so outbound INVITEs to a NAT'd peer route to the public source
+	 * right after a realtime reload (before the peer re-REGISTERs). */
+	char reg_ipaddr[64] = "";
+	int reg_port = 0;
 	for (; v; v = v->next) {
 		if (!strcasecmp(v->name, "encryption") && ast_strlen_zero(v->value)) {
 			peer->encryption = 0;
@@ -2809,16 +3081,14 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			else if (!strcasecmp(v->value, "user")) peer->type = SOFIA_TYPE_USER;
 		} else if (!strcasecmp(v->name, "port")) {
 			peer->port = atoi(v->value);
+			reg_port = peer->port;	/* C: in the sipregs overlay this is the registration source port */
+		} else if (!strcasecmp(v->name, "ipaddr")) {
+			/* C: registration source IP (sipregs column); applied to peer->src_addr after the loop */
+			ast_copy_string(reg_ipaddr, v->value, sizeof(reg_ipaddr));
 		} else if (!strcasecmp(v->name, "insecure")) {
-			if (!strcasecmp(v->value, "port")) peer->insecure = SOFIA_INSECURE_PORT;
-			else if (!strcasecmp(v->value, "invite")) peer->insecure = SOFIA_INSECURE_INVITE;
-			else if (!strcasecmp(v->value, "port,invite") || !strcasecmp(v->value, "very"))
-				peer->insecure = SOFIA_INSECURE_PORT | SOFIA_INSECURE_INVITE;
+			peer->insecure = sofia_parse_insecure(v->value);
 		} else if (!strcasecmp(v->name, "dtmfmode")) {
-			if (!strcasecmp(v->value, "rfc2833")) peer->dtmfmode = SOFIA_DTMF_RFC2833;
-			else if (!strcasecmp(v->value, "info")) peer->dtmfmode = SOFIA_DTMF_INFO;
-			else if (!strcasecmp(v->value, "inband")) peer->dtmfmode = SOFIA_DTMF_INBAND;
-			else if (!strcasecmp(v->value, "auto")) peer->dtmfmode = SOFIA_DTMF_AUTO;
+			peer->dtmfmode = sofia_parse_dtmfmode(v->value);
 		} else if (!strcasecmp(v->name, "qualify")) {
 			/* Mirror the config-file parser: a numeric qualify=<ms> must be honored,
 			 * not read as OFF by ast_true() (would drop trunk monitoring). */
@@ -2847,7 +3117,7 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 		} else if (!strcasecmp(v->name, "directmedia")
 				|| !strcasecmp(v->name, "canreinvite")) {
 			/* canreinvite= = directmedia= alias (legacy-config compat). */
-			peer->directmedia = ast_true(v->value);
+			peer->directmedia = sofia_parse_directmedia(v->value);
 		} else if (!strcasecmp(v->name, "busy_on_active")) {
 			peer->busy_on_active = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "max_contacts")) {
@@ -2883,13 +3153,10 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			else if (!strcasecmp(v->value, "uas")) peer->session_refresher = SESSION_REFRESHER_UAS;
 			else                                   peer->session_refresher = SESSION_REFRESHER_AUTO;
 		} else if (!strcasecmp(v->name, "callingpres")) {
-			int p = ast_parse_caller_presentation(v->value);
-			peer->callingpres = (p < 0) ? AST_PRES_ALLOWED_USER_NUMBER_NOT_SCREENED : p;
+			peer->callingpres = sofia_parse_callingpres(v->value);
 		} else if (!strcasecmp(v->name, "sendrpid")) {
-			/* Outbound RPID/PAI emission: no/pai/rpid. */
-			if (!strcasecmp(v->value, "pai")) peer->sendrpid = 1;
-			else if (!strcasecmp(v->value, "rpid")) peer->sendrpid = 2;
-			else peer->sendrpid = 0;
+			/* Outbound RPID/PAI emission: no/pai/rpid/yes (yes→rpid, chan_sip parity). */
+			peer->sendrpid = sofia_parse_sendrpid(v->value);
 		} else if (!strcasecmp(v->name, "trustrpid")) {
 			peer->trustrpid = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "callcounter")) {
@@ -3161,13 +3428,7 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 					v->name, peer->name, v->value);
 			}
 		} else if (!strcasecmp(v->name, "nat")) {
-			if (!strcasecmp(v->value, "yes")
-					|| !strcasecmp(v->value, "force_rport,comedia")
-					|| !strcasecmp(v->value, "comedia,force_rport"))
-				peer->nat = SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA;
-			else if (!strcasecmp(v->value, "force_rport")) peer->nat = SOFIA_NAT_FORCE_RPORT;
-			else if (!strcasecmp(v->value, "comedia")) peer->nat = SOFIA_NAT_COMEDIA;
-			else peer->nat = 0;
+			peer->nat = sofia_parse_nat(v->value);
 		} else if (!strcasecmp(v->name, "expiresecs")) {
 			peer->expiresecs = atoi(v->value);
 		} else if (!strcasecmp(v->name, "transport")) {
@@ -3177,17 +3438,7 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			 * This sets only the peer's outbound default; INBOUND transport is still governed by the
 			 * [general] *bindaddr listeners and the REGISTER Contact scheme (no inbound allowlist implied).
 			 * chan_sip parity: a comma-list (e.g. transport=tls,udp) uses the first/preferred token. */
-			char tbuf[16];
-			char *comma;
-			ast_copy_string(tbuf, v->value, sizeof(tbuf));
-			if ((comma = strchr(tbuf, ','))) {
-				*comma = '\0';
-			}
-			if (!strcasecmp(tbuf, "tls")) peer->transport = SOFIA_TRANSPORT_TLS;
-			else if (!strcasecmp(tbuf, "tcp")) peer->transport = SOFIA_TRANSPORT_TCP;
-			else if (!strcasecmp(tbuf, "ws")) peer->transport = SOFIA_TRANSPORT_WS;
-			else if (!strcasecmp(tbuf, "wss")) peer->transport = SOFIA_TRANSPORT_WSS;
-			else peer->transport = SOFIA_TRANSPORT_UDP;
+			peer->transport = sofia_parse_transport(v->value);
 		} else if (!strcasecmp(v->name, "allow")) {
 			ast_parse_allow_disallow(&peer->prefs, &peer->capability, v->value, 1);
 		} else if (!strcasecmp(v->name, "disallow")) {
@@ -3197,6 +3448,21 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 	if (ast_strlen_zero(peer->host)) ast_string_field_set(peer, host, "dynamic");
 	if (ast_strlen_zero(peer->context)) ast_string_field_set(peer, context, sofia_cfg.context);
 	if (ast_strlen_zero(peer->defaultuser)) ast_string_field_set(peer, defaultuser, peer->name);
+	/* C (NAT realtime parity, mirrors chan_sip restoring peer->addr): if the realtime row carries a
+	 * registration source (sipregs ipaddr/port), seed peer->src_addr + mark registered so an outbound
+	 * INVITE to a NAT'd peer routes to the PUBLIC source (via NUTAG_PROXY) immediately after a reload,
+	 * before the peer re-REGISTERs. Without this, src_addr is NULL after load and routing falls back to
+	 * the private Contact (the bug). Only when ipaddr is present (a live registration exists).
+	 * NOTE: regseconds-expiry refinement (drop a stale binding) is a tracked follow-up. */
+	if (!ast_strlen_zero(reg_ipaddr)) {
+		struct ast_sockaddr probe;
+		memset(&probe, 0, sizeof(probe));
+		if (ast_sockaddr_parse(&probe, reg_ipaddr, 0) && !ast_sockaddr_isnull(&probe)) {
+			ast_sockaddr_set_port(&probe, reg_port ? reg_port : 5060);
+			ast_sockaddr_copy(&peer->src_addr, &probe);
+			peer->registered = 1;
+		}
+	}
 }
 
 /* Build a realtime peer from the DB WITHOUT linking it into the peers container.
@@ -3217,22 +3483,26 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
  * caller sofia_find_peer below. That way a double-build-dedup LOSER or an ao2_link
  * OOM has NOTHING to unwind: a plain ao2_ref(built,-1) takes the refcount to 0 and
  * the destructor fully frees this parse-only build. */
-static struct sofia_peer *sofia_find_peer_realtime_build(const char *name)
+/* prevar != NULL: build from a CALLER-OWNED variable list already loaded by another lookup (the
+ * realtime-by-addr path passes its winning by-IP row) — skip the by-name DB query and do NOT free
+ * prevar (the caller frees it exactly once). prevar == NULL: load by name + free here, as before.
+ * sofia_apply_peer_variables is copy-only, so the source list is safe to free after the build. */
+static struct sofia_peer *sofia_find_peer_realtime_build(const char *name, struct ast_variable *prevar)
 {
 	struct ast_variable *var;
 	struct sofia_peer *peer;
 
-	var = ast_load_realtime("sippeers", "name", name, SENTINEL);
+	var = prevar ? prevar : ast_load_realtime("sippeers", "name", name, SENTINEL);
 	if (!var) return NULL;
 
 	peer = sofia_peer_alloc(name);
 	if (!peer) {
-		ast_variables_destroy(var);
+		if (!prevar) ast_variables_destroy(var);
 		return NULL;
 	}
 
 	sofia_apply_peer_variables(peer, var, 0);
-	ast_variables_destroy(var);
+	if (!prevar) ast_variables_destroy(var);
 
 	/* sipregs overlay (chan_sip parity): when extconfig wires `sipregs => …`,
 	 * registration state lives in sipregs, not sippeers. Sequential dual-load with
@@ -3276,7 +3546,7 @@ static int peer_cmp_fn(void *obj, void *arg, int flags)
 	return strcasecmp(peer->name, match->name) ? 0 : (CMP_MATCH | CMP_STOP);
 }
 
-struct sofia_peer *sofia_find_peer(const char *name)
+static struct sofia_peer *sofia_find_peer_impl(const char *name, struct ast_variable *prevar)
 {
 	struct sofia_peer *found = NULL;
 	struct sofia_peer *built = NULL;	/* my fresh unlinked realtime build (NULL on cache hit / no realtime) */
@@ -3304,7 +3574,7 @@ struct sofia_peer *sofia_find_peer(const char *name)
 	 * query happens here, off the global gate). PARSE-ONLY: DNS + the dnsmgr ref + the global
 	 * contact_ha rule + allowsubscribe all run POST-LINK below, so a lost-race/OOM build has
 	 * nothing to unwind. */
-	built = sofia_find_peer_realtime_build(name);
+	built = sofia_find_peer_realtime_build(name, prevar);
 	if (!built) {
 		return NULL;
 	}
@@ -3393,6 +3663,14 @@ struct sofia_peer *sofia_find_peer(const char *name)
 	}
 
 	return found;
+}
+
+/* Public realtime peer lookup (cache → by-name realtime build). All external callers
+ * (AMI/CLI/INVITE/REGISTER/SUBSCRIBE/MESSAGE) use this; the realtime-by-addr path calls
+ * sofia_find_peer_impl directly to build from its already-fetched by-IP row (chan_sip parity). */
+struct sofia_peer *sofia_find_peer(const char *name)
+{
+	return sofia_find_peer_impl(name, NULL);
 }
 
 /* Cache-only peer lookup: ao2_find on the in-memory container ONLY, never the realtime DB fallback that
@@ -3516,14 +3794,18 @@ static void sofia_rtlookup_neg_add(const char *ip)
  * An inbound INVITE from a type=peer host=<ip> realtime trunk carries the caller-ID (NOT the peer
  * name) in From, so sofia_find_peer(cid) and the in-memory sofia_find_peer_by_ip both miss while the
  * trunk is not yet cached → alwaysauthreject 401s a legitimate trunk. Resolve the peer NAME from the
- * DB by source IP+port, then hand off to sofia_find_peer() which performs the proven build/link/cache
- * (so EVERY subsequent INVITE resolves in memory via sofia_find_peer_by_ip). Synchronous like the
+ * DB by source IP+port, then build/link/cache the peer DIRECTLY from that by-IP row via
+ * sofia_find_peer_impl (chan_sip realtime_peer parity, chan_sip.c:5606-5607 — NOT a by-name re-query,
+ * which a custom backend may answer differently) so EVERY subsequent INVITE resolves in memory via
+ * sofia_find_peer_by_ip. Synchronous like the
  * by-name realtime path and likewise OFF the peers lock (the lock-across-DB invariant ~:104-105); a
  * short negative-cache bounds an unknown-IP flood against the realtime database backend. */
 static struct sofia_peer *sofia_find_peer_realtime_by_addr(const struct ast_sockaddr *src)
 {
 	struct ast_variable *var, *v;
+	struct sofia_peer *peer;
 	const char *name = NULL;
+	const char *step = NULL;	/* which by-IP step matched, for the debug trace */
 	char ipbuf[48], portbuf[8], namebuf[80];
 
 	if (!src || ast_sockaddr_isnull(src) || !ast_check_realtime("sippeers")) {
@@ -3546,14 +3828,14 @@ static struct sofia_peer *sofia_find_peer_realtime_by_addr(const struct ast_sock
 	 * WHERE — one ast_load_realtime, no multientry. No wide insecure sipregs scan
 	 * (chan_sip.c:5355-5405): that is the DoS-amplifiable path we deliberately omit. */
 	var = ast_load_realtime("sippeers", "host", ipbuf, "port", portbuf, SENTINEL);
-	if (!var) {
-		var = ast_load_realtime("sippeers", "ipaddr", ipbuf, "port", portbuf, SENTINEL);
-	}
-	if (!var) {
-		var = ast_load_realtime("sippeers", "host", ipbuf, "insecure LIKE", "%port%", SENTINEL);
-	}
-	if (!var) {
-		var = ast_load_realtime("sippeers", "ipaddr", ipbuf, "insecure LIKE", "%port%", SENTINEL);
+	if (var) {
+		step = "host+port";
+	} else if ((var = ast_load_realtime("sippeers", "ipaddr", ipbuf, "port", portbuf, SENTINEL))) {
+		step = "ipaddr+port";
+	} else if ((var = ast_load_realtime("sippeers", "host", ipbuf, "insecure LIKE", "%port%", SENTINEL))) {
+		step = "host+insecure~port";
+	} else if ((var = ast_load_realtime("sippeers", "ipaddr", ipbuf, "insecure LIKE", "%port%", SENTINEL))) {
+		step = "ipaddr+insecure~port";
 	}
 	if (!var) {
 		sofia_rtlookup_neg_add(ipbuf);
@@ -3572,12 +3854,20 @@ static struct sofia_peer *sofia_find_peer_realtime_by_addr(const struct ast_sock
 		return NULL;
 	}
 	ast_copy_string(namebuf, name, sizeof(namebuf));
-	ast_variables_destroy(var);
+	if (sofia_debug) {
+		ast_verbose("Sofia: realtime IP-trunk '%s' matched by %s (source %s:%s) — building from the by-IP row\n",
+			namebuf, step ? step : "?", ipbuf, portbuf);
+	}
 
-	/* Hand off to the proven by-name path: it re-loads, builds, links and caches the peer (with the
-	 * dnsmgr/hint/allowsubscribe side effects in the correct link-first order). NULL is fine — the
-	 * caller then falls through to the existing unknown-peer handling. */
-	return sofia_find_peer(namebuf);
+	/* chan_sip realtime_peer parity (chan_sip.c:5606-5607 build_peer(var)): build/link/cache the peer
+	 * DIRECTLY from the by-IP row we already hold — do NOT re-query by name. A custom realtime backend
+	 * can return the trunk by source IP but NOT by name (some realtime backends key the lookup
+	 * differently — e.g. a function-backed view), so the old
+	 * by-name re-load lost the match → unknown-peer 401. sofia_find_peer_impl's build is copy-only and
+	 * never frees `var` (cache-hit/lost-race/OOM included), so WE free it exactly once, here. */
+	peer = sofia_find_peer_impl(namebuf, var);
+	ast_variables_destroy(var);
+	return peer;
 }
 
 /* ast_rtp_glue plumbing; direct-media re-INVITE guarded by reinvite_pending. */
@@ -3854,7 +4144,7 @@ static int sofia_app_dtmfmode(struct ast_channel *chan, const char *data)
 	const char *mode = data;
 
 	if (ast_strlen_zero(mode)) {
-		ast_log(LOG_WARNING, "SIPDtmfMode requires argument: rfc2833 / info / inband / auto\n");
+		ast_log(LOG_WARNING, "SIPDtmfMode requires argument: rfc2833 / info / shortinfo / inband / auto\n");
 		return 0;
 	}
 	ast_channel_lock(chan);
@@ -3869,11 +4159,8 @@ static int sofia_app_dtmfmode(struct ast_channel *chan, const char *data)
 		return 0;
 	}
 	ast_mutex_lock(&pvt->lock);
-	if (!strcasecmp(mode, "rfc2833"))      pvt->dtmfmode = SOFIA_DTMF_RFC2833;
-	else if (!strcasecmp(mode, "info"))    pvt->dtmfmode = SOFIA_DTMF_INFO;
-	else if (!strcasecmp(mode, "inband"))  pvt->dtmfmode = SOFIA_DTMF_INBAND;
-	else if (!strcasecmp(mode, "auto"))    pvt->dtmfmode = SOFIA_DTMF_AUTO;
-	else ast_log(LOG_WARNING, "SIPDtmfMode: unknown mode '%s'\n", mode);
+	/* Shared parser: trims, accepts rfc2833/info/shortinfo/inband/auto, unknown → rfc2833 + warn. */
+	pvt->dtmfmode = sofia_parse_dtmfmode(mode);
 	ast_mutex_unlock(&pvt->lock);
 	ast_channel_unlock(chan);
 	return 0;
@@ -4152,6 +4439,11 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				sofia_build_contact_ruri(c, pvt->exten, ruri, sizeof(ruri),
 					(child->peer && child->peer->path_support), child_path, sizeof(child_path));
 				ast_string_field_set(child, ruri, ruri);
+				/* B (chan_sip parity): keep the (private) Contact in the RURI above; route THIS
+				 * child's INVITE packet to the contact's learned PUBLIC src via NUTAG_PROXY (the fork
+				 * path previously set no proxy, so NAT'd UDP forked contacts went to the private RURI). */
+				char child_proxy_url[128] = "";
+				sofia_build_contact_proxy_url(child->peer, c, child_proxy_url, sizeof(child_proxy_url));
 
 				/* Create handle auto-bound to child. */
 				if (sofia_nua) {
@@ -4159,6 +4451,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 						NUTAG_URL(ruri),
 						SIPTAG_TO_STR(ruri),
 						TAG_IF(child_path[0], NUTAG_INITIAL_ROUTE_STR(child_path)),	/* RFC 3327 Path as Route */
+						TAG_IF(child_proxy_url[0], NUTAG_PROXY(child_proxy_url)),	/* B: packet -> contact public src */
 						TAG_IF(child->peer && child->peer->gruu, NUTAG_SUPPORTED("gruu")),	/* RFC 5627 §4.4 */
 						TAG_END());
 				}
@@ -5047,6 +5340,7 @@ static int sofia_send_digit_begin(struct ast_channel *ast, char digit)
 		}
 		break;
 	case SOFIA_DTMF_INFO:
+	case SOFIA_DTMF_SHORTINFO:
 		break;
 	case SOFIA_DTMF_INBAND:
 		return -1;
@@ -5087,6 +5381,37 @@ static int sofia_send_digit_end(struct ast_channel *ast, char digit, unsigned in
 				"Signal=%c\r\nDuration=%u\r\n", digit, duration ? duration : 250);
 			nua_info(pvt->nh,
 				SIPTAG_CONTENT_TYPE_STR("application/dtmf-relay"),
+				SIPTAG_PAYLOAD_STR(info_body),
+				TAG_END());
+		}
+		break;
+	case SOFIA_DTMF_SHORTINFO:
+		/* chan_sip "shortinfo" parity (add_digit mode 1, chan_sip.c:11720-11747): SIP INFO with
+		 * Content-Type application/dtmf and a numeric event body ("<event>\r\n"): 0-9 -> 0-9,
+		 * * -> 10, # -> 11, A-D/a-d -> 12-15; an unmapped char -> warn + skip (improves on chan_sip,
+		 * which transmits a spurious event 0). */
+		if (pvt->nh) {
+			char info_body[16];
+			int event;
+			if ('0' <= digit && digit <= '9') {
+				event = digit - '0';
+			} else if (digit == '*') {
+				event = 10;
+			} else if (digit == '#') {
+				event = 11;
+			} else if ('A' <= digit && digit <= 'D') {
+				event = 12 + digit - 'A';
+			} else if ('a' <= digit && digit <= 'd') {
+				event = 12 + digit - 'a';
+			} else {
+				/* Improvement over chan_sip add_digit (chan_sip.c:11738) which transmits a
+				 * spurious event 0 for an unmapped char: warn and skip instead. */
+				ast_log(LOG_WARNING, "Sofia: shortinfo DTMF: unhandled digit '%c', not sending\n", digit);
+				break;
+			}
+			snprintf(info_body, sizeof(info_body), "%d\r\n", event);
+			nua_info(pvt->nh,
+				SIPTAG_CONTENT_TYPE_STR("application/dtmf"),
 				SIPTAG_PAYLOAD_STR(info_body),
 				TAG_END());
 		}
@@ -5178,6 +5503,7 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 			char path_buf[1024] = "";	/* RFC 3327 Path of the registered contact (opt-in), pre-loaded as Route */
 			struct ast_sockaddr sel_src;	/* the selected binding's src_addr — picks WHICH contact's Path */
 			int sel_ok = 0;
+			char contact_proxy_url[128] = "";	/* B: contact-level NAT proxy for the single-live path */
 
 			sofia_resolve_peer_target(peer, exten, url, sizeof(url));
 			/* Outbound Route from outboundproxy; sticky-on-handle via
@@ -5235,6 +5561,10 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 					sofia_build_contact_ruri(single, exten, url, sizeof(url),
 						peer->path_support, path_buf, sizeof(path_buf));
 					sofia_pvt_set_active_contact(pvt, single);	/* in-dialog BYE/ACK route + call accounting */
+					/* B (chan_sip parity): keep the (private) Contact in the RURI above; route the
+					 * INVITE packet to the contact's learned PUBLIC src via a contact-level NUTAG_PROXY
+					 * (preferred over the peer-aggregate proxy below). Empty if not NAT / src unknown. */
+					sofia_build_contact_proxy_url(peer, single, contact_proxy_url, sizeof(contact_proxy_url));
 					ao2_ref(single, -1);
 				}
 			}
@@ -5254,6 +5584,8 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 			 * those fields are rewritten under peer->lock by REGISTER/dnsmgr. */
 			char proxy_url[128] = "";
 			sofia_build_nat_proxy_url_from_peer(peer, proxy_url, sizeof(proxy_url));
+			/* B: a contact-level proxy (single-live path) takes precedence over the peer-aggregate one. */
+			const char *eff_proxy = contact_proxy_url[0] ? contact_proxy_url : proxy_url;
 			if (sofia_nua) {
 				pvt->nh = nua_handle(sofia_nua, pvt,
 					NUTAG_URL(url),
@@ -5261,7 +5593,7 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 					TAG_IF(route_buf[0], NUTAG_INITIAL_ROUTE_STR(route_buf)),
 					TAG_IF(sr_buf[0], NUTAG_INITIAL_ROUTE_STR(sr_buf)),	/* RFC 3608 Service-Route, after outboundproxy */
 					TAG_IF(path_buf[0], NUTAG_INITIAL_ROUTE_STR(path_buf)),	/* RFC 3327 Path of the registered contact */
-					TAG_IF(proxy_url[0], NUTAG_PROXY(proxy_url)),
+					TAG_IF(eff_proxy[0], NUTAG_PROXY(eff_proxy)),
 					TAG_IF(peer_gruu, NUTAG_SUPPORTED("gruu")),	/* RFC 5627 §4.4 */
 					TAG_END());
 				if (!pvt->nh) {
@@ -13774,11 +14106,15 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "publish_transport")) {
 			/* ;transport= appended to the PUBLISH R-URI so a tls/tcp/ws/wss ESC is reached over that
 			 * transport (sofia-sip otherwise defaults a bare sip:exten@host:port R-URI to UDP). Validate
-			 * against the same tokens as a peer's transport=; invalid -> udp + warn. udp = no-op. */
-			if (!strcasecmp(v->value, "udp") || !strcasecmp(v->value, "tcp")
-					|| !strcasecmp(v->value, "tls") || !strcasecmp(v->value, "ws")
-					|| !strcasecmp(v->value, "wss")) {
-				ast_copy_string(sofia_cfg.publish_transport, v->value, sizeof(sofia_cfg.publish_transport));
+			 * against the same tokens as a peer's transport=; invalid -> udp + warn. udp = no-op.
+			 * Whitespace-trimmed for immunity (" tls" must not silently downgrade to udp). */
+			char ptbuf[16], *pt;
+			ast_copy_string(ptbuf, v->value, sizeof(ptbuf));
+			pt = ast_strip(ptbuf);
+			if (!strcasecmp(pt, "udp") || !strcasecmp(pt, "tcp")
+					|| !strcasecmp(pt, "tls") || !strcasecmp(pt, "ws")
+					|| !strcasecmp(pt, "wss")) {
+				ast_copy_string(sofia_cfg.publish_transport, pt, sizeof(sofia_cfg.publish_transport));
 			} else {
 				ast_log(LOG_WARNING, "Sofia: invalid publish_transport '%s' (use udp|tcp|tls|ws|wss); using udp\n",
 					v->value);
@@ -13877,12 +14213,9 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			else                                   sofia_cfg.default_session_refresher = SESSION_REFRESHER_AUTO;
 		} else if (!strcasecmp(v->name, "callingpres")) {
 			/* Default presentation for peers that omit callingpres=. */
-			int p = ast_parse_caller_presentation(v->value);
-			sofia_cfg.default_callingpres = (p < 0) ? AST_PRES_ALLOWED_USER_NUMBER_NOT_SCREENED : p;
+			sofia_cfg.default_callingpres = sofia_parse_callingpres(v->value);
 		} else if (!strcasecmp(v->name, "sendrpid")) {
-			if (!strcasecmp(v->value, "pai")) sofia_cfg.default_sendrpid = 1;
-			else if (!strcasecmp(v->value, "rpid")) sofia_cfg.default_sendrpid = 2;
-			else sofia_cfg.default_sendrpid = 0;
+			sofia_cfg.default_sendrpid = sofia_parse_sendrpid(v->value);
 		} else if (!strcasecmp(v->name, "trustrpid")) {
 			sofia_cfg.default_trustrpid = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "callcounter")) {
@@ -14554,23 +14887,9 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 				peer->maxforwards = sofia_cfg.default_max_forwards;
 			}
 		} else if (!strcasecmp(v->name, "insecure")) {
-			if (!strcasecmp(v->value, "port")) {
-				peer->insecure = SOFIA_INSECURE_PORT;
-			} else if (!strcasecmp(v->value, "invite")) {
-				peer->insecure = SOFIA_INSECURE_INVITE;
-			} else if (!strcasecmp(v->value, "port,invite") || !strcasecmp(v->value, "very")) {
-				peer->insecure = SOFIA_INSECURE_PORT | SOFIA_INSECURE_INVITE;
-			}
+			peer->insecure = sofia_parse_insecure(v->value);
 		} else if (!strcasecmp(v->name, "dtmfmode")) {
-			if (!strcasecmp(v->value, "rfc2833")) {
-				peer->dtmfmode = SOFIA_DTMF_RFC2833;
-			} else if (!strcasecmp(v->value, "info")) {
-				peer->dtmfmode = SOFIA_DTMF_INFO;
-			} else if (!strcasecmp(v->value, "inband")) {
-				peer->dtmfmode = SOFIA_DTMF_INBAND;
-			} else if (!strcasecmp(v->value, "auto")) {
-				peer->dtmfmode = SOFIA_DTMF_AUTO;
-			}
+			peer->dtmfmode = sofia_parse_dtmfmode(v->value);
 		} else if (!strcasecmp(v->name, "qualify")) {
 			if (ast_true(v->value)) {
 				peer->qualify = 1;
@@ -14599,7 +14918,7 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "directmedia")
 				|| !strcasecmp(v->name, "canreinvite")) {
 			/* canreinvite = legacy alias for directmedia. */
-			peer->directmedia = ast_true(v->value);
+			peer->directmedia = sofia_parse_directmedia(v->value);
 		} else if (!strcasecmp(v->name, "busy_on_active")) {
 			peer->busy_on_active = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "max_contacts")) {
@@ -14634,12 +14953,9 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			else if (!strcasecmp(v->value, "uas")) peer->session_refresher = SESSION_REFRESHER_UAS;
 			else                                   peer->session_refresher = SESSION_REFRESHER_AUTO;
 		} else if (!strcasecmp(v->name, "callingpres")) {
-			int p = ast_parse_caller_presentation(v->value);
-			peer->callingpres = (p < 0) ? AST_PRES_ALLOWED_USER_NUMBER_NOT_SCREENED : p;
+			peer->callingpres = sofia_parse_callingpres(v->value);
 		} else if (!strcasecmp(v->name, "sendrpid")) {
-			if (!strcasecmp(v->value, "pai")) peer->sendrpid = 1;
-			else if (!strcasecmp(v->value, "rpid")) peer->sendrpid = 2;
-			else peer->sendrpid = 0;
+			peer->sendrpid = sofia_parse_sendrpid(v->value);
 		} else if (!strcasecmp(v->name, "trustrpid")) {
 			peer->trustrpid = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "callcounter")) {
@@ -14896,34 +15212,14 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 					v->name, peer->name, v->value);
 			}
 		} else if (!strcasecmp(v->name, "nat")) {
-			if (!strcasecmp(v->value, "yes")) {
-				peer->nat = SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA;
-			} else if (!strcasecmp(v->value, "force_rport")) {
-				peer->nat = SOFIA_NAT_FORCE_RPORT;
-			} else if (!strcasecmp(v->value, "comedia")) {
-				peer->nat = SOFIA_NAT_COMEDIA;
-			} else if (!strcasecmp(v->value, "force_rport,comedia") || !strcasecmp(v->value, "comedia,force_rport")) {
-				peer->nat = SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA;
-			} else {
-				peer->nat = 0;
-			}
+			peer->nat = sofia_parse_nat(v->value);
 		} else if (!strcasecmp(v->name, "expiresecs") || !strcasecmp(v->name, "defaultexpiry")) {
 			peer->expiresecs = atoi(v->value);
 		} else if (!strcasecmp(v->name, "transport")) {
 			/* Outbound transport for a static config-file peer (realtime twin: sofia_apply_peer_variables).
 			 * Without it a static TLS/TCP/WS/WSS host's RURI defaults to UDP; inbound stays per-listener
 			 * ([general] bind addrs) + per-Contact at REGISTER-time. Comma-list uses the first token. */
-			char tbuf[16];
-			char *comma;
-			ast_copy_string(tbuf, v->value, sizeof(tbuf));
-			if ((comma = strchr(tbuf, ','))) {
-				*comma = '\0';
-			}
-			if (!strcasecmp(tbuf, "tls")) peer->transport = SOFIA_TRANSPORT_TLS;
-			else if (!strcasecmp(tbuf, "tcp")) peer->transport = SOFIA_TRANSPORT_TCP;
-			else if (!strcasecmp(tbuf, "ws")) peer->transport = SOFIA_TRANSPORT_WS;
-			else if (!strcasecmp(tbuf, "wss")) peer->transport = SOFIA_TRANSPORT_WSS;
-			else peer->transport = SOFIA_TRANSPORT_UDP;
+			peer->transport = sofia_parse_transport(v->value);
 		} else if (!strcasecmp(v->name, "allow")) {
 			ast_parse_allow_disallow(&peer->prefs, &peer->capability, v->value, 1);
 		} else if (!strcasecmp(v->name, "disallow")) {

@@ -288,6 +288,7 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 	dtmf_str =
 		peer->dtmfmode == SOFIA_DTMF_RFC2833 ? "rfc2833" :
 		peer->dtmfmode == SOFIA_DTMF_INFO ? "info" :
+		peer->dtmfmode == SOFIA_DTMF_SHORTINFO ? "shortinfo" :
 		peer->dtmfmode == SOFIA_DTMF_INBAND ? "inband" : "auto";
 	type_str =
 		peer->type == SOFIA_TYPE_FRIEND ? "friend" :

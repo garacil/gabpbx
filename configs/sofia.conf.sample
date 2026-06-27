@@ -347,8 +347,8 @@ srvlookup=yes
 ; trustrpid     - trust inbound PAI / RPID and apply caller-id from them.
 ;                 Default: no. Set yes only for trusted upstream proxies / SBCs.
 ;
-;callingpres    = allowed_not_screened
-;sendrpid       = no
+;callingpres    = allowed_not_screened   ; named presentation OR a raw numeric value (chan_sip parity)
+;sendrpid       = no                      ; no / pai / rpid (yes = rpid)
 ;trustrpid      = no
 
 ;
@@ -2846,9 +2846,9 @@ srvlookup=yes
 ;allow=alaw
 ;callerid="Test 100" <100>
 ;qualify=yes
-;nat=force_rport,comedia
-;dtmfmode=rfc2833            ; rfc2833 / info / inband / auto (inband uses core tones)
-;directmedia=no              ; allow direct media re-INVITE (default: no — chan_sip migration safe). Alias 'canreinvite' accepted per chan_sip drop-in compat (chan_sip.c:28137 verbatim dual-acceptance).
+;nat=force_rport,comedia     ; force_rport and/or comedia, in any order and whitespace-tolerant; also yes (=force_rport,comedia) / no. Any unrecognized value defaults to force_rport (never silently no-NAT).
+;dtmfmode=rfc2833            ; rfc2833 / info / shortinfo / inband / auto (inband uses core tones; shortinfo = SIP INFO with Content-Type application/dtmf, numeric body — chan_sip parity)
+;directmedia=no              ; allow direct media re-INVITE (default: no — chan_sip migration safe). Accepts yes/no plus the chan_sip keywords update/nonat/outgoing (all map to enable; chan_sofia has no sub-mode). Alias 'canreinvite' accepted per chan_sip drop-in compat (chan_sip.c:28177 verbatim dual-acceptance).
 ;canreinvite=no              ; legacy chan_sip alias for directmedia (post-T56 alias-acceptance ship); identical effect
 ;busy_on_active=no           ; per-peer override of [general]
 ;max_contacts=6              ; per-peer override of [general]; range [1, 6]
@@ -2872,7 +2872,7 @@ srvlookup=yes
 ;mailbox=1234@a,5678@b       ; comma-separated multi-mailbox (per-mailbox NOTIFY emission)
                              ; chan_sofia honors at-most-1 active subscription per peer; new SUBSCRIBE replaces old (terminated;reason=deactivated).
 ;callingpres=allowed_not_screened ; per-peer presentation override; AST_PRES_* values per [general] callingpres list
-;sendrpid=pai                ; per-peer RPID/PAI emission (no/pai/rpid); typical trunk: pai
+;sendrpid=pai                ; per-peer RPID/PAI emission: no / pai / rpid (yes = rpid, chan_sip parity); typical trunk: pai
 ;trustrpid=yes               ; per-peer trust on inbound PAI/RPID; typical trunk: yes (trusted upstream)
 ;forceddiversion=34931234567 ; CLI-forward compliance (RFC 5806): force a trunk-owned DID as the diverting party in the outbound Diversion header on FORWARDED (desvio) calls, so the carrier validates the diversion against a number it provisions for this trunk (RULE 2). Emitted ONLY when the channel carries a redirect marker — set REDIRECTING(from-num) or REDIRECTING(reason) in the dialplan before Dial(); a non-forwarded direct call NEVER gets a Diversion. Keep RULE 1 (From=original caller): do NOT overwrite CALLERID(num) and do NOT set fromuser= to the DID. Empty = disabled (legacy data-driven Diversion). See memory/project_cli_forward_diversion_compliance.md.
 ;call-limit=5                ; max simultaneous calls; alias accepted: call_limit
@@ -2945,7 +2945,8 @@ srvlookup=yes
 ;                 wssbindaddr; per-Contact transport is derived from the Contact URL
 ;                 scheme at REGISTER-time. Use separate listeners + IP allowlists for
 ;                 transport-based security.
-; nat           - force_rport, comedia, force_rport,comedia (default: none)
+; nat           - force_rport and/or comedia (any order, whitespace-tolerant), or yes (=both) / no;
+;                 an unrecognized value defaults to force_rport (never silent no-NAT)
 ;
 ; --- Dialplan ---
 ; context       - dialplan context for incoming calls
@@ -2981,8 +2982,8 @@ srvlookup=yes
 ; allow=h264
 ;
 ; --- Media ---
-; dtmfmode      - rfc2833, info, inband, auto (default: rfc2833)
-; directmedia   - yes/no (allow direct media between endpoints; default: no)
+; dtmfmode      - rfc2833, info, shortinfo, inband, auto (default: rfc2833)
+; directmedia   - yes/no, or the chan_sip keywords update/nonat/outgoing (all enable; default: no)
 ;                 When yes, after the bridge is up chan_sofia issues a re-INVITE
 ;                 to each leg with the OTHER peer's RTP host:port so RTP flows
 ;                 directly between the endpoints (PBX out of the media path).

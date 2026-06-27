@@ -106,6 +106,7 @@ void *sofia_dc_pair_bridged(struct sofia_pvt *self_pvt, void *self_dc);
 #define SOFIA_DTMF_INBAND  1
 #define SOFIA_DTMF_INFO    2
 #define SOFIA_DTMF_AUTO    3
+#define SOFIA_DTMF_SHORTINFO 4	/* chan_sip "shortinfo": SIP INFO, Content-Type application/dtmf, numeric body */
 #define SOFIA_INSECURE_PORT    (1 << 0)
 #define SOFIA_INSECURE_INVITE  (1 << 1)
 #define SOFIA_TRANSPORT_UDP 1

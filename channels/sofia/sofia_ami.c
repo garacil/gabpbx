@@ -209,10 +209,11 @@ int manager_sofia_show_peer(struct mansession *s, const struct message *m)
 
 	/* dtmfmode → string */
 	switch (peer->dtmfmode) {
-	case SOFIA_DTMF_INFO:    ast_copy_string(dtmfmode, "info", sizeof(dtmfmode)); break;
-	case SOFIA_DTMF_INBAND:  ast_copy_string(dtmfmode, "inband", sizeof(dtmfmode)); break;
-	case SOFIA_DTMF_AUTO:    ast_copy_string(dtmfmode, "auto", sizeof(dtmfmode)); break;
-	default:                 ast_copy_string(dtmfmode, "rfc2833", sizeof(dtmfmode)); break;
+	case SOFIA_DTMF_INFO:      ast_copy_string(dtmfmode, "info", sizeof(dtmfmode)); break;
+	case SOFIA_DTMF_SHORTINFO: ast_copy_string(dtmfmode, "shortinfo", sizeof(dtmfmode)); break;
+	case SOFIA_DTMF_INBAND:    ast_copy_string(dtmfmode, "inband", sizeof(dtmfmode)); break;
+	case SOFIA_DTMF_AUTO:      ast_copy_string(dtmfmode, "auto", sizeof(dtmfmode)); break;
+	default:                   ast_copy_string(dtmfmode, "rfc2833", sizeof(dtmfmode)); break;
 	}
 
 	/* insecure flags to string (chan_sip-parity values). */
