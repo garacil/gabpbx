@@ -3693,13 +3693,17 @@ struct sofia_peer *sofia_find_peer_cached(const char *name)
  * name (e.g. Huawei SoftX3000 sending From: <sip:621120700@…> while the peer
  * is configured as [mytrunk] host=192.0.2.10). Matches peer->src_addr
  * (set both by dnsmgr for static host=<ip> peers and by REGISTER for dynamic
- * peers) or, if that is unset, peer->defaddr. Port is ignored on purpose so
- * the existing SOFIA_INSECURE_PORT semantic stays the only port-mismatch
- * knob. First match wins (chan_sip find_peer(NULL,&addr,…) parity). */
+ * peers) or, if that is unset, peer->defaddr. Ranked, EXACT-FIRST (chan_sip peer_ipcmp_cb
+ * spirit, chan_sip.c:31326-31339): an exact IP+port match wins outright; else the highest-ranked IP
+ * match - a wildcard (insecure=port, or connection-oriented TCP/TLS/WS/WSS whose source port is the
+ * ephemeral connection port) outranks a merely drifted UDP source port. So a same-IP peer whose port
+ * matches is never shadowed by an earlier wildcard one (multi-peer-behind-one-NAT), and a lone drifted
+ * UDP peer still resolves via the low-rank fallback (backward-compatible). */
 static struct sofia_peer *sofia_find_peer_by_ip(const struct ast_sockaddr *src)
 {
 	struct ao2_iterator i;
-	struct sofia_peer *peer, *found = NULL;
+	struct sofia_peer *peer, *found = NULL, *best = NULL;
+	int best_score = 0;	/* 3=exact IP+port, 2=wildcard (insecure=port/conn-oriented/unknown), 1=IP-only port drift */
 
 	if (!src || ast_sockaddr_isnull(src)) {
 		return NULL;
@@ -3711,6 +3715,8 @@ static struct sofia_peer *sofia_find_peer_by_ip(const struct ast_sockaddr *src)
 		struct ast_sockaddr snap_src;
 		struct ast_sockaddr snap_defaddr;
 		char snap_host[MAXHOSTNAMELEN];
+		int snap_insecure, snap_port, snap_transport;
+		char snap_reg_transport[8];
 		const struct ast_sockaddr *candidate = NULL;
 		/* src_addr/host/defaddr are rewritten under peer->lock by the dnsmgr callback
 		 * (sofia_on_dns_update_peer) off the res_dnsmgr thread and by the reload writer;
@@ -3721,6 +3727,10 @@ static struct sofia_peer *sofia_find_peer_by_ip(const struct ast_sockaddr *src)
 		snap_src = peer->src_addr;
 		snap_defaddr = peer->defaddr;
 		ast_copy_string(snap_host, peer->host, sizeof(snap_host));
+		snap_insecure = peer->insecure;
+		snap_port = peer->port;
+		snap_transport = peer->transport;
+		ast_copy_string(snap_reg_transport, peer->reg_transport, sizeof(snap_reg_transport));
 		ast_mutex_unlock(&peer->lock);
 		if (!ast_sockaddr_isnull(&snap_src)) {
 			candidate = &snap_src;
@@ -3735,13 +3745,70 @@ static struct sofia_peer *sofia_find_peer_by_ip(const struct ast_sockaddr *src)
 			candidate = &snap_defaddr;
 		}
 		if (candidate && !ast_sockaddr_cmp_addr(candidate, src)) {
-			found = peer;
-			break;
+			/* IP matched. chan_sip peer_ipcmp_cb parity (chan_sip.c:31326-31339):
+			 *  - connection-oriented transports (TCP/TLS/WS/WSS): the source port is the ephemeral
+			 *    connection port, so match IP-only (chan_sip skips the port test, :31326-31329);
+			 *  - insecure=port: IP-only (a trunk that may send from any port);
+			 *  - else UDP: require the source PORT to match. Expected port = the candidate's
+			 *    learned/registered source port; a static host=<ip> candidate carries none, so fall
+			 *    back to the configured peer port; an unknown (0) expected port stays IP-only. */
+			int conn_oriented;
+			int expected_port = ast_sockaddr_port(candidate);
+			if (expected_port == 0) {
+				expected_port = snap_port;
+			}
+			if (candidate == &snap_src) {
+				/* registered/learned source → the registration-route transport (paired with src_addr) */
+				conn_oriented = !strcasecmp(snap_reg_transport, "tcp")
+						|| !strcasecmp(snap_reg_transport, "tls")
+						|| !strcasecmp(snap_reg_transport, "ws")
+						|| !strcasecmp(snap_reg_transport, "wss");
+			} else {
+				/* static host=<ip> / defaddr → the configured transport enum */
+				conn_oriented = (snap_transport & (SOFIA_TRANSPORT_TCP | SOFIA_TRANSPORT_TLS
+						| SOFIA_TRANSPORT_WS | SOFIA_TRANSPORT_WSS)) != 0;
+			}
+			/* Rank the IP match (exact-FIRST, so a same-IP peer whose port matches wins over a
+			 * wildcard one = correct multi-peer-behind-one-NAT disambiguation):
+			 *   3 = exact IP+port (the strongest - take it and stop);
+			 *   2 = wildcard: insecure=port (any port), connection-oriented (TCP/TLS/WS/WSS, whose
+			 *       source port is the ephemeral connection port), or unknown expected port - a strong
+			 *       fallback;
+			 *   1 = a UDP source port that simply drifted from the registered rport - the weakest
+			 *       fallback, kept for backward-compat with the old IP-only behaviour (chan_sip rejects).
+			 * Keep the HIGHEST-ranked candidate; an exact (3) wins outright. */
+			int score;
+			if (expected_port != 0 && expected_port == ast_sockaddr_port(src)) {
+				score = 3;
+			} else if ((snap_insecure & SOFIA_INSECURE_PORT) || conn_oriented
+					|| expected_port == 0) {
+				score = 2;
+			} else {
+				score = 1;
+			}
+			if (score == 3) {
+				found = peer;	/* exact IP+port - wins outright */
+				break;
+			}
+			if (score > best_score) {
+				if (best) {
+					ao2_ref(best, -1);	/* replace the previous lower-ranked fallback */
+				}
+				best = peer;	/* hold this peer's +1 ref; skip the drop below */
+				best_score = score;
+				continue;
+			}
 		}
 		ao2_ref(peer, -1);
 	}
 	ao2_iterator_destroy(&i);
-	return found;
+	if (found) {
+		if (best) {
+			ao2_ref(best, -1);	/* an exact IP+port match won - release the held fallback */
+		}
+		return found;
+	}
+	return best;	/* no exact IP+port - the highest-ranked IP fallback (or NULL) */
 }
 
 /* Minimal negative-cache for the realtime-by-IP fallback below: a tiny fixed ring of
