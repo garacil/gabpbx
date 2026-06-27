@@ -1003,19 +1003,41 @@ char *ast_tech_to_upper(char *dev_str),
 /*!
  * \brief Compute a hash value on a string
  *
- * This famous hash algorithm was written by Dan Bernstein and is
- * commonly used.
- *
- * http://www.cse.yorku.ca/~oz/hash.html
+ * "fthash": an FNV-1a *variant* that mixes the string as little-endian 32-bit
+ * words (not byte-wise canonical FNV-1a), finished with a Murmur3 fmix32
+ * avalanche so the low bits used by power-of-2 bucket counts are well
+ * distributed (plain FNV-1a, like the former DJB2, clustered badly there).
+ * The result is masked to 31 bits because ao2 indexes with
+ * hash % n_buckets and a negative value would force a full-bucket scan
+ * (see ao2_iterator/__ao2_callback in main/astobj2.c).
  */
 static force_inline int attribute_pure ast_str_hash(const char *str)
 {
-	int hash = 5381;
+	uint32_t h = 0x811c9dc5u;		/* FNV-1a offset basis */
+	const unsigned char *s = (const unsigned char *) str;
+	size_t len = strlen(str);
+	size_t nb = len >> 2, i;
+	uint32_t w;
 
-	while (*str)
-		hash = hash * 33 ^ *str++;
-
-	return abs(hash);
+	for (i = 0; i < nb; i++) {
+		w = (uint32_t) s[0] | (uint32_t) s[1] << 8
+		  | (uint32_t) s[2] << 16 | (uint32_t) s[3] << 24;
+		h = (h ^ w) * 0x01000193u;	/* FNV-1a prime */
+		s += 4;
+	}
+	if (len & 3) {				/* 1..3 trailing bytes */
+		w = 0;
+		switch (len & 3) {
+		case 3: w |= (uint32_t) s[2] << 16;	/* fall through */
+		case 2: w |= (uint32_t) s[1] << 8;	/* fall through */
+		case 1: w |= s[0];
+		}
+		h = (h ^ w) * 0x01000193u;
+	}
+	h ^= h >> 16; h *= 0x85ebca6bu;		/* fmix32 avalanche */
+	h ^= h >> 13; h *= 0xc2b2ae35u;
+	h ^= h >> 16;
+	return (int) (h & 0x7fffffffu);
 }
 
 /*!
@@ -1023,40 +1045,94 @@ static force_inline int attribute_pure ast_str_hash(const char *str)
  *
  * \param[in] str The string to add to the hash
  * \param[in] hash The hash value to add to
- * 
+ *
  * \details
  * This version of the function is for when you need to compute a
- * string hash of more than one string.
- *
- * This famous hash algorithm was written by Dan Bernstein and is
- * commonly used.
- *
- * \sa http://www.cse.yorku.ca/~oz/hash.html
+ * string hash of more than one string: the prior hash seeds the mix
+ * of the next string. Uses the same FNV-1a + fmix32 as ast_str_hash;
+ * it is self-consistent for incremental hashing (the only requirement
+ * for an ao2/event hash callback) but is not bit-identical to hashing
+ * the concatenation, exactly as the former DJB2 chaining was not.
  */
 static force_inline int ast_str_hash_add(const char *str, int hash)
 {
-	while (*str)
-		hash = hash * 33 ^ *str++;
+	uint32_t h = (uint32_t) hash;		/* prior hash seeds this mix */
+	const unsigned char *s = (const unsigned char *) str;
+	size_t len = strlen(str);
+	size_t nb = len >> 2, i;
+	uint32_t w;
 
-	return abs(hash);
+	for (i = 0; i < nb; i++) {
+		w = (uint32_t) s[0] | (uint32_t) s[1] << 8
+		  | (uint32_t) s[2] << 16 | (uint32_t) s[3] << 24;
+		h = (h ^ w) * 0x01000193u;
+		s += 4;
+	}
+	if (len & 3) {
+		w = 0;
+		switch (len & 3) {
+		case 3: w |= (uint32_t) s[2] << 16;	/* fall through */
+		case 2: w |= (uint32_t) s[1] << 8;	/* fall through */
+		case 1: w |= s[0];
+		}
+		h = (h ^ w) * 0x01000193u;
+	}
+	h ^= h >> 16; h *= 0x85ebca6bu;
+	h ^= h >> 13; h *= 0xc2b2ae35u;
+	h ^= h >> 16;
+	return (int) (h & 0x7fffffffu);
+}
+
+/*!
+ * \brief Lowercase one ASCII byte, locale-independent.
+ *
+ * Folds only ASCII A-Z (sets bit 0x20). Used by the case-insensitive hash so
+ * the result is deterministic regardless of LC_CTYPE; glibc tolower() is
+ * locale-dependent (e.g. the Turkish dotless-i maps 'I' away from 'i').
+ * gabpbx hash keys are ASCII, so this is exact and faster (a compare + OR,
+ * fully inlined, no libc call/table).
+ */
+static force_inline unsigned char ast_hash_tolower(unsigned char c)
+{
+	return (c >= 'A' && c <= 'Z') ? (unsigned char) (c | 0x20) : c;
 }
 
 /*!
  * \brief Compute a hash value on a case-insensitive string
  *
- * Uses the same hash algorithm as ast_str_hash, but converts
- * all characters to lowercase prior to computing a hash. This
- * allows for easy case-insensitive lookups in a hash table.
+ * Same fthash (FNV-1a over little-endian 32-bit words) + fmix32 as
+ * ast_str_hash, but folds each byte to lowercase before mixing, for
+ * case-insensitive lookups. Uses an ASCII-only fold (ast_hash_tolower) read
+ * through an unsigned char pointer: locale-independent and free of the
+ * signed-char UB of the former tolower().
  */
 static force_inline int attribute_pure ast_str_case_hash(const char *str)
 {
-	int hash = 5381;
+	uint32_t h = 0x811c9dc5u;
+	const unsigned char *s = (const unsigned char *) str;
+	size_t len = strlen(str);
+	size_t nb = len >> 2, i;
+	uint32_t w;
 
-	while (*str) {
-		hash = hash * 33 ^ tolower(*str++);
+	for (i = 0; i < nb; i++) {
+		w = (uint32_t) ast_hash_tolower(s[0]) | (uint32_t) ast_hash_tolower(s[1]) << 8
+		  | (uint32_t) ast_hash_tolower(s[2]) << 16 | (uint32_t) ast_hash_tolower(s[3]) << 24;
+		h = (h ^ w) * 0x01000193u;
+		s += 4;
 	}
-
-	return abs(hash);
+	if (len & 3) {
+		w = 0;
+		switch (len & 3) {
+		case 3: w |= (uint32_t) ast_hash_tolower(s[2]) << 16;	/* fall through */
+		case 2: w |= (uint32_t) ast_hash_tolower(s[1]) << 8;	/* fall through */
+		case 1: w |= (uint32_t) ast_hash_tolower(s[0]);
+		}
+		h = (h ^ w) * 0x01000193u;
+	}
+	h ^= h >> 16; h *= 0x85ebca6bu;
+	h ^= h >> 13; h *= 0xc2b2ae35u;
+	h ^= h >> 16;
+	return (int) (h & 0x7fffffffu);
 }
 
 #endif /* _GABPBX_STRINGS_H */
