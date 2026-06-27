@@ -6739,7 +6739,10 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		}
 	}
 
-	nua_respond(nh, SIP_100_TRYING, TAG_END());
+	/* No explicit 100 Trying here: the SIP stack's transaction layer already auto-sends one the instant
+	 * the INVITE server transaction is created (immediate), so a manual nua_respond(SIP_100_TRYING) only
+	 * added a redundant duplicate 100 on the wire. The stack's automatic (and earlier) 100 is the
+	 * legitimate one. */
 
 	chan = sofia_new(pvt, AST_STATE_RING, NULL);
 	if (!chan) {
