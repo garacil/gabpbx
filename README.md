@@ -211,7 +211,7 @@ GABPBX uses the standard Asterisk source workflow (`./configure && make menusele
 
 | Dependency | Needed for | Debian/Ubuntu |
 | --- | --- | --- |
-| **Sofia-SIP 1.13.x**, built from source into `/usr/local` | `chan_sofia`'s SIP stack — **not a distro package** | from [garacil/sofia-sip](https://github.com/garacil/sofia-sip) (a fork of [freeswitch/sofia-sip](https://github.com/freeswitch/sofia-sip)) |
+| **Sofia-SIP 1.13.17**, built from source into `/usr/local` | `chan_sofia`'s SIP stack — **not a distro package** | tag `v1.13.17` from [garacil/sofia-sip](https://github.com/garacil/sofia-sip) (a fork of [freeswitch/sofia-sip](https://github.com/freeswitch/sofia-sip)) |
 | OpenSSL | TLS, DTLS-SRTP, WebRTC, SHA-256 auth | `libssl-dev` |
 | libsrtp2 | SRTP / DTLS-SRTP media | `libsrtp2-dev` |
 | usrsctp *(optional)* | WebRTC DataChannel (SCTP-over-DTLS) | `libusrsctp-dev` |
@@ -224,6 +224,7 @@ GABPBX uses the standard Asterisk source workflow (`./configure && make menusele
 ```sh
 # 1) Sofia-SIP into /usr/local (do this first)
 git clone https://github.com/garacil/sofia-sip.git && cd sofia-sip
+git checkout v1.13.17          # the stable release chan_sofia is built + tested against
 ./bootstrap.sh                 # only if ./configure is missing from the checkout
 ./configure --prefix=/usr/local && make && sudo make install && sudo ldconfig
 
