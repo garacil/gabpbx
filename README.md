@@ -19,9 +19,9 @@ Existing Asterisk, Digium and third-party copyright notices and the GPLv2 terms 
 
 ---
 
-## GABPBX 1.2 — the star is `chan_sofia`
+## GABPBX 1.3 — the star is `chan_sofia`
 
-**`chan_sofia` is a complete, modern SIP channel driver built on the battle-tested [Sofia-SIP](https://github.com/freeswitch/sofia-sip) NUA stack — a true drop-in replacement for the aging `chan_sip`, with every `chan_sip` capability and a great deal more.** It is **feature-complete** and, in release **1.2**, **security-hardened** — with **two-way WebRTC video** and **browser-to-browser DataChannels**.
+**`chan_sofia` is a complete, modern SIP channel driver built on the battle-tested [Sofia-SIP](https://github.com/freeswitch/sofia-sip) NUA stack — a true drop-in replacement for the aging `chan_sip`, with every `chan_sip` capability and a great deal more.** It is **feature-complete** and **security-hardened** — with **two-way WebRTC video** and **browser-to-browser DataChannels**. Release **1.3** makes the core **faster at scale**: the string hash that powers every internal hash table is now **XXH3-64**, the `chan_sofia` lookup tables are retuned for carrier load, and a new **`core test hash`** command lets you measure hash throughput on your own hardware.
 
 Where `chan_sip` hand-rolled its own parser, `chan_sofia` rides a real SIP transaction state machine — the same library lineage that powers large-scale softswitches — and puts the PBX behavior on top. The result is a SIP driver that is at once **more capable, more secure, and dramatically more scalable** than the channel it replaces.
 
@@ -40,7 +40,7 @@ Your dial plans, your `sip show …` muscle memory, your `SIPpeers` / `SIPshowpe
 - **Drop-in for `chan_sip`** — same `SIP/<peer>` channel, same `sip show …` CLI, same `SIPpeers` AMI, same `sippeers` realtime family.
 - **Far beyond `chan_sip`** — SIP Outbound, Path, Service-Route, GRUU, PRACK/100rel, UPDATE, REFER transfer, MESSAGE, PUBLISH, presence/BLF, SHA-256 auth, and more.
 - **WebRTC ready** — browsers register and call over secure WebSocket with DTLS-SRTP, ICE-lite, rtcp-mux and BUNDLE, **two-way audio, two-way video and relayed DataChannels**, with **no `pjproject` and no `libnice`** in the tree.
-- **Built for carrier scale** — a single Sofia event thread plus a small fixed I/O pool, O(1) hash tables, a bounded register pool under storms, and a lean high-throughput media engine.
+- **Built for carrier scale** — a single Sofia event thread plus a small fixed I/O pool, **O(1) hash tables with fast XXH3-64 hashing**, a bounded register pool under storms, and a lean high-throughput media engine.
 - **Exceptionally robust** — hardened and security-audited by the world's most advanced AI systems through a rigorous, multi-round adversarial correctness, concurrency and security review.
 
 ---
@@ -157,7 +157,7 @@ Every capability is enumerated below, grouped for scanning. Each is real and liv
 `chan_sofia` is built for high-volume, carrier-grade deployments, not just small installs.
 
 - **Lean concurrency.** A **single Sofia event thread** owns all mutable signaling state and runs every callback, complemented by a **small fixed I/O pool** — not a thread per peer. This keeps context-switching and lock contention flat as registrations climb into the tens of thousands.
-- **O(1) hash tables sized for carrier load.** Peer, dialog and registration lookups are constant-time hash lookups dimensioned for carrier-scale populations, so call setup does not slow down as the system fills.
+- **O(1) hash tables with fast XXH3-64 hashing.** Peer, dialog, presence and registration lookups are constant-time hash lookups dimensioned (all prime bucket counts) for carrier-scale populations, so call setup does not slow down as the system fills. The string hash behind every table is **XXH3 (64-bit)** — markedly faster on the short keys a PBX hashes than the classic byte-wise hash, with equal-or-better distribution and no external dependency. Measure it live with **`core test hash`** (reports Mhash/s, MB/s and ns/hash). The by-source-IP trunk index is specialized to static-host trunks for unambiguous, safe IP-trunk identification.
 - **Bounded register pool under storms.** A bounded background worker pool absorbs realtime registration write-backs off the event thread, with OOM-safe drop semantics (the next REGISTER refreshes a dropped update) so a registration storm cannot stall signaling or exhaust memory.
 - **A lean high-throughput media engine.** A single forked RTP engine carries both plain SIP and WebRTC media on a tight datapath, with the WebRTC demux path dormant until DTLS is active so non-WebRTC RTP pays no overhead.
 
