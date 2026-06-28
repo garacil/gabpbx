@@ -1837,7 +1837,7 @@ int ast_config_text_file_save(const char *configfile, const struct ast_config *c
 	struct ao2_container *fileset;
 	struct inclfile *fi;
 
-	fileset = ao2_container_alloc(1023, hash_string, hashtab_compare_strings);
+	fileset = ao2_container_alloc(1031, hash_string, hashtab_compare_strings); /* prime */
 	if (!fileset) {
 		/* Container creation failed. */
 		return -1;

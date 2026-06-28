@@ -1107,7 +1107,7 @@ static struct sofia_fork *sofia_fork_alloc(void)
 	fork = ao2_alloc(sizeof(*fork), sofia_fork_destructor);
 	if (!fork) return NULL;
 	ast_mutex_init(&fork->lock);
-	fork->children = ao2_container_alloc(8, fork_branch_hash_fn, fork_branch_cmp_fn);
+	fork->children = ao2_container_alloc(11, fork_branch_hash_fn, fork_branch_cmp_fn); /* prime */
 	if (!fork->children) {
 		ao2_ref(fork, -1);
 		return NULL;
