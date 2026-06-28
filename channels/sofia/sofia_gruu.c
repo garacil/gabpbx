@@ -31,7 +31,8 @@
 #include <sofia-sip/sip_header.h>	/* sip_has_feature */
 
 #include <ctype.h>	/* isdigit (Flow-Timer parse) */
-#include <stdlib.h>	/* atoi */
+#include <stdlib.h>	/* atoi, strtol */
+#include <limits.h>	/* INT_MAX (reg-id bound) */
 
 #include "include/chan_sofia_internal.h"
 
@@ -89,6 +90,55 @@ static void sofia_gruu_unquote(const char *val, char *out, size_t outlen)
 		out[o++] = *val++;
 	}
 	out[o] = '\0';
+}
+
+/* Parse RFC 5626 device-identity params from an INCOMING REGISTER Contact: +sip.instance (normalized -
+ * dequoted, surrounding <> stripped) into inst, and a numeric reg-id (1..INT_MAX) into *reg_id. A reg-id
+ * WITHOUT an instance is ignored (RFC 5626: a Contact with reg-id but no instance-id is not valid, the
+ * registrar ignores the reg-id). inst="" / *reg_id=0 = absent. Used to rebind a binding when a NAT UA
+ * rotates its source port + Contact URI on renewal (the instance/reg-id stay stable across the rotation). */
+void sofia_contact_parse_instance(sip_contact_t const *m, char *inst, size_t instlen, int *reg_id)
+{
+	int i, parsed_reg = 0;
+
+	if (inst && instlen) {
+		inst[0] = '\0';
+	}
+	if (reg_id) {
+		*reg_id = 0;
+	}
+	if (!m || !m->m_params) {
+		return;
+	}
+	for (i = 0; m->m_params[i]; i++) {
+		const char *prm = m->m_params[i];
+
+		if (!strncasecmp(prm, "+sip.instance=", 14)) {
+			if (inst && instlen) {
+				char tmp[160];
+				size_t n;
+				sofia_gruu_unquote(prm + 14, tmp, sizeof(tmp));	/* drop the surrounding DQUOTEs */
+				/* Wire value is "<urn:uuid:...>" - strip ONE leading '<' + trailing '>'. */
+				n = strlen(tmp);
+				if (n >= 2 && tmp[0] == '<' && tmp[n - 1] == '>') {
+					tmp[n - 1] = '\0';
+					ast_copy_string(inst, tmp + 1, instlen);
+				} else {
+					ast_copy_string(inst, tmp, instlen);
+				}
+			}
+		} else if (!strncasecmp(prm, "reg-id=", 7)) {
+			char *end;
+			long v = strtol(prm + 7, &end, 10);
+			if (end != prm + 7 && *end == '\0' && v >= 1 && v <= INT_MAX) {
+				parsed_reg = (int)v;
+			}
+		}
+	}
+	/* reg-id is meaningful only alongside an instance (RFC 5626); ignore a lone reg-id. */
+	if (reg_id && inst && inst[0] != '\0') {
+		*reg_id = parsed_reg;
+	}
 }
 
 /* GRUU Phase 2a (gruu=yes): on a REGISTER 200, find the registered Contact bound to OUR +sip.instance

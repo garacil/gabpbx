@@ -1001,6 +1001,142 @@ static struct sofia_contact *sofia_peer_find_contact_by_addr(struct sofia_peer *
 	return found;
 }
 
+/* Rebind lookup #1 (RFC 5626): an existing contact bound to the same +sip.instance. With a reg-id, require
+ * the SAME reg-id - distinct reg-ids are distinct concurrent flows that MUST coexist; an instance with no
+ * reg-id matches by instance alone. Returns the match with a +1 ref. Caller holds peer->lock. */
+static struct sofia_contact *sofia_peer_find_contact_by_instance(struct sofia_peer *peer,
+	const char *instance_id, int reg_id)
+{
+	struct ao2_iterator ci;
+	struct sofia_contact *c, *found = NULL;
+	if (!peer || !peer->contacts || ast_strlen_zero(instance_id))
+		return NULL;
+	ci = ao2_iterator_init(peer->contacts, 0);
+	while ((c = ao2_iterator_next(&ci))) {
+		int match;
+		ao2_lock(c);
+		match = (c->instance_id[0] && !strcasecmp(c->instance_id, instance_id)
+			&& (reg_id == 0 || c->reg_id == reg_id));
+		ao2_unlock(c);
+		if (match) {
+			found = c;	/* keep the iterator ref */
+			break;
+		}
+		ao2_ref(c, -1);
+	}
+	ao2_iterator_destroy(&ci);
+	return found;
+}
+
+/* Rebind lookup #2 (RFC 3261 10.2): an instance-LESS existing contact with the same REGISTER Call-ID and
+ * transport - a legacy rotator keeps its Call-ID across renewals while its source port / Contact URI churn.
+ * Only matches instance-less contacts (the RFC 5626 tier owns instance-bearing ones); gated at the call
+ * site to instance-less single-Contact REGISTERs. Returns +1 ref. Caller holds peer->lock. */
+static struct sofia_contact *sofia_peer_find_contact_by_callid(struct sofia_peer *peer,
+	const char *call_id, const char *transport)
+{
+	struct ao2_iterator ci;
+	struct sofia_contact *c, *found = NULL;
+	if (!peer || !peer->contacts || ast_strlen_zero(call_id))
+		return NULL;
+	ci = ao2_iterator_init(peer->contacts, 0);
+	while ((c = ao2_iterator_next(&ci))) {
+		int match;
+		ao2_lock(c);
+		match = (c->instance_id[0] == '\0' && c->call_id[0] && !strcmp(c->call_id, call_id)
+			&& !strcasecmp(c->transport, S_OR(transport, "")));
+		ao2_unlock(c);
+		if (match) {
+			found = c;
+			break;
+		}
+		ao2_ref(c, -1);
+	}
+	ao2_iterator_destroy(&ci);
+	return found;
+}
+
+/* Rebind lookup #3 (conservative NAT fallback): an instance-LESS existing contact from the same source IP
+ * (host-only - the NAT-mapped port rotates) + same transport + same non-empty User-Agent + same Contact
+ * user. For nat/force_rport peers only (gated at the call site). Returns +1 ref. Caller holds peer->lock. */
+static struct sofia_contact *sofia_peer_find_contact_nat_fallback(struct sofia_peer *peer,
+	const struct ast_sockaddr *src, const char *transport, const char *user_agent,
+	const char *contact_user)
+{
+	struct ao2_iterator ci;
+	struct sofia_contact *c, *found = NULL;
+	if (!peer || !peer->contacts || !src || ast_strlen_zero(user_agent))
+		return NULL;
+	ci = ao2_iterator_init(peer->contacts, 0);
+	while ((c = ao2_iterator_next(&ci))) {
+		int match;
+		char cuser[128];
+		ao2_lock(c);
+		sofia_uri_user_from_contact(c->contact_uri, "", cuser, sizeof(cuser));
+		match = (c->instance_id[0] == '\0'
+			&& ast_sockaddr_cmp_addr(&c->src_addr, src) == 0
+			&& !strcasecmp(c->transport, S_OR(transport, ""))
+			&& c->user_agent[0] && !strcasecmp(c->user_agent, user_agent)
+			&& !strcasecmp(cuser, S_OR(contact_user, "")));
+		ao2_unlock(c);
+		if (match) {
+			found = c;
+			break;
+		}
+		ao2_ref(c, -1);
+	}
+	ao2_iterator_destroy(&ci);
+	return found;
+}
+
+/* Rebind an EXISTING contact onto a renewed registration that arrived with a new Contact URI / source
+ * (the same device rotated its NAT port). contact_uri is the ao2 hash/cmp key (contact_hash_fn/cmp_fn), so
+ * it MUST be re-keyed: unlink under the OLD uri, mutate, relink under the NEW uri (the sofia_peer_ipport_reindex
+ * pattern). The SAME object is kept, so an active call's pvt->active_contact pointer + ao2 ref + active_calls
+ * all survive (a port move on a live call is exactly what we want). Caller holds peer->lock, which serializes
+ * per-peer REGISTER processing (no concurrent rebind for this peer). `c` carries the finder's +1 ref (caller
+ * drops it). old_src_out (optional) receives the pre-rebind src_addr for move accounting. Returns 0, or -1 if
+ * the relink fails (OOM) - fail-closed: the stale binding is gone, but NO duplicate is created (better than the
+ * fork-to-stale-port bug). */
+static int sofia_contact_rebind(struct sofia_peer *peer, struct sofia_contact *c,
+	const char *new_uri, const char *host, int port, const char *transport,
+	const char *user_agent, const struct ast_sockaddr *src, const char *pathstr,
+	const char *instance_id, int reg_id, const char *call_id, time_t expires_at,
+	struct ast_sockaddr *old_src_out)
+{
+	ao2_unlink(peer->contacts, c);	/* remove under the OLD contact_uri (still the live key) */
+	ao2_lock(c);
+	if (old_src_out) {
+		ast_sockaddr_copy(old_src_out, &c->src_addr);
+	}
+	ast_copy_string(c->contact_uri, new_uri, sizeof(c->contact_uri));	/* the re-key, safe while unlinked */
+	if (host) {
+		ast_copy_string(c->host, host, sizeof(c->host));
+	}
+	c->port = port;
+	ast_copy_string(c->transport, transport, sizeof(c->transport));
+	if (!ast_strlen_zero(user_agent)) {
+		ast_copy_string(c->user_agent, user_agent, sizeof(c->user_agent));
+	}
+	ast_copy_string(c->path, pathstr, sizeof(c->path));
+	c->expires = expires_at;
+	memcpy(&c->src_addr, src, sizeof(*src));
+	ast_copy_string(c->instance_id, instance_id ? instance_id : "", sizeof(c->instance_id));
+	c->reg_id = reg_id;
+	ast_copy_string(c->call_id, call_id ? call_id : "", sizeof(c->call_id));
+	ao2_unlock(c);
+	if (!ao2_link(peer->contacts, c)) {	/* relink under the NEW contact_uri */
+		ast_log(LOG_WARNING, "Sofia: contact rebind relink failed for peer '%s' (uri=%s) - "
+			"binding dropped (fail-closed, no duplicate)\n", peer->name, new_uri);
+		return -1;
+	}
+	if (sofia_debug) {
+		ast_verbose("Sofia: Rebound contact for peer '%s' -> %s (same device, renewed flow)\n",
+			peer->name, new_uri);
+	}
+	return 0;
+}
+
 /* Contact lookup by host:port (outbound traffic). */
 static struct sofia_contact *sofia_peer_find_contact_by_host_port(struct sofia_peer *peer,
 	const char *host, int port)
@@ -7586,23 +7722,58 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				return 0;
 				}
 			}
-		/* Specific contact(s) de-registration. */
+		/* Specific contact(s) de-registration. A rotator may de-register with a CHANGED Contact URI/source,
+		 * so on an exact-URI miss match the same device the same way a renewal does (instance/reg-id; else a
+		 * single-Contact Call-ID; else NAT src-IP) and unlink THAT binding - else the old one lingers to timeout. */
+		int dn_contacts = 0;
+		for (m = sip->sip_contact; m; m = m->m_next) {
+			dn_contacts++;
+		}
 		for (m = sip->sip_contact; m; m = m->m_next) {
 			char uri[256];
 			struct sofia_contact *c;
+			char in_instance[128];
+			int in_reg_id;
+			const char *in_call_id;
+			char in_cuser[128];
 
 			sofia_contact_uri_from_url(uri, sizeof(uri), m->m_url);
+			sofia_contact_parse_instance(m, in_instance, sizeof(in_instance), &in_reg_id);
+			in_call_id = (sip->sip_call_id && sip->sip_call_id->i_id) ? sip->sip_call_id->i_id : "";
+			sofia_uri_user_from_contact(uri, "", in_cuser, sizeof(in_cuser));
+
 			c = ao2_find(peer->contacts, uri, OBJ_POINTER);
+			if (!c) {
+				char dtransport[16];
+				sofia_contact_transport_from_url(m->m_url, dtransport, sizeof(dtransport));
+				if (!strcasecmp(dtransport, "ws") && sip->sip_via && sip->sip_via->v_protocol
+						&& (strstr(sip->sip_via->v_protocol, "WSS") || strstr(sip->sip_via->v_protocol, "wss"))) {
+					ast_copy_string(dtransport, "wss", sizeof(dtransport));
+				}
+				if (in_instance[0]) {
+					c = sofia_peer_find_contact_by_instance(peer, in_instance, in_reg_id);
+				} else {
+					if (dn_contacts == 1) {
+						c = sofia_peer_find_contact_by_callid(peer, in_call_id, dtransport);
+					}
+					if (!c && (peer->nat & SOFIA_NAT_FORCE_RPORT)
+							&& sip->sip_user_agent && sip->sip_user_agent->g_string
+							&& !ast_strlen_zero(sip->sip_user_agent->g_string)) {
+						c = sofia_peer_find_contact_nat_fallback(peer, &src, dtransport,
+							sip->sip_user_agent->g_string, in_cuser);
+					}
+				}
+			}
 			if (c) {
 				if (update) {
 					update->contacts_removed++;
 					sofia_register_update_set_uri(update, uri);
 				}
+				ao2_unlink(peer->contacts, c);	/* by OBJECT: a rotated de-register's matched key differs from `uri` */
+				if (sofia_debug)
+					ast_verbose("Sofia: Unlinked contact %s\n", c->contact_uri);
 				ao2_ref(c, -1);
 			}
-			ao2_find(peer->contacts, uri, OBJ_UNLINK | OBJ_NODATA);
-			if (sofia_debug)
-				ast_verbose("Sofia: Unlinked contact %s\n", uri);
 		}
 	} else {
 		/* Preflight the contact-ACL for EVERY Contact before binding ANY, so a
@@ -7614,12 +7785,29 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				return -1;
 			}
 		}
+		/* RFC 3261 allows several Contacts in one REGISTER; a same-UA multi-Contact REGISTER shares
+		 * Call-ID + transport, so the legacy Call-ID rebind tier is restricted to single-Contact REGISTERs
+		 * (the instance + NAT-src-IP tiers are unaffected). */
+		int n_contacts = 0;
+		for (m = sip->sip_contact; m; m = m->m_next) {
+			n_contacts++;
+		}
 		/* Apply loop. */
 		for (m = sip->sip_contact; m; m = m->m_next) {
 			char uri[256];
 			struct sofia_contact *c;
+			char in_instance[128];
+			int in_reg_id;
+			const char *in_call_id;
+			char in_cuser[128];
 
 			sofia_contact_uri_from_url(uri, sizeof(uri), m->m_url);
+
+			/* Device identity for rebind-on-renewal: RFC 5626 +sip.instance/reg-id (if present), the
+			 * REGISTER Call-ID (RFC 3261 10.2, stable per UA boot cycle), and the Contact user. */
+			sofia_contact_parse_instance(m, in_instance, sizeof(in_instance), &in_reg_id);
+			in_call_id = (sip->sip_call_id && sip->sip_call_id->i_id) ? sip->sip_call_id->i_id : "";
+			sofia_uri_user_from_contact(uri, "", in_cuser, sizeof(in_cuser));
 
 			/* Last Contact ;transport= seen is snapshotted into reg_transport
 			 * after the loop. */
@@ -7658,11 +7846,51 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 					ast_copy_string(c->user_agent, sip->sip_user_agent->g_string,
 						sizeof(c->user_agent));
 				ast_copy_string(c->path, pathstr, sizeof(c->path));	/* RFC 3327 Path (empty if none/off) */
+				ast_copy_string(c->instance_id, in_instance, sizeof(c->instance_id));
+				c->reg_id = in_reg_id;
+				ast_copy_string(c->call_id, in_call_id, sizeof(c->call_id));
 				ao2_unlock(c);
 				ao2_ref(c, -1);
 				if (sofia_debug)
 					ast_verbose("Sofia: Refreshed contact %s (expires in %ds)\n", uri, expires);
 			} else {
+				/* Same device that rotated its source port / Contact URI (NAT)? Rebind the existing binding
+				 * instead of accumulating a duplicate. Key priority: RFC 5626 +sip.instance(+reg-id); else a
+				 * legacy single-Contact rotator by Call-ID + transport; else a conservative NAT src-IP match.
+				 * An instance present but unmatched is a genuinely new flow - do NOT fall to the lower tiers
+				 * (they could collapse a distinct reg-id flow). */
+				struct sofia_contact *match = NULL;
+				if (in_instance[0]) {
+					match = sofia_peer_find_contact_by_instance(peer, in_instance, in_reg_id);
+				} else {
+					if (n_contacts == 1) {
+						match = sofia_peer_find_contact_by_callid(peer, in_call_id, reg_transport);
+					}
+					if (!match && (peer->nat & SOFIA_NAT_FORCE_RPORT)
+							&& sip->sip_user_agent && sip->sip_user_agent->g_string
+							&& !ast_strlen_zero(sip->sip_user_agent->g_string)) {
+						match = sofia_peer_find_contact_nat_fallback(peer, &src, reg_transport,
+							sip->sip_user_agent->g_string, in_cuser);
+					}
+				}
+				if (match) {
+					struct ast_sockaddr old_src;
+					sofia_contact_rebind(peer, match, uri, m->m_url->url_host,
+						sofia_contact_url_port(m->m_url->url_port), reg_transport,
+						(sip->sip_user_agent ? sip->sip_user_agent->g_string : NULL),
+						&src, pathstr, in_instance, in_reg_id, in_call_id, now + expires, &old_src);
+					if (update) {
+						update->contacts_refreshed++;	/* a MOVE, not an add -> bypasses evict-oldest */
+						if (ast_sockaddr_cmp(&old_src, &src)) {
+							update->contacts_moved++;
+							sofia_register_update_set_uri(update, uri);
+							ast_sockaddr_copy(&update->changed_old_src, &old_src);
+							ast_sockaddr_copy(&update->new_src, &src);
+						}
+					}
+					ao2_ref(match, -1);	/* drop the finder ref (rebind kept the object linked, or fail-closed) */
+					continue;		/* rebound (or fail-closed); never alloc a duplicate */
+				}
 				/* New contact. */
 				c = ao2_alloc(sizeof(*c), NULL);
 				if (!c) continue;
@@ -7682,6 +7910,9 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				c->expires = now + expires;
 				memcpy(&c->src_addr, &src, sizeof(src));
 				ast_copy_string(c->path, pathstr, sizeof(c->path));	/* RFC 3327 Path (empty if none/off) */
+				ast_copy_string(c->instance_id, in_instance, sizeof(c->instance_id));
+				c->reg_id = in_reg_id;
+				ast_copy_string(c->call_id, in_call_id, sizeof(c->call_id));
 				ao2_lock(peer->contacts);
 				/* Link FIRST, evict oldest AFTER, so an OOM never drops an existing
 				 * binding (NULL = OOM: undo accounting, return -3/500). */

@@ -167,6 +167,11 @@ struct sofia_contact {
 	struct ast_sockaddr src_addr;
 	int active_calls;          /* count of active calls on this contact */
 	char path[1024];           /* Path (RFC 3327) the device registered through, as a ready "<uri;lr>,..." Route value pre-loaded on requests we send to this contact. Empty = none. */
+	/* Device/flow identity for rebind-on-renewal (a NAT UA rotates its source port + Contact URI every
+	 * refresh; matching only contact_uri would accumulate duplicates). Filled at REGISTER; "" / 0 = absent. */
+	char instance_id[128];     /* RFC 5626 +sip.instance (normalized urn:..., quotes + <> stripped). Stable across reboots. */
+	int  reg_id;               /* RFC 5626 reg-id (1..INT_MAX, 0 = absent/invalid). Distinct flows of one instance. */
+	char call_id[128];         /* REGISTER Call-ID (RFC 3261 10.2: stable per UA boot). Universal rotation key. */
 };
 
 extern char sofia_sipnotify_sentinel;
@@ -220,6 +225,7 @@ void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len);
 void sofia_remove_peer_hints(const char *regexten, const char *subscribecontext, const char *registrar);
 /* GRUU (RFC 5627/5626), sofia_gruu.c: advertise +sip.instance + consume the registrar's pub/temp-gruu. */
 void sofia_build_instance_feature(const struct sofia_peer *peer, char *buf, size_t len, int with_reg_id);
+void sofia_contact_parse_instance(sip_contact_t const *m, char *inst, size_t instlen, int *reg_id);	/* RFC 5626 +sip.instance/reg-id from an inbound REGISTER Contact */
 void sofia_outbound_consume(struct sofia_peer *peer, sip_t const *sip, int keepalive_ms);	/* RFC 5626 REGISTER-2xx inspect */
 void sofia_gruu_consume(struct sofia_peer *peer, sip_t const *sip);
 void sofia_service_route_store(struct sofia_peer *peer, sip_t const *sip);	/* Service-Route RFC 3608, sofia_route.c */
