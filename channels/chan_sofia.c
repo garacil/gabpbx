@@ -123,6 +123,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <openssl/sha.h>  /* RFC 7616 SHA-256 digest auth: libcrypto's SHA256() — core SHA256* symbols are not exported to modules */
+#include <openssl/hmac.h> /* HMAC-SHA256 for the stateless self-validating digest nonce (s1.ts.rand.hmac) */
+#include <openssl/evp.h>  /* EVP_sha256() for HMAC() */
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -7934,8 +7936,6 @@ static const char *sofia_pick_auth_username(sip_t const *sip,
 	return fallback_user;
 }
 
-static void sofia_regen_nonce_locked(struct sofia_peer *peer, char *out_buf, size_t out_len);
-
 /* Constant-time compare for digest hashes (avoids a timing oracle). The volatile
  * accumulator + barrier stop the compiler short-circuiting. 0 = match. */
 static inline int sofia_ct_memcmp(const void *a, const void *b, size_t len)
@@ -7948,41 +7948,6 @@ static inline int sofia_ct_memcmp(const void *a, const void *b, size_t len)
 	}
 	__asm__ __volatile__("" ::: "memory");
 	return diff;
-}
-
-/* Crypto-secure 128-bit nonce from /dev/urandom -> 32 hex chars. Falls back to
- * an ast_random composite (with a WARNING) only if urandom is unavailable.
- * out_buf size >= 33. */
-static int sofia_secure_nonce_gen(char *out_buf, size_t out_len)
-{
-	unsigned char raw[16];
-	int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-	if (fd >= 0) {
-		ssize_t r;
-		size_t got = 0;
-		do {
-			r = read(fd, raw + got, sizeof(raw) - got);
-			if (r < 0) {
-				if (errno == EINTR) continue;
-				break;
-			}
-			if (r == 0) break;
-			got += (size_t)r;
-		} while (got < sizeof(raw));
-		close(fd);
-		if (got == sizeof(raw)) {
-			for (size_t i = 0; i < sizeof(raw); i++) {
-				snprintf(out_buf + (i * 2), out_len - (i * 2), "%02x", raw[i]);
-			}
-			return 0;
-		}
-	}
-	ast_log(LOG_WARNING, "Sofia: /dev/urandom unavailable for nonce; "
-		"falling back to ast_random composite (degraded entropy ~96-100 bits vs ideal 128)\n");
-	snprintf(out_buf, out_len, "%08lx%08lx%08lx%08lx",
-		(unsigned long)ast_random(), (unsigned long)ast_random(),
-		(unsigned long)ast_random(), (unsigned long)ast_random());
-	return 0;
 }
 
 /* Digest algorithm selector (MD5 / RFC 7616 SHA-256); MD5 when algorithm= absent. */
@@ -8130,6 +8095,224 @@ static void sofia_emit_auth_challenge(nua_t *nua, nua_handle_t *nh,
 	}
 }
 
+/* ===== Stateless digest nonce + per-nonce replay cache (3-way design) =====
+ * Replaces the per-peer single-nonce + monotonic-nc model that 401-looped concurrent INVITEs from a
+ * multi-call phone: a REGISTER nc=1 advanced the SHARED peer->last_nc, so a later INVITE legitimately
+ * starting at nc=1 on the same live nonce tripped the nc-replay gate -> 401 stale -> rotation cascaded
+ * across the peer's concurrent transactions -> loop -> the outbound INVITE never completed (chan_sip,
+ * which uses no-qop + a per-dialog nonce, was unaffected). Now: the nonce is FRESH per challenge and
+ * SELF-VALIDATING (HMAC-SHA256/128 over s1:ts:rand:realm:method:scope keyed by a per-process secret), and
+ * nc replay is tracked PER NONCE in a bounded leaf-locked cache, updated ONLY AFTER a valid digest (so
+ * unauthenticated floods cannot fill it). RFC 2617 warns strict per-peer nonce tracking breaks
+ * pipelined/concurrent requests; this scopes the replay state to a single challenge. Keeps qop="auth". */
+
+static unsigned char sofia_nonce_secret[32];	/* HMAC key; random, per module load */
+
+/* Fill buf with crypto-random bytes (/dev/urandom; ast_random fallback w/ WARNING). */
+static void sofia_rand_bytes(unsigned char *buf, size_t n)
+{
+	int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		size_t got = 0;
+		while (got < n) {
+			ssize_t r = read(fd, buf + got, n - got);
+			if (r < 0) { if (errno == EINTR) continue; break; }
+			if (r == 0) break;
+			got += (size_t)r;
+		}
+		close(fd);
+		if (got == n) return;
+	}
+	ast_log(LOG_WARNING, "Sofia: /dev/urandom unavailable; ast_random fallback for %zu bytes (degraded entropy)\n", n);
+	for (size_t i = 0; i < n; i++) buf[i] = (unsigned char)(ast_random() & 0xff);
+}
+
+/* One-time module-load init of the nonce HMAC secret (before sofia_thread accepts SIP). */
+static void sofia_nonce_secret_init(void)
+{
+	sofia_rand_bytes(sofia_nonce_secret, sizeof(sofia_nonce_secret));
+}
+
+/* lower-hex of n bytes into out (>= 2n+1). */
+static void sofia_hex_encode(const unsigned char *in, size_t n, char *out)
+{
+	static const char h[] = "0123456789abcdef";
+	for (size_t i = 0; i < n; i++) { out[i * 2] = h[in[i] >> 4]; out[i * 2 + 1] = h[in[i] & 0xf]; }
+	out[n * 2] = '\0';
+}
+
+/* HMAC-SHA256(secret, msg) truncated to 128 bits -> 32 lower-hex into out (>= 33). */
+static void sofia_nonce_hmac(const char *msg, char *out_hex)
+{
+	unsigned char mac[SHA256_DIGEST_LENGTH];
+	unsigned int maclen = 0;
+	HMAC(EVP_sha256(), sofia_nonce_secret, (int)sizeof(sofia_nonce_secret),
+		(const unsigned char *)msg, strlen(msg), mac, &maclen);
+	sofia_hex_encode(mac, 16, out_hex);	/* 128-bit truncation: enough for an online challenge token */
+}
+
+/* Build a FRESH stateless nonce: s1.<ts_hex>.<rand_hex>.<hmac_hex>. scope = peer name (or "*" for an
+ * unknown-peer challenge). Does NOT touch peer state. out >= 96. */
+static void sofia_make_auth_nonce(const char *scope, const char *realm, const char *method,
+		char *out, size_t outlen)
+{
+	char ts_hex[24], rand_hex[33], hmac_hex[33], msg[640];
+	unsigned char rnd[16];
+
+	snprintf(ts_hex, sizeof(ts_hex), "%llx", (unsigned long long)time(NULL));
+	sofia_rand_bytes(rnd, sizeof(rnd));
+	sofia_hex_encode(rnd, sizeof(rnd), rand_hex);
+	/* NOTE: deliberately NOT bound to source IP in v1. pjsip binds to the TRUE packet source
+	 * (rdata->pkt_info.src_name); chan_sofia's only source helper is Via-derived (received/rport),
+	 * and binding the nonce to that could false-stale legit NAT/proxy/TCP/WS traffic - the exact bug
+	 * class this fix removes. Replay is covered by the per-nonce nc cache. Source-IP binding is a v2
+	 * "s2" option IF/when reliable packet-source metadata is plumbed in (IP only, never port). */
+	snprintf(msg, sizeof(msg), "s1:%s:%s:%s:%s:%s", ts_hex, rand_hex,
+		realm ? realm : "", method ? method : "", scope ? scope : "*");
+	sofia_nonce_hmac(msg, hmac_hex);
+	snprintf(out, outlen, "s1.%s.%s.%s", ts_hex, rand_hex, hmac_hex);
+}
+
+/* Validate a returned nonce statelessly. Recomputes the HMAC for `scope`, then "*" (so an unknown-peer
+ * challenge that became a known peer on the authenticated retry still validates). Returns:
+ *   0 = valid HMAC + within TTL (issue_ts out), 1 = valid HMAC but expired/future (stale), -1 = invalid. */
+static int sofia_validate_auth_nonce(const char *nonce, const char *scope, const char *realm,
+		const char *method, time_t *issue_ts)
+{
+	char ts_hex[24], rand_hex[40], hmac_hex[40], msg[640], want_hex[33];
+	unsigned long long ts;
+	int ttl;
+	time_t now;
+
+	if (!nonce) return -1;
+	if (sscanf(nonce, "s1.%23[0-9a-fA-F].%39[0-9a-fA-F].%39[0-9a-fA-F]", ts_hex, rand_hex, hmac_hex) != 3) {
+		return -1;
+	}
+	if (strlen(hmac_hex) != 32) {
+		return -1;	/* our HMAC is exactly 128-bit (32 hex) */
+	}
+	snprintf(msg, sizeof(msg), "s1:%s:%s:%s:%s:%s", ts_hex, rand_hex,
+		realm ? realm : "", method ? method : "", scope ? scope : "*");
+	sofia_nonce_hmac(msg, want_hex);
+	if (sofia_ct_memcmp(want_hex, hmac_hex, 32) != 0) {
+		snprintf(msg, sizeof(msg), "s1:%s:%s:%s:%s:*", ts_hex, rand_hex,
+			realm ? realm : "", method ? method : "");
+		sofia_nonce_hmac(msg, want_hex);
+		if (sofia_ct_memcmp(want_hex, hmac_hex, 32) != 0) {
+			return -1;	/* bad HMAC: forged/foreign nonce */
+		}
+	}
+	ts = strtoull(ts_hex, NULL, 16);
+	if (issue_ts) *issue_ts = (time_t)ts;
+	ttl = sofia_cfg.nonce_ttl_seconds > 0 ? sofia_cfg.nonce_ttl_seconds : SOFIA_NONCE_TTL_SEC_DEFAULT;
+	now = time(NULL);
+	if ((time_t)ts > now + 2) return 1;		/* future (clock skew/forged) -> stale */
+	if (now - (time_t)ts > ttl) return 1;		/* expired -> stale */
+	return 0;
+}
+
+/* Per-nonce replay entry (bounded leaf-locked cache, keyed by the nonce string). `nonce` MUST be the
+ * FIRST member: this ao2 (era-1.8 API) has no OBJ_SEARCH_KEY, so a key-find passes the nonce string as
+ * `arg`/`obj` and the hash casts it to this struct and reads offset 0 (the chan_sofia contact_uri pattern). */
+struct sofia_nonce_replay {
+	char nonce[96];		/* offset 0 - see above */
+	unsigned int max_nc;
+	time_t issue_ts;
+};
+static struct ao2_container *sofia_nonce_cache;
+#define SOFIA_NONCE_CACHE_MAX 65536
+#define SOFIA_NONCE_CACHE_BUCKETS 16381	/* prime */
+
+static int sofia_nonce_cache_hash(const void *obj, int flags)
+{
+	/* obj is a real entry on link, or the nonce string on a key-find; nonce[] at offset 0 makes both work. */
+	return ast_str_hash(((const struct sofia_nonce_replay *)obj)->nonce);
+}
+static int sofia_nonce_cache_cmp(void *obj, void *arg, int flags)
+{
+	const struct sofia_nonce_replay *e = obj;
+	const char *key = arg;	/* a key-find passes the nonce string */
+	return strcmp(e->nonce, key) ? 0 : CMP_MATCH;
+}
+
+/* Drop entries older than now-ttl (issue_ts based). Returns count removed. */
+static void sofia_nonce_cache_prune(void)
+{
+	struct ao2_iterator it;
+	struct sofia_nonce_replay *e;
+	int ttl = sofia_cfg.nonce_ttl_seconds > 0 ? sofia_cfg.nonce_ttl_seconds : SOFIA_NONCE_TTL_SEC_DEFAULT;
+	time_t cutoff = time(NULL) - ttl;
+
+	if (!sofia_nonce_cache) return;
+	it = ao2_iterator_init(sofia_nonce_cache, 0);
+	while ((e = ao2_iterator_next(&it))) {
+		if (e->issue_ts < cutoff) {
+			ao2_unlink(sofia_nonce_cache, e);
+		}
+		ao2_ref(e, -1);
+	}
+	ao2_iterator_destroy(&it);
+}
+
+/* Last resort when full after prune: unlink the single oldest entry (availability-biased). */
+static void sofia_nonce_cache_evict_oldest(void)
+{
+	struct ao2_iterator it;
+	struct sofia_nonce_replay *e, *oldest = NULL;
+
+	if (!sofia_nonce_cache) return;
+	it = ao2_iterator_init(sofia_nonce_cache, 0);
+	while ((e = ao2_iterator_next(&it))) {
+		if (!oldest || e->issue_ts < oldest->issue_ts) {
+			if (oldest) ao2_ref(oldest, -1);
+			oldest = e;	/* keep ref */
+		} else {
+			ao2_ref(e, -1);
+		}
+	}
+	ao2_iterator_destroy(&it);
+	if (oldest) {
+		ao2_unlink(sofia_nonce_cache, oldest);
+		ao2_ref(oldest, -1);
+	}
+}
+
+/* Per-nonce nc replay gate, called ONLY after a valid digest (so bogus auth never inserts).
+ * Returns 0 = accept (recorded/advanced), 1 = replay (nc <= the max already seen for this nonce).
+ * ao2 is leaf-locked; never called while holding peer->lock. */
+static int sofia_nonce_replay_check(const char *nonce, unsigned int nc, time_t issue_ts)
+{
+	struct sofia_nonce_replay *e;
+
+	if (!sofia_nonce_cache || ast_strlen_zero(nonce)) return 0;	/* defensive: never block a call */
+
+	e = ao2_find(sofia_nonce_cache, (char *)nonce, OBJ_POINTER);	/* key-find: nonce string -> struct offset 0 */
+	if (e) {
+		int replay;
+		ao2_lock(e);
+		if (nc > e->max_nc) { e->max_nc = nc; replay = 0; } else { replay = 1; }
+		ao2_unlock(e);
+		ao2_ref(e, -1);
+		return replay;
+	}
+
+	/* New nonce -> bound the cache before inserting. */
+	if (ao2_container_count(sofia_nonce_cache) >= SOFIA_NONCE_CACHE_MAX) {
+		sofia_nonce_cache_prune();
+		if (ao2_container_count(sofia_nonce_cache) >= SOFIA_NONCE_CACHE_MAX) {
+			sofia_nonce_cache_evict_oldest();
+		}
+	}
+	e = ao2_alloc(sizeof(*e), NULL);
+	if (!e) return 0;	/* OOM -> don't block the call */
+	ast_copy_string(e->nonce, nonce, sizeof(e->nonce));
+	e->max_nc = nc;
+	e->issue_ts = issue_ts;
+	ao2_link(sofia_nonce_cache, e);
+	ao2_ref(e, -1);
+	return 0;
+}
+
 /* Unified digest verifier (REGISTER/INVITE/SUBSCRIBE). Caller holds a peer ao2 ref
  * across the call. On CHALLENGE/REJECT the 401/4xx is already emitted; caller
  * ao2_ref(peer,-1)s on every return. */
@@ -8160,7 +8343,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	const char *auth_username;
 	int using_qop;
 	unsigned int new_nc = 0;
-	int nc_replay = 0;	/* set in the qop nonce block; read AFTER the digest verify (deferred nc-replay: rotate only on a valid-but-replayed nc) */
+	time_t nonce_issue_ts = 0;	/* issue time parsed from the validated stateless nonce; fed to the per-nonce replay cache */
 	int algorithm = SOFIA_DIGEST_MD5;  /* RFC 2617 backward-compat default */
 	int hash_len_hex;
 	char expected_hash[65];  /* SHA-256 (64 hex + null); MD5 uses 32+null */
@@ -8172,23 +8355,10 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	 * stale=true (RFC 7616 §3.3) is for a STALE nonce, never a live nonce + valid REGISTER digest. */
 	int register_method = method && !strcasecmp(method, "REGISTER");
 
-	/* No Authorization header: challenge. Offer MD5 first (legacy compat), then SHA-256 (RFC 7616). */
+	/* No Authorization header: challenge with a FRESH stateless nonce (s1.ts.rand.hmac; no peer nonce state). */
 	if (!au) {
-		char nonce[64];
-		time_t now_fc = time(NULL);
-		int ttl_fc = sofia_cfg.nonce_ttl_seconds > 0 ? sofia_cfg.nonce_ttl_seconds : SOFIA_NONCE_TTL_SEC_DEFAULT;
-
-		/* UNVERIFIED first request: reuse the peer's live nonce, regen only if empty/expired,
-		 * so a spoof cannot clobber a victim's in-flight challenge. */
-		ast_mutex_lock(&peer->lock);
-		if (ast_strlen_zero(peer->nonce)
-				|| (peer->nonce_issued_at && (now_fc - peer->nonce_issued_at) > ttl_fc)) {
-			sofia_regen_nonce_locked(peer, nonce, sizeof(nonce));
-		} else {
-			ast_copy_string(nonce, peer->nonce, sizeof(nonce));
-		}
-		ast_mutex_unlock(&peer->lock);
-
+		char nonce[96];
+		sofia_make_auth_nonce(peer->name, realm, method, nonce, sizeof(nonce));
 		sofia_emit_auth_challenge(nua, nh, realm, nonce, 0);
 
 		if (sofia_debug) {
@@ -8293,19 +8463,9 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	/* Realm mismatch → 401-stale (RFC 2617 §3.2.1, byte-exact; missing realm = mismatch).
 	 * Cross-realm replay prevention. */
 	if (!auth_realm || strcmp(auth_realm, realm) != 0) {
-		char chal_nonce[64];
-		time_t now_rm = time(NULL);
-		int ttl_rm = sofia_cfg.nonce_ttl_seconds > 0 ? sofia_cfg.nonce_ttl_seconds : SOFIA_NONCE_TTL_SEC_DEFAULT;
-		/* UNVERIFIED: reuse the live nonce, regen only if empty/expired, so a
-		 * spoofed-username probe cannot DoS the victim's in-flight challenge. */
-		ast_mutex_lock(&peer->lock);
-		if (ast_strlen_zero(peer->nonce)
-				|| (peer->nonce_issued_at && (now_rm - peer->nonce_issued_at) > ttl_rm)) {
-			sofia_regen_nonce_locked(peer, chal_nonce, sizeof(chal_nonce));
-		} else {
-			ast_copy_string(chal_nonce, peer->nonce, sizeof(chal_nonce));
-		}
-		ast_mutex_unlock(&peer->lock);
+		char chal_nonce[96];
+		/* Fresh stateless nonce (no peer nonce state to clobber). */
+		sofia_make_auth_nonce(peer->name, realm, method, chal_nonce, sizeof(chal_nonce));
 		sofia_emit_auth_challenge(nua, nh, realm, chal_nonce, 1);
 		ast_verbose("Sofia: %s auth realm mismatch for '%s' - expected '%s' got '%s'\n",
 			method, peer->name, realm, auth_realm ? auth_realm : "(none)");
@@ -8357,6 +8517,22 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		}
 	}
 
+	/* Stateless nonce validation (replaces the per-peer nonce_dead/nonce_matches/nc_replay model):
+	 * pure HMAC + TTL, no peer lock. Invalid (forged/foreign) or expired -> re-challenge fresh (stale). */
+	{
+		int nv = sofia_validate_auth_nonce(auth_nonce, peer->name, realm, method, &nonce_issue_ts);
+		if (nv != 0) {
+			char fresh[96];
+			sofia_make_auth_nonce(peer->name, realm, method, fresh, sizeof(fresh));
+			sofia_emit_auth_challenge(nua, nh, realm, fresh, 1);
+			if (sofia_debug) {
+				ast_verbose("Sofia: %s auth for '%s' - %s nonce; re-challenged\n",
+					method, peer->name, nv < 0 ? "invalid" : "expired");
+			}
+			return SOFIA_AUTH_CHALLENGE;
+		}
+	}
+
 	ast_mutex_lock(&peer->lock);
 
 	/* RFC 2617 §3.2.2.2 / RFC 7616 §3.4.2: HA1 = unq(username):realm:passwd, where username is the
@@ -8387,58 +8563,8 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		}
 	}
 
-	/* ROTATE the nonce only when dead (empty/expired) or a qop nc-replay against
-	 * the MATCHING nonce. A NON-matching nonce is re-challenged with the existing
-	 * live nonce, never regenerated — so a spoof cannot clobber the per-peer nonce. */
-	{
-		time_t now_nr = time(NULL);
-		int ttl_nr = sofia_cfg.nonce_ttl_seconds > 0 ? sofia_cfg.nonce_ttl_seconds : SOFIA_NONCE_TTL_SEC_DEFAULT;
-		int nonce_dead = ast_strlen_zero(peer->nonce)
-			|| (peer->nonce_issued_at && (now_nr - peer->nonce_issued_at) > ttl_nr);
-		int nonce_matches = (auth_nonce && !ast_strlen_zero(peer->nonce)
-			&& !strcmp(auth_nonce, peer->nonce));
-		/* nc-replay = qop + same live nonce + a NON-advancing nc (new_nc <= last_nc), independent
-		 * of the cnonce. RFC 2617 §3.2.2 / RFC 7616 §3.4: the server MUST track the nonce-count and
-		 * "if the same nc-value is seen twice, then the request is a replay" — the count alone is the
-		 * monotonic anti-replay gate, and a captured Authorization with a different cnonce but an
-		 * equal/lower nc is exactly the replay this must catch. (An earlier cnonce-also-repeats test
-		 * was too weak: swapping the cnonce slipped a replayed low nc straight through to verify.)
-		 *
-		 * A nc-replay is NOT acted on HERE: rotating the nonce before verifying the digest would let
-		 * anyone who merely learned the current nonce force nonce-rotation / 401-stale churn with a
-		 * bogus Authorization (no secret) - a spoof/self-DoS. So we only FLAG it now
-		 * and defer the response to AFTER the digest verify below: a VALID-but-replayed nc rotates +
-		 * 401-stale (a legit refresh re-auths once), an INVALID response 403s WITHOUT rotating. Either
-		 * way an equal/older nc is NEVER accepted and an unauthenticated request can never churn the
-		 * nonce. nonce_dead (the server's own TTL) is not attacker-steerable, so it re-challenges early. */
-		/* REGISTER (idempotent) is exempt: a non-advancing nc on a valid REGISTER is a phone's
-		 * normal nc=1 refresh, not a replay — see the register_method note at the top. Non-idempotent
-		 * methods still flag + rotate below. (Default; a strict_nc_register knob can re-arm REGISTER.) */
-		nc_replay = (using_qop && nonce_matches && new_nc <= peer->last_nc && !register_method);
-
-		if (nonce_dead) {
-			char fresh_nonce[64];
-			sofia_regen_nonce_locked(peer, fresh_nonce, sizeof(fresh_nonce));
-			ast_mutex_unlock(&peer->lock);
-			sofia_emit_auth_challenge(nua, nh, realm, fresh_nonce, 1);
-			if (sofia_debug) {
-				ast_verbose("Sofia: %s auth challenge for '%s' - stale/expired; fresh nonce=%s\n",
-					method, peer->name, fresh_nonce);
-			}
-			return SOFIA_AUTH_CHALLENGE;
-		}
-		if (!nonce_matches) {
-			char chal_nonce[64];
-			ast_copy_string(chal_nonce, peer->nonce, sizeof(chal_nonce));
-			ast_mutex_unlock(&peer->lock);
-			sofia_emit_auth_challenge(nua, nh, realm, chal_nonce, 1);
-			if (sofia_debug) {
-				ast_verbose("Sofia: %s auth challenge for '%s' - wrong/old nonce; re-challenged with live nonce\n",
-					method, peer->name);
-			}
-			return SOFIA_AUTH_CHALLENGE;
-		}
-	}
+	/* (The per-peer nonce_dead/nonce_matches/nc_replay block was removed: the nonce is now validated
+	 * statelessly above (HMAC+TTL), and nc replay is enforced per-nonce AFTER the digest verify below.) */
 
 	/* md5secret is a pre-computed MD5(user:realm:secret), MD5-only, and takes
 	 * precedence over peer->secret — so an md5secret peer cannot satisfy a SHA-256
@@ -8449,12 +8575,14 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		int want_md5, want_sha256;
 		sofia_auth_offered(&want_md5, &want_sha256);
 		if (want_md5) {
-			char fresh_nonce[64];
+			char fresh_nonce[96];
 			char hdr_md5[256];
-			/* Nonce matched + live + response not yet verified: re-challenge MD5-only
-			 * with the EXISTING nonce so a SHA-256-asking request cannot clobber it. */
-			ast_copy_string(fresh_nonce, peer->nonce, sizeof(fresh_nonce));
+			char pname[80];
+			/* Re-challenge MD5-only with a FRESH stateless nonce (snapshot the name, drop the lock
+			 * before the urandom read inside sofia_make_auth_nonce). */
+			ast_copy_string(pname, peer->name, sizeof(pname));
 			ast_mutex_unlock(&peer->lock);
+			sofia_make_auth_nonce(pname, realm, method, fresh_nonce, sizeof(fresh_nonce));
 			snprintf(hdr_md5, sizeof(hdr_md5),
 				"Digest realm=\"%s\", nonce=\"%s\", qop=\"auth\", algorithm=MD5, stale=true",
 				realm, fresh_nonce);
@@ -8462,7 +8590,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 				SIPTAG_WWW_AUTHENTICATE_STR(hdr_md5),
 				NUTAG_WITH_THIS(nua), TAG_END());
 			ast_verbose("Sofia: %s for md5secret peer '%s' requested SHA-256 — re-challenging MD5-only\n",
-				method, peer->name);
+				method, pname);
 			return SOFIA_AUTH_CHALLENGE;
 		}
 		ast_mutex_unlock(&peer->lock);
@@ -8474,9 +8602,10 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		return SOFIA_AUTH_REJECT;
 	}
 
-	/* Compute expected response under peer->lock (secret/name read-stable). */
+	/* Compute expected response under peer->lock (secret/name read-stable). The nonce folded into the
+	 * response is the client's auth_nonce (already HMAC+TTL validated above), NOT a per-peer stored nonce. */
 	if (sofia_compute_digest(peer, realm, method, auth_uri,
-			peer->nonce, auth_nc, auth_cnonce,
+			auth_nonce, auth_nc, auth_cnonce,
 			using_qop ? "auth" : NULL,
 			algorithm,
 			expected_hash) != 0) {
@@ -8498,38 +8627,26 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		return SOFIA_AUTH_REJECT;
 	}
 
-	/* nc-replay (deferred from the qop block): the response is VALID but nc <= last_nc, i.e. a legit
-	 * refresh restarting at nc=1 or a captured valid resend. Rotate to a fresh nonce + 401-stale
-	 * instead of accepting; a legit client re-auths once, a replayer cannot answer the new challenge.
-	 * Reached ONLY after a valid digest, so a bogus response can never get here to churn the nonce.
-	 * (verify-before-rotate. RFC 2617 3.2.2: equal/older nc == replay.) */
-	if (nc_replay) {
-		char fresh_nonce[64];
-		sofia_regen_nonce_locked(peer, fresh_nonce, sizeof(fresh_nonce));
-		ast_mutex_unlock(&peer->lock);
-		sofia_emit_auth_challenge(nua, nh, realm, fresh_nonce, 1);
-		if (sofia_debug) {
-			ast_verbose("Sofia: %s auth for '%s' - valid but nc-replay; rotated nonce=%s\n",
-				method, peer->name, fresh_nonce);
-		}
-		return SOFIA_AUTH_CHALLENGE;
-	}
-
-	/* Auth success — commit nonce/nc state under lock.
-	 * RFC 2617 (qop=auth): keep nonce, advance last_nc.
-	 * RFC 2069 (no qop): clear nonce (single-use). */
-	if (using_qop) {
-		/* Advance-only max: peer->last_nc is per-peer and SHARED across methods, so a REGISTER's
-		 * nc=1 must never LOWER it — else a replayed INVITE/MESSAGE with a higher nc would slip the
-		 * nc-replay gate. Monotonic max keeps non-idempotent replay protection intact while letting
-		 * REGISTER refreshes (exempted above) commit without churning the nonce. */
-		if (new_nc > peer->last_nc) {
-			peer->last_nc = new_nc;
-		}
-	} else {
-		ast_string_field_set(peer, nonce, "");
-	}
+	/* Digest is VALID. Drop the peer lock, then enforce nc replay PER NONCE in the leaf-locked cache
+	 * (never under peer->lock). REGISTER is idempotent (a phone's nc=1 refresh) -> exempt; no-qop has
+	 * no nc to track. A valid-but-replayed nc (<= the max already recorded for THIS nonce) -> 401 stale
+	 * + a fresh nonce; a legit client re-auths once. NO per-peer nonce/nc state is touched, so a phone's
+	 * concurrent transactions never stale each other (the production loop is gone). Insertion happens only
+	 * here (post-valid-digest), so an unauthenticated flood can never fill the cache. */
 	ast_mutex_unlock(&peer->lock);
+
+	if (using_qop && !register_method) {
+		if (sofia_nonce_replay_check(auth_nonce, new_nc, nonce_issue_ts)) {
+			char fresh_nonce[96];
+			sofia_make_auth_nonce(peer->name, realm, method, fresh_nonce, sizeof(fresh_nonce));
+			sofia_emit_auth_challenge(nua, nh, realm, fresh_nonce, 1);
+			if (sofia_debug) {
+				ast_verbose("Sofia: %s auth for '%s' - valid but nc replay on this nonce; re-challenged\n",
+					method, peer->name);
+			}
+			return SOFIA_AUTH_CHALLENGE;
+		}
+	}
 
 	return SOFIA_AUTH_OK;
 }
@@ -8573,17 +8690,6 @@ int sofia_message_authenticate(struct sofia_peer *peer, nua_t *nua, nua_handle_t
 		: (sip_authorization_t const *)sip->sip_proxy_authorization;
 	auth_res = sofia_verify_digest_auth(peer, nua, nh, sip, au, "MESSAGE", realm);
 	return (auth_res == SOFIA_AUTH_OK) ? 0 : 1;
-}
-
-/* Caller must hold peer->lock. Generates a fresh nonce (via
- * sofia_secure_nonce_gen), records the issue time, resets the nc counter. */
-static void sofia_regen_nonce_locked(struct sofia_peer *peer, char *out_buf, size_t out_len)
-{
-	sofia_secure_nonce_gen(out_buf, out_len);
-	ast_string_field_set(peer, nonce, out_buf);
-	peer->nonce_issued_at = time(NULL);
-	peer->last_nc = 0;
-	peer->last_cnonce[0] = '\0';	/* reset the nc window; last_cnonce is RESERVED (no longer consulted), kept cleared */
 }
 
 /* domainsasrealm (chan_sip parity): when set + domain_list non-empty, check the
@@ -8949,10 +9055,12 @@ static void sofia_send_auth_challenge(nua_t *nua, nua_handle_t *nh, sip_t const 
 	/* Real fresh nonce (not a literal "empty" placeholder) so an attacker cannot
 	 * distinguish unknown-peer from known-peer responses, plus the same
 	 * algorithm offer as sofia_verify_digest_auth. */
-	char fresh_nonce[64];
+	char fresh_nonce[96];
 	struct ast_sockaddr src;
 
-	sofia_secure_nonce_gen(fresh_nonce, sizeof(fresh_nonce));
+	/* SAME stateless nonce format as the verifier, scope "*" (unknown peer): the nonce SHAPE no longer
+	 * leaks known-vs-unknown, and the verifier's wildcard fallback validates it on the authenticated retry. */
+	sofia_make_auth_nonce("*", realm, method, fresh_nonce, sizeof(fresh_nonce));
 
 	/* Header-injection defense-in-depth: validate the realm + fresh_nonce
 	 * charset before emission (realm is operator-config, nonce is hex-only by
@@ -17011,6 +17119,12 @@ static int load_module(void)
 
 	ast_verbose("Sofia-SIP channel loading...\n");
 
+	/* Digest auth: init the per-process HMAC secret + the per-nonce replay cache (stateless-nonce model).
+	 * Secret first, before sofia_thread accepts SIP. The cache is non-fatal (the replay check no-ops if
+	 * it is absent — a call is never blocked by a missing cache). */
+	sofia_nonce_secret_init();
+	sofia_nonce_cache = ao2_container_alloc(SOFIA_NONCE_CACHE_BUCKETS, sofia_nonce_cache_hash, sofia_nonce_cache_cmp);
+
 	/* Container allocation — checked individually; the err_cleanup ladder unwinds in reverse. */
 	peers = ao2_container_alloc(MAX_PEER_BUCKETS, peer_hash_fn, peer_cmp_fn);
 	if (!peers) {
@@ -17230,6 +17344,10 @@ err_cleanup:
 		ao2_callback(peers, OBJ_NODATA, sofia_peer_dnsmgr_release_cb, NULL);
 		ao2_ref(peers, -1);
 		peers = NULL;
+	}
+	if (sofia_nonce_cache) {
+		ao2_ref(sofia_nonce_cache, -1);
+		sofia_nonce_cache = NULL;
 	}
 
 	return rc;
