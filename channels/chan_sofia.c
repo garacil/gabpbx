@@ -13998,6 +13998,16 @@ static void *sofia_thread_func(void *data)
 			/* timerb (RFC 3261 §17.1.1.2): caps the INVITE transaction timeout. */
 			TAG_IF(sofia_cfg.default_timer_b,
 				NTATAG_SIP_T1X64(sofia_cfg.default_timer_b)),
+			/* RFC 3581 / force_rport (always): the NTA stamps rport=<actual source port> onto every
+			 * inbound request Via and routes the response there, even when the UA omits ;rport.
+			 * Without it (sofia default sa_server_rport=1 = honor only if present) a NAT'd UA that
+			 * sends no rport gets its 401/200 routed to the Via sent-by port instead of the
+			 * NAT-mapped source, so it never registers. Stamping rport before chan_sofia reads the
+			 * message also makes sofia_get_source_addr learn the real source, fixing contact
+			 * src_addr / NAT routing. Global is correct (source == Via for a non-NAT UA) and is
+			 * standard SIP-server behaviour; per-peer cannot affect the first 401 (sent before the
+			 * peer config is consulted). */
+			NTATAG_SERVER_RPORT(2),
 			/* tos/cos: SIP-listener TOS via setsockopt. */
 			TAG_IF(sofia_cfg.tos_sip, TPTAG_TOS((int)sofia_cfg.tos_sip)),
 			/* App-level keepalive: TPTAG_KEEPALIVE sends a periodic CRLF on an idle
