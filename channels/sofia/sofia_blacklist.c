@@ -29,7 +29,9 @@
 					 * power-of-2 table, so bucket distribution is robust for any hash. */
 #define SOFIA_BLACKLIST_MAX_DEFAULT 1024
 #define SOFIA_BLACKLIST_COUNT_DEFAULT 5
-#define SOFIA_BLACKLIST_TTL_DEFAULT 600   /* seconds of inactivity after which the counter decays (0 = never) */
+#define SOFIA_BLACKLIST_TTL_DEFAULT 86400 /* 24h: a blocked IP stays banned 24h after its last failure, and
+                                           * an accumulating counter is forgiven after 24h of inactivity
+                                           * (fail2ban model). 0 = never decay/expire. */
 
 struct sofia_blacklist_entry {
 	char ip[80];
@@ -43,6 +45,7 @@ struct ao2_container *sofia_blacklist_container(void) { return sofia_blacklist; 
 static int sofia_blacklist_max = SOFIA_BLACKLIST_MAX_DEFAULT;
 static int sofia_blacklist_count = SOFIA_BLACKLIST_COUNT_DEFAULT;
 static int sofia_blacklist_ttl = SOFIA_BLACKLIST_TTL_DEFAULT;
+static int sofia_blacklist_enabled = 1;   /* blacklist_ban=0 turns banning OFF entirely */
 AST_MUTEX_DEFINE_STATIC(sofia_blacklist_lock);
 /* ao2 hash: case-insensitive on the IP string. */
 static int sofia_blacklist_hash_fn(const void *obj, int flags)
@@ -111,8 +114,8 @@ static int sofia_blacklist_check_ip(const char *ip, int add, const char *reason)
 	int blocked = 0;
 	time_t now = time(NULL);
 
-	if (!sofia_blacklist || ast_strlen_zero(ip)) {
-		return 0;
+	if (!sofia_blacklist_enabled || !sofia_blacklist || ast_strlen_zero(ip)) {
+		return 0;	/* blacklist_ban=0: banning disabled - never count, never block. */
 	}
 
 	memset(&key, 0, sizeof(key));
@@ -413,6 +416,25 @@ int sofia_blacklist_init(void)
 	ao2_container_register("sofia/blacklist", sofia_blacklist);
 	return sofia_blacklist ? 0 : -1;
 }
+/* Configure the ban window from sofia.conf `blacklist_ban`, given in MINUTES. Semantics:
+ *   minutes  > 0 : banning ON; a blocked IP stays banned (and an accumulating counter is remembered)
+ *                  for this many minutes after its last failure. Stored internally in seconds.
+ *   minutes == 0 : banning OFF entirely - no IP is ever blocked or counted.
+ *   minutes  < 0 : restore the compiled default (24h, ON) - used to reset on (re)load.
+ * Called from the [general] config apply (and on reload), so it takes effect without a restart. */
+void sofia_blacklist_set_ban_minutes(int minutes)
+{
+	if (minutes < 0) {
+		sofia_blacklist_enabled = 1;
+		sofia_blacklist_ttl = SOFIA_BLACKLIST_TTL_DEFAULT;
+	} else if (minutes == 0) {
+		sofia_blacklist_enabled = 0;
+	} else {
+		sofia_blacklist_enabled = 1;
+		sofia_blacklist_ttl = minutes * 60;
+	}
+}
+
 /* Release the blacklist container. */
 void sofia_blacklist_destroy(void)
 {

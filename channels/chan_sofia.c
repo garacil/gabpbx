@@ -14481,6 +14481,10 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			/* Explicit opt-out for the TLS listener; honored even when tlsbindport>0 (chan_sip parity,
 			 * chan_sip.c:120). Default ON in the compiled defaults above. */
 			sofia_cfg.tls_enable = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "blacklist_ban")) {
+			/* Minutes an offending IP stays blocked / its failure counter is remembered (fail2ban
+			 * model); 0 = disable banning entirely. Default 24h. Applied live on `sofia reload`. */
+			sofia_blacklist_set_ban_minutes(atoi(v->value));
 		} else if (!strcasecmp(v->name, "tlscertfile") || !strcasecmp(v->name, "tlscertdir")) {
 			ast_copy_string(sofia_cfg.tlscertfile, v->value, sizeof(sofia_cfg.tlscertfile));
 		} else if (!strcasecmp(v->name, "tlscafile")) {
@@ -15812,6 +15816,9 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.tls_enable = 1;
 	sofia_cfg.ws_enable = 1;
 	sofia_cfg.wss_enable = 1;
+	/* Local anti-abuse blacklist ban/decay window resets to its 24h default each (re)load;
+	 * sofia.conf `blacklist_ban` (in minutes) overrides it below. */
+	sofia_blacklist_set_ban_minutes(-1);
 	/* Optional real CA file (soft-linked to <certdir>/cafile.pem at NUA create); empty by default. */
 	sofia_cfg.tlscafile[0] = '\0';
 	/* outbound PUBLISH (RFC 3903) off by default (publish_server empty = feature OFF). */
@@ -16381,6 +16388,8 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 	s.wssbindaddr[0] = '\0';
 	s.wssbindport = 0;
 	s.wss_enable = 1;
+	/* Blacklist ban/decay window resets to the 24h default so a removed `blacklist_ban` reverts. */
+	sofia_blacklist_set_ban_minutes(-1);
 	s.tlsverify = 0;
 	s.tlsverifyclient = 0;
 	s.tls_ciphers[0] = '\0';
@@ -16430,6 +16439,8 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 			s.tlsbindport = atoi(v->value);
 		} else if (!strcasecmp(v->name, "tlsenable")) {
 			s.tls_enable = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "blacklist_ban")) {
+			sofia_blacklist_set_ban_minutes(atoi(v->value));
 		} else if (!strcasecmp(v->name, "tlscertfile") || !strcasecmp(v->name, "tlscertdir")) {
 			ast_copy_string(s.tlscertfile, v->value, sizeof(s.tlscertfile));
 		} else if (!strcasecmp(v->name, "tlscafile")) {

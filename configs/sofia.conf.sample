@@ -100,6 +100,18 @@ auth_algorithms = md5
 allowguest=yes
 
 ;
+; Local anti-abuse blacklist (fail2ban-style). Repeated authentication / registration / routing
+; failures from the same source IP are counted; once the threshold is reached the IP is blocked at
+; the gate. Inspect/manage it with the `sip show blacklist` / `sip blacklist ...` CLI.
+;
+; blacklist_ban — how long (in MINUTES) a blocked IP stays banned after its last failure, and how
+;                 long an accumulating failure counter is remembered before it is forgiven.
+;                 Default: 1440 (24 hours). 0 = banning DISABLED (no IP is ever blocked or counted).
+;                 Applied live on `sofia reload` (no restart).
+;
+;blacklist_ban = 1440     ; minutes; default 1440 = 24h; 0 = disable banning
+
+;
 ; SRV lookup for outbound calls
 ; Default: yes
 ;

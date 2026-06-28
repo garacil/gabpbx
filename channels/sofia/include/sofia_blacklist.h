@@ -20,6 +20,8 @@ int sofia_blacklist_init(void);
 void sofia_blacklist_destroy(void);
 int sofia_blacklist_add_sip(sip_t const *sip, const char *reason);
 int sofia_blacklist_check_sip(sip_t const *sip);
+/*! \brief Set the ban window (sofia.conf `blacklist_ban`, in MINUTES; >0 = ban N min; 0 = disable banning; <0 = default 24h). */
+void sofia_blacklist_set_ban_minutes(int minutes);
 char *sofia_cli_show_blacklist(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 char *sofia_cli_blacklist_search(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 char *sofia_cli_blacklist_delete(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
