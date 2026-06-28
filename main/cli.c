@@ -1681,9 +1681,87 @@ static char *handle_cli_wait_fullybooted(struct ast_cli_entry *e, int cmd, struc
 
 static char *handle_help(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 
+static char *handle_core_test_hash(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	/* A small, realistic short-key sample (peer / context / device-name / IP:port shaped). */
+	static const char * const keys[] = {
+		"100", "alice", "sip.example.com", "203.0.113.7:5060", "trunk1",
+		"from-internal", "PJSIP/100-00000abc", "vm@default", "Custom:DND100", "device1",
+		"+10000000000", "device_state_hint", "200", "browser-callee", "PJSIP/bob-00000017",
+		"a", "abcd", "0123456789ABCDEF", "the-quick-brown-fox-jumps", "x",
+	};
+	const int nkeys = ARRAY_LEN(keys);
+	size_t total_bytes = 0;
+	unsigned long iters, i;
+	struct timeval t0;
+	int64_t us;
+	volatile int sink = 0;
+	int j;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "core test hash";
+		e->usage =
+			"Usage: core test hash [iterations]\n"
+			"       Benchmark the string hash (ast_str_hash and ast_str_case_hash)\n"
+			"       and report throughput (Mhash/s, MB/s, ns/hash). Also shows the\n"
+			"       active hash algorithm. 'iterations' defaults to 5000000.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	if (a->argc > e->args) {
+		iters = strtoul(a->argv[e->args], NULL, 10);
+		if (!iters) {
+			return CLI_SHOWUSAGE;
+		}
+	} else {
+		iters = 5000000UL;
+	}
+	for (j = 0; j < nkeys; j++) {
+		total_bytes += strlen(keys[j]);
+	}
+
+	ast_cli(a->fd, "String hash benchmark\n");
+	ast_cli(a->fd, "  algorithm  : %s\n", ast_str_hash_algorithm());
+	ast_cli(a->fd, "  iterations : %lu  (cycling %d sample keys, avg %.1f bytes)\n",
+		iters, nkeys, (double) total_bytes / nkeys);
+
+	t0 = ast_tvnow();
+	for (i = 0; i < iters; i++) {
+		sink += ast_str_hash(keys[i % nkeys]);
+	}
+	us = ast_tvdiff_us(ast_tvnow(), t0);
+	if (us < 1) {
+		us = 1;
+	}
+	ast_cli(a->fd, "  ast_str_hash      : %8.2f Mhash/s  %8.0f MB/s  %6.2f ns/hash\n",
+		(double) iters / us,
+		(double) total_bytes * iters / nkeys / us,
+		(double) us * 1000.0 / iters);
+
+	t0 = ast_tvnow();
+	for (i = 0; i < iters; i++) {
+		sink += ast_str_case_hash(keys[i % nkeys]);
+	}
+	us = ast_tvdiff_us(ast_tvnow(), t0);
+	if (us < 1) {
+		us = 1;
+	}
+	ast_cli(a->fd, "  ast_str_case_hash : %8.2f Mhash/s  %8.0f MB/s  %6.2f ns/hash\n",
+		(double) iters / us,
+		(double) total_bytes * iters / nkeys / us,
+		(double) us * 1000.0 / iters);
+
+	(void) sink;
+	return CLI_SUCCESS;
+}
+
 static struct ast_cli_entry cli_cli[] = {
 	/* Deprecated, but preferred command is now consolidated (and already has a deprecated command for it). */
 	AST_CLI_DEFINE(handle_commandcomplete, "Command complete"),
+	AST_CLI_DEFINE(handle_core_test_hash, "Benchmark the string hash throughput"),
 	AST_CLI_DEFINE(handle_commandnummatches, "Returns number of command matches"),
 	AST_CLI_DEFINE(handle_commandmatchesarray, "Returns command matches array"),
 

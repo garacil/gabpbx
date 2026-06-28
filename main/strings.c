@@ -173,3 +173,56 @@ char *__ast_str_helper2(struct ast_str **buf, ssize_t maxlen, const char *src, s
 	return (*buf)->__AST_STR_STR;
 }
 
+/*
+ * String hash routines: XXH3 64-bit (xxHash 0.8.3) folded to a non-negative 31-bit int for
+ * ao2 bucket indexing (hash % n_buckets; a negative value would force a full-bucket scan).
+ * The explicit, self-contained XXH3-64 lives in gabpbx/xxh3_64.h (force_inline, no external
+ * dependency); it inlines into these thin wrappers. The public ast_str_hash* are declared in
+ * gabpbx/strings.h - the implementation is kept out of that widely-included header to bound
+ * code size, and the call into ast_str_hash costs ~0.2 ns (measured).
+ */
+#include "gabpbx/xxh3_64.h"
+
+int attribute_pure ast_str_hash(const char *str)
+{
+	return (int) (XXH3_64bits(str, strlen(str)) & 0x7fffffffULL);
+}
+
+int ast_str_hash_add(const char *str, int hash)
+{
+	/* The prior hash seeds the next string's mix (self-consistent incremental hash). */
+	return (int) (XXH3_64bits_withSeed(str, strlen(str), (uint64_t) (uint32_t) hash) & 0x7fffffffULL);
+}
+
+int ast_str_case_hash(const char *str)
+{
+	/* Case-insensitive: ASCII-lowercase the key (locale-independent) and XXH3 it. To avoid any
+	 * heap use - and the correctness pitfall of an OOM fallback hashing different bytes - fold in
+	 * fixed stack-sized windows and chain them via XXH3's seed: a key <= one window (every real
+	 * gabpbx key) is a single XXH3 call; longer keys chain deterministically. No malloc, no
+	 * failure path, and the same folded bytes always produce the same hash. */
+	char window[256];
+	uint64_t h = 0;
+	size_t i = 0, n = strlen(str);
+
+	do {
+		size_t c = n - i, j;
+		if (c > sizeof(window)) {
+			c = sizeof(window);
+		}
+		for (j = 0; j < c; j++) {
+			unsigned char ch = (unsigned char) str[i + j];
+			window[j] = (ch >= 'A' && ch <= 'Z') ? (char) (ch | 0x20) : (char) ch;
+		}
+		h = XXH3_64bits_withSeed(window, c, h);
+		i += c;
+	} while (i < n);
+
+	return (int) (h & 0x7fffffffULL);
+}
+
+const char *ast_str_hash_algorithm(void)
+{
+	return "XXH3-64 (xxHash 0.8.3)";
+}
+

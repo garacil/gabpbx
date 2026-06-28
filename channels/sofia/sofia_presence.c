@@ -38,7 +38,12 @@
  *  only snapshots {state}+ref then marshals to sofia_thread (mirrors mwi_event_cb).
  *  A subscription-scoped AMI event (SofiaPresenceState) is emitted per NOTIFY. */
 
-#define MAX_PRESENCE_SUB_BUCKETS 1009		/* prime; one entry per active watcher dialog */
+#define MAX_PRESENCE_SUB_BUCKETS 65521		/* prime (largest < 2^16), sized like the peers table for
+						 * headroom on busy boxes with many BLF/presence watchers. Prime keeps
+						 * the hash well distributed (% folds in all bits). The bucket array
+						 * (~1 MiB) is calloc'd, so when the table is sparse the empty buckets
+						 * stay on lazy zero pages and cost little resident memory. Allocated
+						 * once at load and kept for the process life. */
 #define SOFIA_PRESENCE_SWEEP_MS 5000		/* expiry-sweep timer interval (ms) */
 #define SOFIA_PRESENCE_EXPIRY_GRACE 5		/* seconds past expires_at before a stale sub is swept */
 

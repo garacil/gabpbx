@@ -118,10 +118,12 @@ char * attribute_pure ast_skip_blanks_mut(char *str),
 }
 )
 
-/* _Generic dispatch (C11 6.5.1.1, GCC >= 4.9): preserves caller-name
- * compatibility while keeping the input/return const-ness aligned. Build
- * assumes >= C11. Dispatches by input const-ness: const char * input →
- * const char * return; char * input → char * return. */
+/* T54 (2026-04-27): _Generic dispatch — preserves caller-name compatibility while
+ * eliminating the T42.5 union-pattern type-pun. C11 6.5.1.1 keyword; available
+ * since GCC 4.9. Build assumes >=C11 (gnu23 default in GCC 15.2.1+). If a future
+ * build target downgrades to <C11, this macro breaks — see CHAN_SOFIA_AUDIT.md
+ * operational note for context. Dispatches by input const-ness: const char * input
+ * → const char * return; char * input → char * return. */
 #define ast_skip_blanks(s) _Generic((s), \
 	const char *: ast_skip_blanks_const, \
 	char *:       ast_skip_blanks_mut \
@@ -1003,42 +1005,13 @@ char *ast_tech_to_upper(char *dev_str),
 /*!
  * \brief Compute a hash value on a string
  *
- * "fthash": an FNV-1a *variant* that mixes the string as little-endian 32-bit
- * words (not byte-wise canonical FNV-1a), finished with a Murmur3 fmix32
- * avalanche so the low bits used by power-of-2 bucket counts are well
- * distributed (plain FNV-1a, like the former DJB2, clustered badly there).
- * The result is masked to 31 bits because ao2 indexes with
- * hash % n_buckets and a negative value would force a full-bucket scan
- * (see ao2_iterator/__ao2_callback in main/astobj2.c).
+ * XXH3 (xxHash 0.8.3, 64-bit) folded to a non-negative 31-bit int. The XXH3
+ * implementation is large, so it is NOT inlined into this widely-included header;
+ * the body lives in main/strings.c and these are thin extern declarations. The
+ * result is masked to 31 bits because ao2 indexes with hash % n_buckets and a
+ * negative value would force a full-bucket scan (see main/astobj2.c).
  */
-static force_inline int attribute_pure ast_str_hash(const char *str)
-{
-	uint32_t h = 0x811c9dc5u;		/* FNV-1a offset basis */
-	const unsigned char *s = (const unsigned char *) str;
-	size_t len = strlen(str);
-	size_t nb = len >> 2, i;
-	uint32_t w;
-
-	for (i = 0; i < nb; i++) {
-		w = (uint32_t) s[0] | (uint32_t) s[1] << 8
-		  | (uint32_t) s[2] << 16 | (uint32_t) s[3] << 24;
-		h = (h ^ w) * 0x01000193u;	/* FNV-1a prime */
-		s += 4;
-	}
-	if (len & 3) {				/* 1..3 trailing bytes */
-		w = 0;
-		switch (len & 3) {
-		case 3: w |= (uint32_t) s[2] << 16;	/* fall through */
-		case 2: w |= (uint32_t) s[1] << 8;	/* fall through */
-		case 1: w |= s[0];
-		}
-		h = (h ^ w) * 0x01000193u;
-	}
-	h ^= h >> 16; h *= 0x85ebca6bu;		/* fmix32 avalanche */
-	h ^= h >> 13; h *= 0xc2b2ae35u;
-	h ^= h >> 16;
-	return (int) (h & 0x7fffffffu);
-}
+int attribute_pure ast_str_hash(const char *str);
 
 /*!
  * \brief Compute a hash value on a string
@@ -1047,92 +1020,29 @@ static force_inline int attribute_pure ast_str_hash(const char *str)
  * \param[in] hash The hash value to add to
  *
  * \details
- * This version of the function is for when you need to compute a
- * string hash of more than one string: the prior hash seeds the mix
- * of the next string. Uses the same FNV-1a + fmix32 as ast_str_hash;
- * it is self-consistent for incremental hashing (the only requirement
- * for an ao2/event hash callback) but is not bit-identical to hashing
- * the concatenation, exactly as the former DJB2 chaining was not.
+ * This version is for hashing more than one string into one value: the prior
+ * hash seeds the XXH3 mix of the next string (XXH3_64bits_withSeed). It is
+ * self-consistent for incremental hashing (the only requirement for an
+ * ao2/event hash callback).
  */
-static force_inline int ast_str_hash_add(const char *str, int hash)
-{
-	uint32_t h = (uint32_t) hash;		/* prior hash seeds this mix */
-	const unsigned char *s = (const unsigned char *) str;
-	size_t len = strlen(str);
-	size_t nb = len >> 2, i;
-	uint32_t w;
-
-	for (i = 0; i < nb; i++) {
-		w = (uint32_t) s[0] | (uint32_t) s[1] << 8
-		  | (uint32_t) s[2] << 16 | (uint32_t) s[3] << 24;
-		h = (h ^ w) * 0x01000193u;
-		s += 4;
-	}
-	if (len & 3) {
-		w = 0;
-		switch (len & 3) {
-		case 3: w |= (uint32_t) s[2] << 16;	/* fall through */
-		case 2: w |= (uint32_t) s[1] << 8;	/* fall through */
-		case 1: w |= s[0];
-		}
-		h = (h ^ w) * 0x01000193u;
-	}
-	h ^= h >> 16; h *= 0x85ebca6bu;
-	h ^= h >> 13; h *= 0xc2b2ae35u;
-	h ^= h >> 16;
-	return (int) (h & 0x7fffffffu);
-}
-
-/*!
- * \brief Lowercase one ASCII byte, locale-independent.
- *
- * Folds only ASCII A-Z (sets bit 0x20). Used by the case-insensitive hash so
- * the result is deterministic regardless of LC_CTYPE; glibc tolower() is
- * locale-dependent (e.g. the Turkish dotless-i maps 'I' away from 'i').
- * gabpbx hash keys are ASCII, so this is exact and faster (a compare + OR,
- * fully inlined, no libc call/table).
- */
-static force_inline unsigned char ast_hash_tolower(unsigned char c)
-{
-	return (c >= 'A' && c <= 'Z') ? (unsigned char) (c | 0x20) : c;
-}
+int ast_str_hash_add(const char *str, int hash);
 
 /*!
  * \brief Compute a hash value on a case-insensitive string
  *
- * Same fthash (FNV-1a over little-endian 32-bit words) + fmix32 as
- * ast_str_hash, but folds each byte to lowercase before mixing, for
- * case-insensitive lookups. Uses an ASCII-only fold (ast_hash_tolower) read
- * through an unsigned char pointer: locale-independent and free of the
- * signed-char UB of the former tolower().
+ * Same XXH3 as ast_str_hash, folding each byte to lowercase first (ASCII A-Z,
+ * locale-independent) so case-insensitive lookups hash identically.
  */
-static force_inline int attribute_pure ast_str_case_hash(const char *str)
-{
-	uint32_t h = 0x811c9dc5u;
-	const unsigned char *s = (const unsigned char *) str;
-	size_t len = strlen(str);
-	size_t nb = len >> 2, i;
-	uint32_t w;
+int ast_str_case_hash(const char *str);
 
-	for (i = 0; i < nb; i++) {
-		w = (uint32_t) ast_hash_tolower(s[0]) | (uint32_t) ast_hash_tolower(s[1]) << 8
-		  | (uint32_t) ast_hash_tolower(s[2]) << 16 | (uint32_t) ast_hash_tolower(s[3]) << 24;
-		h = (h ^ w) * 0x01000193u;
-		s += 4;
-	}
-	if (len & 3) {
-		w = 0;
-		switch (len & 3) {
-		case 3: w |= (uint32_t) ast_hash_tolower(s[2]) << 16;	/* fall through */
-		case 2: w |= (uint32_t) ast_hash_tolower(s[1]) << 8;	/* fall through */
-		case 1: w |= (uint32_t) ast_hash_tolower(s[0]);
-		}
-		h = (h ^ w) * 0x01000193u;
-	}
-	h ^= h >> 16; h *= 0x85ebca6bu;
-	h ^= h >> 13; h *= 0xc2b2ae35u;
-	h ^= h >> 16;
-	return (int) (h & 0x7fffffffu);
-}
+/*!
+ * \brief Human-readable name of the active string-hash algorithm.
+ *
+ * For diagnostics (e.g. the "core test hash" CLI), so the running build reports
+ * which ast_str_hash implementation it was compiled with.
+ *
+ * \return A static, never-NULL string (e.g. "XXH3-64 (xxHash 0.8.3)").
+ */
+const char *ast_str_hash_algorithm(void);
 
 #endif /* _GABPBX_STRINGS_H */

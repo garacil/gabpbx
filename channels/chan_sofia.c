@@ -223,7 +223,12 @@
  * window we BYE ourselves so the dialog doesn't leak. 32s = chan_sip parity. */
 #define SOFIA_DEFER_BYE_TIMEOUT_MS  32000
 /* Hash-table bucket caps for carrier scale (primes → even ao2 distribution). */
-#define MAX_PEER_BUCKETS 65521    /* ~50k peers at load factor < 1 */
+#define MAX_PEER_BUCKETS 65521    /* prime (largest < 2^16) for the by-NAME peers table. Headroom so the
+                                   * load factor stays tiny; prime keeps the hash well distributed. ~1 MiB
+                                   * bucket array, calloc'd (lazy zero pages when sparse), kept for life. */
+#define MAX_PEER_IPPORT_BUCKETS 16381  /* prime (largest < 2^14); the by-IP:port fast index holds ONLY
+                                   * static-host trunks (few), so it is sized ~8x smaller than the by-name
+                                   * table. ~256 KiB. */
 #define MAX_DIALOG_BUCKETS 32749  /* concurrent-dialog headroom */
 /* Digest-auth nonce TTL fallback when sofia_cfg.nonce_ttl_seconds is unset (=0).
  * Aligned with the registration max so refreshes don't trigger stale=true. */
@@ -3600,24 +3605,32 @@ static void peer_ipport_destructor(void *obj)
 	}
 }
 
-/* Indexable IP+port key for a peer (CALLER HOLDS peer->lock). Same candidate precedence as the ranked
- * scan: src_addr, else static IP-literal host, else defaddr; port = candidate's, else peer->port.
- * Returns 1 if indexable (concrete IP + non-zero port), else 0 (the peer is served by the O(N) fallback). */
+/* Indexable IP+port key for a peer (CALLER HOLDS peer->lock). The by-IP:port fast index is SPECIALIZED:
+ * it indexes ONLY trunks identified by their source IP, i.e. peers with a STATIC host (host != dynamic) -
+ * an IP literal, or an FQDN whose dnsmgr-resolved address is in src_addr. A registered phone
+ * (host=dynamic) is identified by username/digest, NEVER by source IP, so it is NOT indexed here (it is
+ * served by the ranked O(N) scan, which the by-name path means phones almost never reach). This keeps the
+ * fast index a 1:1 trunk identity map, avoids shared-NAT duplicate keys, and closes the risk of a phone
+ * being mis-identified as an insecure=invite trunk. Returns 1 if indexable (concrete IP + non-zero port),
+ * else 0 (the peer is served by the O(N) fallback). */
 static int sofia_peer_ipport_make_key_locked(struct sofia_peer *peer, struct ast_sockaddr *key)
 {
 	struct ast_sockaddr parsed;
 	int port;
 
 	ast_sockaddr_setnull(key);
-	if (!ast_sockaddr_isnull(&peer->src_addr)) {
-		ast_sockaddr_copy(key, &peer->src_addr);
-	} else if (!ast_strlen_zero(peer->host) && strcasecmp(peer->host, "dynamic")
-			&& ast_sockaddr_parse(&parsed, peer->host, PARSE_PORT_FORBID)) {
-		ast_sockaddr_copy(key, &parsed);
+	/* host=dynamic (or unset) -> registered phone -> NEVER in the by-IP fast index. */
+	if (ast_strlen_zero(peer->host) || !strcasecmp(peer->host, "dynamic")) {
+		return 0;
+	}
+	if (ast_sockaddr_parse(&parsed, peer->host, PARSE_PORT_FORBID)) {
+		ast_sockaddr_copy(key, &parsed);		/* host=<IP literal> */
+	} else if (!ast_sockaddr_isnull(&peer->src_addr)) {
+		ast_sockaddr_copy(key, &peer->src_addr);	/* host=<FQDN> resolved by dnsmgr */
 	} else if (!ast_sockaddr_isnull(&peer->defaddr)) {
 		ast_sockaddr_copy(key, &peer->defaddr);
 	} else {
-		return 0;
+		return 0;					/* unresolved FQDN trunk -> O(N) fallback */
 	}
 	port = ast_sockaddr_port(key);
 	if (!port) {
@@ -3662,22 +3675,41 @@ void sofia_peer_ipport_reindex(struct sofia_peer *peer)
 		ao2_find(peers_by_ipport, &srch, OBJ_POINTER | OBJ_UNLINK | OBJ_NODATA);	/* drop old (+ its peer ref) */
 	}
 	if (want) {
-		struct sofia_peer_ipport *e = ao2_alloc(sizeof(*e), peer_ipport_destructor);
-		if (e) {
-			ast_sockaddr_copy(&e->key, &newkey);
-			ao2_ref(peer, +1);
-			e->peer = peer;
-			if (ao2_link(peers_by_ipport, e)) {
-				ast_mutex_lock(&peer->lock);
-				peer->ipport_indexed = 1;	/* mark indexed ONLY on a successful link */
-				ast_mutex_unlock(&peer->lock);
-			} else {
-				/* OOM link: leave ipport_indexed = 0 so the NEXT reindex retries (no false indexed
-				 * state that the unchanged-key fast-return would then skip forever). */
-				ast_log(LOG_WARNING, "Sofia: peers_by_ipport link failed for '%s' — by-IP lookup uses the O(N) scan\n",
-					peer->name);
+		/* NEVER store a DUPLICATE key: keep the fast index strictly 1:1 so the O(1) first-match is
+		 * always unambiguous (no wrong-trunk identity, no insecure=invite mis-gate). THIS peer's own
+		 * old entry was already dropped above (if `was`), so any entry present at newkey now belongs to
+		 * a DIFFERENT trunk -> leave this one OUT of the fast index; sofia_find_peer_by_ip serves it via
+		 * the ranked O(N) scan. All under peers_ipport_lock, so the probe+link is atomic. */
+		struct sofia_peer_ipport probe = { .peer = NULL };
+		struct sofia_peer_ipport *dup;
+		ast_sockaddr_copy(&probe.key, &newkey);
+		dup = ao2_find(peers_by_ipport, &probe, OBJ_POINTER);
+		if (dup) {
+			ao2_ref(dup, -1);
+			ast_mutex_lock(&peer->lock);
+			ast_sockaddr_setnull(&peer->ipport_key);	/* not indexed -> clear so reindex retries cleanly */
+			peer->ipport_indexed = 0;
+			ast_mutex_unlock(&peer->lock);
+			ast_log(LOG_NOTICE, "Sofia: '%s' shares IP:port with an already-indexed trunk - left out of "
+				"the by-IP fast index (ranked O(N) fallback applies)\n", peer->name);
+		} else {
+			struct sofia_peer_ipport *e = ao2_alloc(sizeof(*e), peer_ipport_destructor);
+			if (e) {
+				ast_sockaddr_copy(&e->key, &newkey);
+				ao2_ref(peer, +1);
+				e->peer = peer;
+				if (ao2_link(peers_by_ipport, e)) {
+					ast_mutex_lock(&peer->lock);
+					peer->ipport_indexed = 1;	/* mark indexed ONLY on a successful link */
+					ast_mutex_unlock(&peer->lock);
+				} else {
+					/* OOM link: leave ipport_indexed = 0 so the NEXT reindex retries (no false indexed
+					 * state that the unchanged-key fast-return would then skip forever). */
+					ast_log(LOG_WARNING, "Sofia: peers_by_ipport link failed for '%s' — by-IP lookup uses the O(N) scan\n",
+						peer->name);
+				}
+				ao2_ref(e, -1);				/* drop our alloc ref (frees e + the manual peer +1 on link-fail) */
 			}
-			ao2_ref(e, -1);					/* drop our alloc ref (frees e + the manual peer +1 on link-fail) */
 		}
 	}
 	ast_mutex_unlock(&peers_ipport_lock);
@@ -16907,7 +16939,7 @@ static int load_module(void)
 	ao2_container_register("sofia/peers", peers);
 	/* B: the O(1) by-IP+port index (perf). Non-fatal if it fails — the lookup just no-ops and every
 	 * by-IP lookup uses the O(N) ranked scan. */
-	peers_by_ipport = ao2_container_alloc(MAX_PEER_BUCKETS, peer_ipport_hash_fn, peer_ipport_cmp_fn);
+	peers_by_ipport = ao2_container_alloc(MAX_PEER_IPPORT_BUCKETS, peer_ipport_hash_fn, peer_ipport_cmp_fn);
 	dialogs = ao2_container_alloc(MAX_DIALOG_BUCKETS, dialog_hash_fn, dialog_cmp_fn);
 	if (!dialogs) {
 		ast_log(LOG_ERROR, "Unable to create Sofia dialogs container\n");

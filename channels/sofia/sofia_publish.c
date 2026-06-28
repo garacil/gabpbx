@@ -71,8 +71,8 @@ struct sofia_publication {
 	int last_status;			/* last final nua_r_method status (0 = no response yet) — CLI diag */
 };
 
-#define MAX_PUBLICATION_BUCKETS 10007			/* prime; one entry per publish=yes peer — sized for
-							 * large deployments (~5000-10000 users, load factor <=1) */
+#define MAX_PUBLICATION_BUCKETS 32749			/* prime (largest < 2^15) = half the peers/presence table
+							 * size; one entry per publish=yes peer, ample headroom. */
 static struct ao2_container *publications;	/* keyed by key; created in load_module */
 struct ao2_container *sofia_publications_container(void) { return publications; }
 static su_timer_t *publication_refresh_timer;	/* recurring refresh sweep on sofia_thread */

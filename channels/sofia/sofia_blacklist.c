@@ -25,7 +25,8 @@
 #include "include/chan_sofia_internal.h"
 #include "include/sofia_blacklist.h"
 
-#define SOFIA_BLACKLIST_BUCKETS 1024
+#define SOFIA_BLACKLIST_BUCKETS 4093	/* prime (~4x the former 1024); prime also drops the only
+					 * power-of-2 table, so bucket distribution is robust for any hash. */
 #define SOFIA_BLACKLIST_MAX_DEFAULT 1024
 #define SOFIA_BLACKLIST_COUNT_DEFAULT 5
 #define SOFIA_BLACKLIST_TTL_DEFAULT 600   /* seconds of inactivity after which the counter decays (0 = never) */
