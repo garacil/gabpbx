@@ -272,9 +272,18 @@ srvlookup=yes
 ;         video offer (answerer) AND OFFERS video on an outbound leg (offerer) when the peer's
 ;         allow= has vp8/h264, so two-way browser-to-browser video works. (Preserving video
 ;         across a later local re-offer/hold is a follow-up.) DTLS/ICE security per RFC 8827.
-;     webrtc=yes makes chan_sofia offer/answer UDP/TLS/RTP/SAVPF with DTLS+ICE;
-;     a plain-RTP/SDES peer is unaffected (only a SAVPF offer engages the WebRTC
-;     path), so webrtc=yes in [general] is safe for a mixed fleet.
+;     webrtc=yes is only the ENABLE/permission for DTLS-SRTP (DTLS+ICE). The actual OUTBOUND media
+;     profile is ALWAYS chosen by the TARGET's physical transport, never forced by webrtc=yes:
+;       - a contact registered over ws/wss            -> UDP/TLS/RTP/SAVPF (DTLS-SRTP)
+;       - a contact registered over udp/tcp/tls       -> RTP/AVP (or RTP/SAVP with encryption=yes)
+;       - a static peer (host!=dynamic)               -> by its configured transport= (ws/wss -> DTLS, else RTP)
+;     So ONE account can be used from several phones at once with DIFFERENT technologies - a wss browser,
+;     a udp phone and a tls phone registered simultaneously - and EACH contact is served per its own
+;     transport (gabpbx forks an INVITE per contact). A udp/tls target is NEVER offered DTLS-SRTP even
+;     with webrtc=yes set explicitly (a plain phone would reject it 406/488). webrtc=no (per-peer) fully
+;     disables DTLS for that peer. A realtime backend with no per-peer webrtc column needs no change:
+;     WebRTC is auto-detected from each contact's ws/wss registration. An inbound SAVPF/DTLS offer still
+;     engages the WebRTC answerer path as before (the answer mirrors the offer).
 ;
 ;     ICE-lite REQUIRES the server's media address be reachable by the browser:
 ;     on a NAT'd host set externip / media_address to the public IP. Full ICE

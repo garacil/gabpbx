@@ -613,7 +613,7 @@ struct sofia_peer {
 	int busy_on_active;
 	int max_contacts;
 	int encryption;                 /* SDES-SRTP per-peer toggle (0/1); default off; encryption=yes enables */
-	int webrtc;                     /* WebRTC per-peer toggle (0/1): DTLS-SRTP + ICE-lite + rtcp-mux; default off; webrtc=yes enables — A4 */
+	int webrtc;                     /* WebRTC per-peer toggle (0/1): the ENABLE/permission for DTLS-SRTP + ICE-lite + rtcp-mux; default off; webrtc=yes enables. The actual media profile is decided by the target's physical transport (sofia_offer_effective_webrtc), so webrtc=yes never forces DTLS onto a non-ws/wss target. - A4 */
 	int datachannel;                /* WebRTC DataChannel per-peer toggle (0/1): accept the offered m=application (RFC 8841 SCTP) on the BUNDLE'd audio DTLS; default off; requires webrtc=yes + a usrsctp build (Phase 3). With it off the m=application is port-0 reflected exactly as today. */
 	int callingpres;                /* AST_PRES_* mask; per-peer default presentation (chan_sip parity); default AST_PRES_ALLOWED_USER_NUMBER_NOT_SCREENED (=0) */
 	int sendrpid;                   /* 0=none / 1=PAI / 2=RPID (chan_sip SIP_SENDRPID parity) */

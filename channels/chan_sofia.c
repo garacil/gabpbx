@@ -2512,7 +2512,7 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	peer->busy_on_active = sofia_cfg.busy_on_active;
 	peer->max_contacts = sofia_cfg.max_contacts ? sofia_cfg.max_contacts : 6;
 	peer->encryption = 0;
-	peer->webrtc = sofia_cfg.webrtc;	/* A4: inherit [general] webrtc; per-peer webrtc= overrides */
+	peer->webrtc = sofia_cfg.webrtc;	/* A4: inherit [general] webrtc (the ENABLE); per-peer webrtc= overrides. The media profile is chosen by the target transport, not this flag - sofia_offer_effective_webrtc */
 	peer->datachannel = sofia_cfg.datachannel;	/* Phase 3: inherit [general] datachannel; per-peer datachannel= overrides */
 	ast_string_field_set(peer, srtpcipher, S_OR(sofia_cfg.default_srtpcipher, ""));
 	peer->session_timers = sofia_cfg.default_session_timers;
@@ -3138,7 +3138,7 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 		} else if (!strcasecmp(v->name, "encryption")) {
 			peer->encryption = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "webrtc")) {
-			peer->webrtc = ast_true(v->value);	/* WebRTC A4: DTLS-SRTP + ICE-lite + rtcp-mux */
+			peer->webrtc = ast_true(v->value);	/* WebRTC A4 ENABLE (DTLS-SRTP + ICE-lite + rtcp-mux); the per-contact/static transport picks the actual profile (sofia_offer_effective_webrtc) */
 		} else if (!strcasecmp(v->name, "datachannel")) {
 			peer->datachannel = ast_true(v->value);	/* Phase 3: accept the WebRTC m=application (RFC 8841 SCTP); requires webrtc=yes + usrsctp */
 		} else if (!strcasecmp(v->name, "srtpcipher")) {
@@ -4584,6 +4584,26 @@ static int sofia_build_addheader_str(struct ast_channel *chan, char *out_buf, si
 	return found;
 }
 
+/* Effective WebRTC for an OUTBOUND offer. peer->webrtc (per-peer or inherited from [general]) is ONLY the
+ * enable/permission; the actual media profile is ALWAYS decided by the TARGET's physical transport. So one
+ * account used from several phones at once is served per-contact: a ws/wss target gets DTLS-SRTP
+ * (UDP/TLS/RTP/SAVPF), a udp/tls target gets RTP/AVP (or RTP/SAVP with SDES). DTLS-SRTP is NEVER offered to
+ * a non-ws/wss target - a plain phone cannot answer that transport profile and rejects it 406/488 (RFC 3264
+ * sec 6.1 / RFC 5764 sec 8) - not even when webrtc=yes is set explicitly. target_transport is the per-contact
+ * registration transport for a registered peer, or the configured transport= for a static/no-contact peer.
+ * Mirrors the per-endpoint model of the canonical chan_sip and PJSIP SDP builders. (To force DTLS-SRTP over a
+ * non-ws transport - exotic DTLS-SRTP-over-UDP, RFC 5763 - a separate explicit force knob would be needed,
+ * never webrtc=yes, so it cannot poison a shared dynamic account's udp/tls phones.) */
+static int sofia_transport_is_ws(const char *t)
+{
+	return t && (!strcasecmp(t, "ws") || !strcasecmp(t, "wss"));
+}
+
+static int sofia_offer_effective_webrtc(const struct sofia_peer *peer, const char *target_transport)
+{
+	return peer && peer->webrtc && sofia_transport_is_ws(target_transport);
+}
+
 static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 {
 	struct sofia_pvt *pvt = ast->tech_pvt;
@@ -4771,7 +4791,19 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 					 * child->rtp exists from sofia_rtp_init(child) above. Mutually
 					 * exclusive with the per-child a=crypto block. Fail per child (skip
 					 * its INVITE); if ALL children fail, the fork-empty path → 503. */
-					if (pvt->peer->webrtc) {
+					/* effective WebRTC for THIS child's contact = webrtc enabled AND this contact registered over
+					 * ws/wss; a udp/tls contact -> RTP/AVP (even with webrtc=yes, global or explicit). Snapshot
+					 * c->transport under the contact lock (mirrors the c->expires snapshot above). This is what
+					 * serves one account from several phones at once: DTLS to the wss child, RTP/AVP to the udp/tls child. */
+					int want_webrtc;
+					{
+						char tgt_transport[8] = "";
+						ao2_lock(c);
+						ast_copy_string(tgt_transport, c->transport, sizeof(tgt_transport));
+						ao2_unlock(c);
+						want_webrtc = sofia_offer_effective_webrtc(pvt->peer, tgt_transport);
+					}
+					if (want_webrtc) {
 						if (sofia_webrtc_provision_offer(child)) {
 							ast_log(LOG_ERROR, "Sofia: fork-child %d WebRTC offer provisioning failed (peer '%s')\n",
 								branch_idx, pvt->peer->name);
@@ -4940,16 +4972,42 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 	 * non-inband peers pay zero alloc cost. */
 	sofia_enable_dsp_detect(pvt);
 
-	/* A5: outbound WebRTC offer — provision DTLS(actpass)+ICE-lite BEFORE generate_sdp
-	 * so the emitter produces a UDP/TLS/RTP/SAVPF offer carrying our fingerprint +
-	 * ufrag/pwd + host candidate. Mutually exclusive with the SDES a=crypto block
-	 * below (a WebRTC leg never offers a=crypto). pvt->peer is reliably set here
-	 * (sofia_request_call assigns it before sofia_rtp_init), so peer->webrtc is
-	 * authoritative on the outbound path. Fail closed: a webrtc=yes peer is never
-	 * downgraded to plain RTP. */
-	if (pvt->peer && pvt->peer->webrtc) {
+	/* Outbound WebRTC offer - provision DTLS(actpass)+ICE-lite BEFORE generate_sdp so the emitter produces a
+	 * UDP/TLS/RTP/SAVPF offer carrying our fingerprint + ufrag/pwd + host candidate. Mutually exclusive with
+	 * the SDES a=crypto block below (a WebRTC leg never offers a=crypto). We offer WebRTC media ONLY when
+	 * sofia_offer_effective_webrtc is true = webrtc enabled AND the target transport is ws/wss. A udp/tls
+	 * target (even with webrtc=yes, global or explicit) is NOT WebRTC (a DTLS-SRTP offer would 406/488) -> it
+	 * falls through to plain RTP/AVP below; webrtc=yes is only the enable, the transport picks the profile.
+	 * The single live contact was selected + ref'd in sofia_request_call (pvt->active_contact), so snapshot
+	 * its transport under the contact lock; when no contact is set fall back
+	 * to the peer's learned reg_transport (under peer->lock), and for a static non-registering peer whose
+	 * reg_transport is empty to the CONFIGURED transport= (see below) - the same transport used to route the
+	 * call to a static host, so the offer profile matches the outbound transport. Fail closed
+	 * for a real WebRTC target: provisioning failure aborts rather than silently downgrading. */
+	int want_webrtc = 0;
+	{
+		char tgt_transport[8] = "";
+		if (pvt->active_contact) {
+			ao2_lock(pvt->active_contact);
+			ast_copy_string(tgt_transport, pvt->active_contact->transport, sizeof(tgt_transport));
+			ao2_unlock(pvt->active_contact);
+		} else if (pvt->peer) {
+			ast_mutex_lock(&pvt->peer->lock);
+			ast_copy_string(tgt_transport, pvt->peer->reg_transport, sizeof(tgt_transport));
+			ast_mutex_unlock(&pvt->peer->lock);
+			/* Static (non-registering) peer: reg_transport is empty (only written at REGISTER), so fall
+			 * back to the CONFIGURED transport - a static ws/wss WebRTC trunk that inherited [general]
+			 * webrtc still offers DTLS-SRTP, while a static udp trunk stays RTP/AVP. peer->transport is
+			 * set at config-parse time and not mutated at runtime, so it is safe to read lock-free. */
+			if (ast_strlen_zero(tgt_transport)) {
+				ast_copy_string(tgt_transport, sofia_transport_name(pvt->peer->transport), sizeof(tgt_transport));
+			}
+		}
+		want_webrtc = sofia_offer_effective_webrtc(pvt->peer, tgt_transport);
+	}
+	if (want_webrtc) {
 		if (sofia_webrtc_provision_offer(pvt)) {
-			ast_log(LOG_ERROR, "Sofia: webrtc=yes peer '%s' but WebRTC offer provisioning failed — aborting call\n",
+			ast_log(LOG_ERROR, "Sofia: WebRTC peer '%s' but WebRTC offer provisioning failed - aborting call\n",
 				pvt->peer->name);
 			return -1;
 		}
@@ -15376,7 +15434,7 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "encryption")) {
 			peer->encryption = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "webrtc")) {
-			peer->webrtc = ast_true(v->value);	/* WebRTC A4: DTLS-SRTP + ICE-lite + rtcp-mux */
+			peer->webrtc = ast_true(v->value);	/* WebRTC A4 ENABLE (DTLS-SRTP + ICE-lite + rtcp-mux); the per-contact/static transport picks the actual profile (sofia_offer_effective_webrtc) */
 		} else if (!strcasecmp(v->name, "datachannel")) {
 			peer->datachannel = ast_true(v->value);	/* Phase 3: accept the WebRTC m=application (RFC 8841 SCTP); requires webrtc=yes + usrsctp */
 		} else if (!strcasecmp(v->name, "srtpcipher")) {
