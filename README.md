@@ -205,6 +205,40 @@ GABPBX 1.2 is a security-hardening release for `chan_sofia`. Every hardening gat
 
 ---
 
+## Building from source
+
+GABPBX uses the standard Asterisk source workflow (`./configure && make menuselect && make && make install`). Beyond the usual Asterisk build dependencies, `chan_sofia` adds a few of its own.
+
+| Dependency | Needed for | Debian/Ubuntu |
+| --- | --- | --- |
+| **Sofia-SIP 1.13.x**, built from source into `/usr/local` | `chan_sofia`'s SIP stack — **not a distro package** | from [freeswitch/sofia-sip](https://github.com/freeswitch/sofia-sip) |
+| OpenSSL | TLS, DTLS-SRTP, WebRTC, SHA-256 auth | `libssl-dev` |
+| libsrtp2 | SRTP / DTLS-SRTP media | `libsrtp2-dev` |
+| usrsctp *(optional)* | WebRTC DataChannel (SCTP-over-DTLS) | `libusrsctp-dev` |
+| libopus | Opus codec (WebRTC) | `libopus-dev` |
+| Standard Asterisk deps | core build | `build-essential pkg-config libedit-dev libjansson-dev libxml2-dev libsqlite3-dev uuid-dev libncurses-dev zlib1g-dev` |
+| libpq *(optional)* | PostgreSQL realtime / CDR | `libpq-dev` |
+
+**Sofia-SIP is the one non-obvious requirement.** `chan_sofia` links against `/usr/local/include/sofia-sip-1.13` and `/usr/local/lib/libsofia-sip-ua`, so install Sofia-SIP **before** building GABPBX, or `chan_sofia` fails with `fatal error: sofia-sip/nua.h: No such file or directory`.
+
+```sh
+# 1) Sofia-SIP into /usr/local (do this first)
+git clone https://github.com/freeswitch/sofia-sip.git && cd sofia-sip
+./bootstrap.sh                 # only if ./configure is missing from the checkout
+./configure --prefix=/usr/local && make && sudo make install && sudo ldconfig
+
+# 2) GABPBX
+cd /path/to/gabpbx
+./configure
+make menuselect.makeopts       # build menuselect first; avoids a -j race in its bundled mxml
+make -j$(nproc)                # if a parallel build ever trips on menuselect/mxml, just re-run make
+sudo make install
+```
+
+Full step-by-step — the Debian 13 recipe, the Sofia-SIP build, the per-module dependency map, and troubleshooting — is on the wiki: **[Build and Installation](https://github.com/garacil/gabpbx/wiki/Build-and-Installation)**.
+
+---
+
 ## License
 
 GABPBX is distributed under the GNU General Public License v2 (GPLv2). Existing Asterisk, Digium and third-party copyright notices and license terms are preserved in the source files where they apply.
