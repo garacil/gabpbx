@@ -1322,6 +1322,7 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	 * the media instances but master->is_webrtc stays 0 and master->capability/mids/tls-ids are unset, so a
 	 * later master re-INVITE/hold would emit plain RTP/AVP on a DTLS-SRTP leg and lose video. */
 	master->is_webrtc = child->is_webrtc;
+	ast_string_field_set(master, outbound_proxy, child->outbound_proxy);	/* NAT: keep routing master re-INVITEs to the winner contact's public source */
 	master->webrtc_offerer = child->webrtc_offerer;
 	master->webrtc_bundle = child->webrtc_bundle;	/* sofia_generate_sdp emits the session a=group:BUNDLE only when is_webrtc && webrtc_bundle — a forked winner must keep it */
 	master->webrtc_answer_applied = child->webrtc_answer_applied;
@@ -4350,6 +4351,7 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 		SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 		SIPTAG_PAYLOAD_STR(sdp_buf),
 		SIPTAG_MAX_FORWARDS_STR(mf_str),
+		TAG_IF(!ast_strlen_zero(pvt->outbound_proxy), NUTAG_PROXY(pvt->outbound_proxy)),	/* NAT: re-INVITE to the learned public source (operation-level) */
 		TAG_IF(have_gruu, SIPTAG_CONTACT_STR(gruu_contact)),
 		TAG_END());
 	ast_verbose("Sofia: directmedia re-INVITE sent on '%s' -> %s:%d\n",
@@ -4771,6 +4773,10 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				 * path previously set no proxy, so NAT'd UDP forked contacts went to the private RURI). */
 				char child_proxy_url[128] = "";
 				sofia_build_contact_proxy_url(child->peer, c, child_proxy_url, sizeof(child_proxy_url));
+				/* NAT: apply the next-hop proxy at the child nua_invite OPERATION level (below), not at
+				 * nua_handle (ineffective for the initial INVITE in this sofia-sip fork). Stash on the child;
+				 * sofia_fork_pick_winner copies it onto master so later master re-INVITEs keep routing here. */
+				ast_string_field_set(child, outbound_proxy, child_proxy_url);
 
 				/* Create handle auto-bound to child. */
 				if (sofia_nua) {
@@ -4778,7 +4784,6 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 						NUTAG_URL(ruri),
 						SIPTAG_TO_STR(ruri),
 						TAG_IF(child_path[0], NUTAG_INITIAL_ROUTE_STR(child_path)),	/* RFC 3327 Path as Route */
-						TAG_IF(child_proxy_url[0], NUTAG_PROXY(child_proxy_url)),	/* B: packet -> contact public src */
 						TAG_IF(child->peer && child->peer->gruu, NUTAG_SUPPORTED("gruu")),	/* RFC 5627 §4.4 */
 						TAG_END());
 				}
@@ -4907,6 +4912,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 								TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
 								SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 								SIPTAG_PAYLOAD_STR(sdp_buf),
+								TAG_IF(!ast_strlen_zero(child->outbound_proxy), NUTAG_PROXY(child->outbound_proxy)),	/* NAT: steer this child INVITE to the contact public source (operation-level) */
 								SIPTAG_MAX_FORWARDS_STR(mf_str_child),
 								TAG_END());
 						} else {
@@ -4918,6 +4924,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 								TAG_IF(st_seconds >= 0, NUTAG_SESSION_TIMER(st_seconds)),
 								TAG_IF(st_min_se > 0, NUTAG_MIN_SE(st_min_se)),
 								TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
+								TAG_IF(!ast_strlen_zero(child->outbound_proxy), NUTAG_PROXY(child->outbound_proxy)),	/* NAT: steer this child INVITE to the contact public source (operation-level) */
 								SIPTAG_MAX_FORWARDS_STR(mf_str_child),
 								TAG_END());
 						}
@@ -5113,6 +5120,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				TAG_IF(needs_manual_ack, NUTAG_AUTOACK(0)),
 				SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 				SIPTAG_PAYLOAD_STR(sdp_buf),
+				TAG_IF(!ast_strlen_zero(pvt->outbound_proxy), NUTAG_PROXY(pvt->outbound_proxy)),	/* NAT: steer the INVITE packet to the learned public source (operation-level; a handle-level proxy is ineffective for the initial INVITE in this sofia-sip fork) */
 				SIPTAG_MAX_FORWARDS_STR(mf_str_call),
 				TAG_END());
 		} else {
@@ -5126,6 +5134,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				TAG_IF(st_min_se > 0, NUTAG_MIN_SE(st_min_se)),
 				TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
 				TAG_IF(needs_manual_ack, NUTAG_AUTOACK(0)),
+				TAG_IF(!ast_strlen_zero(pvt->outbound_proxy), NUTAG_PROXY(pvt->outbound_proxy)),	/* NAT: steer the INVITE packet to the learned public source (operation-level; a handle-level proxy is ineffective for the initial INVITE in this sofia-sip fork) */
 				SIPTAG_MAX_FORWARDS_STR(mf_str_call),
 				TAG_END());
 		}
@@ -5949,8 +5958,13 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 			 * those fields are rewritten under peer->lock by REGISTER/dnsmgr. */
 			char proxy_url[128] = "";
 			sofia_build_nat_proxy_url_from_peer(peer, proxy_url, sizeof(proxy_url));
-			/* B: a contact-level proxy (single-live path) takes precedence over the peer-aggregate one. */
+			/* B: a contact-level proxy (single-live path) takes precedence over the peer-aggregate one. The
+			 * NAT next-hop proxy MUST be applied at the nua_invite OPERATION level (the call/re-INVITE below),
+			 * NOT at nua_handle creation: a handle-level NUTAG_PROXY does NOT steer the initial INVITE in this
+			 * sofia-sip fork (only the in-dialog ACK/BYE, which pass it per-operation, reach the public src).
+			 * Stash it on the pvt so sofia_call's nua_invite (and any re-INVITE) route to the public source. */
 			const char *eff_proxy = contact_proxy_url[0] ? contact_proxy_url : proxy_url;
+			ast_string_field_set(pvt, outbound_proxy, eff_proxy);
 			if (sofia_nua) {
 				pvt->nh = nua_handle(sofia_nua, pvt,
 					NUTAG_URL(url),
@@ -5958,7 +5972,6 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 					TAG_IF(route_buf[0], NUTAG_INITIAL_ROUTE_STR(route_buf)),
 					TAG_IF(sr_buf[0], NUTAG_INITIAL_ROUTE_STR(sr_buf)),	/* RFC 3608 Service-Route, after outboundproxy */
 					TAG_IF(path_buf[0], NUTAG_INITIAL_ROUTE_STR(path_buf)),	/* RFC 3327 Path of the registered contact */
-					TAG_IF(eff_proxy[0], NUTAG_PROXY(eff_proxy)),
 					TAG_IF(peer_gruu, NUTAG_SUPPORTED("gruu")),	/* RFC 5627 §4.4 */
 					TAG_END());
 				if (!pvt->nh) {

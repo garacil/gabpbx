@@ -400,6 +400,7 @@ struct sofia_pvt {
 		AST_STRING_FIELD(fromuser);
 		AST_STRING_FIELD(uri);
 		AST_STRING_FIELD(ruri);
+		AST_STRING_FIELD(outbound_proxy);	/* NAT next-hop (NUTAG_PROXY) = the contact's learned PUBLIC source; applied at the nua_invite OPERATION level for the initial INVITE + re-INVITE so the packet steers to the public src while the RURI keeps the (private) Contact. Empty = non-NAT (no override). */
 		AST_STRING_FIELD(cid_num);   /* inbound caller-id num; from sip_from, overwritten by PAI/RPID when peer->trustrpid */
 		AST_STRING_FIELD(cid_name);  /* inbound caller-id name; same chain as cid_num */
 	);
