@@ -582,6 +582,60 @@ static void sofia_contact_transport_from_url(const url_t *url, char *out, size_t
 	}
 }
 
+/* Override the contact-derived transport with the ACTUAL WebSocket transport from the top Via sent-protocol
+ * (RFC 7118 5: WS = plain WebSocket, WSS = secure WebSocket). A WebSocket UA (e.g. SIP.js) sends a synthetic
+ * Contact (RFC 7118 - it cannot know its local address) with NO ;transport, so sofia_contact_transport_from_url
+ * defaults it to "udp" - but the REGISTER physically arrived over WS/WSS, and the stored contact transport
+ * must reflect that (the protocol is decided by HOW the request arrives, not the Contact URI param). Used for
+ * outbound media-profile selection AND the ws/wss contact-rebind relaxation. Only touches WS/WSS; udp/tcp/tls
+ * keep the Contact ;transport / sips semantics (the request-URI target transport for ordinary SIP). */
+static void sofia_register_transport_from_via(sip_via_t const *via, char *out, size_t outlen)
+{
+	if (!via || !via->v_protocol || !out) {
+		return;
+	}
+	if (strstr(via->v_protocol, "WSS") || strstr(via->v_protocol, "wss")) {
+		ast_copy_string(out, "wss", outlen);
+	} else if (strstr(via->v_protocol, "WS") || strstr(via->v_protocol, "ws")) {
+		ast_copy_string(out, "ws", outlen);
+	}
+}
+
+/* The AUTHORITATIVE transport of the request being processed: the protocol of the actual sofia-sip tport it
+ * was DELIVERED on (the real connection), not text the UA wrote in Contact/Via. This is how the protocol must
+ * be decided - a WebSocket arrives on the ws/wss listener, it can never be "udp". Returns "" (out[0]='\0') if
+ * the tport is not reachable (caller then falls back to the Via/Contact derivation). Call only from inside a
+ * nua event callback on sofia_thread, where nua_current_request() is the message being handled. */
+static void sofia_incoming_transport(nua_t *nua, char *out, size_t outlen)
+{
+	nta_agent_t *agent;
+	msg_t *msg;
+	tport_t *tp;
+
+	if (out && outlen) {
+		out[0] = '\0';
+	} else {
+		return;
+	}
+	if (!nua) {
+		return;
+	}
+	agent = nua_get_agent(nua);
+	msg = nua_current_request(nua);
+	if (!agent || !msg) {
+		return;
+	}
+	tp = tport_delivered_by(nta_agent_tports(agent), msg);
+	if (tp) {
+		const tp_name_t *tpn = tport_name(tp);
+		if (tpn && tpn->tpn_proto && (!strcasecmp(tpn->tpn_proto, "udp") || !strcasecmp(tpn->tpn_proto, "tcp")
+				|| !strcasecmp(tpn->tpn_proto, "tls") || !strcasecmp(tpn->tpn_proto, "ws")
+				|| !strcasecmp(tpn->tpn_proto, "wss"))) {
+			ast_copy_string(out, tpn->tpn_proto, outlen);
+		}
+	}
+}
+
 /* Append ;transport= so an outbound request to a TCP/TLS/WS/WSS-registered phone routes
  * over the transport it registered on (sofia-sip otherwise defaults to UDP). tcp/tls/ws/wss
  * act; udp/empty/unknown are no-ops. For ws/wss this is REQUIRED: NTA selects the WS/WSS transport
@@ -1056,12 +1110,17 @@ static struct sofia_contact *sofia_peer_find_contact_by_callid(struct sofia_peer
 	return found;
 }
 
-/* Rebind lookup #3 (conservative NAT fallback): an instance-LESS existing contact from the same source IP
- * (host-only - the NAT-mapped port rotates) + same transport + same non-empty User-Agent + same Contact
- * user. For nat/force_rport peers only (gated at the call site). Returns +1 ref. Caller holds peer->lock. */
+/* Rebind lookup (no-id fallback, RFC 5626 spirit): when the Contact carries NO stable id (no +sip.instance,
+ * no usable Call-ID), match an instance-LESS existing contact of the SAME DEVICE by source IP (host only -
+ * the NAT-mapped port rotates) + same transport + same User-Agent. Deliberately does NOT use the Contact
+ * user: a WebSocket UA (SIP.js) sends a synthetic RANDOM Contact (RFC 7118 .invalid / RFC 5737 host) so it is
+ * not a device key, and within one AOR a normal UA's Contact user just equals the AOR (so it discriminates
+ * nothing). For nat/force_rport, single-Contact REGISTERs only (gated at the call site). Returns +1 ref;
+ * caller holds peer->lock. Inherent limit: two identical (same IP+transport+UA+AOR) instance-less devices
+ * collapse to one binding - RFC 5626 4.1 requires the UA to send +sip.instance to be distinguished;
+ * max_contacts caps anything else. */
 static struct sofia_contact *sofia_peer_find_contact_nat_fallback(struct sofia_peer *peer,
-	const struct ast_sockaddr *src, const char *transport, const char *user_agent,
-	const char *contact_user)
+	const struct ast_sockaddr *src, const char *transport, const char *user_agent)
 {
 	struct ao2_iterator ci;
 	struct sofia_contact *c, *found = NULL;
@@ -1070,14 +1129,13 @@ static struct sofia_contact *sofia_peer_find_contact_nat_fallback(struct sofia_p
 	ci = ao2_iterator_init(peer->contacts, 0);
 	while ((c = ao2_iterator_next(&ci))) {
 		int match;
-		char cuser[128];
 		ao2_lock(c);
-		sofia_uri_user_from_contact(c->contact_uri, "", cuser, sizeof(cuser));
 		match = (c->instance_id[0] == '\0'
 			&& ast_sockaddr_cmp_addr(&c->src_addr, src) == 0
 			&& !strcasecmp(c->transport, S_OR(transport, ""))
-			&& c->user_agent[0] && !strcasecmp(c->user_agent, user_agent)
-			&& !strcasecmp(cuser, S_OR(contact_user, "")));
+			/* c->user_agent is stored truncated to its 64-byte buffer (SIP.js UA is ~108 chars), so compare
+			 * only up to the stored length - a full-vs-truncated strcasecmp would never match. */
+			&& c->user_agent[0] && !strncasecmp(c->user_agent, user_agent, sizeof(c->user_agent) - 1));
 		ao2_unlock(c);
 		if (match) {
 			found = c;
@@ -6950,8 +7008,15 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		}
 	}
 
-	/* comedia: override the SDP-derived RTP remote with the SIP source. */
-	if (pvt->peer && (pvt->peer->nat & SOFIA_NAT_COMEDIA) && pvt->rtp) {
+	/* comedia: override the SDP-derived RTP remote with the SIP source - a plain-RTP NAT trick ONLY.
+	 * NEVER for WebRTC: ICE (RFC 8445) owns the media destination. ICE discovers the real NAT-mapped media
+	 * source as the peer-reflexive candidate via STUN connectivity checks (RFC 8445 s6, the translated address
+	 * in the Binding response), nominates a pair, and "only the selected pairs will be used for sending and
+	 * receiving data" (RFC 8445 s8). Overriding that with the SIP SIGNALLING source (wrong port) breaks the
+	 * DTLS/SRTP path -> no audio. pjsip does the same separation: webrtc forces ICE
+	 * (endpoint->media.rtp.ice_support |= webrtc) and ICE manages the remote; rtp_symmetric learns from the
+	 * media packet, never the SIP source. So skip comedia when this leg is WebRTC. */
+	if (pvt->peer && (pvt->peer->nat & SOFIA_NAT_COMEDIA) && pvt->rtp && !pvt->is_webrtc) {
 		struct ast_sockaddr src;
 		sofia_get_source_addr(sip, &src);
 		if (!ast_sockaddr_isnull(&src)) {
@@ -7656,7 +7721,7 @@ static int sofia_contact_acl_check(struct sofia_peer *peer, const url_t *url, co
  * Returns 0 ok, -1 ACL-denied, -2 malformed wildcard, -3 OOM. Unregister
  * side-effects are deferred to the caller via *update (see emit_unregister). */
 static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip, int expires,
-	struct sofia_register_update *update)
+	struct sofia_register_update *update, const char *real_transport)
 {
 	time_t now = time(NULL);
 	struct ast_sockaddr src;
@@ -7735,20 +7800,19 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 			char in_instance[128];
 			int in_reg_id;
 			const char *in_call_id;
-			char in_cuser[128];
 
 			sofia_contact_uri_from_url(uri, sizeof(uri), m->m_url);
 			sofia_contact_parse_instance(m, in_instance, sizeof(in_instance), &in_reg_id);
 			in_call_id = (sip->sip_call_id && sip->sip_call_id->i_id) ? sip->sip_call_id->i_id : "";
-			sofia_uri_user_from_contact(uri, "", in_cuser, sizeof(in_cuser));
 
 			c = ao2_find(peer->contacts, uri, OBJ_POINTER);
 			if (!c) {
 				char dtransport[16];
-				sofia_contact_transport_from_url(m->m_url, dtransport, sizeof(dtransport));
-				if (!strcasecmp(dtransport, "ws") && sip->sip_via && sip->sip_via->v_protocol
-						&& (strstr(sip->sip_via->v_protocol, "WSS") || strstr(sip->sip_via->v_protocol, "wss"))) {
-					ast_copy_string(dtransport, "wss", sizeof(dtransport));
+				if (!ast_strlen_zero(real_transport)) {
+					ast_copy_string(dtransport, real_transport, sizeof(dtransport));	/* authoritative: the delivering tport */
+				} else {
+					sofia_contact_transport_from_url(m->m_url, dtransport, sizeof(dtransport));
+					sofia_register_transport_from_via(sip->sip_via, dtransport, sizeof(dtransport));	/* fallback: Via, then Contact */
 				}
 				if (in_instance[0]) {
 					c = sofia_peer_find_contact_by_instance(peer, in_instance, in_reg_id);
@@ -7756,11 +7820,13 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 					if (dn_contacts == 1) {
 						c = sofia_peer_find_contact_by_callid(peer, in_call_id, dtransport);
 					}
-					if (!c && (peer->nat & SOFIA_NAT_FORCE_RPORT)
+					/* No id (no instance, no matching Call-ID): match the same device by source-IP + transport
+					 * + User-Agent. Single-Contact REGISTERs only (a multi-Contact no-id reg has no safe identity). */
+					if (!c && (peer->nat & SOFIA_NAT_FORCE_RPORT) && dn_contacts == 1
 							&& sip->sip_user_agent && sip->sip_user_agent->g_string
 							&& !ast_strlen_zero(sip->sip_user_agent->g_string)) {
 						c = sofia_peer_find_contact_nat_fallback(peer, &src, dtransport,
-							sip->sip_user_agent->g_string, in_cuser);
+							sip->sip_user_agent->g_string);
 					}
 				}
 			}
@@ -7799,7 +7865,6 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 			char in_instance[128];
 			int in_reg_id;
 			const char *in_call_id;
-			char in_cuser[128];
 
 			sofia_contact_uri_from_url(uri, sizeof(uri), m->m_url);
 
@@ -7807,21 +7872,21 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 			 * REGISTER Call-ID (RFC 3261 10.2, stable per UA boot cycle), and the Contact user. */
 			sofia_contact_parse_instance(m, in_instance, sizeof(in_instance), &in_reg_id);
 			in_call_id = (sip->sip_call_id && sip->sip_call_id->i_id) ? sip->sip_call_id->i_id : "";
-			sofia_uri_user_from_contact(uri, "", in_cuser, sizeof(in_cuser));
 
 			/* Last Contact ;transport= seen is snapshotted into reg_transport
 			 * after the loop. */
-			sofia_contact_transport_from_url(m->m_url, reg_transport, sizeof(reg_transport));
-			/* RFC 7118: the SIP URI ;transport= param is always "ws" (there is NO "wss" URI param —
-			 * secure WebSocket is conveyed by the Via sent-protocol SIP/2.0/WSS, not the Contact). A
-			 * browser registering over WSS therefore sends Contact ;transport=ws, but the OUTBOUND
-			 * INVITE must use ;transport=wss so NTA reuses the accepted WSS tport (a ws RURI selects
-			 * the ws primary, never the wss primary's open connection -> 503). Override ws -> wss when
-			 * this REGISTER's Via sent-protocol is WSS. */
-			if (!strcasecmp(reg_transport, "ws") && sip->sip_via && sip->sip_via->v_protocol) {
-				if (strstr(sip->sip_via->v_protocol, "WSS") || strstr(sip->sip_via->v_protocol, "wss")) {
-					ast_copy_string(reg_transport, "wss", sizeof(reg_transport));
-				}
+			/* Transport is decided by HOW the REGISTER physically ARRIVES, not by text the UA wrote in
+			 * Contact/Via: use the protocol of the actual delivering tport (the real connection). A WebSocket
+			 * UA (SIP.js) sends a synthetic Contact with no ;transport, so the text would default to "udp"
+			 * though it arrived over ws/wss; the real transport drives outbound routing/media profile AND the
+			 * ws/wss contact-rebind relaxation. (No "wss" SIP-URI param exists; ;transport=ws/wss is re-derived
+			 * outbound from this stored transport.) */
+			if (!ast_strlen_zero(real_transport)) {
+				ast_copy_string(reg_transport, real_transport, sizeof(reg_transport));	/* authoritative: the delivering tport */
+			} else {
+				/* Fallback when the tport is unreachable: Contact ;transport, then the Via sent-protocol. */
+				sofia_contact_transport_from_url(m->m_url, reg_transport, sizeof(reg_transport));
+				sofia_register_transport_from_via(sip->sip_via, reg_transport, sizeof(reg_transport));
 			}
 
 			c = ao2_find(peer->contacts, uri, OBJ_POINTER);
@@ -7866,11 +7931,13 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 					if (n_contacts == 1) {
 						match = sofia_peer_find_contact_by_callid(peer, in_call_id, reg_transport);
 					}
-					if (!match && (peer->nat & SOFIA_NAT_FORCE_RPORT)
+					/* No id (no instance, no matching Call-ID): match the same device by source-IP + transport
+					 * + User-Agent. Single-Contact REGISTERs only (a multi-Contact no-id reg has no safe identity). */
+					if (!match && (peer->nat & SOFIA_NAT_FORCE_RPORT) && n_contacts == 1
 							&& sip->sip_user_agent && sip->sip_user_agent->g_string
 							&& !ast_strlen_zero(sip->sip_user_agent->g_string)) {
 						match = sofia_peer_find_contact_nat_fallback(peer, &src, reg_transport,
-							sip->sip_user_agent->g_string, in_cuser);
+							sip->sip_user_agent->g_string);
 					}
 				}
 				if (match) {
@@ -9789,10 +9856,18 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 	char realm_buf[MAXHOSTNAMELEN];
 	const char *realm;
 	struct sofia_register_update reg_update;
+	char real_transport[16];
 
 	if (!sip || !sip->sip_from) {
 		nua_respond(nh, SIP_400_BAD_REQUEST, TAG_END());
 		return;
+	}
+	/* Authoritative transport from the actual delivering tport (the real connection), threaded into the
+	 * contact store so ws/wss WebSocket registrations are not mis-stored as udp from a synthetic Contact. */
+	sofia_incoming_transport(nua, real_transport, sizeof(real_transport));
+	if (sofia_debug) {
+		ast_verbose("Sofia: REGISTER incoming transport (real tport): '%s'\n",
+			ast_strlen_zero(real_transport) ? "(unknown - fallback to Via/Contact)" : real_transport);
 	}
 	realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
 
@@ -9889,7 +9964,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			return;
 		}
 		ast_mutex_lock(&peer->lock);
-		int rc = sofia_update_peer_contacts(peer, sip, expires, &reg_update);
+		int rc = sofia_update_peer_contacts(peer, sip, expires, &reg_update, real_transport);
 		ast_mutex_unlock(&peer->lock);
 		sofia_peer_ipport_reindex(peer);	/* B: re-key on the REGISTER's learned src_addr (lock released; cheap when unchanged) */
 		if (rc == -4) {	/* Path serialization overflow -> reject; never bind without the route vector (RFC 3327). */
@@ -9990,7 +10065,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 				return;
 			}
 			ast_mutex_lock(&peer->lock);
-			int rc = sofia_update_peer_contacts(peer, sip, expires, &reg_update);
+			int rc = sofia_update_peer_contacts(peer, sip, expires, &reg_update, real_transport);
 			ast_mutex_unlock(&peer->lock);
 			sofia_peer_ipport_reindex(peer);	/* B: re-key on the REGISTER's learned src_addr (lock released; cheap when unchanged) */
 			if (rc == -4) {	/* Path serialization overflow -> reject; never bind without the route vector (RFC 3327). */

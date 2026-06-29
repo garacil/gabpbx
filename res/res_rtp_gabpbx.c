@@ -249,7 +249,7 @@ struct ast_rtp {
 	char local_pwd[28];                /*!< OUR ice-pwd = HMAC key (>=22); CSPRNG-generated */
 	char remote_ufrag[257];            /*!< browser's ice-ufrag (<=256 + NUL); prefix-matched */
 	char remote_pwd[257];              /*!< browser's ice-pwd (<=256 + NUL); stored for symmetry */
-	struct ast_sockaddr ice_peer;      /*!< validated peer addr learned from the first good check */
+	struct ast_sockaddr ice_peer;      /*!< the SELECTED/nominated peer addr (set on USE-CANDIDATE, RFC 8445 §8.2), not the latest STUN source */
 	enum ast_rtp_ice_role ice_role;    /*!< always AST_RTP_ICE_ROLE_CONTROLLED for a lite agent */
 	unsigned int ice_lite:1;           /*!< peer advertised a=ice-lite (recorded only) */
 	unsigned int ice_active:1;         /*!< start() called — the responder is armed (hardening: gate) */
@@ -1705,16 +1705,13 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 	}
 
 
-	/* 5. AUTHENTICATED. LATCH the RTP remote address to the live authenticated check source for the WHOLE call
-	 *    (symmetric-RTP, like Asterisk's pjproject aiming at valid_check->rcand->addr). The controlling browser
-	 *    nominates several candidates and then runs RFC 7675 consent freshness ONLY on its SELECTED pair, which
-	 *    can differ from the first/transient USE-CANDIDATE; a WebRTC browser binds its DTLS to that selected pair
-	 *    (RFC 8445 §2.3) and ignores DTLS on any other candidate. Freezing on the first nominated pair misdirects
-	 *    our ServerHello + SRTP to a dead 5-tuple → no audio. Updating on EVERY authenticated check follows the
-	 *    selected pair, and is SAFE because the MESSAGE-INTEGRITY (our secret local_pwd, exchanged only over the
-	 *    secure SIP/WSS signaling) cannot be forged — a spoofer cannot move the tuple. */
-	ast_sockaddr_copy(&rtp->ice_peer, sa);
-	ast_rtp_instance_set_remote_address(instance, sa);
+	/* 5. AUTHENTICATED. Per RFC 8445 §8.1.1, "only the selected pairs will be used for sending and receiving
+	 *    data", and the selected pair is the one the controlling browser NOMINATES with USE-CANDIDATE (§7.3.1.5;
+	 *    lite agent §8.2). So we do NOT move media on every check here: the old LATCH-ALWAYS re-pointed our
+	 *    ServerHello/SRTP at whichever connectivity-check candidate sent the last STUN, so with a browser probing
+	 *    from several candidates the media tuple flapped and only aligned with the browser's real selected pair
+	 *    by luck after ~10-20s. We still answer EVERY authenticated check (step 6) - RFC 7675: a lite agent only
+	 *    responds to consent/connectivity checks - but the media/DTLS latch happens ONLY on nomination, in step 7. */
 
 	/* 6. Build + send the success Binding Response FIRST (MED2 — the browser confirms the pair before
 	 *    our ClientHello arrives): XOR-MAPPED-ADDRESS + MESSAGE-INTEGRITY + FINGERPRINT (last). */
@@ -1739,12 +1736,22 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 
 	rtp_raw_sendto(rtp, out, oo, sa, 0);
 
-	/* 7. USE-CANDIDATE → selected pair → ICE complete; fire the active DTLS handshake AFTER the success
-	 *    reply + remote address are set (MED2). dtls_perform_handshake re-locks ao2 (recursive — safe);
-	 *    no-op on the passive side. */
-	if (has_use_candidate && !rtp->ice_complete) {
+	/* 7. USE-CANDIDATE nominates this pair (RFC 8445 §7.3.1.5; lite agent §8.2) → it becomes the SELECTED pair.
+	 *    LATCH media/DTLS to THIS tuple (ice_peer = the nominated peer, not the latest STUN source), re-latching
+	 *    on each nomination so a later/better nomination moves us immediately (RFC 8445 §8.1.1: only selected
+	 *    pairs carry data). Then drive the active-side DTLS to that tuple - on the first nomination to start it,
+	 *    and on a later nomination while the handshake is still in flight so the ClientHello retransmit follows
+	 *    the moved pair (dtls_perform_handshake is a no-op on the passive side; it re-locks ao2 recursively, safe).
+	 *    Non-USE-CANDIDATE checks are answered (step 6) but never move media (RFC 7675: consent is per the
+	 *    selected 5-tuple and does not update ICE). */
+	if (has_use_candidate) {
+		int first_nomination = !rtp->ice_complete;
+		ast_sockaddr_copy(&rtp->ice_peer, sa);
+		ast_rtp_instance_set_remote_address(instance, sa);
 		rtp->ice_complete = 1;
-		dtls_perform_handshake(instance, rtp);
+		if (first_nomination || (rtp->dtls.ssl && !SSL_is_init_finished(rtp->dtls.ssl))) {
+			dtls_perform_handshake(instance, rtp);
+		}
 	}
 }
 #endif /* HAVE_OPENSSL */
