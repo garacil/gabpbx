@@ -2711,6 +2711,7 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	peer->encryption = 0;
 	peer->webrtc = sofia_cfg.webrtc;	/* A4: inherit [general] webrtc (the ENABLE); per-peer webrtc= overrides. The media profile is chosen by the target transport, not this flag - sofia_offer_effective_webrtc */
 	peer->datachannel = sofia_cfg.datachannel;	/* Phase 3: inherit [general] datachannel; per-peer datachannel= overrides */
+	peer->flowclose_emit_unregister = sofia_cfg.flowclose_emit_unregister;	/* RFC 5626: inherit [general]; per-peer flowclose_emit_unregister= overrides */
 	ast_string_field_set(peer, srtpcipher, S_OR(sofia_cfg.default_srtpcipher, ""));
 	peer->session_timers = sofia_cfg.default_session_timers;
 	peer->session_expires = sofia_cfg.default_session_expires;
@@ -3338,6 +3339,8 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			peer->webrtc = ast_true(v->value);	/* WebRTC A4 ENABLE (DTLS-SRTP + ICE-lite + rtcp-mux); the per-contact/static transport picks the actual profile (sofia_offer_effective_webrtc) */
 		} else if (!strcasecmp(v->name, "datachannel")) {
 			peer->datachannel = ast_true(v->value);	/* Phase 3: accept the WebRTC m=application (RFC 8841 SCTP); requires webrtc=yes + usrsctp */
+		} else if (!strcasecmp(v->name, "flowclose_emit_unregister")) {
+			peer->flowclose_emit_unregister = ast_true(v->value);	/* RFC 5626 flow-close: yes = emit unregister side-effects on flow close; no (default) = silent removal */
 		} else if (!strcasecmp(v->name, "srtpcipher")) {
 			/* SRTP suite preference for outbound a=crypto:N (RFC 4568 §6.1); typo
 			 * warnings deferred to emit time (a future res_srtp may add the suite). */
@@ -7717,11 +7720,200 @@ static int sofia_contact_acl_check(struct sofia_peer *peer, const url_t *url, co
 	return 0;
 }
 
+/* ============ RFC 5626 Complement B: flow-close contact cleanup, via sofia's BUILT-IN registrar watch ========
+ * sofia-sip's nua_registrar_server_preprocess (libsofia-sip-ua/nua/nua_registrar.c) already arms a tport_pend on
+ * the connection a connection-oriented (tcp/tls/ws/wss) REGISTER physically arrived on - ON THE STACK THREAD that
+ * owns the tports - gated on tport_is_tcp, and on connection CLOSE fires nua_i_media_error on that REGISTER handle,
+ * which nua MARSHALS to sofia_thread. We never touch any tport_* from chan_sofia (the event thread); we only own
+ * the REGISTER handle lifecycle and react to the marshalled event (RFC 5626 6). An earlier design that called
+ * tport_pend/tport_by_name from sofia_process_register was cross-thread-unsafe (sofia_thread is the nua EVENT
+ * thread, NOT the tport-owning stack thread) and has been removed.
+ *
+ * We retain the REGISTER handle ONLY for a SUCCESSFUL, SINGLE-Contact, connection-oriented binding (multi-Contact
+ * REGISTERs and udp fall back to expiry + max_contacts - one handle must never be claimed by several contacts).
+ * The handle is tracked in a global ao2 registry KEYED BY THE HANDLE POINTER; no nh_magic is bound, so the
+ * media_error handler does a type-safe pointer-membership lookup and never dereferences an untyped hmagic. The
+ * contact stores reg_nh and is the SOLE dropper: on supersede (refresh/rebind) and on every removal path via the
+ * contact destructor, the registry entry is unlinked and the handle destroyed (deferred to sofia_thread) - exactly
+ * once. media_error only UNLINKS the matched contact (-> destructor drops the handle). Orphaned registrar handles
+ * (the 401-challenge / multi-Contact / non-stored ones, which the built-in watch also arms with hmagic=NULL) are
+ * destroyed when their own media_error fires, so none leak. */
+
+#define SOFIA_REGFLOW_BUCKETS 4093		/* prime */
+static struct ao2_container *sofia_regflow_handles;	/* nua_handle_t* (offset 0) -> {peer_name, contact_uri} */
+static volatile int sofia_regflow_shutdown;		/* set after su_root_run() returns: do not dispatch destroys to a stopped root */
+
+struct sofia_regflow_entry {
+	nua_handle_t *nh;		/* KEY at offset 0: the retained REGISTER handle */
+	char peer_name[128];		/* re-locate the peer via sofia_find_peer_cached() on close */
+	char contact_uri[256];		/* re-locate the binding in peer->contacts */
+	unsigned int dropping:1;	/* destroy queued: the entry stays linked until the task runs (under the entry ao2 lock) */
+};
+
+static int sofia_regflow_hash(const void *obj, int flags)
+{
+	/* obj is a real entry on link, or a stack key {nh} on a find; nh at offset 0 makes both work. */
+	return (int) (((uintptr_t) ((const struct sofia_regflow_entry *) obj)->nh) >> 4);
+}
+static int sofia_regflow_cmp(void *obj, void *arg, int flags)
+{
+	const struct sofia_regflow_entry *e = obj, *key = arg;
+	return (e->nh == key->nh) ? (CMP_MATCH | CMP_STOP) : 0;
+}
+
+static int sofia_transport_is_connection_oriented(const char *t)
+{
+	return t && (!strcasecmp(t, "tcp") || !strcasecmp(t, "tls")
+		|| !strcasecmp(t, "ws") || !strcasecmp(t, "wss"));
+}
+
+/* Deferred (sofia_thread) destroy of a retained REGISTER handle. Runs once per entry: UNLINK the registry entry
+ * HERE (not in drop), so that during the dispatch window a duplicate nua_i_media_error for the same handle still
+ * finds the entry (marked `dropping`) and is consumed without an orphan-destroy -> no double free. No nh_magic is
+ * bound, so this is just the handle destroy; it must not run inside the handle's own event callback, hence deferred. */
+static void sofia_regflow_destroy_task(void *data)
+{
+	struct sofia_regflow_entry *e = data;
+	if (sofia_regflow_handles) {
+		ao2_unlink(sofia_regflow_handles, e);	/* drop the container ref now that the duplicate window is closing */
+	}
+	nua_handle_destroy(e->nh);
+	ao2_ref(e, -1);					/* TASK ref -> may free e */
+}
+
+/* Drop a retained REGISTER handle: mark its entry `dropping` and queue the destroy task (which unlinks + destroys
+ * exactly once). The entry stays in the registry until the task runs (so a duplicate media_error is consumed, not
+ * orphan-destroyed). ANY thread (the contact destructor may run off sofia_thread). At/after shutdown the root is
+ * stopped: leave the entry for sofia_regflow_teardown_all() / nua_destroy(). Idempotent per entry. */
+static void sofia_regflow_drop(nua_handle_t *nh)
+{
+	struct sofia_regflow_entry key, *e;
+	int queue = 0;
+	if (!nh || !sofia_regflow_handles) {
+		return;
+	}
+	key.nh = nh;
+	if (!(e = ao2_find(sofia_regflow_handles, &key, OBJ_POINTER))) {
+		return;					/* not tracked by us (link failed / already torn down) */
+	}
+	ao2_lock(e);
+	if (!e->dropping) {
+		e->dropping = 1;
+		ao2_ref(e, +1);				/* TASK ref: pin e (and its registry slot) until the task runs */
+		queue = 1;
+	}
+	ao2_unlock(e);
+	ao2_ref(e, -1);					/* finder */
+	if (!queue) {
+		return;					/* another drop already owns the teardown */
+	}
+	if (sofia_regflow_shutdown) {
+		/* root stopped: leave the entry for sofia_regflow_teardown_all() / nua_destroy() (expected, silent). */
+		ao2_lock(e);
+		e->dropping = 0;
+		ao2_unlock(e);
+		ao2_ref(e, -1);				/* undo task ref */
+		return;
+	}
+	if (sofia_dispatch_to_root_thread(sofia_regflow_destroy_task, e) < 0) {
+		ast_log(LOG_WARNING, "Sofia flow-watch: handle-destroy dispatch failed; reaped at teardown\n");
+		ao2_lock(e);
+		e->dropping = 0;
+		ao2_unlock(e);
+		ao2_ref(e, -1);				/* undo task ref */
+	}
+}
+
+/* Retain this REGISTER handle as the flow-watch owner of contact `c`, superseding any previous handle. sofia_thread
+ * under peer->lock. ONLY a SUCCESSFUL single-Contact connection-oriented binding (one handle must never be claimed
+ * by several contacts; the built-in watch only arms tport_is_tcp transports). */
+static void sofia_regflow_attach(struct sofia_peer *peer, struct sofia_contact *c, nua_handle_t *nh,
+	const char *reg_transport, int single_contact)
+{
+	struct sofia_regflow_entry *e;
+
+	if (!nh || !single_contact || !sofia_regflow_handles
+			|| !sofia_transport_is_connection_oriented(reg_transport)) {
+		return;					/* udp / multi-Contact / no handle: rely on expiry + max_contacts */
+	}
+	if (c->reg_nh == nh) {
+		return;					/* this REGISTER transaction already owns the contact */
+	}
+	e = ao2_alloc(sizeof(*e), NULL);
+	if (!e) {
+		return;					/* fail-safe: no watch -> expiry cleans up */
+	}
+	e->nh = nh;
+	ast_copy_string(e->peer_name, peer->name, sizeof(e->peer_name));
+	ast_copy_string(e->contact_uri, c->contact_uri, sizeof(e->contact_uri));
+	if (c->reg_nh) {
+		sofia_regflow_drop(c->reg_nh);		/* supersede: tear down the previous handle */
+		c->reg_nh = NULL;			/* unpublish the old before linking the new */
+	}
+	if (!ao2_link(sofia_regflow_handles, e)) {
+		ao2_ref(e, -1);				/* link failed (OOM) -> free the entry, leave the contact unwatched */
+		return;					/* reg_nh stays NULL -> expiry fallback (no dangling reg_nh) */
+	}
+	ao2_ref(e, -1);					/* the container holds the ref */
+	c->reg_nh = nh;					/* publish ONLY after a successful link */
+	if (sofia_debug) {
+		ast_verbose("Sofia: flow-watch attached nh=%p to contact %s\n", (void *) nh, c->contact_uri);
+	}
+}
+
+/* The single free-path hook: drop the retained REGISTER handle when the contact's last ref goes (any thread). */
+static void sofia_contact_destructor(void *obj)
+{
+	struct sofia_contact *c = obj;
+	if (c->reg_nh) {
+		nua_handle_t *nh = c->reg_nh;
+		c->reg_nh = NULL;			/* refcount 0 here -> exclusively owned; no lock needed */
+		sofia_regflow_drop(nh);
+	}
+}
+
+/* After su_root_run() returns (before nua_destroy): clear every retained reg_nh reachable from `peers` and drop
+ * its registry entry, so the later off-thread contact destructors do not dispatch to a stopped root. nua_destroy()
+ * reaps the handles. A peer still pinned by an in-call pvt is not walked (bounded process-exit residual). */
+static void sofia_regflow_teardown_all(void)
+{
+	struct ao2_iterator pi;
+	struct sofia_peer *peer;
+	if (!peers) {
+		return;
+	}
+	pi = ao2_iterator_init(peers, 0);
+	while ((peer = ao2_iterator_next(&pi))) {
+		struct ao2_iterator ci;
+		struct sofia_contact *c;
+		ast_mutex_lock(&peer->lock);
+		ci = ao2_iterator_init(peer->contacts, 0);
+		while ((c = ao2_iterator_next(&ci))) {
+			if (c->reg_nh) {
+				struct sofia_regflow_entry key, *e;
+				if (sofia_regflow_handles) {
+					key.nh = c->reg_nh;
+					if ((e = ao2_find(sofia_regflow_handles, &key, OBJ_POINTER))) {
+						ao2_unlink(sofia_regflow_handles, e);
+						ao2_ref(e, -1);
+					}
+				}
+				c->reg_nh = NULL;	/* nua_destroy() reaps the handle */
+			}
+			ao2_ref(c, -1);
+		}
+		ao2_iterator_destroy(&ci);
+		ast_mutex_unlock(&peer->lock);
+		ao2_ref(peer, -1);
+	}
+	ao2_iterator_destroy(&pi);
+}
+
 /* Apply a REGISTER's Contact bindings to the peer. Caller holds peer->lock.
  * Returns 0 ok, -1 ACL-denied, -2 malformed wildcard, -3 OOM. Unregister
  * side-effects are deferred to the caller via *update (see emit_unregister). */
 static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip, int expires,
-	struct sofia_register_update *update, const char *real_transport)
+	struct sofia_register_update *update, const char *real_transport, nua_handle_t *nh)
 {
 	time_t now = time(NULL);
 	struct ast_sockaddr src;
@@ -7740,6 +7932,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 
 	/* "Contact: *" is valid only as the sole Contact with Expires:0 (RFC 3261
 	 * §10.2.2 bulk unregister); else malformed → -2 (400). */
+	int single_contact = 0;	/* exactly one concrete Contact → eligible for the flow-watch (one handle ↔ one contact) */
 	{
 		int has_wildcard = 0, n_contacts = 0;
 		for (m = sip->sip_contact; m; m = m->m_next) {
@@ -7751,6 +7944,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 		if (has_wildcard && (expires != 0 || n_contacts > 1)) {
 			return -2;
 		}
+		single_contact = (n_contacts == 1 && !has_wildcard);
 	}
 
 	sofia_get_source_addr(sip, &src);
@@ -7915,6 +8109,9 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				c->reg_id = in_reg_id;
 				ast_copy_string(c->call_id, in_call_id, sizeof(c->call_id));
 				ao2_unlock(c);
+				/* RFC 5626 Complement B: a same-URI refresh may arrive on a NEW connection (TCP/WSS
+				 * reconnect) -> disarm the stale watch + arm on the new tport (no-op if unchanged). */
+				sofia_regflow_attach(peer, c, nh, reg_transport, single_contact);
 				ao2_ref(c, -1);
 				if (sofia_debug)
 					ast_verbose("Sofia: Refreshed contact %s (expires in %ds)\n", uri, expires);
@@ -7942,24 +8139,31 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				}
 				if (match) {
 					struct ast_sockaddr old_src;
-					sofia_contact_rebind(peer, match, uri, m->m_url->url_host,
+					int rc = sofia_contact_rebind(peer, match, uri, m->m_url->url_host,
 						sofia_contact_url_port(m->m_url->url_port), reg_transport,
 						(sip->sip_user_agent ? sip->sip_user_agent->g_string : NULL),
 						&src, pathstr, in_instance, in_reg_id, in_call_id, now + expires, &old_src);
-					if (update) {
-						update->contacts_refreshed++;	/* a MOVE, not an add -> bypasses evict-oldest */
-						if (ast_sockaddr_cmp(&old_src, &src)) {
-							update->contacts_moved++;
-							sofia_register_update_set_uri(update, uri);
-							ast_sockaddr_copy(&update->changed_old_src, &old_src);
-							ast_sockaddr_copy(&update->new_src, &src);
+					/* Only count the move + (re)arm the flow watch when the relink SUCCEEDED. On rc<0 the
+					 * binding was unlinked and is about to drop its finder ref (fail-closed: no duplicate);
+					 * arming a watch for an unlinked contact would be wrong. */
+					if (rc == 0) {
+						if (update) {
+							update->contacts_refreshed++;	/* a MOVE, not an add -> bypasses evict-oldest */
+							if (ast_sockaddr_cmp(&old_src, &src)) {
+								update->contacts_moved++;
+								sofia_register_update_set_uri(update, uri);
+								ast_sockaddr_copy(&update->changed_old_src, &old_src);
+								ast_sockaddr_copy(&update->new_src, &src);
+							}
 						}
+						/* URI/tport may have changed -> disarm the old watch, arm a new one (no-op if same). */
+						sofia_regflow_attach(peer, match, nh, reg_transport, single_contact);
 					}
 					ao2_ref(match, -1);	/* drop the finder ref (rebind kept the object linked, or fail-closed) */
 					continue;		/* rebound (or fail-closed); never alloc a duplicate */
 				}
 				/* New contact. */
-				c = ao2_alloc(sizeof(*c), NULL);
+				c = ao2_alloc(sizeof(*c), sofia_contact_destructor);
 				if (!c) continue;
 				if (update) {
 					update->contacts_added++;
@@ -8029,6 +8233,9 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 					}
 				}
 				ao2_unlock(peer->contacts);
+				/* RFC 5626 Complement B: watch this binding's connection for close (no-op unless
+				 * connection-oriented). Under peer->lock; c is linked + we still hold the local ref. */
+				sofia_regflow_attach(peer, c, nh, reg_transport, single_contact);
 				ao2_ref(c, -1);
 				if (sofia_debug)
 					ast_verbose("Sofia: New contact %s for peer '%s'\n", uri, peer->name);
@@ -8393,7 +8600,7 @@ static void sofia_emit_auth_challenge(nua_t *nua, nua_handle_t *nh,
 	}
 }
 
-/* ===== Stateless digest nonce + per-nonce replay cache (3-way design) =====
+/* ===== Stateless digest nonce + per-nonce replay cache =====
  * Replaces the per-peer single-nonce + monotonic-nc model that 401-looped concurrent INVITEs from a
  * multi-call phone: a REGISTER nc=1 advanced the SHARED peer->last_nc, so a later INVITE legitimately
  * starting at nc=1 on the same live nonce tripped the nc-replay gate -> 401 stale -> rotation cascaded
@@ -9964,7 +10171,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			return;
 		}
 		ast_mutex_lock(&peer->lock);
-		int rc = sofia_update_peer_contacts(peer, sip, expires, &reg_update, real_transport);
+		int rc = sofia_update_peer_contacts(peer, sip, expires, &reg_update, real_transport, nh);
 		ast_mutex_unlock(&peer->lock);
 		sofia_peer_ipport_reindex(peer);	/* B: re-key on the REGISTER's learned src_addr (lock released; cheap when unchanged) */
 		if (rc == -4) {	/* Path serialization overflow -> reject; never bind without the route vector (RFC 3327). */
@@ -10065,7 +10272,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 				return;
 			}
 			ast_mutex_lock(&peer->lock);
-			int rc = sofia_update_peer_contacts(peer, sip, expires, &reg_update, real_transport);
+			int rc = sofia_update_peer_contacts(peer, sip, expires, &reg_update, real_transport, nh);
 			ast_mutex_unlock(&peer->lock);
 			sofia_peer_ipport_reindex(peer);	/* B: re-key on the REGISTER's learned src_addr (lock released; cheap when unchanged) */
 			if (rc == -4) {	/* Path serialization overflow -> reject; never bind without the route vector (RFC 3327). */
@@ -11018,7 +11225,6 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 				"Peer: SIP/%s\r\n"
 				"PeerStatus: CallLimitExceeded\r\n"
 				"Address: %s\r\n"
-				"TuCloudPBXName: \r\n"
 				"Context: %s\r\n"
 				"Accountcode: %s\r\n"
 				"ActiveCalls: %d\r\n"
@@ -11040,7 +11246,6 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 				"Peer: SIP/%s\r\n"
 				"PeerStatus: CallCountUpdated\r\n"
 				"Address: %s\r\n"
-				"TuCloudPBXName: \r\n"
 				"Context: %s\r\n"
 				"Accountcode: %s\r\n"
 				"ActiveCalls: %d\r\n"
@@ -13119,6 +13324,88 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		return;
 	}
 
+	/* RFC 5626 flow-close (Complement B): sofia's built-in registrar watch fires nua_i_media_error on a REGISTER
+	 * handle when its connection-oriented binding's connection closes (armed on the stack thread, marshalled here
+	 * to sofia_thread). We look the handle up BY POINTER in our registry (type-safe: never dereference an untyped
+	 * hmagic). A hit -> a tracked binding: UNLINK the matched contact (the contact destructor is the SOLE handle
+	 * dropper -> no double free). A miss with hmagic==NULL -> an orphaned registrar handle (401-challenge /
+	 * multi-Contact / non-stored, which the built-in watch also armed) -> destroy it so it does not leak. A miss
+	 * with a bound hmagic -> a session/media error: fall through to normal handling. */
+	if (event == nua_i_media_error) {
+		struct sofia_regflow_entry key, *e = NULL;
+		if (sofia_regflow_handles) {
+			key.nh = nh;
+			e = ao2_find(sofia_regflow_handles, &key, OBJ_POINTER);	/* +1 finder, pointer-membership */
+		}
+		if (e) {
+			char pname[128], uri[256];
+			struct sofia_peer *peer;
+			int dropping;
+			ao2_lock(e);
+			dropping = e->dropping;
+			ao2_unlock(e);
+			if (dropping) {
+				/* A drop is already in flight for this handle (its destroy task will run). Consume this
+				 * (possibly duplicate) event without acting -> no orphan-destroy, no double free. */
+				ao2_ref(e, -1);				/* finder */
+				return;
+			}
+			ast_copy_string(pname, e->peer_name, sizeof(pname));
+			ast_copy_string(uri, e->contact_uri, sizeof(uri));
+			ao2_ref(e, -1);					/* finder (registry keeps its ref until the drop task) */
+			peer = sofia_find_peer_cached(pname);		/* +1 or NULL (cache-only) */
+			if (peer) {
+				struct sofia_contact *c;
+				int became_empty = 0, emit_unregister = 0;
+				ast_mutex_lock(&peer->lock);
+				c = ao2_find(peer->contacts, uri, OBJ_POINTER);	/* +1 finder */
+				if (c) {
+					if (c->reg_nh == nh) {		/* still the current binding for this handle */
+						ao2_unlink(peer->contacts, c);	/* -> contact destructor drops reg_nh (sole dropper) */
+						if (sofia_debug) {
+							ast_verbose("Sofia: flow closed (connection gone) - removed contact %s of peer %s\n",
+								uri, pname);
+						}
+						if (ao2_container_count(peer->contacts) == 0) {
+							peer->registered = 0;
+							memset(&peer->src_addr, 0, sizeof(peer->src_addr));
+							ast_copy_string(peer->reg_transport, "udp", sizeof(peer->reg_transport));
+							peer->expire = 0;
+							peer->reg_expiry = 0;
+							became_empty = 1;
+							emit_unregister = peer->flowclose_emit_unregister;	/* policy under lock */
+						}
+					}
+					ao2_ref(c, -1);			/* finder */
+				}
+				ast_mutex_unlock(&peer->lock);
+				if (became_empty) {
+					/* Internal routing state is ALWAYS corrected regardless of policy. */
+					sofia_peer_ipport_reindex(peer);
+					/* External unregister side-effects only when flowclose_emit_unregister=yes (option 1);
+					 * default (no) stays silent so a browser F5 does not flap the BLF. NOT under peer->lock. */
+					if (emit_unregister) {
+						struct sofia_register_update upd = { 0 };
+						upd.emit_unregister = 1;
+						upd.unregister_cause = "Flow closed";
+						sofia_emit_register_side_effects(peer, NULL, &upd);	/* sip=NULL safe */
+					}
+				}
+				ao2_ref(peer, -1);
+			}
+			return;						/* consumed our tracked handle's event */
+		}
+		if (!hmagic) {
+			/* Registry MISS + NULL hmagic = a never-tracked orphaned registrar handle (the 401-challenge /
+			 * multi-Contact / non-stored REGISTER, which the built-in watch also armed) whose connection just
+			 * closed. We bind no hmagic to handles we track (they live in sofia_regflow_handles) and bind a pvt
+			 * to every session handle, so a NULL-hmagic non-registry handle is reapable -> destroy it (no leak). */
+			nua_handle_destroy(nh);
+			return;
+		}
+		/* bound hmagic -> session/media error: not ours, fall through. */
+	}
+
 	/* Debug-gated event logging for peer/ip filter modes. */
 	if (sofia_debug > 1 && sip) {
 		const char *peer = NULL;
@@ -14060,6 +14347,10 @@ static unsigned sofia_tls_min_version_mask(const char *v);
 
 static void *sofia_thread_func(void *data)
 {
+	/* Fresh run: clear the flow-watch shutdown flag (a prior failed load/retry in the same process could
+	 * otherwise leave it stuck at 1 and force every off-thread handle drop into leak-at-exit mode). */
+	sofia_regflow_shutdown = 0;
+
 	if (su_init() != 0) {
 		ast_log(LOG_ERROR, "Failed to initialize Sofia-SIP SU\n");
 		return NULL;
@@ -14387,6 +14678,12 @@ static void *sofia_thread_func(void *data)
 	sofia_eventsub_start();
 
 	su_root_run(sofia_root);
+
+	/* RFC 5626 flow watches (Complement B): stop dispatching handle drops to the now-stopped root, then clear +
+	 * free every retained reg_nh ctx reachable from `peers` INLINE on this (sofia) thread before nua_destroy, so
+	 * the later off-thread contact destructors during nua_destroy have nothing to marshal to a dead root. */
+	sofia_regflow_shutdown = 1;
+	sofia_regflow_teardown_all();
 
 	/* Async timing-equalized rejects: cancel + destroy every still-pending one-shot
 	 * timer and free its ctx (dropping the pinned nua_handle ref) BEFORE nua_destroy /
@@ -15100,6 +15397,8 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			sofia_cfg.webrtc = ast_true(v->value);	/* A4 WebRTC general default */
 		} else if (!strcasecmp(v->name, "datachannel")) {
 			sofia_cfg.datachannel = ast_true(v->value);	/* Phase 3 WebRTC DataChannel general default; per-peer datachannel= overrides */
+		} else if (!strcasecmp(v->name, "flowclose_emit_unregister")) {
+			sofia_cfg.flowclose_emit_unregister = ast_true(v->value);	/* RFC 5626 flow-close general default; per-peer overrides */
 		} else if (!strcasecmp(v->name, "default_srtpcipher") || !strcasecmp(v->name, "srtpcipher")) {
 			/* Default SRTP cipher list inherited by sofia_peer_alloc; both spellings accepted. */
 			ast_copy_string(sofia_cfg.default_srtpcipher, v->value, sizeof(sofia_cfg.default_srtpcipher));
@@ -15874,6 +16173,8 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			peer->webrtc = ast_true(v->value);	/* WebRTC A4 ENABLE (DTLS-SRTP + ICE-lite + rtcp-mux); the per-contact/static transport picks the actual profile (sofia_offer_effective_webrtc) */
 		} else if (!strcasecmp(v->name, "datachannel")) {
 			peer->datachannel = ast_true(v->value);	/* Phase 3: accept the WebRTC m=application (RFC 8841 SCTP); requires webrtc=yes + usrsctp */
+		} else if (!strcasecmp(v->name, "flowclose_emit_unregister")) {
+			peer->flowclose_emit_unregister = ast_true(v->value);	/* RFC 5626 flow-close: yes = emit unregister side-effects on flow close; no (default) = silent removal */
 		} else if (!strcasecmp(v->name, "srtpcipher")) {
 			/* SRTP suite preference; typo WARN happens at sdp_crypto_offer_list emit, not here. */
 			ast_string_field_set(peer, srtpcipher, v->value);
@@ -16336,6 +16637,10 @@ static int sofia_apply_config(struct ast_config *cfg)
 	 * datachannel=yes from [general] actually disables it (mirrors sofia_cfg.webrtc above). An
 	 * explicit per-peer datachannel= still wins. */
 	sofia_cfg.datachannel = 0;
+	/* RFC 5626 flow-close: default OFF = remove a connection-oriented binding SILENTLY on flow close (no
+	 * external unregister side-effects), avoiding a BLF flap on browser F5. RESET here so a reload that drops
+	 * the [general] value reverts to silent; an explicit per-peer flowclose_emit_unregister= still wins. */
+	sofia_cfg.flowclose_emit_unregister = 0;
 	/* empty default = sdp_crypto.c fallback (AES_CM_128_HMAC_SHA1_80). */
 	sofia_cfg.default_srtpcipher[0] = '\0';
 	/* default 0 = shared-key mode. Module-scope mirror reset for sdp_crypto.c extern visibility. */
@@ -17452,6 +17757,9 @@ static int load_module(void)
 	/* B: the O(1) by-IP+port index (perf). Non-fatal if it fails — the lookup just no-ops and every
 	 * by-IP lookup uses the O(N) ranked scan. */
 	peers_by_ipport = ao2_container_alloc(MAX_PEER_IPPORT_BUCKETS, peer_ipport_hash_fn, peer_ipport_cmp_fn);
+	/* RFC 5626 flow-close registry (nh -> peer/contact). Non-fatal if it fails: the flow-watch simply degrades
+	 * to expiry/max_contacts cleanup (sofia_regflow_attach no-ops when the container is NULL). */
+	sofia_regflow_handles = ao2_container_alloc(SOFIA_REGFLOW_BUCKETS, sofia_regflow_hash, sofia_regflow_cmp);
 	dialogs = ao2_container_alloc(MAX_DIALOG_BUCKETS, dialog_hash_fn, dialog_cmp_fn);
 	if (!dialogs) {
 		ast_log(LOG_ERROR, "Unable to create Sofia dialogs container\n");
@@ -17652,6 +17960,12 @@ err_cleanup:
 		 * container lets the peer dnsmgr-release + ref-drop below free the peers cleanly. */
 		ao2_ref(peers_by_ipport, -1);
 		peers_by_ipport = NULL;
+	}
+	if (sofia_regflow_handles) {
+		/* RFC 5626 flow-close registry: sofia_regflow_teardown_all() already cleared the reachable entries
+		 * before nua_destroy; drop the container ref (any residual entry holds no peer ref, so order-free). */
+		ao2_ref(sofia_regflow_handles, -1);
+		sofia_regflow_handles = NULL;
 	}
 	if (peers) {
 		/* Release every peer's dnsmgr handle + its +1 ref BEFORE dropping the container ref,

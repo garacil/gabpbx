@@ -172,6 +172,13 @@ struct sofia_contact {
 	char instance_id[128];     /* RFC 5626 +sip.instance (normalized urn:..., quotes + <> stripped). Stable across reboots. */
 	int  reg_id;               /* RFC 5626 reg-id (1..INT_MAX, 0 = absent/invalid). Distinct flows of one instance. */
 	char call_id[128];         /* REGISTER Call-ID (RFC 3261 10.2: stable per UA boot). Universal rotation key. */
+	/* RFC 5626 flow-close: the retained REGISTER handle whose built-in registrar watch fires nua_i_media_error
+	 * when this connection-oriented (ws/wss/tcp/tls) binding's connection closes. NULL = unwatched (udp,
+	 * multi-Contact, or link failed). Read/written under peer->lock while the contact is linked; the contact is
+	 * the SOLE owner and drops it (unlink its registry entry + deferred nua_handle_destroy) on supersede and in
+	 * the destructor. The handle is tracked in the sofia_regflow_handles ao2 registry keyed by the handle
+	 * pointer (no nh_magic is bound). See sofia_regflow_* in chan_sofia.c. */
+	nua_handle_t *reg_nh;
 };
 
 extern char sofia_sipnotify_sentinel;
@@ -622,6 +629,7 @@ struct sofia_peer {
 	int encryption;                 /* SDES-SRTP per-peer toggle (0/1); default off; encryption=yes enables */
 	int webrtc;                     /* WebRTC per-peer toggle (0/1): the ENABLE/permission for DTLS-SRTP + ICE-lite + rtcp-mux; default off; webrtc=yes enables. The actual media profile is decided by the target's physical transport (sofia_offer_effective_webrtc), so webrtc=yes never forces DTLS onto a non-ws/wss target. - A4 */
 	int datachannel;                /* WebRTC DataChannel per-peer toggle (0/1): accept the offered m=application (RFC 8841 SCTP) on the BUNDLE'd audio DTLS; default off; requires webrtc=yes + a usrsctp build (Phase 3). With it off the m=application is port-0 reflected exactly as today. */
+	int flowclose_emit_unregister;  /* RFC 5626 flow-close policy (0/1; default 0): a connection-oriented binding is ALWAYS removed when its flow closes. 0 = remove silently (no external unregister side-effects: no AMI PeerStatus, BLF/devstate, or regexten cleanup) - avoids a BLF flap on browser F5. 1 = also emit the full unregister side-effects (accurate BLF/regexten, at the cost of a brief Unregistered->Registered flap on reload). Per-peer overrides [general]. */
 	int callingpres;                /* AST_PRES_* mask; per-peer default presentation (chan_sip parity); default AST_PRES_ALLOWED_USER_NUMBER_NOT_SCREENED (=0) */
 	int sendrpid;                   /* 0=none / 1=PAI / 2=RPID (chan_sip SIP_SENDRPID parity) */
 	int trustrpid;                  /* 0/1; trust inbound PAI/RPID (chan_sip SIP_TRUSTRPID parity) */
@@ -814,6 +822,7 @@ struct sofia_config {
 	int encryption;                   /* SDES-SRTP general default (0=off, 1=on); soft-zeroed at load if res_srtp absent */
 	int webrtc;                       /* WebRTC general default (0=off,1=on); per-peer webrtc= overrides */
 	int datachannel;                  /* WebRTC DataChannel general default (0=off,1=on); per-peer datachannel= overrides. Requires webrtc=yes + a usrsctp build to take effect (Phase 3). */
+	int flowclose_emit_unregister;    /* RFC 5626 flow-close general default (0=off,1=on); per-peer flowclose_emit_unregister= overrides. 0 = remove a connection-oriented binding silently on flow close (no external unregister side-effects); 1 = emit them (PeerStatus/BLF/devstate/regexten). */
 	char default_srtpcipher[256];     /* srtpcipher: comma-separated cipher preference inherited by peers; empty = sdp_crypto.c default AES_CM_128_HMAC_SHA1_80 */
 	int srtp_per_suite_keys;          /* 0 = shared-key (one master_key across all suites in a multi-cipher offer) / 1 = per-suite-fresh-key (independent random key per suite — forensic key separation). [general]-only; no chan_sip equivalent. */
 	int force_invite_auth;            /* 0 = chan_sip parity (per-peer insecure=invite bypass active) / 1 = global lockdown: ALL inbound INVITEs require digest auth regardless of insecure=invite. [general]-only security override; logs NOTICE when overriding a peer. */

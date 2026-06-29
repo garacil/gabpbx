@@ -118,6 +118,7 @@ static int dtmftimeout = DEFAULT_DTMF_TIMEOUT;
 static int rtpstart = DEFAULT_RTP_START;			/*!< First port for RTP sessions (set in rtp.conf) */
 static int rtpend = DEFAULT_RTP_END;			/*!< Last port for RTP sessions (set in rtp.conf) */
 static int rtpdebug;			/*!< Are we debugging? */
+static int rtpicedebug;			/*!< Are we debugging WebRTC ICE/DTLS (nomination + selected-pair vs media source)? Toggle: "rtp set debug ice on" */
 static int rtcpdebug;			/*!< Are we debugging RTCP? */
 static int rtcpstats;			/*!< Are we debugging RTCP? */
 static int rtcpinterval = RTCP_DEFAULT_INTERVALMS; /*!< Time between rtcp reports in millisecs */
@@ -254,6 +255,7 @@ struct ast_rtp {
 	unsigned int ice_lite:1;           /*!< peer advertised a=ice-lite (recorded only) */
 	unsigned int ice_active:1;         /*!< start() called — the responder is armed (hardening: gate) */
 	unsigned int ice_complete:1;       /*!< a USE-CANDIDATE check passed → selected pair (RFC 8445 §8.2) */
+	unsigned int ice_rx_logged:1;      /*!< rtpicedebug: first post-complete media packet already logged (log once/instance) */
 #endif
 	struct rtp_red *red;
 };
@@ -322,9 +324,12 @@ struct ast_rtcp {
 struct rtp_red {
 	struct ast_frame t140;  /*!< Primary data  */
 	struct ast_frame t140red;   /*!< Redundant t140*/
-	unsigned char pt[AST_RED_MAX_GENERATION];  /*!< Payload types for redundancy data */
-	unsigned char ts[AST_RED_MAX_GENERATION]; /*!< Time stamps */
-	unsigned short len[AST_RED_MAX_GENERATION]; /*!< length of each generation (RFC 2198 10-bit block length) */
+	/* MAX_GENERATION + 1 entries: rtp_red_init writes the PRIMARY pt at index `generations`, and
+	 * red_t140_to_red writes len[num_gen] (num_gen == generations), so the valid index range is
+	 * 0..generations inclusive. Sizing to MAX only was a latent OOB when generations == MAX. */
+	unsigned char pt[AST_RED_MAX_GENERATION + 1];  /*!< Payload types for redundancy data (+ primary at [generations]) */
+	unsigned char ts[AST_RED_MAX_GENERATION + 1]; /*!< Time stamps */
+	unsigned short len[AST_RED_MAX_GENERATION + 1]; /*!< length of each generation (RFC 2198 10-bit block length) */
 	int num_gen; /*!< Number of generations */
 	int schedid; /*!< Timer id */
 	int ti; /*!< How long to buffer data before send */
@@ -1743,12 +1748,25 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 	 *    and on a later nomination while the handshake is still in flight so the ClientHello retransmit follows
 	 *    the moved pair (dtls_perform_handshake is a no-op on the passive side; it re-locks ao2 recursively, safe).
 	 *    Non-USE-CANDIDATE checks are answered (step 6) but never move media (RFC 7675: consent is per the
-	 *    selected 5-tuple and does not update ICE). */
+	 *    selected 5-tuple and does not update ICE).
+	 *    ┌─ DO NOT "HARDEN" THIS WITH PRIORITY PINNING ──────────────────────────────────────────────────┐
+	 *    │ A PRIORITY non-downgrade guard (keep the highest-priority nominated pair, RFC 8445 §8.1.1) was  │
+	 *    │ TRIED 2026-06-29 and BROKE AUDIO on live SIP.js, so it was REVERTED. This browser nominates from │
+	 *    │ several candidate ports and the WORKING (reachable) pair is not necessarily the highest priority;│
+	 *    │ pinning leaves set_remote_address on a non-media port → the passive ServerHello never reaches the│
+	 *    │ browser → DTLS never completes → no audio. RFC 8445 priority selection needs a real valid-list   │
+	 *    │ model we do not have here. KEEP "latest authenticated USE-CANDIDATE wins" (re-latch every        │
+	 *    │ nomination); it is the pragmatic interop rule that gets DTLS/SRTP up.                            │
+	 *    └─────────────────────────────────────────────────────────────────────────────────────────────────┘ */
 	if (has_use_candidate) {
 		int first_nomination = !rtp->ice_complete;
 		ast_sockaddr_copy(&rtp->ice_peer, sa);
 		ast_rtp_instance_set_remote_address(instance, sa);
 		rtp->ice_complete = 1;
+		if (rtpicedebug) {	/* "rtp set debug ice on": each nomination = the (re)selected pair (latest-wins) */
+			char *p = ast_strdupa(ast_sockaddr_stringify(sa));
+			ast_verbose("ICE-DBG nominate inst=%p selected_pair=%s first=%d\n", rtp, p, first_nomination);
+		}
 		if (first_nomination || (rtp->dtls.ssl && !SSL_is_init_finished(rtp->dtls.ssl))) {
 			dtls_perform_handshake(instance, rtp);
 		}
@@ -2850,7 +2868,12 @@ static struct ast_frame *red_t140_to_red(struct rtp_red *red) {
 	/* Store length of each generation and primary data length*/
 	for (i = 0; i < red->num_gen; i++)
 		red->len[i] = red->len[i+1];
-	red->len[i] = red->t140.datalen;
+	/* Promote the just-sent primary to the newest redundant generation. A redundant block's RFC 2198 length
+	 * field is only 10 bits (max 1023); the PRIMARY block has no length field so it may be larger, but it
+	 * cannot be carried as redundancy without wrapping the field mod 1024 and desyncing the receiver. Refuse
+	 * to promote an oversized block (len 0 = no redundancy for it): it still went out as this packet's primary,
+	 * it is simply not protected redundantly afterward. */
+	red->len[i] = (red->t140.datalen > 1023) ? 0 : red->t140.datalen;
 
 	/* Write each generation length into its RED block header as the RFC 2198 10-bit field
 	 * (rfc2198.txt:247): the low 8 bits go in byte 3, the high 2 bits in the low 2 bits of byte 2
@@ -2863,6 +2886,15 @@ static struct ast_frame *red_t140_to_red(struct rtp_red *red) {
 		len += red->len[i];
 	}
 
+	/* Belt-and-suspenders: the rtp_red_buffer cap should already keep len + datalen within t140red_data, but
+	 * guard this output copy directly - drop fail-closed rather than overflow if anything ever diverged
+	 * (len = hdrlen + carried redundancy; data == t140red_data[sizeof]). */
+	if (red->t140.datalen > (int) sizeof(red->t140red_data) - len) {
+		ast_log(LOG_WARNING, "RED T.140: output overflow guard (primary %d at offset %d > %zu); dropping packet\n",
+			red->t140.datalen, len, sizeof(red->t140red_data));
+		red->t140.datalen = 0;
+		return NULL;
+	}
 	/* add primary data to buffer */
 	memcpy(&data[len], red->t140.data.ptr, red->t140.datalen);
 	red->t140red.datalen = len + red->t140.datalen;
@@ -3859,6 +3891,34 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 		return &ast_null_frame;
 	}
 
+#ifdef HAVE_OPENSSL
+	/* WebRTC ICE debug ("rtp set debug ice on"): on the first media packet after ICE completes, show the
+	 * nominated/selected peer vs the ACTUAL media source. This browser sends ICE checks and RTP/DTLS media
+	 * from DIFFERENT source ports (same IP) - cmp!=0 but cmp_addr==0 - which is why an ice_peer-with-port RX
+	 * drop kills audio; the symmetric-RTP block below is what follows media to its real source. LOG ONLY. */
+	if (rtpicedebug && rtp->ice_active && rtp->ice_complete && !rtp->ice_rx_logged) {
+		char *p_peer = ast_strdupa(ast_sockaddr_stringify(&rtp->ice_peer));
+		char *p_addr = ast_strdupa(ast_sockaddr_stringify(&addr));
+		char *p_strict = ast_strdupa(ast_sockaddr_stringify(&rtp->strict_rtp_address));
+		rtp->ice_rx_logged = 1;
+		ast_verbose("ICE-RXDBG inst=%p ice_peer=%s media_src=%s cmp=%d cmp_addr=%d "
+			"peer_v4mapped=%d src_v4mapped=%d dtls_conn=%d strict_state=%d strict_addr=%s\n",
+			rtp, p_peer, p_addr,
+			ast_sockaddr_cmp(&rtp->ice_peer, &addr), ast_sockaddr_cmp_addr(&rtp->ice_peer, &addr),
+			ast_sockaddr_is_ipv4_mapped(&rtp->ice_peer), ast_sockaddr_is_ipv4_mapped(&addr),
+			(int)rtp->dtls.connection, (int)rtp->strict_rtp_state, p_strict);
+	}
+#endif
+
+	/* ┌─ DO NOT ADD AN ICE "SELECTED-PAIR" RX DROP HERE ──────────────────────────────────────────────────┐
+	 * │ A guard like `if (ice_active && ice_complete && ast_sockaddr_cmp(&ice_peer,&addr)) return null;` was │
+	 * │ TRIED 2026-06-29 and DROPPED ALL AUDIO on live SIP.js, so it was REVERTED. Live ICE-RXDBG proved the │
+	 * │ browser sends ICE/DTLS checks and the SRTP MEDIA from DIFFERENT source ports (SAME IP): cmp != 0 but │
+	 * │ cmp_addr == 0. The symmetric-RTP follow BELOW is REQUIRED to move media to its real source; SRTP     │
+	 * │ auth/replay already rejects forged packets. If RX hardening is ever revisited it must be HOST-ONLY   │
+	 * │ (ast_sockaddr_cmp_addr) and log-backed, never host+port — and is probably not worth touching this    │
+	 * │ hot path. Enable "rtp set debug ice on" to see ice_peer vs media_src.                                │
+	 * └─────────────────────────────────────────────────────────────────────────────────────────────────────┘ */
 	/* If symmetric RTP is enabled see if the remote side is not what we expected and change where we are sending audio */
 	if (ast_rtp_instance_get_prop(instance, AST_RTP_PROPERTY_NAT)) {
 		if (ast_sockaddr_cmp(&remote_address, &addr)) {
@@ -4287,6 +4347,14 @@ static int rtp_red_init(struct ast_rtp_instance *instance, int buffer_time, int 
 	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
 	int x;
 
+	/* `generations` indexes pt/ts/len (and the primary at index `generations`); the public engine API
+	 * ast_rtp_red_init can pass an arbitrary value, so bound it to the array capacity (0..MAX inclusive). */
+	if (generations < 1 || generations > AST_RED_MAX_GENERATION) {
+		ast_log(LOG_WARNING, "RED init refused: generations=%d out of range [1..%d]\n",
+			generations, AST_RED_MAX_GENERATION);
+		return -1;
+	}
+
 	if (!(rtp->red = ast_calloc(1, sizeof(*rtp->red)))) {
 		return -1;
 	}
@@ -4321,8 +4389,26 @@ static int rtp_red_buffer(struct ast_rtp_instance *instance, struct ast_frame *f
 {
 	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
 
-	if (frame->datalen > -1) {
+	if (frame->datalen > 0) {
 		struct rtp_red *red = rtp->red;
+		/* Bound the accumulation: t140.datalen only resets after a send (red_t140_to_red), so a burst of
+		 * T.140 faster than the buffer timer would otherwise smash the heap. The accumulated primary must fit
+		 * in BOTH buf_data AND the RED OUTPUT (t140red_data), which also carries the header + up to num_gen
+		 * redundant blocks (each <=1023 by the promote-guard in red_t140_to_red). Cap against the tighter of
+		 * the two so neither memcpy (here, or the primary copy in red_t140_to_red) can overflow.
+		 * (datalen<=0 is also skipped now - a negative datalen would be a huge size_t to memcpy.) */
+		int max_primary = (int) sizeof(red->t140red_data) - red->hdrlen - red->num_gen * 1023;
+		if (max_primary > (int) sizeof(red->buf_data)) {
+			max_primary = (int) sizeof(red->buf_data);
+		}
+		if (max_primary < 0) {
+			max_primary = 0;
+		}
+		if (red->t140.datalen + frame->datalen > max_primary) {
+			ast_log(LOG_WARNING, "RED T.140: buffer full (have %d + %d > cap %d); dropping frame to avoid overflow\n",
+				red->t140.datalen, frame->datalen, max_primary);
+			return 0;
+		}
 		memcpy(&red->buf_data[red->t140.datalen], frame->data.ptr, frame->datalen);
 		red->t140.datalen += frame->datalen;
 		red->t140.ts = frame->ts;
@@ -4560,6 +4646,37 @@ static char *handle_cli_rtp_set_debug(struct ast_cli_entry *e, int cmd, struct a
 	return CLI_SHOWUSAGE;   /* default, failure */
 }
 
+static char *handle_cli_rtp_set_debug_ice(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "rtp set debug ice {on|off}";
+		e->usage =
+			"Usage: rtp set debug ice {on|off}\n"
+			"       Enable/Disable WebRTC ICE/DTLS debugging. Logs each ICE nomination\n"
+			"       (the (re)selected candidate pair, latest-wins) and, on the first media\n"
+			"       packet after ICE completes, the nominated peer vs the actual media\n"
+			"       source (they legitimately differ by port for some browsers).\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	if (a->argc == e->args) {
+		if (!strncasecmp(a->argv[e->args-1], "on", 2)) {
+			rtpicedebug = 1;
+			ast_cli(a->fd, "WebRTC ICE Debugging Enabled\n");
+			return CLI_SUCCESS;
+		} else if (!strncasecmp(a->argv[e->args-1], "off", 3)) {
+			rtpicedebug = 0;
+			ast_cli(a->fd, "WebRTC ICE Debugging Disabled\n");
+			return CLI_SUCCESS;
+		}
+	}
+
+	return CLI_SHOWUSAGE;
+}
+
 static char *handle_cli_rtcp_set_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
 	switch (cmd) {
@@ -4622,6 +4739,7 @@ static char *handle_cli_rtcp_set_stats(struct ast_cli_entry *e, int cmd, struct 
 
 static struct ast_cli_entry cli_rtp[] = {
 	AST_CLI_DEFINE(handle_cli_rtp_set_debug,  "Enable/Disable RTP debugging"),
+	AST_CLI_DEFINE(handle_cli_rtp_set_debug_ice,  "Enable/Disable WebRTC ICE/DTLS debugging"),
 	AST_CLI_DEFINE(handle_cli_rtcp_set_debug, "Enable/Disable RTCP debugging"),
 	AST_CLI_DEFINE(handle_cli_rtcp_set_stats, "Enable/Disable RTCP stats"),
 };
