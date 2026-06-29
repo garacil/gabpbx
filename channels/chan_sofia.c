@@ -257,6 +257,51 @@ struct sofia_config sofia_cfg;
 int sofia_debug;
 char sofia_debug_filter[64];
 int sofia_debug_match(const char *peer_name, const char *src_ip);
+
+/* Transaction tag for the chan_sofia debug log: every "Sofia: ..." verbose line is prefixed with
+ * [from-user|to-user|callid-last8] (like gabpbx's [channel|uniqueid]) so each line is attributable to a
+ * SIP transaction instead of interleaving anonymously with other calls. Set from the event's sip in
+ * sofia_event_callback and from the pvt on the outbound path; thread-local, empty when unavailable. */
+static __thread char sofia_logctx_buf[160];
+static const char *sofia_logctx(void)
+{
+	return sofia_logctx_buf;
+}
+static void sofia_logctx_set(const char *from, const char *to, const char *callid)
+{
+	char cid[12] = "-";
+	if (ast_strlen_zero(from) && ast_strlen_zero(to) && ast_strlen_zero(callid)) {
+		sofia_logctx_buf[0] = '\0';
+		return;
+	}
+	if (!ast_strlen_zero(callid)) {
+		/* The unique token of a Call-ID is its local part (before '@'); take up to its first 8 chars
+		 * (the trailing '@host' is not discriminating). */
+		const char *at = strchr(callid, '@');
+		int local = at ? (int)(at - callid) : (int)strlen(callid);
+		snprintf(cid, sizeof(cid), "%.*s", local > 8 ? 8 : local, callid);
+	}
+	snprintf(sofia_logctx_buf, sizeof(sofia_logctx_buf), " [%s|%s|%s]",
+		S_OR(from, "-"), S_OR(to, "-"), cid);
+}
+static void sofia_logctx_set_sip(sip_t const *sip)
+{
+	sofia_logctx_set(
+		(sip && sip->sip_from && sip->sip_from->a_url) ? sip->sip_from->a_url->url_user : NULL,
+		(sip && sip->sip_to && sip->sip_to->a_url) ? sip->sip_to->a_url->url_user : NULL,
+		(sip && sip->sip_call_id) ? sip->sip_call_id->i_id : NULL);
+}
+static void sofia_logctx_set_pvt(struct sofia_pvt *pvt)
+{
+	if (pvt) {
+		sofia_logctx_set(pvt->fromuser, pvt->exten, pvt->callid);
+	} else {
+		sofia_logctx_set(NULL, NULL, NULL);
+	}
+}
+/* Prefix-tagged verbose for chan_sofia. Replaces sofia_vrb("...") so every line carries the
+ * current [from|to|callid] context (sofia_logctx). fmt must be a string literal. */
+#define sofia_vrb(fmt, ...) ast_verbose("Sofia%s: " fmt, sofia_logctx(), ##__VA_ARGS__)
 /* Set when the respective [general] key is parsed; consumed at config end for
  * the Timer B vs T1*64 cross-validation. */
 static int sofia_timerb_set;
@@ -1189,7 +1234,7 @@ static int sofia_contact_rebind(struct sofia_peer *peer, struct sofia_contact *c
 		return -1;
 	}
 	if (sofia_debug) {
-		ast_verbose("Sofia: Rebound contact for peer '%s' -> %s (same device, renewed flow)\n",
+		sofia_vrb("Rebound contact for peer '%s' -> %s (same device, renewed flow)\n",
 			peer->name, new_uri);
 	}
 	return 0;
@@ -1595,7 +1640,7 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 		ast_channel_unref(m_owner);
 	}
 
-	ast_verbose("Sofia: Fork winner picked - branch %s for peer '%s' (%s)\n",
+	sofia_vrb("Fork winner picked - branch %s for peer '%s' (%s)\n",
 		child->fork_branch_id, master->peername, fork->fork_id);
 
 	/* Release the master lifetime ref taken under fork->lock above. */
@@ -2624,7 +2669,7 @@ static void sofia_on_dns_update_peer(struct ast_sockaddr *old, struct ast_sockad
 	ast_mutex_unlock(&peer->lock);
 	sofia_peer_ipport_reindex(peer);	/* B: re-key on the freshly resolved address (peer->lock released) */
 
-	ast_verbose("Sofia: dnsmgr — peer '%s' resolved %s -> %s\n",
+	sofia_vrb("dnsmgr — peer '%s' resolved %s -> %s\n",
 		peer->name, old_buf, new_buf);
 
 	manager_event(EVENT_FLAG_SYSTEM, "DnsManagerUpdate",
@@ -4041,7 +4086,7 @@ static struct sofia_peer *sofia_find_peer_impl(const char *name, struct ast_vari
 	found = built;
 	built_realtime = 1;	/* fresh link: create the hint below, after the peers lock is dropped */
 	if (sofia_debug) {
-		ast_verbose("Sofia: Peer '%s' found via realtime\n", name);
+		sofia_vrb("Peer '%s' found via realtime\n", name);
 	}
 
 	/* Side effects run LINK-FIRST (mirrors the config path ~:14590-14625): only after a
@@ -4362,7 +4407,7 @@ static struct sofia_peer *sofia_find_peer_realtime_by_addr(const struct ast_sock
 	}
 	ast_copy_string(namebuf, name, sizeof(namebuf));
 	if (sofia_debug) {
-		ast_verbose("Sofia: realtime IP-trunk '%s' matched by %s (source %s:%s) — building from the by-IP row\n",
+		sofia_vrb("realtime IP-trunk '%s' matched by %s (source %s:%s) — building from the by-IP row\n",
 			namebuf, step ? step : "?", ipbuf, portbuf);
 	}
 
@@ -4553,7 +4598,7 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 		TAG_IF(!ast_strlen_zero(pvt->outbound_proxy), NUTAG_PROXY(pvt->outbound_proxy)),	/* NAT: re-INVITE to the learned public source (operation-level) */
 		TAG_IF(have_gruu, SIPTAG_CONTACT_STR(gruu_contact)),
 		TAG_END());
-	ast_verbose("Sofia: directmedia re-INVITE sent on '%s' -> %s:%d\n",
+	sofia_vrb("directmedia re-INVITE sent on '%s' -> %s:%d\n",
 		pvt->callid ? pvt->callid : "(no-callid)",
 		ast_sockaddr_stringify_host(&pvt->redirip),
 		ast_sockaddr_port(&pvt->redirip));
@@ -4816,6 +4861,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		ast_log(LOG_ERROR, "Sofia call: no pvt\n");
 		return -1;
 	}
+	sofia_logctx_set_pvt(pvt);	/* tag this outbound leg's "Sofia: ..." lines with [from|to|callid] */
 
 	/* SIP history: apply the capture filter (source = our caller-id number, destination = dial string). */
 	pvt->do_history = sofia_history_should_record(S_OR(ast->caller.id.number.str, ""), S_OR(dest, ""));
@@ -4857,7 +4903,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		}
 		ao2_iterator_destroy(&ci);
 		if (any_busy) {
-			ast_verbose("Sofia: busy_on_active — peer '%s' has active call(s), rejecting new call\n",
+			sofia_vrb("busy_on_active — peer '%s' has active call(s), rejecting new call\n",
 				pvt->peer->name);
 			ast_queue_control(ast, AST_CONTROL_BUSY);
 			return 0;
@@ -5132,7 +5178,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				}
 
 				if (sofia_debug)
-					ast_verbose("Sofia: Fork child %d -> %s (branch=%s)\n",
+					sofia_vrb("Fork child %d -> %s (branch=%s)\n",
 						branch_idx, ruri, child->fork_branch_id);
 
 				ao2_ref(child, -1);
@@ -5161,7 +5207,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 			}
 			ast_mutex_unlock(&pvt->lock);
 			if (sofia_debug)
-				ast_verbose("Sofia: Forking %d INVITEs to peer '%s' (%s)\n",
+				sofia_vrb("Forking %d INVITEs to peer '%s' (%s)\n",
 					branch_idx, pvt->peername, fork->fork_id);
 
 			return 0;
@@ -5287,7 +5333,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		}
 
 		if (sofia_debug) {
-			ast_verbose("Sofia: outbound INVITE headers to '%s' from=[%s] contact=[%s] addhdr=[%s] rpid=[%s] diversion=[%s]\n",
+			sofia_vrb("outbound INVITE headers to '%s' from=[%s] contact=[%s] addhdr=[%s] rpid=[%s] diversion=[%s]\n",
 				pvt->peer ? pvt->peer->name : "(none)",
 				from_buf, contact_buf,
 				has_addheaders ? addheader_buf : "",
@@ -5359,7 +5405,7 @@ static int sofia_send_text(struct ast_channel *ast, const char *text)
 	}
 
 	if (sofia_debug) {
-		ast_verbose("Sofia: outbound MESSAGE on %s: '%s'\n", ast->name, text);
+		sofia_vrb("outbound MESSAGE on %s: '%s'\n", ast->name, text);
 	}
 
 	nua_message(pvt->nh,
@@ -5430,7 +5476,7 @@ static int sofia_hangup(struct ast_channel *ast)
 		if (!picked) {
 			ao2_callback(fork->children, OBJ_UNLINK | OBJ_MULTIPLE | OBJ_NODATA,
 				sofia_fork_cancel_all_cb, have_reason ? reason_buf : NULL);
-			ast_verbose("Sofia: Fork master hangup — cancelled all children (%s)\n",
+			sofia_vrb("Fork master hangup — cancelled all children (%s)\n",
 				fork->fork_id);
 		}
 		/* Post-winner: master stole winner's nh, fall through to nua_bye below. */
@@ -6142,8 +6188,9 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 				}
 			}
 			ast_string_field_set(pvt, ruri, url);
+			sofia_logctx_set_pvt(pvt);
 			if (sofia_debug) {
-				ast_verbose("Sofia: Outbound call to peer %s, RURI=%s%s%s\n",
+				sofia_vrb("Outbound call to peer %s, RURI=%s%s%s\n",
 					peername, url,
 					route_buf[0] ? ", Route=" : "",
 					route_buf[0] ? route_buf : "");
@@ -6355,7 +6402,7 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	}
 
 	if (trans) {
-		ast_verbose("Sofia: in-dialog re-INVITE on '%s' - hold=%d\n",
+		sofia_vrb("in-dialog re-INVITE on '%s' - hold=%d\n",
 			pvt->callid ? pvt->callid : "(no-callid)", new_hold);
 		if (owner) {
 			manager_event(EVENT_FLAG_CALL, "Hold",
@@ -6564,7 +6611,7 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 	}
 
 	if (trans) {
-		ast_verbose("Sofia: in-dialog UPDATE on '%s' - hold=%d\n",
+		sofia_vrb("in-dialog UPDATE on '%s' - hold=%d\n",
 			pvt->callid ? pvt->callid : "(no-callid)", new_hold);
 		if (owner) {
 			manager_event(EVENT_FLAG_CALL, "Hold",
@@ -6764,7 +6811,7 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			 * lookup below identifies the real sender (chan_sip matches peers by IP, users by name). */
 			if (caller_peer && !(caller_peer->type & SOFIA_TYPE_USER)) {
 				if (sofia_debug) {
-					ast_verbose("Sofia: INVITE From-user '%s' matched a type=peer (not a user); discarding for source-IP match\n",
+					sofia_vrb("INVITE From-user '%s' matched a type=peer (not a user); discarding for source-IP match\n",
 						cid_num);
 				}
 				ao2_ref(caller_peer, -1);
@@ -6866,7 +6913,7 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			/* Cosmetic bypass trace (debug-gated); AMI InsecureInviteBypass below
 			 * is the auditable surface. */
 			if (sofia_debug_match(pvt->peer->name, addr_buf)) {
-				ast_verbose("Sofia: INVITE auth bypassed per insecure=invite "
+				sofia_vrb("INVITE auth bypassed per insecure=invite "
 					"for peer '%s' from %s\n",
 					pvt->peer->name, addr_buf);
 			}
@@ -6889,7 +6936,7 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 				&& ast_strlen_zero(pvt->peer->secret)
 				&& ast_strlen_zero(pvt->peer->md5secret)) {
 			if (sofia_debug) {
-				ast_verbose("Sofia: INVITE from peer '%s' accepted without auth — "
+				sofia_vrb("INVITE from peer '%s' accepted without auth — "
 					"no secret/md5secret configured\n", pvt->peer->name);
 			}
 			auth_required = 0;
@@ -7031,7 +7078,7 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			ast_sockaddr_set_port(&src, rtp_port);
 			ast_rtp_instance_set_remote_address(pvt->rtp, &src);
 			if (sofia_debug)
-				ast_verbose("Sofia: comedia - RTP remote set to %s\n",
+				sofia_vrb("comedia - RTP remote set to %s\n",
 					ast_sockaddr_stringify(&src));
 		}
 	}
@@ -7617,7 +7664,7 @@ void sofia_get_source_addr(sip_t const *sip, struct ast_sockaddr *addr)
 		}
 		ast_sockaddr_parse(addr, addr_str, 0);
 		if (sofia_debug)
-			ast_verbose("Sofia: source addr (via received): %s\n", addr_str);
+			sofia_vrb("source addr (via received): %s\n", addr_str);
 	} else {
 		const char *host = via->v_host;
 		const char *port = via->v_rport ? via->v_rport : via->v_port;
@@ -7632,7 +7679,7 @@ void sofia_get_source_addr(sip_t const *sip, struct ast_sockaddr *addr)
 		}
 		ast_sockaddr_parse(addr, addr_str, 0);
 		if (sofia_debug)
-			ast_verbose("Sofia: source addr (via host): %s\n", addr_str);
+			sofia_vrb("source addr (via host): %s\n", addr_str);
 	}
 }
 
@@ -7678,7 +7725,7 @@ static int sofia_expire_contacts_cb(void *obj, void *arg, int flags)
 		return 0;
 	}
 	if (c->expires > 0 && c->expires < *now) {
-		ast_verbose("Sofia: Expiring contact %s\n", c->contact_uri);
+		sofia_vrb("Expiring contact %s\n", c->contact_uri);
 		return CMP_MATCH;
 	}
 	return 0;
@@ -7857,7 +7904,7 @@ static void sofia_regflow_attach(struct sofia_peer *peer, struct sofia_contact *
 	ao2_ref(e, -1);					/* the container holds the ref */
 	c->reg_nh = nh;					/* publish ONLY after a successful link */
 	if (sofia_debug) {
-		ast_verbose("Sofia: flow-watch attached nh=%p to contact %s\n", (void *) nh, c->contact_uri);
+		sofia_vrb("flow-watch attached nh=%p to contact %s\n", (void *) nh, c->contact_uri);
 	}
 }
 
@@ -8031,7 +8078,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				}
 				ao2_unlink(peer->contacts, c);	/* by OBJECT: a rotated de-register's matched key differs from `uri` */
 				if (sofia_debug)
-					ast_verbose("Sofia: Unlinked contact %s\n", c->contact_uri);
+					sofia_vrb("Unlinked contact %s\n", c->contact_uri);
 				ao2_ref(c, -1);
 			}
 		}
@@ -8114,7 +8161,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				sofia_regflow_attach(peer, c, nh, reg_transport, single_contact);
 				ao2_ref(c, -1);
 				if (sofia_debug)
-					ast_verbose("Sofia: Refreshed contact %s (expires in %ds)\n", uri, expires);
+					sofia_vrb("Refreshed contact %s (expires in %ds)\n", uri, expires);
 			} else {
 				/* Same device that rotated its source port / Contact URI (NAT)? Rebind the existing binding
 				 * instead of accumulating a duplicate. Key priority: RFC 5626 +sip.instance(+reg-id); else a
@@ -8222,7 +8269,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 					if (oldest) {
 						/* Cosmetic eviction trace, gated by `sip set debug`. */
 						if (sofia_debug_match(peer->name, NULL)) {
-							ast_verbose("Sofia: peer '%s' at max_contacts=%d \xe2\x80\x94 evicting oldest contact %s\n",
+							sofia_vrb("peer '%s' at max_contacts=%d \xe2\x80\x94 evicting oldest contact %s\n",
 								peer->name, peer->max_contacts, oldest->contact_uri);
 						}
 						if (update) {
@@ -8238,7 +8285,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				sofia_regflow_attach(peer, c, nh, reg_transport, single_contact);
 				ao2_ref(c, -1);
 				if (sofia_debug)
-					ast_verbose("Sofia: New contact %s for peer '%s'\n", uri, peer->name);
+					sofia_vrb("New contact %s for peer '%s'\n", uri, peer->name);
 			}
 		}
 	}
@@ -8869,7 +8916,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		if (sofia_debug) {
 			int want_md5, want_sha256;
 			sofia_auth_offered(&want_md5, &want_sha256);
-			ast_verbose("Sofia: Challenging %s from '%s' (nonce=%s, algorithms=%s)\n",
+			sofia_vrb("Challenging %s from '%s' (nonce=%s, algorithms=%s)\n",
 				method, peer->name, nonce,
 				(want_md5 && want_sha256) ? "MD5+SHA-256" : (want_sha256 ? "SHA-256" : "MD5"));
 		}
@@ -8897,7 +8944,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 			if (!strcasecmp(auth_algorithm, "MD5")) {
 				if (!want_md5) {
 					nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
-					ast_verbose("Sofia: %s auth rejected for '%s' - MD5 not offered (auth_algorithms)\n",
+					sofia_vrb("%s auth rejected for '%s' - MD5 not offered (auth_algorithms)\n",
 						method, peer->name);
 					sofia_blacklist_add_sip(sip, "digest algorithm not offered");
 					return SOFIA_AUTH_REJECT;
@@ -8906,7 +8953,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 			} else if (!strcasecmp(auth_algorithm, "SHA-256")) {
 				if (!want_sha256) {
 					nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
-					ast_verbose("Sofia: %s auth rejected for '%s' - SHA-256 not offered (auth_algorithms)\n",
+					sofia_vrb("%s auth rejected for '%s' - SHA-256 not offered (auth_algorithms)\n",
 						method, peer->name);
 					sofia_blacklist_add_sip(sip, "digest algorithm not offered");
 					return SOFIA_AUTH_REJECT;
@@ -8914,14 +8961,14 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 				algorithm = SOFIA_DIGEST_SHA256;
 			} else {
 				nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
-				ast_verbose("Sofia: %s auth rejected for '%s' - unknown algorithm '%s'\n",
+				sofia_vrb("%s auth rejected for '%s' - unknown algorithm '%s'\n",
 					method, peer->name, auth_algorithm);
 				sofia_blacklist_add_sip(sip, "digest unknown algorithm");
 				return SOFIA_AUTH_REJECT;
 			}
 		} else if (!want_md5) {
 			nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
-			ast_verbose("Sofia: %s auth rejected for '%s' - algorithm= required (MD5 not offered)\n",
+			sofia_vrb("%s auth rejected for '%s' - algorithm= required (MD5 not offered)\n",
 				method, peer->name);
 			sofia_blacklist_add_sip(sip, "digest algorithm required");
 			return SOFIA_AUTH_REJECT;
@@ -8932,7 +8979,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	/* uri= required (RFC 2617 §3.2.2). */
 	if (!auth_uri) {
 		nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
-		ast_verbose("Sofia: %s auth rejected for '%s' - uri= missing\n",
+		sofia_vrb("%s auth rejected for '%s' - uri= missing\n",
 			method, peer->name);
 		sofia_blacklist_add_sip(sip, "digest missing uri");
 		return SOFIA_AUTH_REJECT;
@@ -8958,7 +9005,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 			}
 			su_home_deinit(rhome);
 			nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
-			ast_verbose("Sofia: %s auth rejected for '%s' - digest uri='%s' does not match Request-URI '%s'\n",
+			sofia_vrb("%s auth rejected for '%s' - digest uri='%s' does not match Request-URI '%s'\n",
 				method, peer->name, auth_uri, ruri_str);
 			sofia_blacklist_add_sip(sip, "digest uri mismatch");
 			return SOFIA_AUTH_REJECT;
@@ -8972,7 +9019,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		/* Fresh stateless nonce (no peer nonce state to clobber). */
 		sofia_make_auth_nonce(peer->name, realm, method, chal_nonce, sizeof(chal_nonce));
 		sofia_emit_auth_challenge(nua, nh, realm, chal_nonce, 1);
-		ast_verbose("Sofia: %s auth realm mismatch for '%s' - expected '%s' got '%s'\n",
+		sofia_vrb("%s auth realm mismatch for '%s' - expected '%s' got '%s'\n",
 			method, peer->name, realm, auth_realm ? auth_realm : "(none)");
 		return SOFIA_AUTH_CHALLENGE;
 	}
@@ -8985,7 +9032,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	 * would misread as "no qop"). MISSING qop is still accepted (RFC 2069 compat). */
 	if (au && msg_header_find_param(au->au_common, "qop") && !using_qop) {
 		nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
-		ast_verbose("Sofia: %s auth rejected for '%s' - unsupported/oversized qop (only qop=auth is offered)\n",
+		sofia_vrb("%s auth rejected for '%s' - unsupported/oversized qop (only qop=auth is offered)\n",
 			method, peer->name);
 		sofia_blacklist_add_sip(sip, "digest unsupported qop");
 		return SOFIA_AUTH_REJECT;
@@ -8994,7 +9041,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	/* RFC 2617 §3.2.2: qop present requires nc + cnonce. */
 	if (auth_qop && (!auth_nc || !auth_cnonce)) {
 		nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
-		ast_verbose("Sofia: %s auth rejected for '%s' - qop without nc/cnonce\n",
+		sofia_vrb("%s auth rejected for '%s' - qop without nc/cnonce\n",
 			method, peer->name);
 		sofia_blacklist_add_sip(sip, "digest malformed qop");
 		return SOFIA_AUTH_REJECT;
@@ -9007,7 +9054,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		 * peer->last_nc (self-replay-DoS until nonce rotates). */
 		if (strlen(auth_nc) != 8 || strspn(auth_nc, "0123456789abcdefABCDEF") != 8) {
 			nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
-			ast_verbose("Sofia: %s auth rejected for '%s' - nc not 8 hex digits: %s\n",
+			sofia_vrb("%s auth rejected for '%s' - nc not 8 hex digits: %s\n",
 				method, peer->name, auth_nc);
 			sofia_blacklist_add_sip(sip, "digest malformed nc");
 			return SOFIA_AUTH_REJECT;
@@ -9015,7 +9062,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		new_nc = (unsigned int)strtoul(auth_nc, &endptr, 16);
 		if (!endptr || endptr == auth_nc || *endptr != '\0' || new_nc == 0) {
 			nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
-			ast_verbose("Sofia: %s auth rejected for '%s' - malformed nc=%s\n",
+			sofia_vrb("%s auth rejected for '%s' - malformed nc=%s\n",
 				method, peer->name, auth_nc);
 			sofia_blacklist_add_sip(sip, "digest malformed nc");
 			return SOFIA_AUTH_REJECT;
@@ -9031,7 +9078,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 			sofia_make_auth_nonce(peer->name, realm, method, fresh, sizeof(fresh));
 			sofia_emit_auth_challenge(nua, nh, realm, fresh, 1);
 			if (sofia_debug) {
-				ast_verbose("Sofia: %s auth for '%s' - %s nonce; re-challenged\n",
+				sofia_vrb("%s auth for '%s' - %s nonce; re-challenged\n",
 					method, peer->name, nv < 0 ? "invalid" : "expired");
 			}
 			return SOFIA_AUTH_CHALLENGE;
@@ -9056,11 +9103,11 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 			ast_mutex_unlock(&peer->lock);
 			if (missing) {
 				nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
-				ast_verbose("Sofia: %s auth rejected for '%s' - username= missing\n", method, snap_name);
+				sofia_vrb("%s auth rejected for '%s' - username= missing\n", method, snap_name);
 				sofia_blacklist_add_sip(sip, "digest missing username");
 			} else {
 				nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
-				ast_verbose("Sofia: %s auth rejected for '%s' - username '%s' != configured '%s'\n",
+				sofia_vrb("%s auth rejected for '%s' - username '%s' != configured '%s'\n",
 					method, snap_name, auth_username, snap_exp);
 				sofia_blacklist_add_sip(sip, "digest username mismatch");
 			}
@@ -9094,7 +9141,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 			nua_respond(nh, SIP_401_UNAUTHORIZED,
 				SIPTAG_WWW_AUTHENTICATE_STR(hdr_md5),
 				NUTAG_WITH_THIS(nua), TAG_END());
-			ast_verbose("Sofia: %s for md5secret peer '%s' requested SHA-256 — re-challenging MD5-only\n",
+			sofia_vrb("%s for md5secret peer '%s' requested SHA-256 — re-challenging MD5-only\n",
 				method, pname);
 			return SOFIA_AUTH_CHALLENGE;
 		}
@@ -9117,7 +9164,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		/* OOM building HA1/HA2 → 500; never compare against a partial hash. */
 		ast_mutex_unlock(&peer->lock);
 		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
-		ast_verbose("Sofia: %s auth digest-compute failed (OOM) for '%s' — rejecting\n",
+		sofia_vrb("%s auth digest-compute failed (OOM) for '%s' — rejecting\n",
 			method, peer->name);
 		return SOFIA_AUTH_REJECT;
 	}
@@ -9126,7 +9173,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	if (!auth_response || sofia_ct_memcmp(auth_response, expected_hash, hash_len_hex) != 0) {
 		ast_mutex_unlock(&peer->lock);
 		nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
-		ast_verbose("Sofia: %s auth failed for '%s' - bad response\n",
+		sofia_vrb("%s auth failed for '%s' - bad response\n",
 			method, peer->name);
 		sofia_blacklist_add_sip(sip, "digest bad response");
 		return SOFIA_AUTH_REJECT;
@@ -9146,7 +9193,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 			sofia_make_auth_nonce(peer->name, realm, method, fresh_nonce, sizeof(fresh_nonce));
 			sofia_emit_auth_challenge(nua, nh, realm, fresh_nonce, 1);
 			if (sofia_debug) {
-				ast_verbose("Sofia: %s auth for '%s' - valid but nc replay on this nonce; re-challenged\n",
+				sofia_vrb("%s auth for '%s' - valid but nc replay on this nonce; re-challenged\n",
 					method, peer->name);
 			}
 			return SOFIA_AUTH_CHALLENGE;
@@ -9692,7 +9739,7 @@ static int sofia_check_lockuseragent(nua_t *nua, nua_handle_t *nh,
 				ast_copy_string(peer->locked_user_agent, current_ua,
 					sizeof(peer->locked_user_agent));
 				ast_mutex_unlock(&peer->lock);
-				ast_verbose("Sofia: lockuseragent captured \"%s\" for peer '%s'\n",
+				sofia_vrb("lockuseragent captured \"%s\" for peer '%s'\n",
 					current_ua, peer->name);
 			}
 			return 0;
@@ -10005,7 +10052,7 @@ static void sofia_respond_register_query(nua_t *nua, nua_handle_t *nh, struct so
 	}
 	ast_free(contacts);
 	if (sofia_debug) {
-		ast_verbose("Sofia: REGISTER query (no Contact) for peer '%s' — returned current bindings\n",
+		sofia_vrb("REGISTER query (no Contact) for peer '%s' — returned current bindings\n",
 			peer->name);
 	}
 }
@@ -10073,7 +10120,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 	 * contact store so ws/wss WebSocket registrations are not mis-stored as udp from a synthetic Contact. */
 	sofia_incoming_transport(nua, real_transport, sizeof(real_transport));
 	if (sofia_debug) {
-		ast_verbose("Sofia: REGISTER incoming transport (real tport): '%s'\n",
+		sofia_vrb("REGISTER incoming transport (real tport): '%s'\n",
 			ast_strlen_zero(real_transport) ? "(unknown - fallback to Via/Contact)" : real_transport);
 	}
 	realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
@@ -10082,7 +10129,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 	domain = sip->sip_from->a_url->url_host;
 
 	if (sofia_debug) {
-		ast_verbose("Sofia: REGISTER from %s@%s\n",
+		sofia_vrb("REGISTER from %s@%s\n",
 			user ? user : "(null)", domain ? domain : "(null)");
 	}
 
@@ -10106,10 +10153,10 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		if (sofia_cfg.alwaysauthreject) {
 			/* REGISTER: no pvt pin / no reap — unaffected by the residual-race fence. */
 			sofia_send_auth_challenge(nua, nh, sip, realm, "REGISTER", "UnknownPeer", NULL, 0);
-			ast_verbose("Sofia: REGISTER from unknown peer '%s' — 401 challenge (alwaysauthreject)\n", user);
+			sofia_vrb("REGISTER from unknown peer '%s' — 401 challenge (alwaysauthreject)\n", user);
 		} else {
 			nua_respond(nh, SIP_403_FORBIDDEN, TAG_END());
-			ast_verbose("Sofia: Registration rejected for unknown peer '%s'\n", user);
+			sofia_vrb("Registration rejected for unknown peer '%s'\n", user);
 		}
 		sofia_log_register_outcome("REJECT (unknown peer)", user, sip);
 		sofia_blacklist_add_sip(sip, "REGISTER unknown peer");
@@ -10195,7 +10242,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			return;
 		}
 		if (rc < 0) {
-			ast_verbose("Sofia: REGISTER from peer '%s' rejected with 403 \xe2\x80\x94 too many registered devices (limit=%d)\n",
+			sofia_vrb("REGISTER from peer '%s' rejected with 403 \xe2\x80\x94 too many registered devices (limit=%d)\n",
 				peer->name, peer->max_contacts);
 			sofia_log_register_outcome("REJECT (max contacts)", peer->name, sip);
 			nua_respond(nh, SIP_403_FORBIDDEN,
@@ -10296,7 +10343,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 				return;
 			}
 			if (rc < 0) {
-				ast_verbose("Sofia: REGISTER from peer '%s' rejected with 403 \xe2\x80\x94 too many registered devices (limit=%d)\n",
+				sofia_vrb("REGISTER from peer '%s' rejected with 403 \xe2\x80\x94 too many registered devices (limit=%d)\n",
 					peer->name, peer->max_contacts);
 				sofia_log_register_outcome("REJECT (max contacts)", peer->name, sip);
 				nua_respond(nh, SIP_403_FORBIDDEN,
@@ -11424,7 +11471,7 @@ static void transmit_mwi_notify_for_peer(struct sofia_peer *peer)
 		SIPTAG_PAYLOAD_STR(ast_str_buffer(body)),
 		TAG_END());
 	if (sofia_debug) {
-		ast_verbose("Sofia MWI: solicited NOTIFY for peer '%s' (new=%d old=%d)\n",
+		sofia_vrb("MWI: solicited NOTIFY for peer '%s' (new=%d old=%d)\n",
 			peer->name, total_new, total_old);
 	}
 	ast_free(body);
@@ -11483,7 +11530,7 @@ static void transmit_unsolicited_mwi_for_peer(struct sofia_peer *peer)
 			SIPTAG_PAYLOAD_STR(ast_str_buffer(body)),
 			TAG_END());
 		if (sofia_debug) {
-			ast_verbose("Sofia MWI: unsolicited NOTIFY for peer '%s' -> %s (new=%d old=%d)\n",
+			sofia_vrb("MWI: unsolicited NOTIFY for peer '%s' -> %s (new=%d old=%d)\n",
 				peer->name, target, total_new, total_old);
 		}
 	}
@@ -11652,7 +11699,7 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 	if (old_nh == nh) {
 		transmit_mwi_notify_for_peer(peer);
 		if (sofia_debug) {
-			ast_verbose("Sofia MWI: SUBSCRIBE refresh for peer '%s'\n", peer->name);
+			sofia_vrb("MWI: SUBSCRIBE refresh for peer '%s'\n", peer->name);
 		}
 		ao2_ref(peer, -1);
 		return;
@@ -11673,7 +11720,7 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 	transmit_mwi_notify_for_peer(peer);
 
 	if (sofia_debug) {
-		ast_verbose("Sofia MWI: SUBSCRIBE accepted for peer '%s'\n", peer->name);
+		sofia_vrb("MWI: SUBSCRIBE accepted for peer '%s'\n", peer->name);
 	}
 
 	ao2_ref(peer, -1);
@@ -11861,7 +11908,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	 * floods the log on every such SUBSCRIBE. Visible with `sip set debug on`. */
 	if (!ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, l_context, to_user)) {
 		if (sofia_debug) {
-			ast_verbose("Sofia presence: no hint for %s@%s (watcher SIP/%s) — 404\n",
+			sofia_vrb("presence: no hint for %s@%s (watcher SIP/%s) — 404\n",
 				to_user, l_context, l_peername);
 		}
 		nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
@@ -11898,7 +11945,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 			TAG_END());
 		sofia_subscribe_reject_reap(nh);	/* reap the challenge handle (MWI discipline) */
 		if (sofia_debug) {
-			ast_verbose("Sofia presence: SUBSCRIBE Expires:%d below min %d — 423 Interval Too Brief "
+			sofia_vrb("presence: SUBSCRIBE Expires:%d below min %d — 423 Interval Too Brief "
 				"(watcher SIP/%s -> %s@%s)\n",
 				expires, sofia_cfg.min_expiry, l_peername, to_user, l_context);
 		}
@@ -11937,7 +11984,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 				sofia_subscribe_reject_reap(nh);
 			}
 			if (sofia_debug) {
-				ast_verbose("Sofia presence: UNSUBSCRIBE — watcher SIP/%s -> %s@%s\n",
+				sofia_vrb("presence: UNSUBSCRIBE — watcher SIP/%s -> %s@%s\n",
 					l_peername, to_user, l_context);
 			}
 			return;
@@ -12059,7 +12106,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	ao2_ref(sub, -1);	/* drop creation ref; container + registration hold it */
 
 	if (sofia_debug) {
-		ast_verbose("Sofia presence: SUBSCRIBE accepted — watcher SIP/%s -> %s@%s (%s)\n",
+		sofia_vrb("presence: SUBSCRIBE accepted — watcher SIP/%s -> %s@%s (%s)\n",
 			l_peername, sub->exten, sub->context, sofia_presence_mime(sub->format));
 	}
 }
@@ -12119,7 +12166,7 @@ static void sofia_process_notify(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		sip_t const *sip, tagi_t tags[])
 {
 	if (sofia_debug)
-		ast_verbose("Sofia: Received NOTIFY\n");
+		sofia_vrb("Received NOTIFY\n");
 
 	/* Outbound MWI SUBSCRIBE (a watcher): a message-summary NOTIFY on one of OUR SUBSCRIBE
 	 * dialogs. Checked FIRST (before the transfer hook and presence/MWI dispatch). The check
@@ -12228,7 +12275,7 @@ struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op)
 	ast_channel_unlock(self);
 	if (bridged) {
 		if (sofia_debug) {
-			ast_verbose("Sofia: bridged-finder method 1 (_bridge): %s\n", bridged->name);
+			sofia_vrb("bridged-finder method 1 (_bridge): %s\n", bridged->name);
 		}
 		ast_channel_unref(self);
 		return bridged;
@@ -12241,7 +12288,7 @@ struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op)
 		bridged = ast_channel_get_by_name_prefix(bridgepeer_copy, strlen(bridgepeer_copy));
 		if (bridged) {
 			if (sofia_debug) {
-				ast_verbose("Sofia: bridged-finder method 2 (BRIDGEPEER=%s): %s\n",
+				sofia_vrb("bridged-finder method 2 (BRIDGEPEER=%s): %s\n",
 					bridgepeer_copy, bridged->name);
 			}
 			ast_channel_unref(self);
@@ -12268,7 +12315,7 @@ struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op)
 			ao2_ref(p, -1);
 			if (bridged) {
 				if (sofia_debug) {
-					ast_verbose("Sofia: bridged-finder method 3 (linkedid=%s): %s\n",
+					sofia_vrb("bridged-finder method 3 (linkedid=%s): %s\n",
 						linkedid_copy, bridged->name);
 				}
 				break;
@@ -12691,7 +12738,7 @@ static int sofia_local_attended_transfer(struct sofia_pvt *transferer, const str
 	}
 
 	if (sofia_debug) {
-		ast_verbose("Sofia: attended transfer local bridge %s <-> %s using Replaces %s\n",
+		sofia_vrb("attended transfer local bridge %s <-> %s using Replaces %s\n",
 			transferee_chan->name, target_peer_chan->name, replaces->callid);
 	}
 
@@ -12831,7 +12878,7 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 	}
 
 	if (sofia_debug)
-		ast_verbose("Sofia: REFER from %s to %s%s\n",
+		sofia_vrb("REFER from %s to %s%s\n",
 			op ? op->username : "unknown",
 			refer_to ? refer_to : "unknown",
 			is_attended ? " (ATTENDED)" : " (BLIND)");
@@ -12866,7 +12913,7 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 				refer_to ? refer_to : "");
 		}
 		if (sofia_debug)
-			ast_verbose("Sofia: REFER rejected (allowtransfer=no) — 603 Declined (policy)\n");
+			sofia_vrb("REFER rejected (allowtransfer=no) — 603 Declined (policy)\n");
 		return;
 	}
 
@@ -12950,7 +12997,7 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 		struct ast_channel *bridged = sofia_find_bridged_channel(op);
 
 		if (sofia_debug) {
-			ast_verbose("Sofia: %s transfer to %s — bridged=%s\n",
+			sofia_vrb("%s transfer to %s — bridged=%s\n",
 				is_attended ? "Attended" : "Blind",
 				refer_to,
 				bridged ? bridged->name : "(none)");
@@ -12958,7 +13005,7 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 
 		if (bridged) {
 			if (sofia_debug) {
-				ast_verbose("Sofia: redirecting %s to %s@%s\n",
+				sofia_vrb("redirecting %s to %s@%s\n",
 					bridged->name, refer_to, op->context);
 			}
 			/* RFC 3515: in-progress NOTIFY before transferee redirect. */
@@ -13098,7 +13145,7 @@ static void sofia_process_info(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *o
 		}
 
 		if (sofia_debug)
-			ast_verbose("Sofia: Received DTMF '%c' via SIP INFO (duration=%u)\n", digit, duration);
+			sofia_vrb("Received DTMF '%c' via SIP INFO (duration=%u)\n", digit, duration);
 	}
 }
 
@@ -13106,7 +13153,7 @@ static void sofia_process_prack(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 		sip_t const *sip, tagi_t tags[])
 {
 	if (sofia_debug)
-		ast_verbose("Sofia: Received PRACK\n");
+		sofia_vrb("Received PRACK\n");
 	nua_respond(nh, SIP_200_OK, TAG_END());
 }
 
@@ -13128,7 +13175,7 @@ static void sofia_process_ack(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op
 		if (sip && sip->sip_payload && sip->sip_payload->pl_data && op->rtp) {
 			sofia_parse_sdp(op, sip);
 			if (sofia_debug)
-				ast_verbose("Sofia: ACK with SDP, remote RTP set\n");
+				sofia_vrb("ACK with SDP, remote RTP set\n");
 		}
 		if (owner) {
 			ast_channel_unref(owner);
@@ -13183,7 +13230,7 @@ void sofia_qualify_peer(struct sofia_peer *peer)
 	peer->qualify_nh = nh;
 	peer->qualify_sent = ast_tvnow();
 	if (sofia_debug)
-			ast_verbose("Sofia: Sending OPTIONS qualify to %s (url=%s, hmagic=%p)\n",
+			sofia_vrb("Sending OPTIONS qualify to %s (url=%s, hmagic=%p)\n",
 			peer->name, url, (void *)peer);
 	ast_mutex_unlock(&peer->lock);
 
@@ -13298,6 +13345,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	struct sofia_pvt *dialog_pvt = NULL;
 	const char *event_name = nua_event_name(event);
 
+	/* Tag every "Sofia: ..." line in this dispatch with [from|to|callid] from the event's request. */
+	sofia_logctx_set_sip(sip);
+
 	/* SIPnotify / unsolicited-MWI one-shot handle (sentinel hmagic): destroy the app-owned
 	 * out-of-dialog NOTIFY handle on its final response (sofia-sip never auto-reaps it). The NOTIFY is
 	 * sent via nua_method (this fork rejects an out-of-dialog nua_notify locally with 481), so the final
@@ -13307,7 +13357,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	if (hmagic == SOFIA_SIPNOTIFY_HMAGIC) {
 		if ((event == nua_r_method || event == nua_r_notify) && status >= 200) {
 			if (sofia_debug) {
-				ast_verbose("Sofia SIPnotify: NOTIFY final response %d %s — destroying one-shot handle\n",
+				sofia_vrb("SIPnotify: NOTIFY final response %d %s — destroying one-shot handle\n",
 					status, phrase);
 			}
 			nua_handle_destroy(nh);
@@ -13363,7 +13413,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					if (c->reg_nh == nh) {		/* still the current binding for this handle */
 						ao2_unlink(peer->contacts, c);	/* -> contact destructor drops reg_nh (sole dropper) */
 						if (sofia_debug) {
-							ast_verbose("Sofia: flow closed (connection gone) - removed contact %s of peer %s\n",
+							sofia_vrb("flow closed (connection gone) - removed contact %s of peer %s\n",
 								uri, pname);
 						}
 						if (ao2_container_count(peer->contacts) == 0) {
@@ -13572,7 +13622,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		 * races `sip prune realtime` and the 200 branch reads peer fields outside
 		 * peer->lock, so the REF (not just the lock) is load-bearing. NULL = freed. */
 		struct sofia_peer *peer = hmagic ? sofia_peer_ref_if_linked((struct sofia_peer *)hmagic) : NULL;
-		ast_verbose("Sofia: REGISTER response %d %s\n", status, phrase);
+		sofia_vrb("REGISTER response %d %s\n", status, phrase);
 		if (status == 200) {
 			if (sip && sip->sip_contact) {
 				int expires = DEFAULT_EXPIRY;
@@ -13587,7 +13637,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				if (expires < 0) {
 					expires = DEFAULT_EXPIRY;
 				}
-				ast_verbose("Sofia: Registration OK, expires=%d\n", expires);
+				sofia_vrb("Registration OK, expires=%d\n", expires);
 				if (peer) {
 					ast_mutex_lock(&peer->lock);
 					peer->registered = 1;
@@ -13680,7 +13730,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				/* sip:user@host:port + ;transport= for tls/tcp/ws/wss (UDP no-op). */
 				sofia_build_register_uri(peer, uri, sizeof(uri));
 
-				ast_verbose("Sofia: Responding to auth challenge for %s\n", peer->name);
+				sofia_vrb("Responding to auth challenge for %s\n", peer->name);
 
 				/* maxforwards: RFC 3261 §20.22 Max-Forwards on the REGISTER. */
 				char mf_str_reg[8];
@@ -13705,7 +13755,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				ast_mutex_unlock(&peer->lock);
 			}
 		} else if (status >= 300) {
-			ast_verbose("Sofia: Registration failed %d %s\n", status, phrase);
+			sofia_vrb("Registration failed %d %s\n", status, phrase);
 			if (peer) {
 				ast_mutex_lock(&peer->lock);
 				peer->registered = 0;
@@ -13730,7 +13780,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	}
 	case nua_r_invite:
 		if (sofia_debug)
-			ast_verbose("Sofia: INVITE response %d %s\n", status, phrase);
+			sofia_vrb("INVITE response %d %s\n", status, phrase);
 		/* OUTBOUND INVITE auth (RFC 3261 §22): answer a 401/407 from an upstream trunk by
 		 * feeding peer creds to NUA, which restarts the INVITE. MUST be reactive — NUTAG_AUTH
 		 * applies only after a challenge created nh_auth (chan_sip handle_response_invite parity).
@@ -13866,7 +13916,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					ao2_ref(m, -1);
 				}
 				if (sofia_debug)
-					ast_verbose("Sofia: Fork child %s -> %d %s (first=%d)\n",
+					sofia_vrb("Fork child %s -> %d %s (first=%d)\n",
 						pvt->fork_branch_id, status, phrase, first);
 			} else if (status >= 200 && status < 300) {
 				int rc = sofia_fork_pick_winner(fork, pvt, sip);
@@ -13880,7 +13930,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			} else if (status >= 300) {
 				int remaining = sofia_fork_child_failed(fork, pvt);
 				if (sofia_debug)
-					ast_verbose("Sofia: Fork child %s failed %d %s (remaining=%d)\n",
+					sofia_vrb("Fork child %s failed %d %s (remaining=%d)\n",
 						pvt->fork_branch_id, status, phrase, remaining);
 			}
 			break;
@@ -13961,7 +14011,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				ast_log(LOG_NOTICE, "Sofia: directmedia re-INVITE 2xx had an unusable SDP on '%s' but the call is no longer up — not reverting\n",
 					pvt->callid ? pvt->callid : "(no-callid)");
 			} else if (has_sdp) {
-				ast_verbose("Sofia: directmedia re-INVITE accepted on '%s'\n",
+				sofia_vrb("directmedia re-INVITE accepted on '%s'\n",
 					pvt->callid ? pvt->callid : "(no-callid)");
 			}
 			break;
@@ -14134,7 +14184,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		break;
 	case nua_r_bye:
 		if (sofia_debug)
-			ast_verbose("Sofia: BYE response %d %s\n", status, phrase);
+			sofia_vrb("BYE response %d %s\n", status, phrase);
 		/* nua_r_bye DEC site (defensive; flag-gated idempotency makes it multi-site safe). */
 		if (pvt) {
 			sofia_update_call_counter(pvt, SOFIA_DEC_CALL_LIMIT);
@@ -14142,7 +14192,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		break;
 	case nua_r_cancel:
 		if (sofia_debug)
-			ast_verbose("Sofia: CANCEL response %d %s\n", status, phrase);
+			sofia_vrb("CANCEL response %d %s\n", status, phrase);
 		if (pvt && pvt->is_fork_child && pvt->fork) {
 			ao2_unlink(dialogs, pvt);
 			ao2_unlink(pvt->fork->children, pvt);
@@ -14150,7 +14200,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		break;
 	case nua_r_options:
 			if (sofia_debug)
-				ast_verbose("Sofia: OPTIONS response %d %s for peer %s (hmagic=%p)\n",
+				sofia_vrb("OPTIONS response %d %s for peer %s (hmagic=%p)\n",
 			status, phrase,
 			hmagic ? ((struct sofia_peer *)hmagic)->name : "NULL",
 			(void *)hmagic);
@@ -14163,7 +14213,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			int pingtime;
 			if (!peer) {
 				if (sofia_debug)
-					ast_verbose("Sofia: OPTIONS response for a pruned/freed peer (hmagic=%p) — dropped\n",
+					sofia_vrb("OPTIONS response for a pruned/freed peer (hmagic=%p) — dropped\n",
 						(void *)hmagic);
 				break;
 			}
@@ -14225,7 +14275,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 
 			/* Blocking / contexts-rwlock / nua_* bookkeeping, OUTSIDE peer->lock. */
 			if (transitioned) {
-				ast_verbose("Sofia: Peer '%s' is now %s (%dms)\n", l_name, new_name, l_lastms);
+				sofia_vrb("Peer '%s' is now %s (%dms)\n", l_name, new_name, l_lastms);
 				manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
 					"ChannelType: SIP\r\n"
 					"Peer: SIP/%s\r\n"
@@ -14249,7 +14299,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		break;
 	case nua_r_message:
 		if (sofia_debug)
-			ast_verbose("Sofia: MESSAGE response %d %s\n", status, phrase);
+			sofia_vrb("MESSAGE response %d %s\n", status, phrase);
 		sofia_message_reap_outbound(nh, status);
 		break;
 	case nua_r_subscribe:
@@ -14261,11 +14311,11 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		if (sofia_eventsub_on_subscribe_response(nh, sip, status))
 			break;
 		if (sofia_debug)
-			ast_verbose("Sofia: SUBSCRIBE response %d %s\n", status, phrase);
+			sofia_vrb("SUBSCRIBE response %d %s\n", status, phrase);
 		break;
 	case nua_r_notify:
 		if (sofia_debug)
-			ast_verbose("Sofia: NOTIFY response %d %s\n", status, phrase);
+			sofia_vrb("NOTIFY response %d %s\n", status, phrase);
 		/* Presence sub expiry/terminate: sofia-sip auto-sends the final NOTIFY and
 		 * reports nua_substate_terminated here. Correlate by handle and free it. */
 		if (sofia_substate_terminated(tags)) {
@@ -14278,7 +14328,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		break;
 	case nua_r_refer:
 		if (sofia_debug)
-			ast_verbose("Sofia: REFER response %d %s\n", status, phrase);
+			sofia_vrb("REFER response %d %s\n", status, phrase);
 		/* The REFER request's own response. The event callback does NOT pin pvt for
 		 * nua_r_refer, so re-validate/pin by the handle magic ourselves. >=300 fails
 		 * the pending outbound transfer (sofia_transfer_on_refer_response). */
@@ -14292,27 +14342,27 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		break;
 	case nua_r_info:
 		if (sofia_debug)
-			ast_verbose("Sofia: INFO response %d %s\n", status, phrase);
+			sofia_vrb("INFO response %d %s\n", status, phrase);
 		break;
 	case nua_r_publish:
 		if (sofia_debug)
-			ast_verbose("Sofia: PUBLISH response %d %s\n", status, phrase);
+			sofia_vrb("PUBLISH response %d %s\n", status, phrase);
 		break;
 	case nua_r_prack:
 		if (sofia_debug)
-			ast_verbose("Sofia: PRACK response %d %s\n", status, phrase);
+			sofia_vrb("PRACK response %d %s\n", status, phrase);
 		break;
 	case nua_r_shutdown:
-		ast_verbose("Sofia: Shutdown response %d %s\n", status, phrase);
+		sofia_vrb("Shutdown response %d %s\n", status, phrase);
 		break;
 	case nua_i_state:
 		break;
 	case nua_i_error:
 		if (sofia_debug)
-			ast_verbose("Sofia: Error event status=%d phrase=%s\n", status, phrase ? phrase : "(null)");
+			sofia_vrb("Error event status=%d phrase=%s\n", status, phrase ? phrase : "(null)");
 		if (pvt) {
 			if (sofia_debug)
-					ast_verbose("Sofia: Error pvt=%p owner=%p nh=%p state=%d\n",
+					sofia_vrb("Error pvt=%p owner=%p nh=%p state=%d\n",
 					(void *)pvt, pvt->owner ? (void *)pvt->owner : NULL,
 					(void *)pvt->nh, pvt->state);
 		}
@@ -15148,7 +15198,7 @@ static void sofia_parse_register_line(const char *value)
 				/* OOM — drain MWI before the destructor (normally a no-op for register=> peers). */
 				sofia_peer_drain_mwi(peer);
 			} else {
-				ast_verbose("Sofia: register=> peer '%s' created (target %s:%d)\n",
+				sofia_vrb("register=> peer '%s' created (target %s:%d)\n",
 					user, host, port);
 				sofia_peer_ipport_reindex(peer);	/* B: index by host:port (parity with the O(N) scan) */
 			}
@@ -16927,7 +16977,7 @@ static void *sofia_reg_thread_func(void *data)
 				/* sip:user@host:port + ;transport= (UDP no-op); opt-in via is_register_line. */
 				sofia_build_register_uri(peer, uri, sizeof(uri));
 				if (sofia_debug)
-					ast_verbose("Sofia: Re-registering %s\n", uri);
+					sofia_vrb("Re-registering %s\n", uri);
 				/* RFC 3261 §20.22 outbound REGISTER refresh. */
 				char mf_str_reregister[8];
 				char instance_feature_rereg[120];
@@ -17035,7 +17085,7 @@ static void sofia_do_register(void)
 					TAG_END());
 
 				if (sofia_debug) {
-					ast_verbose("Sofia: Registering %s\n", uri);
+					sofia_vrb("Registering %s\n", uri);
 				}
 			}
 		}
