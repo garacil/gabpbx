@@ -56,6 +56,7 @@ Every capability is enumerated below, grouped for scanning. Each is real and liv
 | **Inbound REGISTER / registrar** | Phones register their location with credential checks, per-peer source ACLs and unknown-peer rejection. |
 | **REGISTER expiry bounds** | Enforces min/max registration lifetimes; a too-short refresh gets `423 Interval Too Brief` with `Min-Expires`, blunting registration-flood abuse. |
 | **Contact binding registry + query** | Stores each phone's reachable Contact under lock; a Contact-less REGISTER is answered as a pure "where am I registered?" query without changing state. |
+| **Connection-flow close (RFC 5626)** | A connection-oriented binding (WSS / WS / TLS / TCP) is dropped promptly when its underlying connection closes, instead of lingering until the registration expires — so a WebSocket browser that reconnects on a page refresh never leaves a stale binding. `flowclose_emit_unregister` (default `no`) chooses whether the external unregister side-effects — AMI `PeerStatus`, BLF / hint device-state and regexten cleanup — fire on a flow close; the binding and routing state are always corrected regardless. |
 | **Outbound REGISTER (trunk)** | `register =>` lines register the PBX to upstream providers, with scheduled re-registration and an AMI `Registry` event on the response. |
 | **Qualify / OPTIONS keepalive** | Periodic SIP OPTIONS pings confirm reachability, measure round-trip time, and mark dead peers unreachable. |
 | **RTP keepalive** | Optional tiny periodic media packets keep NAT/firewall pinholes open during a call or on hold. |
@@ -122,7 +123,7 @@ Every capability is enumerated below, grouped for scanning. Each is real and liv
 
 | Feature | What it does |
 | :-- | :-- |
-| **CLI — `sip show …`** | `sip show peers`, `sip show peer <name>` (full detail, tab-completed), `sip show settings`, `sip show registry`, `sip show channels` / `channelstats`, `sip show inuse` — chan_sip's column layout, snapshotted under lock. |
+| **CLI — `sip show …`** | `sip show peers`, `sip show peer <name>` (a concise, friendly summary — registration, endpoint, context, media, calls, qualify — followed by the per-contact list; `sip show peer <name> detail` for the full per-field dump, tab-completed), `sip show settings`, `sip show registry`, `sip show channels` / `channelstats`, `sip show inuse` — chan_sip's column layout, snapshotted under lock. |
 | **CLI operations** | `sip reload`, `sip set debug [on|off|peer|ip]`, `sip qualify peer`, `sip unregister`, `sip prune realtime`, `sip notify`, plus the history and blacklist families. |
 | **AMI parity** | `SIPpeers`/`SIPshowpeer`, `SIPqualifypeer`, `SIPshowregistry`, `SIPnotify`, and `SofiaMessageSend`, each mirroring chan_sip's field set (Transport extended to `ws`/`wss`). |
 | **Realtime `sippeers` family** | On a cache miss a peer is loaded from `sippeers`, with optional dual-load of `sipregs` auto-detected via `ast_check_realtime`. |

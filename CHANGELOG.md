@@ -4,6 +4,46 @@
 
 _No changes yet._
 
+## 1.3.4
+
+A reliability and diagnostics release: connection-oriented bindings now follow the
+life of their transport, the `sip show peer` CLI gains a readable summary, and the
+RED redundant-text sender is hardened.
+
+### Registration
+
+- **RFC 5626 flow-close.** A connection-oriented binding (WSS / WS / TLS / TCP) is now
+  removed promptly when its underlying connection closes, instead of lingering until the
+  SIP registration expires — the registrar watches the connection and drops the binding
+  on close. This clears stale bindings for WebSocket browser clients that reconnect
+  often (for example, a page refresh). A new option `flowclose_emit_unregister`
+  (per-peer and `[general]`, default `no`) controls whether the external unregister
+  side-effects — AMI `PeerStatus`, BLF / hint device-state, and `regexten` cleanup —
+  fire on a flow close. The default keeps it silent (a browser refresh does not flap the
+  BLF lamp); set `yes` for an explicit unregister event/state update on each flow close.
+  The binding is always removed and routing state always corrected regardless of the
+  option.
+
+### CLI
+
+- **`sip show peer <name>` concise summary.** The default view now prints a friendly
+  summary — peer name, registration state, endpoint (`user@host:port` via transport),
+  context / source, accountcode, contact slots used/allowed, media (codecs, dtmf, nat,
+  directmedia), calls (active/limit, ringing, on-hold) and qualify status — followed by
+  the full contact list (each with state, TTL, source and user-agent). `sip show peer
+  <name> detail` (tab-completed) shows the complete per-field dump: session timers,
+  identity headers, network & media, limits & features, fax/T.38, timers & RTP, routing
+  & dialplan, security & ACL, registration and contacts.
+- **`rtp set debug ice {on|off}`.** Toggleable ICE diagnostics for troubleshooting
+  WebRTC media — logs candidate nomination and the post-completion media source.
+
+### Reliability
+
+- **RED (RFC 2198) redundant-text sender hardening.** The per-generation arrays in the
+  RTP RED / T.140 redundant-text sender are now bounds-checked, oversized blocks (over
+  the RFC 2198 1023-byte length limit) are clamped/rejected, and the redundancy buffer is
+  capped — preventing buffer overruns when emitting redundant text.
+
 ## 1.1
 
 `chan_sofia` matures into a more capable SIP driver, building on the 1.0 correctness

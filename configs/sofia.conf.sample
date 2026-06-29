@@ -290,6 +290,26 @@ srvlookup=yes
 ;     candidate gathering + TURN for a server behind NAT is a future item — until
 ;     then deploy gabpbx with a public-reachable media address (or a media relay).
 ;
+;     FLOW-CLOSE CLEANUP (RFC 5626) — flowclose_emit_unregister=yes|no (default no):
+;       A binding registered over a connection-oriented transport (ws/wss/tcp/tls) is
+;       ALWAYS removed promptly when its underlying connection CLOSES (a browser tab
+;       reload/F5 closing the old WebSocket, or a client that goes away without an
+;       Expires:0 unregister) instead of lingering until expiry. This knob only chooses
+;       whether that removal ANNOUNCES an unregistration:
+;         no  (DEFAULT) — remove the binding SILENTLY: no AMI PeerStatus Unregistered,
+;                          no BLF/device-state change, no regexten (regcontext) cleanup.
+;                          Best for browsers: a reload (close then immediate re-REGISTER)
+;                          does NOT flap BLF/presence. Trade-off: a client that leaves for
+;                          good keeps a stale BLF/regexten until a later natural event
+;                          (re-REGISTER, qualify, reload). Internal routing state is always
+;                          correct (the peer shows 0 contacts and is not routable).
+;         yes           — also emit the full unregister side-effects (PeerStatus + BLF +
+;                          device-state + regexten), i.e. accurate presence at the cost of
+;                          a brief Unregistered->Registered flap on every reload. Use for
+;                          hard phones where you want presence to track an unplug exactly.
+;       UDP bindings have no connection close, so they are unaffected by this knob.
+;       Settable in [general] (all peers inherit) and per-peer (override).
+;
 ; (5) chan_sofia advantage over chan_sip on WS+WSS:
 ;     chan_sip has NO WebSocket support whatsoever (0 hits in chan_sip.c for
 ;     websocket / RFC 7118 / wsbindport). chan_sofia adds:
