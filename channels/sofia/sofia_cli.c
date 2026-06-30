@@ -882,16 +882,19 @@ char *sofia_set_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 	if (cmd == CLI_INIT) {
 		e->command = "sip set debug";
 		e->usage =
-			"Usage: sip set debug [on|off|peer <name>|ip <addr>]\n"
+			"Usage: sip set debug [on|off|peer <name>|ip <addr>|sdp on|off]\n"
 			"       Show current debug state, or enable/disable Sofia-SIP debug.\n"
 			"       'on'  - enable debug for all peers\n"
 			"       'off' - disable debug\n"
 			"       'peer <name>' - enable debug for a specific peer\n"
-			"       'ip <addr>'   - enable debug for a specific IP address\n";
+			"       'ip <addr>'   - enable debug for a specific IP address\n"
+			"       'sdp on|off'  - dump generated offer SDP + the WebRTC offer-gate decision\n";
 		return NULL;
 	} else if (cmd == CLI_GENERATE) {
 		if (a->pos == 3)
-			return ast_cli_complete(a->word, (const char *[]){ "on", "off", "peer", "ip", NULL }, a->n);
+			return ast_cli_complete(a->word, (const char *[]){ "on", "off", "peer", "ip", "sdp", NULL }, a->n);
+		if (a->pos == 4 && !strcasecmp(a->argv[3], "sdp"))
+			return ast_cli_complete(a->word, (const char *[]){ "on", "off", NULL }, a->n);
 		return NULL;
 	}
 
@@ -941,6 +944,10 @@ char *sofia_set_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 		if (sofia_nua)
 			tport_set_params(nta_agent_tports(nua_get_agent(sofia_nua)), TPTAG_LOG(0), TAG_END());
 		ast_cli(a->fd, "Sofia debug enabled for IP '%s'\n", sofia_debug_filter);
+		return CLI_SUCCESS;
+	} else if (!strcasecmp(what, "sdp")) {
+		sofia_debug_sdp = (a->argc == 5 && !strcasecmp(a->argv[4], "on"));
+		ast_cli(a->fd, "Sofia SDP/offer-gate debug %s\n", sofia_debug_sdp ? "enabled" : "disabled");
 		return CLI_SUCCESS;
 	}
 

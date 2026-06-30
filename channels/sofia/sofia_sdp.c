@@ -1194,6 +1194,11 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	}
 
 	sdp_data = sip->sip_payload->pl_data;
+	if (sofia_debug_sdp)
+		sofia_vrb("parse-sdp ENTRY pvt=%p is_webrtc=%d webrtc_offerer=%d answer_applied=%d peer_webrtc=%d len=%d:\n%.*s",
+			(void *)pvt, pvt->is_webrtc, pvt->webrtc_offerer, pvt->webrtc_answer_applied,
+			(pvt->peer ? pvt->peer->webrtc : -99), (int)sip->sip_payload->pl_len,
+			(int)sip->sip_payload->pl_len, sdp_data);
 	parser = sdp_parse(pvt->home, sdp_data, sip->sip_payload->pl_len, 0);
 	if (!parser) {
 		return 0;
@@ -1310,6 +1315,10 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 					audio_webrtc_offered = 1;
 				}
 			}
+			if (sofia_debug_sdp)
+				sofia_vrb("parse-sdp audio m_proto='%s' m_port=%lu peer_webrtc=%d -> savpf=%d webrtc_offered=%d\n",
+					media->m_proto_name ? media->m_proto_name : "(null)", (unsigned long)media->m_port,
+					(pvt->peer ? pvt->peer->webrtc : -99), audio_savpf_offered, audio_webrtc_offered);
 			for (a = media->m_attributes; a; a = a->a_next) {
 				if (!audio_webrtc_offered && a->a_name && su_casematch(a->a_name, "crypto") && a->a_value) {
 					if (sofia_process_crypto(pvt, pvt->rtp, &pvt->srtp, a->a_value)) {
@@ -2252,6 +2261,11 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 	 * NOT be re-run (would rebuild our cert / restart DTLS). Apply the remote params
 	 * once, in RFC-5763/5764 order, then start ICE (remote creds are present now) and
 	 * activate. Re-INVITE / duplicate 18x+200 are guarded by webrtc_answer_applied. */
+	if (sofia_debug_sdp)
+		sofia_vrb("A5-gate audio_webrtc_offered=%d is_webrtc=%d webrtc_offerer=%d !answer_applied=%d | wrtc fp=%d setup=%d ufrag=%d pwd=%d mux=%d cand=%d\n",
+			audio_webrtc_offered, pvt->is_webrtc, pvt->webrtc_offerer, !pvt->webrtc_answer_applied,
+			wrtc.have_fingerprint, wrtc.have_setup, wrtc.have_ice_ufrag, wrtc.have_ice_pwd,
+			wrtc.have_rtcp_mux, wrtc.cand_count);
 	if (audio_webrtc_offered && pvt->is_webrtc && pvt->webrtc_offerer && !pvt->webrtc_answer_applied) {
 		struct ast_rtp_engine_dtls *dtls = ast_rtp_instance_get_dtls(pvt->rtp);
 		struct ast_rtp_engine_ice *ice = ast_rtp_instance_get_ice(pvt->rtp);
@@ -2307,6 +2321,9 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 		ice->set_role(pvt->rtp, AST_RTP_ICE_ROLE_CONTROLLED);	/* permanent lite role */
 		ice->start(pvt->rtp);	/* remote creds are set now — safe to arm the STUN responder */
 		pvt->webrtc_answer_applied = 1;
+		if (sofia_debug_sdp)
+			sofia_vrb("A5 APPLIED: set_authentication(ufrag='%s') + set_setup(%d) + ice->start done; awaiting authenticated browser STUN to latch\n",
+				wrtc.ice_ufrag, wrtc.remote_setup);
 		/* (5) activate AFTER the remote params are applied; the ICE/DTLS state machine
 		 * is armed and the DTLS handshake self-fires from the USE-CANDIDATE STUN path.
 		 * A duplicate activate elsewhere is a no-op (A4 OQ6). */
@@ -2426,6 +2443,18 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip)
 			pvt->webrtc_video_offerer = 0;
 			pvt->capability &= ~((format_t)AST_FORMAT_VIDEO_MASK);
 			staged_video_valid = 0;	/* Review LOW: don't let the staged_video_valid commit copy install a codec map onto a vrtp we never activate for this rejected-video offerer */
+			/* sofia_webrtc_provision_offer already created the video DTLS SSL and started the video ICE
+			 * responder BEFORE the answer was known (unlike the answerer accept gate, which creates the SSL
+			 * only on accept). With video rejected here, tear both down: otherwise the controlling browser can
+			 * still nominate the offered video candidate, which fires a DTLS handshake on an instance that has
+			 * NO stored remote fingerprint → dtls_failure → the video fd read returns -1 → the whole call is
+			 * torn down. Stopping DTLS clears the SSL so the STUN/DTLS demux skips this instance entirely. */
+			if (vdtls && vdtls->stop) {
+				vdtls->stop(pvt->vrtp);
+			}
+			if (vice && vice->stop) {
+				vice->stop(pvt->vrtp);
+			}
 		}
 	}
 

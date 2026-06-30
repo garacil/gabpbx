@@ -52,6 +52,10 @@ extern struct ao2_container *peers;
 extern nua_t *sofia_nua;
 extern su_root_t *sofia_root;
 extern int sofia_debug;
+extern int sofia_debug_sdp;
+/* [from|to|callid] transaction tag shared by chan_sofia.c and the sofia subdirectory sources. */
+const char *sofia_logctx(void);
+#define sofia_vrb(fmt, ...) ast_verbose("Sofia%s: " fmt, sofia_logctx(), ##__VA_ARGS__)
 
 /* The Sofia channel tech (chan_sofia.c). The WebRTC DataChannel relay (sofia_datachannel.c)
  * compares a bridged channel's ->tech against this to confirm the far leg is a Sofia channel. */

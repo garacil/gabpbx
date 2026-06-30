@@ -255,6 +255,7 @@ struct sofia_config sofia_cfg;
 	struct ast_sched_thread *sofia_sched;
 
 int sofia_debug;
+int sofia_debug_sdp;	/* `sip set debug sdp on`: dump generated offer SDP + the WebRTC offer-gate decision */
 char sofia_debug_filter[64];
 int sofia_debug_match(const char *peer_name, const char *src_ip);
 
@@ -263,7 +264,7 @@ int sofia_debug_match(const char *peer_name, const char *src_ip);
  * SIP transaction instead of interleaving anonymously with other calls. Set from the event's sip in
  * sofia_event_callback and from the pvt on the outbound path; thread-local, empty when unavailable. */
 static __thread char sofia_logctx_buf[160];
-static const char *sofia_logctx(void)
+const char *sofia_logctx(void)
 {
 	return sofia_logctx_buf;
 }
@@ -299,9 +300,8 @@ static void sofia_logctx_set_pvt(struct sofia_pvt *pvt)
 		sofia_logctx_set(NULL, NULL, NULL);
 	}
 }
-/* Prefix-tagged verbose for chan_sofia. Replaces sofia_vrb("...") so every line carries the
- * current [from|to|callid] context (sofia_logctx). fmt must be a string literal. */
-#define sofia_vrb(fmt, ...) ast_verbose("Sofia%s: " fmt, sofia_logctx(), ##__VA_ARGS__)
+/* sofia_logctx() + the sofia_vrb() prefix-tagged verbose macro are declared in chan_sofia_internal.h
+ * so the sofia subdirectory sources can carry the same [from|to|callid] context. */
 /* Set when the respective [general] key is parsed; consumed at config end for
  * the Timer B vs T1*64 cross-validation. */
 static int sofia_timerb_set;
@@ -5052,6 +5052,10 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 						ast_copy_string(tgt_transport, c->transport, sizeof(tgt_transport));
 						ao2_unlock(c);
 						want_webrtc = sofia_offer_effective_webrtc(pvt->peer, tgt_transport);
+						if (sofia_debug_sdp)
+							sofia_vrb("offer-gate FORK child %d peer='%s' webrtc=%d contact_transport='%s' -> want_webrtc=%d\n",
+								branch_idx, pvt->peer ? pvt->peer->name : "?",
+								pvt->peer ? pvt->peer->webrtc : -1, tgt_transport, want_webrtc);
 					}
 					if (want_webrtc) {
 						if (sofia_webrtc_provision_offer(child)) {
@@ -5147,6 +5151,8 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 						ast_mutex_unlock(&fork->lock);
 						posted_any = 1;
 						if (sofia_generate_sdp(child, sdp_buf, sizeof(sdp_buf))) {
+							if (sofia_debug_sdp)
+								sofia_vrb("TX offer SDP (fork child %d) is_webrtc=%d:\n%s", branch_idx, child->is_webrtc, sdp_buf);
 							nua_invite(child->nh,
 								SIPTAG_FROM_STR(from_buf),
 								SIPTAG_CONTACT_STR(contact_buf),
@@ -5256,6 +5262,10 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 			}
 		}
 		want_webrtc = sofia_offer_effective_webrtc(pvt->peer, tgt_transport);
+		if (sofia_debug_sdp)
+			sofia_vrb("offer-gate SINGLE peer='%s' webrtc=%d active_contact=%p tgt_transport='%s' -> want_webrtc=%d\n",
+				pvt->peer ? pvt->peer->name : "?", pvt->peer ? pvt->peer->webrtc : -1,
+				(void *)pvt->active_contact, tgt_transport, want_webrtc);
 	}
 	if (want_webrtc) {
 		if (sofia_webrtc_provision_offer(pvt)) {
@@ -5353,6 +5363,8 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		int needs_manual_ack = sofia_build_nat_proxy_url_from_peer(pvt->peer,
 			nat_proxy_probe, sizeof(nat_proxy_probe));
 		if (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf))) {
+			if (sofia_debug_sdp)
+				sofia_vrb("TX offer SDP (single) is_webrtc=%d:\n%s", pvt->is_webrtc, sdp_buf);
 			nua_invite(pvt->nh,
 				SIPTAG_FROM_STR(from_buf),
 				SIPTAG_CONTACT_STR(contact_buf),
@@ -5644,12 +5656,23 @@ static struct ast_frame *sofia_read(struct ast_channel *ast)
 	case 1:
 		if (!pvt->rtp) return &ast_null_frame;
 		return ast_rtp_instance_read(pvt->rtp, 1);
-	case 2:
+	case 2: {
+		/* Video read. A dead/failed video DTLS instance returns NULL; isolate it to the video path and
+		 * never let it propagate as a channel-read failure that hangs up the whole (audio) call. The
+		 * offerer pre-arms the video DTLS/ICE before the answer (sofia_webrtc_provision_offer), so a
+		 * pre-answer or rejected-video handshake can fail with no remote fingerprint yet; the audio fds
+		 * (0/1) are separate and unaffected — exactly like the !pvt->vrtp audio-only case. */
+		struct ast_frame *vf;
 		if (!pvt->vrtp) return &ast_null_frame;
-		return ast_rtp_instance_read(pvt->vrtp, 0);
-	case 3:
+		vf = ast_rtp_instance_read(pvt->vrtp, 0);
+		return vf ? vf : &ast_null_frame;
+	}
+	case 3: {
+		struct ast_frame *vf;
 		if (!pvt->vrtp) return &ast_null_frame;
-		return ast_rtp_instance_read(pvt->vrtp, 1);
+		vf = ast_rtp_instance_read(pvt->vrtp, 1);
+		return vf ? vf : &ast_null_frame;
+	}
 	case 5:
 		/* T.38 UDPTL from fd-5 → AST_FRAME_MODEM. NULL-safe vs a teardown race
 		 * (pvt->udptl → NULL between fd-poll and read). */

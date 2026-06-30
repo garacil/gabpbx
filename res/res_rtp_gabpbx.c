@@ -1220,6 +1220,18 @@ static int dtls_srtp_handle_record(struct ast_rtp_instance *instance, struct ast
 	if (!dtls->ssl) {
 		return 0;
 	}
+	/* OFFERER pre-answer DTLS race (RFC 5763 §5). We offered a=setup:actpass and sofia_webrtc_provision_offer
+	 * pre-armed DTLS before the answer. A controlling browser (after the 487 role repair) can nominate and
+	 * send its ClientHello BEFORE its SIP 200-OK answer — which carries the a=fingerprint trust anchor — has
+	 * reached and been applied to us. Driving the handshake to completion now would reach
+	 * dtls_srtp_finish_negotiation with NO remote fingerprint, fail closed, and tear the WHOLE call down (the
+	 * read returns -1 -> hangup). DEFER instead: drop the record — DTLS is reliable, the client retransmits
+	 * its ClientHello — until the answer installs the fingerprint; the retransmit then completes and verifies.
+	 * Non-fatal (return 0). The ANSWERER is unaffected: it already holds the offer's a=fingerprint before any
+	 * DTLS record arrives, so remote_fingerprint_len is non-zero and this gate is transparent. */
+	if (!rtp->remote_fingerprint_len) {
+		return 0;
+	}
 	/* An inbound DTLS record at an ACTPASS offerer (provision_offer, before the answer fixes our role)
 	 * means the peer (browser answering a=setup:active) is the DTLS client: commit us to the SERVER role
 	 * NOW so SSL processes the ClientHello as the server (RFC 5763 §5 — an actpass offerer MUST be ready to
@@ -1517,11 +1529,15 @@ static inline int rtcp_debug_test_addr(struct ast_sockaddr *addr)
 #define ICE_STUN_MAGIC_COOKIE       0x2112a442u
 #define ICE_STUN_BINDING_REQUEST    0x0001
 #define ICE_STUN_BINDING_SUCCESS    0x0101
+#define ICE_STUN_BINDING_ERROR      0x0111
 #define ICE_ATTR_USERNAME           0x0006
 #define ICE_ATTR_MESSAGE_INTEGRITY  0x0008
+#define ICE_ATTR_ERROR_CODE         0x0009
 #define ICE_ATTR_XOR_MAPPED_ADDRESS 0x0020
 #define ICE_ATTR_USE_CANDIDATE      0x0025
 #define ICE_ATTR_FINGERPRINT        0x8028
+#define ICE_ATTR_ICE_CONTROLLED     0x8029
+#define ICE_ATTR_ICE_CONTROLLING    0x802a
 #define ICE_FINGERPRINT_XOR         0x5354554eu
 
 struct ice_stun_hdr {
@@ -1624,7 +1640,7 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 	unsigned char *buf, int len, struct ast_sockaddr *sa)
 {
 	struct ice_stun_hdr *h = (struct ice_stun_hdr *) buf;
-	int mlen, off, mi_off = -1, fp_off = -1, has_use_candidate = 0;
+	int mlen, off, mi_off = -1, fp_off = -1, has_use_candidate = 0, has_ice_controlled = 0;
 	const unsigned char *username = NULL;
 	int username_len = 0;
 	uint8_t calc[20], out[512], xma[20], mi[20];
@@ -1676,6 +1692,14 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 				has_use_candidate = 1;
 			}
 			break;
+		case ICE_ATTR_ICE_CONTROLLED:
+			/* The peer claims the CONTROLLED role too (64-bit tiebreaker value). We are permanently
+			 * ICE-lite/controlled, so this is a role conflict to repair with 487 (step 5b). Honour only
+			 * an authenticated (pre-MI), well-formed attribute, mirroring the USE-CANDIDATE discipline. */
+			if (mi_off < 0 && alen == 8) {
+				has_ice_controlled = 1;
+			}
+			break;
 		default:
 			break;	/* PRIORITY / ICE-CONTROLLING etc.: parsed past, never acted on (we are controlled) */
 		}
@@ -1707,6 +1731,48 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 	h->msglen = saved;
 	if (memcmp(calc, buf + mi_off + sizeof(struct ice_stun_attr), 20) != 0) {
 		return;	/* MI mismatch — silent drop */
+	}
+
+	/* 5b. ROLE-CONFLICT REPAIR (RFC 8445 §6.1.1 + §7.3.1.1). We are permanently ICE-lite, hence controlled
+	 *     (the role is clamped CONTROLLED at instance init). A full peer that ANSWERED our SDP offer can
+	 *     default to the controlled role and send ICE-CONTROLLED, leaving BOTH ends controlled: neither
+	 *     nominates, no USE-CANDIDATE ever arrives, media is never selected → one-way/dead audio. Per RFC
+	 *     8445 §7.2.5.1 a full agent that receives a 487 for a request carrying ICE-CONTROLLED reverses its
+	 *     role to controlling and re-checks (now with USE-CANDIDATE), which the normal path below then
+	 *     nominates and latches. A lite agent can never take the controlling role, so it always answers 487
+	 *     (no tiebreaker comparison). Reply Binding Error + ERROR-CODE(487) + MESSAGE-INTEGRITY(local_pwd) +
+	 *     FINGERPRINT (last) — RFC 5389 §15.6/§15.4/§15.5 — then return: do NOT send success, do NOT latch. */
+	if (has_ice_controlled) {
+		uint8_t ec[4 + 16];
+		int eclen;
+		r = (struct ice_stun_hdr *) out;
+		r->msgtype = htons(ICE_STUN_BINDING_ERROR);
+		r->cookie = htonl(ICE_STUN_MAGIC_COOKIE);
+		memcpy(r->tid, h->tid, sizeof(r->tid));
+		oo = sizeof(*r);
+
+		ec[0] = 0; ec[1] = 0;		/* reserved (RFC 5389 §15.6) */
+		ec[2] = 487 / 100;		/* class */
+		ec[3] = 487 % 100;		/* number */
+		memcpy(ec + 4, "Role Conflict", 13);
+		eclen = 4 + 13;
+		oo = ice_put_attr(out, oo, ICE_ATTR_ERROR_CODE, ec, eclen);
+
+		r->msglen = htons((uint16_t)((oo - 20) + 24));	/* cover through MI before hashing */
+		if (ice_hmac_sha1((const uint8_t *) rtp->local_pwd, strlen(rtp->local_pwd), out, oo, mi)) {
+			return;	/* HMAC failure — do not emit a response with a bad MI */
+		}
+		oo = ice_put_attr(out, oo, ICE_ATTR_MESSAGE_INTEGRITY, mi, 20);
+
+		r->msglen = htons((uint16_t)((oo - 20) + 8));	/* cover through FINGERPRINT before the CRC */
+		fp = htonl(ice_crc32(out, oo) ^ ICE_FINGERPRINT_XOR);
+		oo = ice_put_attr(out, oo, ICE_ATTR_FINGERPRINT, &fp, 4);
+
+		rtp_raw_sendto(rtp, out, oo, sa, 0);
+		if (rtpicedebug) {
+			ast_verbose("ICE-DBG role-conflict inst=%p: peer sent ICE-CONTROLLED; replied 487 Role Conflict (we are lite/controlled)\n", rtp);
+		}
+		return;
 	}
 
 
