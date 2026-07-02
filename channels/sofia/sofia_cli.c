@@ -232,15 +232,16 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 	const char *transport_str;
 	const char *type_str;
 	int contacts_used;
-	int detail = 0;		/* "sip show peer <name> detail" -> full per-field dump; bare -> concise summary */
 	struct ast_str *buf;
+	int detail = 0;	/* "sip show peer <name> detail" -> full per-field dump; bare -> concise operational summary */
 
 	switch (cmd) {
 	case CLI_INIT:
 		e->command = "sip show peer";
 		e->usage = "Usage: sip show peer <name> [detail]\n"
-			   "       Show a Sofia-SIP peer. Without 'detail' a concise summary is shown;\n"
-			   "       add 'detail' for the full per-field dump.\n";
+			   "       Show a Sofia-SIP peer. Without 'detail' a concise operational summary\n"
+			   "       (endpoint, media, calls, and the full Contacts list) is shown; add\n"
+			   "       'detail' for the full per-field dump.\n";
 		return NULL;
 	case CLI_GENERATE:
 		/* complete the peer name (token 3) by prefix; offer 'detail' at token 4. */
@@ -351,7 +352,6 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 	sofia_cli_peer_line(&buf, "Endpoint", "%s@%s:%d via %s",
 		S_OR(peer->defaultuser, peer->name), peer->host, peer->port, transport_str);
 	sofia_cli_peer_line(&buf, "Context / source", "%s / %s", peer->context, source_str);
-	sofia_cli_peer_line(&buf, "Accountcode", "%s", S_OR(peer->accountcode, "(none)"));
 	sofia_cli_peer_line(&buf, "Contact slots", "%d used of %d allowed", contacts_used, peer->max_contacts);
 	sofia_cli_peer_line(&buf, "Media", "codecs=%s dtmf=%s nat=%s directmedia=%s",
 		ast_strlen_zero(codec_buf) ? "(default)" : codec_buf,
@@ -363,282 +363,295 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 	} else {
 		sofia_cli_peer_line(&buf, "Qualify", "no");
 	}
+	/* Account code (a billing tag, not a credential) stays in the concise summary. */
+	sofia_cli_peer_line(&buf, "Account code", "%s", S_OR(peer->accountcode, "(none)"));
+
+	/* "detail" gates the FULL per-field dump below. The concise (bare) view keeps the operational summary
+	 * above + the full Contacts section further down (the hot diagnostic path) — but NEVER a credential:
+	 * Secret stays masked, and md5secret / password / key / nonce are never printed. */
 	if (detail) {
-		sofia_cli_peer_line(&buf, "Session timers", "%s, expires=%d, minse=%d, refresher=%s",
-			st_mode_str, peer->session_expires, peer->session_minse, st_refresher_str);
-		sofia_cli_peer_line(&buf, "Identity headers", "send=%s, trust=%s, presentation=%s",
-			sendrpid_str, AST_CLI_YESNO(peer->trustrpid),
-			ast_named_caller_presentation(peer->callingpres));
+	sofia_cli_peer_line(&buf, "Session timers", "%s, expires=%d, minse=%d, refresher=%s",
+		st_mode_str, peer->session_expires, peer->session_minse, st_refresher_str);
+	sofia_cli_peer_line(&buf, "Identity headers", "send=%s, trust=%s, presentation=%s",
+		sendrpid_str, AST_CLI_YESNO(peer->trustrpid),
+		ast_named_caller_presentation(peer->callingpres));
 
-		sofia_cli_peer_section(&buf, "Identity");
-		sofia_cli_peer_line(&buf, "Name", "%s", peer->name);
-		sofia_cli_peer_line(&buf, "Username", "%s", S_OR(peer->defaultuser, "(none)"));
-		sofia_cli_peer_line(&buf, "Type", "%s", type_str);
-		sofia_cli_peer_line(&buf, "Host", "%s", peer->host);
-		sofia_cli_peer_line(&buf, "Port", "%d", peer->port);
-		sofia_cli_peer_line(&buf, "Transport", "%s", transport_str);
-		sofia_cli_peer_line(&buf, "Context", "%s", peer->context);
-		sofia_cli_peer_line(&buf, "Registered", "%s", AST_CLI_YESNO(peer->registered));
-		/* Expires (registration TTL) is meaningful ONLY when this peer takes part in registration: a
-		 * dynamic peer that registers TO us, or a register=> peer we register to. A static challenge-auth
-		 * trunk (host=<ip/fqdn>, no register=>) never registers either way, so a TTL there was misleading. */
-		if (peer->is_register_line || !strcasecmp(peer->host, "dynamic")) {
-			sofia_cli_peer_line(&buf, "Expires", "%ds", peer->expiresecs);
+	sofia_cli_peer_section(&buf, "Identity");
+	sofia_cli_peer_line(&buf, "Name", "%s", peer->name);
+	sofia_cli_peer_line(&buf, "Username", "%s", S_OR(peer->defaultuser, "(none)"));
+	sofia_cli_peer_line(&buf, "Type", "%s", type_str);
+	sofia_cli_peer_line(&buf, "Host", "%s", peer->host);
+	sofia_cli_peer_line(&buf, "Port", "%d", peer->port);
+	sofia_cli_peer_line(&buf, "Transport", "%s", transport_str);
+	sofia_cli_peer_line(&buf, "Context", "%s", peer->context);
+	sofia_cli_peer_line(&buf, "Registered", "%s", AST_CLI_YESNO(peer->registered));
+	/* Expires (registration TTL) is meaningful ONLY when this peer takes part in registration: a
+	 * dynamic peer that registers TO us, or a register=> peer we register to. A static challenge-auth
+	 * trunk (host=<ip/fqdn>, no register=>) never registers either way, so a TTL there was misleading. */
+	if (peer->is_register_line || !strcasecmp(peer->host, "dynamic")) {
+		sofia_cli_peer_line(&buf, "Expires", "%ds", peer->expiresecs);
+	}
+	sofia_cli_peer_line(&buf, "Secret", "%s", ast_strlen_zero(peer->secret) ? "(none)" : "(set)");
+	if (peer->qualify) {
+		sofia_cli_peer_line(&buf, "Qualify", "yes, freq=%ds, timeout=%ds, status=%s",
+			peer->qualifyfreq, peer->qualifytimeout, status);
+	} else {
+		sofia_cli_peer_line(&buf, "Qualify", "no");
+	}
+	if (!ast_strlen_zero(peer->callerid)) {
+		sofia_cli_peer_line(&buf, "CallerID", "%s", peer->callerid);
+	}
+	if (!ast_strlen_zero(peer->cid_num) || !ast_strlen_zero(peer->cid_name)) {
+		char merged[256];
+		ast_callerid_merge(merged, sizeof(merged),
+			S_OR(peer->cid_name, ""), S_OR(peer->cid_num, ""), "<unknown>");
+		sofia_cli_peer_line(&buf, "Callerid", "%s", merged);
+	}
+	if (!ast_strlen_zero(peer->cid_tag)) {
+		sofia_cli_peer_line(&buf, "CID tag", "%s", peer->cid_tag);
+	}
+
+	sofia_cli_peer_section(&buf, "Network and media");
+	sofia_cli_peer_line(&buf, "NAT", "%s", nat);
+	sofia_cli_peer_line(&buf, "DTMF mode", "%s", dtmf_str);
+	sofia_cli_peer_line(&buf, "Direct media", "%s", AST_CLI_YESNO(peer->directmedia));
+	sofia_cli_peer_line(&buf, "Encryption", "%s", AST_CLI_YESNO(peer->encryption));
+	sofia_cli_peer_line(&buf, "WebRTC", "%s", AST_CLI_YESNO(peer->webrtc));
+	sofia_cli_peer_line(&buf, "Codecs", "%s", ast_strlen_zero(codec_buf) ? "(default)" : codec_buf);
+	sofia_cli_peer_line(&buf, "Max call BR", "%d kbps", peer->maxcallbitrate);
+
+	sofia_cli_peer_section(&buf, "Limits and features");
+	sofia_cli_peer_line(&buf, "Busy on active", "%s", AST_CLI_YESNO(peer->busy_on_active));
+	sofia_cli_peer_line(&buf, "Max contacts", "%d (used: %d)", peer->max_contacts, contacts_used);
+	sofia_cli_peer_line(&buf, "Transfer mode", "%s", sofia_transfer_mode_str(peer->allowtransfer));
+	sofia_cli_peer_line(&buf, "Lock user-agent", "%s", AST_CLI_YESNO(peer->lockuseragent));
+	if (peer->lockuseragent && peer->locked_user_agent[0]) {
+		sofia_cli_peer_line(&buf, "Locked UA", "%s", peer->locked_user_agent);
+	}
+	if (peer->lockuseragent && !ast_strlen_zero(peer->lockuseragent_prefixes)) {
+		sofia_cli_peer_line(&buf, "UA prefixes", "%s", peer->lockuseragent_prefixes);
+	}
+	sofia_cli_peer_line(&buf, "Language", "%s", ast_strlen_zero(peer->language) ? "(none)" : peer->language);
+	sofia_cli_peer_line(&buf, "Default IP", "%s", ast_sockaddr_stringify(&peer->defaddr));
+	sofia_cli_peer_line(&buf, "AMA flags", "%s", ast_cdr_flags2str(peer->amaflags));
+	sofia_cli_peer_line(&buf, "Subscribe MWI", "%s", AST_CLI_YESNO(peer->subscribemwi));
+	sofia_cli_peer_line(&buf, "Preferred codec", "%s", AST_CLI_YESNO(peer->preferred_codec_only));
+	/* ignoresdpversion: parse-compat-only (every SDP is processed). */
+	sofia_cli_peer_line(&buf, "Ignore SDP ver", "%s", AST_CLI_YESNO(peer->ignoresdpversion));
+	/* promiscredir: parse-compat-only (no nua_r_redirect handler). */
+	sofia_cli_peer_line(&buf, "Promisc redir", "%s", AST_CLI_YESNO(peer->promiscredir));
+	/* autoframing: parse-compat-only (ptime gate not wired). */
+	sofia_cli_peer_line(&buf, "Auto framing", "%s", AST_CLI_YESNO(peer->autoframing));
+	/* faxdetect per-peer mode (DSP CNG + peer T.38 reINVITE detection). */
+	sofia_cli_peer_line(&buf, "Fax detect", "%s",
+		peer->faxdetect_mode == SOFIA_FAX_DETECT_NONE ? "no" :
+		peer->faxdetect_mode == SOFIA_FAX_DETECT_BOTH ? "yes (cng,t38)" :
+		peer->faxdetect_mode == SOFIA_FAX_DETECT_CNG ? "cng" : "t38");
+	sofia_cli_peer_section(&buf, "Fax and T.38");
+	/* 5-field T.38 display (chan_sip parity). */
+	sofia_cli_peer_line(&buf, "T38 support", "%s", AST_CLI_YESNO(peer->t38pt_udptl));
+	sofia_cli_peer_line(&buf, "T38 EC mode", "%s",
+		peer->t38_ec_mode == SOFIA_T38_EC_REDUNDANCY ? "Redundancy" :
+		peer->t38_ec_mode == SOFIA_T38_EC_FEC ? "FEC" : "None");
+	sofia_cli_peer_line(&buf, "T38 max datagram", "%d", peer->t38_maxdatagram);
+	sofia_cli_peer_line(&buf, "T38 RTP source", "%s", AST_CLI_YESNO(peer->t38pt_usertpsource));
+	sofia_cli_peer_section(&buf, "Timers and RTP");
+	sofia_cli_peer_line(&buf, "Timer B", "%d", peer->timer_b);
+	sofia_cli_peer_line(&buf, "Timer T1", "%d", peer->timer_t1);
+	sofia_cli_peer_line(&buf, "Overlap dial", "%s", sofia_allowoverlap_str(peer->allowoverlap_mode));
+	/* rtp-timeout bundle (chan_sip parity). */
+	sofia_cli_peer_line(&buf, "RTP timeout", "%d", peer->rtptimeout);
+	sofia_cli_peer_line(&buf, "RTP hold timeout", "%d", peer->rtpholdtimeout);
+	sofia_cli_peer_line(&buf, "RTP keepalive", "%d", peer->rtpkeepalive);
+	sofia_cli_peer_section(&buf, "Routing and dialplan");
+	sofia_cli_peer_line(&buf, "Parking lot", "%s", ast_strlen_zero(peer->parkinglot) ? "(none)" : peer->parkinglot);
+	/* usereqphone (chan_sip parity): 3-state inheritance display. */
+	if (peer->usereqphone) {
+		int from_general = sofia_cfg.default_usereqphone && peer->usereqphone == sofia_cfg.default_usereqphone;
+		sofia_cli_peer_line(&buf, "User=Phone", "yes%s", from_general ? " (from [general])" : "");
+	} else {
+		sofia_cli_peer_line(&buf, "User=Phone", "no");
+	}
+	/* Account code is shown in the concise summary (above); not duplicated here. */
+	/* maxforwards (chan_sip parity): 3-state inheritance display. */
+	if (peer->maxforwards == sofia_cfg.default_max_forwards) {
+		sofia_cli_peer_line(&buf, "Max forwards", "%d (from [general])", peer->maxforwards);
+	} else {
+		sofia_cli_peer_line(&buf, "Max forwards", "%d", peer->maxforwards);
+	}
+	{
+		/* MWI mailbox list (NOLOCK; peer->lock is held by the outer caller). */
+		struct sofia_mailbox *mb;
+		char mailbox_buf[512] = "";
+		int first = 1;
+		AST_LIST_TRAVERSE(&peer->mailboxes, mb, list) {
+			char mailbox_entry[128];
+			snprintf(mailbox_entry, sizeof(mailbox_entry), "%s@%s", mb->mailbox, mb->context);
+			if (!first) {
+				strncat(mailbox_buf, ", ", sizeof(mailbox_buf) - strlen(mailbox_buf) - 1);
+			}
+			strncat(mailbox_buf, mailbox_entry, sizeof(mailbox_buf) - strlen(mailbox_buf) - 1);
+			first = 0;
 		}
-		sofia_cli_peer_line(&buf, "Secret", "%s", ast_strlen_zero(peer->secret) ? "(none)" : "(set)");
-		if (peer->qualify) {
-			sofia_cli_peer_line(&buf, "Qualify", "yes, freq=%ds, timeout=%ds, status=%s",
-				peer->qualifyfreq, peer->qualifytimeout, status);
+		sofia_cli_peer_line(&buf, "Mailbox", "%s", first ? "(none)" : mailbox_buf);
+	}
+	{
+		/* outboundproxy: peer value, else [general] inherit-marker, else (none). */
+		const char *peer_p = peer->outboundproxy;
+		if (!ast_strlen_zero(peer_p)) {
+			sofia_cli_peer_line(&buf, "Outbound proxy", "%s", peer_p);
+		} else if (!ast_strlen_zero(sofia_cfg.outboundproxy)) {
+			sofia_cli_peer_line(&buf, "Outbound proxy", "%s (from [general])", sofia_cfg.outboundproxy);
 		} else {
-			sofia_cli_peer_line(&buf, "Qualify", "no");
-		}
-		if (!ast_strlen_zero(peer->callerid)) {
-			sofia_cli_peer_line(&buf, "CallerID", "%s", peer->callerid);
-		}
-		if (!ast_strlen_zero(peer->cid_num) || !ast_strlen_zero(peer->cid_name)) {
-			char merged[256];
-			ast_callerid_merge(merged, sizeof(merged),
-				S_OR(peer->cid_name, ""), S_OR(peer->cid_num, ""), "<unknown>");
-			sofia_cli_peer_line(&buf, "Callerid", "%s", merged);
-		}
-		if (!ast_strlen_zero(peer->cid_tag)) {
-			sofia_cli_peer_line(&buf, "CID tag", "%s", peer->cid_tag);
-		}
-
-		sofia_cli_peer_section(&buf, "Network and media");
-		sofia_cli_peer_line(&buf, "NAT", "%s", nat);
-		sofia_cli_peer_line(&buf, "DTMF mode", "%s", dtmf_str);
-		sofia_cli_peer_line(&buf, "Direct media", "%s", AST_CLI_YESNO(peer->directmedia));
-		sofia_cli_peer_line(&buf, "Encryption", "%s", AST_CLI_YESNO(peer->encryption));
-		sofia_cli_peer_line(&buf, "WebRTC", "%s", AST_CLI_YESNO(peer->webrtc));
-		sofia_cli_peer_line(&buf, "Codecs", "%s", ast_strlen_zero(codec_buf) ? "(default)" : codec_buf);
-		sofia_cli_peer_line(&buf, "Max call BR", "%d kbps", peer->maxcallbitrate);
-
-		sofia_cli_peer_section(&buf, "Limits and features");
-		sofia_cli_peer_line(&buf, "Busy on active", "%s", AST_CLI_YESNO(peer->busy_on_active));
-		sofia_cli_peer_line(&buf, "Max contacts", "%d (used: %d)", peer->max_contacts, contacts_used);
-		sofia_cli_peer_line(&buf, "Transfer mode", "%s", sofia_transfer_mode_str(peer->allowtransfer));
-		sofia_cli_peer_line(&buf, "Lock user-agent", "%s", AST_CLI_YESNO(peer->lockuseragent));
-		if (peer->lockuseragent && peer->locked_user_agent[0]) {
-			sofia_cli_peer_line(&buf, "Locked UA", "%s", peer->locked_user_agent);
-		}
-		if (peer->lockuseragent && !ast_strlen_zero(peer->lockuseragent_prefixes)) {
-			sofia_cli_peer_line(&buf, "UA prefixes", "%s", peer->lockuseragent_prefixes);
-		}
-		sofia_cli_peer_line(&buf, "Language", "%s", ast_strlen_zero(peer->language) ? "(none)" : peer->language);
-		sofia_cli_peer_line(&buf, "Default IP", "%s", ast_sockaddr_stringify(&peer->defaddr));
-		sofia_cli_peer_line(&buf, "AMA flags", "%s", ast_cdr_flags2str(peer->amaflags));
-		sofia_cli_peer_line(&buf, "Subscribe MWI", "%s", AST_CLI_YESNO(peer->subscribemwi));
-		sofia_cli_peer_line(&buf, "Preferred codec", "%s", AST_CLI_YESNO(peer->preferred_codec_only));
-		/* ignoresdpversion: parse-compat-only (every SDP is processed). */
-		sofia_cli_peer_line(&buf, "Ignore SDP ver", "%s", AST_CLI_YESNO(peer->ignoresdpversion));
-		/* promiscredir: parse-compat-only (no nua_r_redirect handler). */
-		sofia_cli_peer_line(&buf, "Promisc redir", "%s", AST_CLI_YESNO(peer->promiscredir));
-		/* autoframing: parse-compat-only (ptime gate not wired). */
-		sofia_cli_peer_line(&buf, "Auto framing", "%s", AST_CLI_YESNO(peer->autoframing));
-		/* faxdetect per-peer mode (DSP CNG + peer T.38 reINVITE detection). */
-		sofia_cli_peer_line(&buf, "Fax detect", "%s",
-			peer->faxdetect_mode == SOFIA_FAX_DETECT_NONE ? "no" :
-			peer->faxdetect_mode == SOFIA_FAX_DETECT_BOTH ? "yes (cng,t38)" :
-			peer->faxdetect_mode == SOFIA_FAX_DETECT_CNG ? "cng" : "t38");
-		sofia_cli_peer_section(&buf, "Fax and T.38");
-		/* 5-field T.38 display (chan_sip parity). */
-		sofia_cli_peer_line(&buf, "T38 support", "%s", AST_CLI_YESNO(peer->t38pt_udptl));
-		sofia_cli_peer_line(&buf, "T38 EC mode", "%s",
-			peer->t38_ec_mode == SOFIA_T38_EC_REDUNDANCY ? "Redundancy" :
-			peer->t38_ec_mode == SOFIA_T38_EC_FEC ? "FEC" : "None");
-		sofia_cli_peer_line(&buf, "T38 max datagram", "%d", peer->t38_maxdatagram);
-		sofia_cli_peer_line(&buf, "T38 RTP source", "%s", AST_CLI_YESNO(peer->t38pt_usertpsource));
-		sofia_cli_peer_section(&buf, "Timers and RTP");
-		sofia_cli_peer_line(&buf, "Timer B", "%d", peer->timer_b);
-		sofia_cli_peer_line(&buf, "Timer T1", "%d", peer->timer_t1);
-		sofia_cli_peer_line(&buf, "Overlap dial", "%s", sofia_allowoverlap_str(peer->allowoverlap_mode));
-		/* rtp-timeout bundle (chan_sip parity). */
-		sofia_cli_peer_line(&buf, "RTP timeout", "%d", peer->rtptimeout);
-		sofia_cli_peer_line(&buf, "RTP hold timeout", "%d", peer->rtpholdtimeout);
-		sofia_cli_peer_line(&buf, "RTP keepalive", "%d", peer->rtpkeepalive);
-		sofia_cli_peer_section(&buf, "Routing and dialplan");
-		sofia_cli_peer_line(&buf, "Parking lot", "%s", ast_strlen_zero(peer->parkinglot) ? "(none)" : peer->parkinglot);
-		/* usereqphone (chan_sip parity): 3-state inheritance display. */
-		if (peer->usereqphone) {
-			int from_general = sofia_cfg.default_usereqphone && peer->usereqphone == sofia_cfg.default_usereqphone;
-			sofia_cli_peer_line(&buf, "User=Phone", "yes%s", from_general ? " (from [general])" : "");
-		} else {
-			sofia_cli_peer_line(&buf, "User=Phone", "no");
-		}
-		/* (Accountcode is shown in the always-on summary above.) */
-		/* maxforwards (chan_sip parity): 3-state inheritance display. */
-		if (peer->maxforwards == sofia_cfg.default_max_forwards) {
-			sofia_cli_peer_line(&buf, "Max forwards", "%d (from [general])", peer->maxforwards);
-		} else {
-			sofia_cli_peer_line(&buf, "Max forwards", "%d", peer->maxforwards);
-		}
-		{
-			/* MWI mailbox list (NOLOCK; peer->lock is held by the outer caller). */
-			struct sofia_mailbox *mb;
-			char mailbox_buf[512] = "";
-			int first = 1;
-			AST_LIST_TRAVERSE(&peer->mailboxes, mb, list) {
-				char mailbox_entry[128];
-				snprintf(mailbox_entry, sizeof(mailbox_entry), "%s@%s", mb->mailbox, mb->context);
-				if (!first) {
-					strncat(mailbox_buf, ", ", sizeof(mailbox_buf) - strlen(mailbox_buf) - 1);
-				}
-				strncat(mailbox_buf, mailbox_entry, sizeof(mailbox_buf) - strlen(mailbox_buf) - 1);
-				first = 0;
-			}
-			sofia_cli_peer_line(&buf, "Mailbox", "%s", first ? "(none)" : mailbox_buf);
-		}
-		{
-			/* outboundproxy: peer value, else [general] inherit-marker, else (none). */
-			const char *peer_p = peer->outboundproxy;
-			if (!ast_strlen_zero(peer_p)) {
-				sofia_cli_peer_line(&buf, "Outbound proxy", "%s", peer_p);
-			} else if (!ast_strlen_zero(sofia_cfg.outboundproxy)) {
-				sofia_cli_peer_line(&buf, "Outbound proxy", "%s (from [general])", sofia_cfg.outboundproxy);
-			} else {
-				sofia_cli_peer_line(&buf, "Outbound proxy", "(none)");
-			}
-		}
-		{
-			/* MOH Interpret + Suggest (chan_sip parity). Suggest signals INBOUND only today
-			 * (outbound HOLD re-INVITE is not issued). */
-			sofia_cli_peer_line(&buf, "MOH interpret", "%s",
-				ast_strlen_zero(peer->mohinterpret) ? "(none)" : peer->mohinterpret);
-			sofia_cli_peer_line(&buf, "MOH suggest", "%s",
-				ast_strlen_zero(peer->mohsuggest) ? "(none)" : peer->mohsuggest);
-		}
-		{
-			/* SRTP cipher: 3-state inheritance display. */
-			if (!ast_strlen_zero(peer->srtpcipher)) {
-				sofia_cli_peer_line(&buf, "SRTP cipher", "%s", peer->srtpcipher);
-			} else if (!ast_strlen_zero(sofia_cfg.default_srtpcipher)) {
-				sofia_cli_peer_line(&buf, "SRTP cipher", "%s (from [general])", sofia_cfg.default_srtpcipher);
-			} else {
-				sofia_cli_peer_line(&buf, "SRTP cipher", "(default AES_CM_128_HMAC_SHA1_80)");
-			}
-		}
-		sofia_cli_peer_section(&buf, "Session and identity headers");
-		/* Session timers (RFC 4028): 4-line display. */
-		sofia_cli_peer_line(&buf, "Session timers", "%s", st_mode_str);
-		sofia_cli_peer_line(&buf, "Session expires", "%d", peer->session_expires);
-		sofia_cli_peer_line(&buf, "Session Min-SE", "%d", peer->session_minse);
-		sofia_cli_peer_line(&buf, "Session refresher", "%s", st_refresher_str);
-		sofia_cli_peer_line(&buf, "Calling pres", "%s", ast_named_caller_presentation(peer->callingpres));
-		sofia_cli_peer_line(&buf, "Send RPID", "%s", sendrpid_str);
-		sofia_cli_peer_line(&buf, "Trust RPID", "%s", AST_CLI_YESNO(peer->trustrpid));
-		sofia_cli_peer_line(&buf, "Concurrent calls", "%d/%s (%d ringing, %d on-hold)",
-			peer->inUse, limit_str, peer->inRinging, peer->onHold);
-
-		sofia_cli_peer_section(&buf, "Groups and source");
-		{
-			char grp_buf[256];
-			sofia_cli_peer_line(&buf, "Call group", "%s", ast_print_group(grp_buf, sizeof(grp_buf), peer->callgroup));
-			sofia_cli_peer_line(&buf, "Pickup group", "%s", ast_print_group(grp_buf, sizeof(grp_buf), peer->pickupgroup));
-		}
-		/* regexten display-gate (chan_sip parity): shown only when regcontext is set. */
-		if (!ast_strlen_zero(sofia_cfg.regcontext) && !ast_strlen_zero(peer->regexten)) {
-			sofia_cli_peer_line(&buf, "Reg ext", "%s", peer->regexten);
-		}
-		if (!ast_strlen_zero(peer->callbackextension)) {
-			sofia_cli_peer_line(&buf, "Callback ext", "%s", peer->callbackextension);
-		}
-		/* GRUU (RFC 5627): advertisement opt-in + any GRUU the registrar minted (Phase 2). */
-		if (peer->gruu) {
-			sofia_cli_peer_line(&buf, "GRUU", "advertised (+sip.instance)");
-			if (!ast_strlen_zero(peer->pub_gruu)) {
-				sofia_cli_peer_line(&buf, "Pub-GRUU", "%s", peer->pub_gruu);
-			}
-			if (!ast_strlen_zero(peer->temp_gruu)) {
-				sofia_cli_peer_line(&buf, "Temp-GRUU", "%s", peer->temp_gruu);
-			}
-		}
-		/* Service-Route (RFC 3608): opt-in + any route learned from the registrar's REGISTER 200. */
-		if (peer->use_service_route) {
-			sofia_cli_peer_line(&buf, "Service-Route", "%s",
-				!ast_strlen_zero(peer->service_route) ? peer->service_route : "(enabled, none learned)");
-		}
-		/* 100rel/PRACK (RFC 3262): reliable non-183 provisionals to this peer (opt-in). */
-		if (peer->rel100) {
-			sofia_cli_peer_line(&buf, "100rel", "reliable provisionals (PRACK)");
-		}
-		/* SIP Outbound (RFC 5626): opt-in advertisement + the registrar's runtime confirmation/Flow-Timer. */
-		if (peer->sip_outbound) {
-			char ft[32] = "";
-			if (peer->flow_timer > 0) {
-				snprintf(ft, sizeof(ft), ", Flow-Timer %ds", peer->flow_timer);
-			}
-			sofia_cli_peer_line(&buf, "SIP Outbound", "advertised (reg-id=1, +sip.instance); registrar %s%s",
-				peer->sip_outbound_active ? "confirmed (Require: outbound)" : "not confirmed", ft);
-		}
-		/* setvar + header display (chan_sip parity): header= entries carry the
-		 * __SIPADDHEADERpre%2d= prefix. */
-		if (peer->chanvars) {
-			struct ast_variable *var;
-			for (var = peer->chanvars; var; var = var->next) {
-				sofia_cli_peer_line(&buf, "Variable", "%s = %s", var->name, var->value);
-			}
-		}
-		/* subscribecontext (chan_sip parity): 3-state inheritance display. */
-		if (!ast_strlen_zero(peer->subscribecontext)) {
-			int from_general = !ast_strlen_zero(sofia_cfg.default_subscribecontext)
-				&& !strcmp(peer->subscribecontext, sofia_cfg.default_subscribecontext);
-			sofia_cli_peer_line(&buf, "Subscribe context", "%s%s", peer->subscribecontext,
-				from_general ? " (from [general])" : "");
-		} else if (!ast_strlen_zero(sofia_cfg.default_subscribecontext)) {
-			sofia_cli_peer_line(&buf, "Subscribe context", "%s (from [general])", sofia_cfg.default_subscribecontext);
-		} else {
-			sofia_cli_peer_line(&buf, "Subscribe context", "<Not set>");
-		}
-		if (!ast_strlen_zero(peer->fromuser)) {
-			sofia_cli_peer_line(&buf, "From user", "%s", peer->fromuser);
-		}
-		if (!ast_strlen_zero(peer->fromdomain)) {
-			sofia_cli_peer_line(&buf, "From domain", "%s", peer->fromdomain);
-		}
-
-		sofia_cli_peer_section(&buf, "Security and ACL");
-		{
-			char ins[64] = "";
-			if (peer->insecure & SOFIA_INSECURE_PORT) {
-				ast_copy_string(ins, "port", sizeof(ins));
-			}
-			if (peer->insecure & SOFIA_INSECURE_INVITE) {
-				if (ins[0]) {
-					strncat(ins, ",", sizeof(ins) - strlen(ins) - 1);
-				}
-				strncat(ins, "invite", sizeof(ins) - strlen(ins) - 1);
-			}
-			sofia_cli_peer_line(&buf, "Insecure", "%s", ins[0] ? ins : "no");
-		}
-
-		if (peer->ha) {
-			sofia_cli_peer_line(&buf, "ACL", "yes");
-			sofia_print_ha_lines(&buf, peer->ha);
-		} else {
-			sofia_cli_peer_line(&buf, "ACL", "no");
-		}
-		sofia_cli_peer_line(&buf, "Contact ACL", "%s", peer->contactha ? "yes" : "no");
-		sofia_cli_peer_line(&buf, "Direct media ACL", "%s", peer->directmediaha ? "yes" : "no");
-		sofia_cli_peer_line(&buf, "DNS managed", "%s", peer->dnsmgr ? "yes" : "no");
-
-		sofia_cli_peer_section(&buf, "Registration");
-		sofia_cli_peer_line(&buf, "Source", "%s", source_str);
-		/* Outbound register state — ONLY for an explicit register=> peer (is_register_line), matching
-		 * sofia_do_register's opt-in gate. A static challenge-auth trunk (secret only for outbound digest
-		 * auth, e.g. a carrier or SBC challenge-auth trunk) is NOT a register target and must not show register
-		 * scaffolding — showing it falsely implied the peer was registering. */
-		if (peer->is_register_line) {
-			sofia_cli_peer_line(&buf, "Outbound reg", "target=%s:%d expiry=%lds attempts=%d",
-				peer->host, peer->port,
-				peer->reg_expiry > 0 ? (long)(peer->reg_expiry - time(NULL)) : 0,
-				peer->reg_attempts);
-		}
-
-		if (!ast_sockaddr_isnull(&peer->src_addr)) {
-			sofia_cli_peer_line(&buf, "Source addr", "%s", ast_sockaddr_stringify(&peer->src_addr));
+			sofia_cli_peer_line(&buf, "Outbound proxy", "(none)");
 		}
 	}
+	{
+		/* MOH Interpret + Suggest (chan_sip parity). Suggest signals INBOUND only today
+		 * (outbound HOLD re-INVITE is not issued). */
+		sofia_cli_peer_line(&buf, "MOH interpret", "%s",
+			ast_strlen_zero(peer->mohinterpret) ? "(none)" : peer->mohinterpret);
+		sofia_cli_peer_line(&buf, "MOH suggest", "%s",
+			ast_strlen_zero(peer->mohsuggest) ? "(none)" : peer->mohsuggest);
+	}
+	{
+		/* SRTP cipher: 3-state inheritance display. */
+		if (!ast_strlen_zero(peer->srtpcipher)) {
+			sofia_cli_peer_line(&buf, "SRTP cipher", "%s", peer->srtpcipher);
+		} else if (!ast_strlen_zero(sofia_cfg.default_srtpcipher)) {
+			sofia_cli_peer_line(&buf, "SRTP cipher", "%s (from [general])", sofia_cfg.default_srtpcipher);
+		} else {
+			sofia_cli_peer_line(&buf, "SRTP cipher", "(default AES_CM_128_HMAC_SHA1_80)");
+		}
+	}
+	sofia_cli_peer_section(&buf, "Session and identity headers");
+	/* Session timers (RFC 4028): 4-line display. */
+	sofia_cli_peer_line(&buf, "Session timers", "%s", st_mode_str);
+	sofia_cli_peer_line(&buf, "Session expires", "%d", peer->session_expires);
+	sofia_cli_peer_line(&buf, "Session Min-SE", "%d", peer->session_minse);
+	sofia_cli_peer_line(&buf, "Session refresher", "%s", st_refresher_str);
+	sofia_cli_peer_line(&buf, "Calling pres", "%s", ast_named_caller_presentation(peer->callingpres));
+	sofia_cli_peer_line(&buf, "Send RPID", "%s", sendrpid_str);
+	sofia_cli_peer_line(&buf, "Trust RPID", "%s", AST_CLI_YESNO(peer->trustrpid));
+	sofia_cli_peer_line(&buf, "Concurrent calls", "%d/%s (%d ringing, %d on-hold)",
+		peer->inUse, limit_str, peer->inRinging, peer->onHold);
+
+	sofia_cli_peer_section(&buf, "Groups and source");
+	{
+		char grp_buf[256];
+		sofia_cli_peer_line(&buf, "Call group", "%s", ast_print_group(grp_buf, sizeof(grp_buf), peer->callgroup));
+		sofia_cli_peer_line(&buf, "Pickup group", "%s", ast_print_group(grp_buf, sizeof(grp_buf), peer->pickupgroup));
+	}
+	/* regexten display-gate (chan_sip parity): shown only when regcontext is set. */
+	if (!ast_strlen_zero(sofia_cfg.regcontext) && !ast_strlen_zero(peer->regexten)) {
+		sofia_cli_peer_line(&buf, "Reg ext", "%s", peer->regexten);
+	}
+	if (!ast_strlen_zero(peer->callbackextension)) {
+		sofia_cli_peer_line(&buf, "Callback ext", "%s", peer->callbackextension);
+	}
+	/* GRUU (RFC 5627): advertisement opt-in + any GRUU the registrar minted (Phase 2). */
+	if (peer->gruu) {
+		sofia_cli_peer_line(&buf, "GRUU", "advertised (+sip.instance)");
+		if (!ast_strlen_zero(peer->pub_gruu)) {
+			sofia_cli_peer_line(&buf, "Pub-GRUU", "%s", peer->pub_gruu);
+		}
+		if (!ast_strlen_zero(peer->temp_gruu)) {
+			sofia_cli_peer_line(&buf, "Temp-GRUU", "%s", peer->temp_gruu);
+		}
+	}
+	/* Service-Route (RFC 3608): opt-in + any route learned from the registrar's REGISTER 200. */
+	if (peer->use_service_route) {
+		sofia_cli_peer_line(&buf, "Service-Route", "%s",
+			!ast_strlen_zero(peer->service_route) ? peer->service_route : "(enabled, none learned)");
+	}
+	/* 100rel/PRACK (RFC 3262): reliable non-183 provisionals to this peer (opt-in). */
+	if (peer->rel100) {
+		sofia_cli_peer_line(&buf, "100rel", "reliable provisionals (PRACK)");
+	}
+	/* SIP Outbound (RFC 5626): opt-in advertisement + the registrar's runtime confirmation/Flow-Timer. */
+	if (peer->sip_outbound) {
+		char ft[32] = "";
+		if (peer->flow_timer > 0) {
+			snprintf(ft, sizeof(ft), ", Flow-Timer %ds", peer->flow_timer);
+		}
+		sofia_cli_peer_line(&buf, "SIP Outbound", "advertised (reg-id=1, +sip.instance); registrar %s%s",
+			peer->sip_outbound_active ? "confirmed (Require: outbound)" : "not confirmed", ft);
+	}
+	/* setvar + header display (chan_sip parity): header= entries carry the
+	 * __SIPADDHEADERpre%2d= prefix. */
+	if (peer->chanvars) {
+		struct ast_variable *var;
+		for (var = peer->chanvars; var; var = var->next) {
+			/* FULL-security: never print the VALUE of a chanvar whose NAME suggests a credential (an admin
+			 * could stash a token/password in setvar=). Case-insensitive substring match on the name. */
+			int secret_name = strcasestr(var->name, "secret") || strcasestr(var->name, "password")
+				|| strcasestr(var->name, "pass") || strcasestr(var->name, "token")
+				|| strcasestr(var->name, "key") || strcasestr(var->name, "nonce")
+				|| strcasestr(var->name, "auth");
+			sofia_cli_peer_line(&buf, "Variable", "%s = %s", var->name,
+				secret_name ? "<redacted>" : var->value);
+		}
+	}
+	/* subscribecontext (chan_sip parity): 3-state inheritance display. */
+	if (!ast_strlen_zero(peer->subscribecontext)) {
+		int from_general = !ast_strlen_zero(sofia_cfg.default_subscribecontext)
+			&& !strcmp(peer->subscribecontext, sofia_cfg.default_subscribecontext);
+		sofia_cli_peer_line(&buf, "Subscribe context", "%s%s", peer->subscribecontext,
+			from_general ? " (from [general])" : "");
+	} else if (!ast_strlen_zero(sofia_cfg.default_subscribecontext)) {
+		sofia_cli_peer_line(&buf, "Subscribe context", "%s (from [general])", sofia_cfg.default_subscribecontext);
+	} else {
+		sofia_cli_peer_line(&buf, "Subscribe context", "<Not set>");
+	}
+	if (!ast_strlen_zero(peer->fromuser)) {
+		sofia_cli_peer_line(&buf, "From user", "%s", peer->fromuser);
+	}
+	if (!ast_strlen_zero(peer->fromdomain)) {
+		sofia_cli_peer_line(&buf, "From domain", "%s", peer->fromdomain);
+	}
+
+	sofia_cli_peer_section(&buf, "Security and ACL");
+	{
+		char ins[64] = "";
+		if (peer->insecure & SOFIA_INSECURE_PORT) {
+			ast_copy_string(ins, "port", sizeof(ins));
+		}
+		if (peer->insecure & SOFIA_INSECURE_INVITE) {
+			if (ins[0]) {
+				strncat(ins, ",", sizeof(ins) - strlen(ins) - 1);
+			}
+			strncat(ins, "invite", sizeof(ins) - strlen(ins) - 1);
+		}
+		sofia_cli_peer_line(&buf, "Insecure", "%s", ins[0] ? ins : "no");
+	}
+
+	if (peer->ha) {
+		sofia_cli_peer_line(&buf, "ACL", "yes");
+		sofia_print_ha_lines(&buf, peer->ha);
+	} else {
+		sofia_cli_peer_line(&buf, "ACL", "no");
+	}
+	sofia_cli_peer_line(&buf, "Contact ACL", "%s", peer->contactha ? "yes" : "no");
+	sofia_cli_peer_line(&buf, "Direct media ACL", "%s", peer->directmediaha ? "yes" : "no");
+	sofia_cli_peer_line(&buf, "DNS managed", "%s", peer->dnsmgr ? "yes" : "no");
+
+	sofia_cli_peer_section(&buf, "Registration");
+	sofia_cli_peer_line(&buf, "Source", "%s", source_str);
+	/* Outbound register state — ONLY for an explicit register=> peer (is_register_line), matching
+	 * sofia_do_register's opt-in gate. A static challenge-auth trunk (secret only for outbound digest
+	 * auth, e.g. a carrier or SBC challenge-auth trunk) is NOT a register target and must not show register
+	 * scaffolding — showing it falsely implied the peer was registering. */
+	if (peer->is_register_line) {
+		sofia_cli_peer_line(&buf, "Outbound reg", "target=%s:%d expiry=%lds attempts=%d",
+			peer->host, peer->port,
+			peer->reg_expiry > 0 ? (long)(peer->reg_expiry - time(NULL)) : 0,
+			peer->reg_attempts);
+	}
+
+	if (!ast_sockaddr_isnull(&peer->src_addr)) {
+		sofia_cli_peer_line(&buf, "Source addr", "%s", ast_sockaddr_stringify(&peer->src_addr));
+	}
+	}	/* end of the "detail"-only per-field dump; the Contacts section below is always shown */
 
 	sofia_cli_peer_section(&buf, "Contacts");
 	if (peer->contacts && contacts_used > 0) {
@@ -656,6 +669,7 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 			char src_buf[64];
 			int active_calls;
 			long ttl;
+			time_t c_last;
 			const char *src;
 
 			/* Snapshot the mutable contact fields under the contact lock (a REGISTER
@@ -664,6 +678,7 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 			char c_path[1024];
 			ao2_lock(c);
 			ttl = (long)(c->expires - now);
+			c_last = c->last_register;
 			ast_copy_string(src_buf, !ast_sockaddr_isnull(&c->src_addr) ?
 				ast_sockaddr_stringify(&c->src_addr) : "(unknown)", sizeof(src_buf));
 			ast_copy_string(ua_buf, c->user_agent[0] ? c->user_agent : "(none)", sizeof(ua_buf));
@@ -673,16 +688,29 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 			src = src_buf;
 
 			snprintf(ttl_buf, sizeof(ttl_buf), "%lds", ttl > 0 ? ttl : 0);
-			if (active_calls > 0) {
+			if (ttl <= 0) {
+				ast_copy_string(contact_status, "EXPIRED", sizeof(contact_status));	/* registration lapsed -> not routable (CHANUNAVAIL on a dynamic peer) */
+			} else if (active_calls > 0) {
 				snprintf(contact_status, sizeof(contact_status),
 					"IN-CALL:%d", active_calls);
 			} else {
-				ast_copy_string(contact_status, "IDLE", sizeof(contact_status));
+				ast_copy_string(contact_status, "AVAILABLE", sizeof(contact_status));
 			}
 			snprintf(contact_label, sizeof(contact_label), "Contact %d URI", idx++);
 			sofia_cli_peer_line(&buf, contact_label, "%s", c->contact_uri);
 			sofia_cli_peer_subline(&buf, "State", "%s", contact_status);
 			sofia_cli_peer_subline(&buf, "TTL", "%s", ttl_buf);
+			{	/* diagnostic: seconds since this contact last (re)REGISTERed + expiry state */
+				char idle_buf[128];
+				if (!c_last) {
+					ast_copy_string(idle_buf, "unknown (never stamped)", sizeof(idle_buf));
+				} else {
+					long age = (long)(now - c_last);
+					snprintf(idle_buf, sizeof(idle_buf), "%lds ago - %s", age,
+						ttl <= 0 ? "EXPIRED (re-REGISTER required)" : "live");
+				}
+				sofia_cli_peer_subline(&buf, "Last-REGISTER", "%s", idle_buf);
+			}
 			sofia_cli_peer_subline(&buf, "Source", "%s", src);
 			sofia_cli_peer_subline(&buf, "User-Agent", "%s", ua_buf);
 			if (!ast_strlen_zero(c_path)) {
@@ -882,18 +910,27 @@ char *sofia_set_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 	if (cmd == CLI_INIT) {
 		e->command = "sip set debug";
 		e->usage =
-			"Usage: sip set debug [on|off|peer <name>|ip <addr>|sdp on|off]\n"
+			"Usage: sip set debug [on|off|peer <name>|ip <addr>|file <path>|off|capture <host:port>|off|fork {on|off}]\n"
 			"       Show current debug state, or enable/disable Sofia-SIP debug.\n"
 			"       'on'  - enable debug for all peers\n"
 			"       'off' - disable debug\n"
 			"       'peer <name>' - enable debug for a specific peer\n"
 			"       'ip <addr>'   - enable debug for a specific IP address\n"
-			"       'sdp on|off'  - dump generated offer SDP + the WebRTC offer-gate decision\n";
+			"       'file <path>' - append EVERY decrypted SIP message (incl. SDP, over ws/wss/tls/udp)\n"
+			"                       to <path>; 'file off' stops it (Homer/HEP-free, plain text)\n"
+			"       'capture <host:port>' - stream all decrypted SIP as HEP (UDP) to a Homer/sipcapture\n"
+			"                       server (e.g. 127.0.0.1:9060); 'capture off' stops it. HEP version\n"
+			"                       from sip_capture_hep (default 3).\n"
+			"       'fork {on|off}' - fork/flow lifecycle trace (child create/cancel, winner nh/rtp/fd\n"
+			"                       steal, regflow drop + media_error). Correlates to 'rtp set debug ice'\n"
+			"                       by the rtp pointer. Pure logging, default OFF.\n";
 		return NULL;
 	} else if (cmd == CLI_GENERATE) {
 		if (a->pos == 3)
-			return ast_cli_complete(a->word, (const char *[]){ "on", "off", "peer", "ip", "sdp", NULL }, a->n);
-		if (a->pos == 4 && !strcasecmp(a->argv[3], "sdp"))
+			return ast_cli_complete(a->word, (const char *[]){ "on", "off", "peer", "ip", "file", "capture", "fork", NULL }, a->n);
+		if (a->pos == 4 && (!strcasecmp(a->argv[3], "file") || !strcasecmp(a->argv[3], "capture")))
+			return ast_cli_complete(a->word, (const char *[]){ "off", NULL }, a->n);
+		if (a->pos == 4 && !strcasecmp(a->argv[3], "fork"))
 			return ast_cli_complete(a->word, (const char *[]){ "on", "off", NULL }, a->n);
 		return NULL;
 	}
@@ -945,9 +982,52 @@ char *sofia_set_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 			tport_set_params(nta_agent_tports(nua_get_agent(sofia_nua)), TPTAG_LOG(0), TAG_END());
 		ast_cli(a->fd, "Sofia debug enabled for IP '%s'\n", sofia_debug_filter);
 		return CLI_SUCCESS;
-	} else if (!strcasecmp(what, "sdp")) {
-		sofia_debug_sdp = (a->argc == 5 && !strcasecmp(a->argv[4], "on"));
-		ast_cli(a->fd, "Sofia SDP/offer-gate debug %s\n", sofia_debug_sdp ? "enabled" : "disabled");
+	} else if (!strcasecmp(what, "fork")) {
+		/* B1: fork/flow lifecycle trace (fork child create/cancel, winner nh/rtp/fd steal, regflow
+		 * drop + media_error). Separate flag from sofia_debug; pure logging, no behavior change. */
+		if (a->argc != 5)
+			return CLI_SHOWUSAGE;
+		if (!strcasecmp(a->argv[4], "on")) {
+			sofia_forkdebug = 1;
+			ast_cli(a->fd, "Sofia fork/flow debug enabled\n");
+		} else if (!strcasecmp(a->argv[4], "off")) {
+			sofia_forkdebug = 0;
+			ast_cli(a->fd, "Sofia fork/flow debug disabled\n");
+		} else {
+			return CLI_SHOWUSAGE;
+		}
+		return CLI_SUCCESS;
+	} else if (!strcasecmp(what, "file")) {
+		/* Dump EVERY decrypted SIP message (recv+sent, udp/tcp/tls/ws/wss, incl. SDP) to a file
+		 * via sofia-sip's built-in TPTAG_DUMP. Runtime override; a `sip reload` re-applies sofia.conf. */
+		if (a->argc != 5)
+			return CLI_SHOWUSAGE;
+		if (!strcasecmp(a->argv[4], "off")) {
+			sofia_cfg.sip_capture_file[0] = '\0';
+			sofia_apply_capture();
+			ast_cli(a->fd, "Sofia: SIP message dump to file disabled\n");
+		} else {
+			ast_copy_string(sofia_cfg.sip_capture_file, a->argv[4], sizeof(sofia_cfg.sip_capture_file));
+			sofia_apply_capture();
+			ast_cli(a->fd, "Sofia: dumping decrypted SIP messages to '%s'\n", a->argv[4]);
+		}
+		return CLI_SUCCESS;
+	} else if (!strcasecmp(what, "capture")) {
+		/* Stream all decrypted SIP as HEP (UDP) to a Homer/sipcapture server via TPTAG_CAPT.
+		 * HEP version from sip_capture_hep (default 3). Runtime override; `sip reload` re-applies. */
+		if (a->argc != 5)
+			return CLI_SHOWUSAGE;
+		if (!strcasecmp(a->argv[4], "off")) {
+			sofia_cfg.sip_capture_address[0] = '\0';
+			sofia_apply_capture();
+			ast_cli(a->fd, "Sofia: SIP HEP capture disabled\n");
+		} else {
+			int hep = (sofia_cfg.sip_capture_hep >= 1 && sofia_cfg.sip_capture_hep <= 3)
+				? sofia_cfg.sip_capture_hep : 3;
+			ast_copy_string(sofia_cfg.sip_capture_address, a->argv[4], sizeof(sofia_cfg.sip_capture_address));
+			sofia_apply_capture();
+			ast_cli(a->fd, "Sofia: streaming decrypted SIP as HEPv%d (UDP) to '%s'\n", hep, a->argv[4]);
+		}
 		return CLI_SUCCESS;
 	}
 

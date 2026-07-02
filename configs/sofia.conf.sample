@@ -18,6 +18,26 @@
 
 [general]
 ;
+; --- Live SIP tracing (decrypted) -> Homer/HEP + file dump ---------------------
+; SIP over ws/wss/tls is encrypted on the wire, so a raw tcpdump only sees ciphertext.
+; These options tap sofia-sip's transport layer to expose EVERY SIP message DECRYPTED,
+; both directions (recv+sent), for udp/tcp/tls/ws/wss, INCLUDING the SDP body (the WebRTC
+; signalling: a=candidate / a=fingerprint / a=setup ...). Off by default (zero overhead).
+; The capture socket is non-blocking, so it never stalls the SIP stack.
+;
+;sip_capture_address = 127.0.0.1:9060   ; stream HEP (UDP) to a Homer/sipcapture server; empty = OFF.
+;                                        ; Read it with `sngrep -H udp:127.0.0.1:9060`, Homer, or the
+;                                        ; Wireshark HEP dissector. Port must be 1024-65535.
+;sip_capture_hep = 3                     ; HEP protocol version 1|2|3 (default 3).
+;sip_capture_id = 200                    ; HEP capture-agent id (default 200).
+;sip_capture_file = /var/log/gabpbx/sip_trace.txt ; ALSO append every decrypted message to this file
+;                                        ; (plain text, no Homer needed); empty = OFF.
+;
+; Runtime toggles (no reload needed):
+;   sip set debug capture <host:port> | capture off
+;   sip set debug file <path>         | file off
+; A `sip reload` re-applies whatever is set above (a runtime toggle not in this file is then cleared).
+;
 ; Reload behaviour
 ;
 ; `sip reload` (and the equivalent `module reload chan_sofia.so`) re-reads
@@ -290,25 +310,15 @@ srvlookup=yes
 ;     candidate gathering + TURN for a server behind NAT is a future item — until
 ;     then deploy gabpbx with a public-reachable media address (or a media relay).
 ;
-;     FLOW-CLOSE CLEANUP (RFC 5626) — flowclose_emit_unregister=yes|no (default no):
-;       A binding registered over a connection-oriented transport (ws/wss/tcp/tls) is
-;       ALWAYS removed promptly when its underlying connection CLOSES (a browser tab
-;       reload/F5 closing the old WebSocket, or a client that goes away without an
-;       Expires:0 unregister) instead of lingering until expiry. This knob only chooses
-;       whether that removal ANNOUNCES an unregistration:
-;         no  (DEFAULT) — remove the binding SILENTLY: no AMI PeerStatus Unregistered,
-;                          no BLF/device-state change, no regexten (regcontext) cleanup.
-;                          Best for browsers: a reload (close then immediate re-REGISTER)
-;                          does NOT flap BLF/presence. Trade-off: a client that leaves for
-;                          good keeps a stale BLF/regexten until a later natural event
-;                          (re-REGISTER, qualify, reload). Internal routing state is always
-;                          correct (the peer shows 0 contacts and is not routable).
-;         yes           — also emit the full unregister side-effects (PeerStatus + BLF +
-;                          device-state + regexten), i.e. accurate presence at the cost of
-;                          a brief Unregistered->Registered flap on every reload. Use for
-;                          hard phones where you want presence to track an unplug exactly.
-;       UDP bindings have no connection close, so they are unaffected by this knob.
-;       Settable in [general] (all peers inherit) and per-peer (override).
+;     WEBRTC VIDEO BUNDLE (RFC 8843 max-bundle) — set webrtc_video_bundle=yes:
+;       webrtc_video_bundle=yes makes chan_sofia carry WebRTC VIDEO on the SAME
+;       BUNDLE'd audio ICE+DTLS transport (one m=video at the audio port, listed in
+;       a=group:BUNDLE, PT-demuxed, with no separate video ICE/DTLS/fingerprint) —
+;       which is what modern browsers negotiate (max-bundle). With it OFF, video
+;       uses a separate transport that max-bundle browsers refuse to key, giving
+;       one-way / black video. REQUIRES webrtc=yes. DEFAULT no — off is byte-identical
+;       to today's separate-transport video. Per-peer webrtc_video_bundle= overrides
+;       [general].
 ;
 ; (5) chan_sofia advantage over chan_sip on WS+WSS:
 ;     chan_sip has NO WebSocket support whatsoever (0 hits in chan_sip.c for
@@ -3069,6 +3079,20 @@ srvlookup=yes
 ; callingpres    - default presentation (AST_PRES_*); chan_sip parity values:
 ;                  allowed_not_screened (default), allowed_passed_screen,
 ;                  allowed_failed_screen, allowed, prohib_not_screened,
+; webrtc_video_bundle - yes/no: carry WebRTC video on the BUNDLE'd audio ICE/DTLS
+;                  transport (RFC 8843 max-bundle) instead of a separate vrtp
+;                  (default: no); REQUIRES webrtc=yes. Off = separate-transport
+;                  video (today's behavior)
+; flowclose_emit_unregister - yes/no (default no): RFC 5626 flow-close. A
+;                  connection-oriented binding (ws/wss/tcp/tls) is ALWAYS removed
+;                  the instant its flow (socket) closes — so a closed browser tab
+;                  becomes CHANUNAVAIL immediately, without waiting for the
+;                  registration to expire (expiry remains the fallback for udp and
+;                  for a flow that dies without a close event). This knob only
+;                  controls the EXTERNAL side-effects of that removal: no (default)
+;                  removes silently (no AMI PeerStatus / BLF / regexten flap — best
+;                  for browsers that F5); yes also emits the full unregister
+;                  side-effects (accurate BLF/regexten, at a brief flap on reload)
 ;                  prohib_passed_screen, prohib_failed_screen, prohib, unavailable
 ; sendrpid       - outbound RPID/PAI emission: no (default), pai (RFC 3325), rpid
 ; trustrpid      - yes/no: trust inbound PAI/RPID (default: no);

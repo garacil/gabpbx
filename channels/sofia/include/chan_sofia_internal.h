@@ -52,10 +52,7 @@ extern struct ao2_container *peers;
 extern nua_t *sofia_nua;
 extern su_root_t *sofia_root;
 extern int sofia_debug;
-extern int sofia_debug_sdp;
-/* [from|to|callid] transaction tag shared by chan_sofia.c and the sofia subdirectory sources. */
-const char *sofia_logctx(void);
-#define sofia_vrb(fmt, ...) ast_verbose("Sofia%s: " fmt, sofia_logctx(), ##__VA_ARGS__)
+extern int sofia_forkdebug;	/* B1: fork/flow lifecycle debug ("sip set debug fork on"); pure logging, default OFF */
 
 /* The Sofia channel tech (chan_sofia.c). The WebRTC DataChannel relay (sofia_datachannel.c)
  * compares a bridged channel's ->tech against this to confirm the far leg is a Sofia channel. */
@@ -176,13 +173,8 @@ struct sofia_contact {
 	char instance_id[128];     /* RFC 5626 +sip.instance (normalized urn:..., quotes + <> stripped). Stable across reboots. */
 	int  reg_id;               /* RFC 5626 reg-id (1..INT_MAX, 0 = absent/invalid). Distinct flows of one instance. */
 	char call_id[128];         /* REGISTER Call-ID (RFC 3261 10.2: stable per UA boot). Universal rotation key. */
-	/* RFC 5626 flow-close: the retained REGISTER handle whose built-in registrar watch fires nua_i_media_error
-	 * when this connection-oriented (ws/wss/tcp/tls) binding's connection closes. NULL = unwatched (udp,
-	 * multi-Contact, or link failed). Read/written under peer->lock while the contact is linked; the contact is
-	 * the SOLE owner and drops it (unlink its registry entry + deferred nua_handle_destroy) on supersede and in
-	 * the destructor. The handle is tracked in the sofia_regflow_handles ao2 registry keyed by the handle
-	 * pointer (no nh_magic is bound). See sofia_regflow_* in chan_sofia.c. */
-	nua_handle_t *reg_nh;
+	time_t last_register;      /* wall-clock of the last REGISTER (re)bind for THIS contact; distinct from expires. Diagnostic only ("Last-REGISTER Ns ago" in sip show peer). 0 = never stamped. */
+	nua_handle_t *reg_nh;      /* RFC 5626 flow-close: retained REGISTER handle whose sofia built-in registrar watch fires nua_i_media_error when this connection-oriented binding's flow closes. NULL = unwatched (udp / multi-Contact / link-failed). Contact is the SOLE dropper (sofia_contact_destructor); r/w under peer->lock while linked. */
 };
 
 extern char sofia_sipnotify_sentinel;
@@ -196,6 +188,8 @@ void sofia_change_t38_state(struct sofia_pvt *pvt, int new_state);
 int sofia_t38_abort(const void *data);
 int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_control_t38_parameters *parameters);
 int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip);
+int sofia_dtmf_wants_rfc2833(const struct sofia_pvt *pvt);	/* g1/g3: effective mode carries DTMF as RFC2833/telephone-event (rfc2833 || unresolved-auto || is_webrtc) */
+void sofia_dtmf_reconfigure(struct sofia_pvt *pvt);		/* g2: re-apply RTP property + dtmf mode + fax-safe DSP from pvt->dtmf_effective (call after an AUTO resolution / SIPDtmfMode / DIGIT_DETECT toggle) */
 
 /*!
  * \brief A5: provision the local DTLS-SRTP + ICE-lite state for an OUTBOUND WebRTC
@@ -308,6 +302,15 @@ struct sofia_register_update {
 extern char sofia_debug_filter[64];
 int sofia_debug_match(const char *peer_name, const char *src_ip);
 int sofia_reload_request_sync(char *errmsg, size_t errmsglen, int timeout_ms);
+
+/* Push the live SIP-capture state (sip_capture_address/file in sofia_cfg) onto the sofia-sip tport layer
+ * (TPTAG_CAPT HEP stream + TPTAG_DUMP file). Called at startup, on reload, and by the CLI subcommands. */
+void sofia_apply_capture(void);
+
+/* Fully release a (WebRTC) RTP instance and NULL *inst: stop RTCP + the DTLS retransmit timer (which each
+ * hold their own ao2 ref) BEFORE ast_rtp_instance_destroy, so the engine destructor actually runs and the
+ * UDP socket is closed. Use everywhere chan_sofia/sofia_sdp tears down pvt->rtp/vrtp. */
+void sofia_rtp_stop_destroy(struct ast_rtp_instance **inst);
 void sofia_peer_drain_mwi(struct sofia_peer *peer);
 /* B perf index (peers_by_ipport): keep the O(1) by-IP+port index in sync. reindex at every peer-address
  * stabilization point (link/REGISTER/dnsmgr/reload); unindex BEFORE every ao2_unlink(peers,peer)/destroy
@@ -422,7 +425,9 @@ struct sofia_pvt {
 		AST_STRING_FIELD(cid_name);  /* inbound caller-id name; same chain as cid_num */
 	);
 	enum sofia_dialog_state state;
-	int dtmfmode;
+	int dtmfmode;			/* CONFIGURED/admin DTMF mode (SOFIA_DTMF_*): from the peer, or SIPDtmfMode(). Stays put across re-INVITE so AUTO keeps re-resolving. */
+	int dtmf_effective;		/* RUNTIME/negotiated DTMF mode (SOFIA_DTMF_*): equals dtmfmode until an AUTO offer is resolved at SDP-parse (RFC2833 if the remote offered telephone-event, else INBAND). The send/DSP/property paths consult THIS. */
+	int dtmf_detect_off;		/* runtime AST_OPTION_DIGIT_DETECT override (0 = detect; 1 = core suspended inband digit detection, e.g. native-bridge DTMF features). Honored by sofia_dtmf_reconfigure; fax-CNG DSP is kept regardless. */
 	int alreadygone;
 	int owner_busy;
 	struct ast_channel *owner;
@@ -524,12 +529,16 @@ struct sofia_pvt {
 	char webrtc_mid[64];
 	unsigned int webrtc_bundle:1;
 	char webrtc_tls_id[40];
+	char webrtc_cname[24];               /* RFC 3550 CNAME for our a=ssrc lines; generated once/dialog, audio+video shared */
+	char webrtc_msid[40];                /* our MediaStream id (a=msid / a=ssrc msid), audio+video shared */
+	unsigned int webrtc_video_bundled:1; /* offered m=video mid is in a=group:BUNDLE -> video rides pvt->rtp (no separate vrtp) */
 	/* A6 multi-m / video over WebRTC (RFC 3264 §6 + RFC 8843): the WebRTC answer MUST carry one m=
 	 * line per offered m= line (unaccepted ones reflected at port 0). Recorded at parse, emitted by
 	 * sofia_generate_sdp. v1a accepts audio and port-0 reflects ALL non-audio sections (incl. video) so a
 	 * browser audio+video+datachannel offer is not rejected for an m-line mismatch; v1b ACCEPTS video on a
 	 * separate non-BUNDLE pvt->vrtp transport (its own DTLS/ICE), datachannel stays port-0. */
 	char webrtc_video_mid[64];           /* offered m=video a=mid ("" = no video offered) */
+	int webrtc_mid_ext_id;               /* RFC 8285/8843 §9: negotiated a=extmap id for sdes:mid (0 = none/non-WebRTC) */
 	unsigned int webrtc_video_offered:1;
 	unsigned int webrtc_video_accepted:1;    /* VP8/H264 intersect + own DTLS/ICE attrs + rtcp-mux + NOT bundle-only */
 	/* v1b non-BUNDLE video transport (audit STEP 1): the m=video runs on pvt->vrtp with its OWN
@@ -633,7 +642,8 @@ struct sofia_peer {
 	int encryption;                 /* SDES-SRTP per-peer toggle (0/1); default off; encryption=yes enables */
 	int webrtc;                     /* WebRTC per-peer toggle (0/1): the ENABLE/permission for DTLS-SRTP + ICE-lite + rtcp-mux; default off; webrtc=yes enables. The actual media profile is decided by the target's physical transport (sofia_offer_effective_webrtc), so webrtc=yes never forces DTLS onto a non-ws/wss target. - A4 */
 	int datachannel;                /* WebRTC DataChannel per-peer toggle (0/1): accept the offered m=application (RFC 8841 SCTP) on the BUNDLE'd audio DTLS; default off; requires webrtc=yes + a usrsctp build (Phase 3). With it off the m=application is port-0 reflected exactly as today. */
-	int flowclose_emit_unregister;  /* RFC 5626 flow-close policy (0/1; default 0): a connection-oriented binding is ALWAYS removed when its flow closes. 0 = remove silently (no external unregister side-effects: no AMI PeerStatus, BLF/devstate, or regexten cleanup) - avoids a BLF flap on browser F5. 1 = also emit the full unregister side-effects (accurate BLF/regexten, at the cost of a brief Unregistered->Registered flap on reload). Per-peer overrides [general]. */
+	int webrtc_video_bundle;        /* WebRTC video BUNDLE per-peer toggle (0/1): ride video on the audio ICE/DTLS transport (RFC 8843 max-bundle) instead of a separate vrtp; default off; requires webrtc=yes. Off = today's separate-transport video. Consumed in STAGE 2. */
+	int flowclose_emit_unregister;  /* RFC 5626 flow-close policy (0/1; default 0): a connection-oriented binding is ALWAYS removed when its flow closes. 0 = remove silently (no external unregister side-effects: no AMI PeerStatus, BLF/devstate, regexten) — avoids a BLF flap on browser F5. 1 = also emit the full unregister side-effects. Per-peer overrides [general]. */
 	int callingpres;                /* AST_PRES_* mask; per-peer default presentation (chan_sip parity); default AST_PRES_ALLOWED_USER_NUMBER_NOT_SCREENED (=0) */
 	int sendrpid;                   /* 0=none / 1=PAI / 2=RPID (chan_sip SIP_SENDRPID parity) */
 	int trustrpid;                  /* 0/1; trust inbound PAI/RPID (chan_sip SIP_TRUSTRPID parity) */
@@ -826,6 +836,7 @@ struct sofia_config {
 	int encryption;                   /* SDES-SRTP general default (0=off, 1=on); soft-zeroed at load if res_srtp absent */
 	int webrtc;                       /* WebRTC general default (0=off,1=on); per-peer webrtc= overrides */
 	int datachannel;                  /* WebRTC DataChannel general default (0=off,1=on); per-peer datachannel= overrides. Requires webrtc=yes + a usrsctp build to take effect (Phase 3). */
+	int webrtc_video_bundle;          /* WebRTC video BUNDLE general default (0=off,1=on); per-peer webrtc_video_bundle= overrides; requires webrtc=yes. Consumed in STAGE 2. */
 	int flowclose_emit_unregister;    /* RFC 5626 flow-close general default (0=off,1=on); per-peer flowclose_emit_unregister= overrides. 0 = remove a connection-oriented binding silently on flow close (no external unregister side-effects); 1 = emit them (PeerStatus/BLF/devstate/regexten). */
 	char default_srtpcipher[256];     /* srtpcipher: comma-separated cipher preference inherited by peers; empty = sdp_crypto.c default AES_CM_128_HMAC_SHA1_80 */
 	int srtp_per_suite_keys;          /* 0 = shared-key (one master_key across all suites in a multi-cipher offer) / 1 = per-suite-fresh-key (independent random key per suite — forensic key separation). [general]-only; no chan_sip equivalent. */
@@ -933,6 +944,12 @@ struct sofia_config {
 	int  wssbindport;        /* 0 = disabled; common: 7443 */
 	int  wss_enable;         /* wssenable= (default 1): explicit opt-out for the secure WebSocket
 	                          * listener; built only when (wss_enable && wssbindport>0). Needs a cert. */
+	/* Live SIP tracing (sofia-sip built-in tport capture). Off by default; captures EVERY SIP message
+	 * DECRYPTED on recv+sent for udp/tcp/tls/ws/wss — including the SDP (WebRTC signalling). */
+	char sip_capture_address[128]; /* sip_capture_address=HOST:PORT: stream HEP to a Homer/sipcapture server (UDP). Empty=OFF. Builds "udp:HOST:PORT;hep=N;capture_id=ID" -> TPTAG_CAPT. */
+	int  sip_capture_hep;          /* sip_capture_hep=1|2|3: HEP protocol version (default 3). */
+	int  sip_capture_id;           /* sip_capture_id=<uint32>: HEP capture-agent id (default 200). */
+	char sip_capture_file[256];    /* sip_capture_file=<path>: append every decrypted SIP message to this file -> TPTAG_DUMP. Empty=OFF. */
 	/* MWI message-summary defaults (RFC 3842). */
 	char mwi_from[80];        /* From header used in MWI NOTIFY; empty -> peer->fromdomain or sofia_cfg.realm fallback */
 	char notifymime[80];      /* Content-Type for MWI NOTIFY body; default "application/simple-message-summary" */

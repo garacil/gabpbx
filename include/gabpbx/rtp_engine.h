@@ -109,6 +109,10 @@ enum ast_rtp_property {
 	AST_RTP_PROPERTY_STUN,
 	/*! Enable RTCP support */
 	AST_RTP_PROPERTY_RTCP,
+	/*! WebRTC BUNDLE (RFC 8843): this instance carries audio AND video RTP sub-streams demultiplexed by
+	 *  payload type on ONE ICE/DTLS transport. Off by default; set only by chan_sofia on a WebRTC leg when
+	 *  webrtc_video_bundle is enabled. When 0, every bundle-specific branch is bypassed (byte-identical). */
+	AST_RTP_PROPERTY_BUNDLE,
 
 	/*!
 	 * \brief Maximum number of RTP properties supported
@@ -224,6 +228,8 @@ enum ast_rtp_instance_stat {
 	AST_RTP_INSTANCE_STAT_LOCAL_SSRC,
 	/*! Retrieve remote SSRC */
 	AST_RTP_INSTANCE_STAT_REMOTE_SSRC,
+	/*! Retrieve local bundled-video sub-stream SSRC (RFC 8843 BUNDLE) */
+	AST_RTP_INSTANCE_STAT_LOCAL_VIDEO_SSRC,
 };
 
 /* Codes for RTP-specific data - not defined by our AST_FORMAT codes */
@@ -304,6 +310,8 @@ struct ast_rtp_instance_stats {
 	unsigned int local_ssrc;
 	/*! Their SSRC */
 	unsigned int remote_ssrc;
+	/*! Our bundled-video sub-stream SSRC (RFC 8843 BUNDLE) */
+	unsigned int local_video_ssrc;
 };
 
 #define AST_RTP_STAT_SET(current_stat, combined, placement, value) \
@@ -532,6 +540,8 @@ struct ast_rtp_engine {
 	int (*available_formats)(struct ast_rtp_instance *instance, format_t to_endpoint, format_t to_gabpbx);
 	/*! Callback to send CNG */
 	int (*sendcng)(struct ast_rtp_instance *instance, int level);
+	/*! Callback to configure the RFC 8285 MID header extension for WebRTC BUNDLE (RFC 8843 §9). NULL = unsupported. */
+	int (*set_mid_ext)(struct ast_rtp_instance *instance, int ext_id, const char *audio_mid, const char *video_mid);
 	/*! Optional ICE support (ICE-lite); NULL if the engine has no ICE (WebRTC A1) */
 	struct ast_rtp_engine_ice *ice;
 	/*! Optional DTLS-SRTP support; NULL if the engine has no DTLS (WebRTC A1) */
@@ -1645,6 +1655,12 @@ int ast_rtp_red_buffer(struct ast_rtp_instance *instance, struct ast_frame *fram
 int ast_rtp_instance_get_stats(struct ast_rtp_instance *instance, struct ast_rtp_instance_stats *stats, enum ast_rtp_instance_stat stat);
 
 /*!
+ * \brief Configure the RFC 8285 MID header extension (RFC 8843 §9 BUNDLE) stamped on egressing bundled RTP.
+ * \param ext_id negotiated one-byte extmap id (1..14); 0 disables. audio_mid/video_mid = a=mid tokens.
+ */
+int ast_rtp_instance_set_mid_extension(struct ast_rtp_instance *instance, int ext_id, const char *audio_mid, const char *video_mid);
+
+/*!
  * \brief Set standard statistics from an RTP instance on a channel
  *
  * \param chan Channel to set the statistics on
@@ -2085,6 +2101,14 @@ int ast_rtp_instance_sendcng(struct ast_rtp_instance *instance, int level);
  * \retval non-zero Failure
  */
 int ast_rtp_instance_add_srtp_policy(struct ast_rtp_instance *instance, struct ast_srtp_policy* remote_policy, struct ast_srtp_policy *local_policy);
+
+/*!
+ * \brief Add an extra outbound SRTP stream policy to an ALREADY-initialized instance srtp session, WITHOUT
+ * recreating/replacing it (unlike ast_rtp_instance_add_srtp_policy, which replaces the session on an existing
+ * srtp). Needed for WebRTC BUNDLE: the bundled video sub-stream uses a 2nd local SSRC needing its own outbound
+ * SRTP context, so protect() does not fail and drop the video packets.
+ */
+int ast_rtp_instance_add_srtp_stream(struct ast_rtp_instance *instance, struct ast_srtp_policy *local_policy);
 
 /*!
  * \brief Obtain the SRTP instance associated with an RTP instance

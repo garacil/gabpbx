@@ -1594,6 +1594,11 @@ int ast_rtp_instance_get_stats(struct ast_rtp_instance *instance, struct ast_rtp
 	return instance->engine->get_stat ? instance->engine->get_stat(instance, stats, stat) : -1;
 }
 
+int ast_rtp_instance_set_mid_extension(struct ast_rtp_instance *instance, int ext_id, const char *audio_mid, const char *video_mid)
+{
+	return instance->engine->set_mid_ext ? instance->engine->set_mid_ext(instance, ext_id, audio_mid, video_mid) : -1;
+}
+
 char *ast_rtp_instance_get_quality(struct ast_rtp_instance *instance, enum ast_rtp_instance_stat_field field, char *buf, size_t size)
 {
 	struct ast_rtp_instance_stats stats = { 0, };
@@ -1752,7 +1757,7 @@ void ast_rtp_instance_stun_request(struct ast_rtp_instance *instance,
  * the wrappers only lock + dispatch to callbacks that stay NULL until A3 populates them
  * (the getters return NULL while the slot is unset, so they are never invoked).
  *
- * A2 NOTE: the instance lock is a NEW lock surface (rtp_engine.c had no
+ * NOTE: the instance lock is a NEW lock surface (rtp_engine.c had no
  * ao2_lock today). For it to be effective, the A2 packet-path DTLS demux at the
  * rtp_recvfrom insertion point MUST take the SAME ao2_lock(instance) as these wrappers
  * — a one-sided lock is cosmetic. Lock order: channel -> pvt -> instance -> peer
@@ -1956,7 +1961,7 @@ static int rtp_dtls_wrap_write_appdata(struct ast_rtp_instance *instance, const 
 	ao2_lock(instance);
 	/* A third-party DTLS engine may not implement this optional op (the public getter exposes this
 	 * wrapper table for every DTLS engine, not only ones that populate write_appdata). Guard the
-	 * slot rather than dereference NULL. (Review hardening.) */
+	 * slot rather than dereference NULL. (Defensive hardening.) */
 	res = instance->engine->dtls->write_appdata
 		? instance->engine->dtls->write_appdata(instance, buf, len)
 		: -1;
@@ -2107,6 +2112,14 @@ int ast_rtp_instance_add_srtp_policy(struct ast_rtp_instance *instance, struct a
 	}
 
 	return res;
+}
+
+int ast_rtp_instance_add_srtp_stream(struct ast_rtp_instance *instance, struct ast_srtp_policy *local_policy)
+{
+	if (!res_srtp || !instance->srtp) {
+		return -1;
+	}
+	return res_srtp->add_stream(instance->srtp, local_policy);
 }
 
 struct ast_srtp *ast_rtp_instance_get_srtp(struct ast_rtp_instance *instance)

@@ -118,7 +118,7 @@ static int dtmftimeout = DEFAULT_DTMF_TIMEOUT;
 static int rtpstart = DEFAULT_RTP_START;			/*!< First port for RTP sessions (set in rtp.conf) */
 static int rtpend = DEFAULT_RTP_END;			/*!< Last port for RTP sessions (set in rtp.conf) */
 static int rtpdebug;			/*!< Are we debugging? */
-static int rtpicedebug;			/*!< Are we debugging WebRTC ICE/DTLS (nomination + selected-pair vs media source)? Toggle: "rtp set debug ice on" */
+static int rtpicedebug;			/*!< WebRTC ICE/DTLS debug ("rtp set debug ice on"): pure logging, default OFF, ZERO datapath change */
 static int rtcpdebug;			/*!< Are we debugging RTCP? */
 static int rtcpstats;			/*!< Are we debugging RTCP? */
 static int rtcpinterval = RTCP_DEFAULT_INTERVALMS; /*!< Time between rtcp reports in millisecs */
@@ -166,6 +166,26 @@ struct ast_rtp {
 	unsigned int ssrc;		/*!< Synchronization source, RFC 3550, page 10. */
 	unsigned int themssrc;		/*!< Their SSRC */
 	unsigned int rxssrc;
+	/* WebRTC BUNDLE (RFC 8843; gated by AST_RTP_PROPERTY_BUNDLE / rtp->bundle). When set, this single
+	 * instance/transport carries BOTH audio and a video sub-stream, demultiplexed by payload type. The video
+	 * sub-stream keeps its OWN SSRC/seqno/cycle/count state so its RTP is well-formed (a single SSRC must not
+	 * mix payload types from different bundled m-sections, RFC 8843) and so a 2nd SSRC never triggers the audio
+	 * SRCCHANGE. All of these are zero/unused unless rtp->bundle == 1 (then non-WebRTC stays byte-identical). */
+	unsigned int bundle:1;          /*!< 1 = audio+video on this transport (set via AST_RTP_PROPERTY_BUNDLE) */
+	unsigned int v_ssrc;            /*!< TX SSRC of the bundled video sub-stream (distinct from audio ssrc) */
+	unsigned short v_seqno;         /*!< TX sequence number of the bundled video sub-stream */
+	unsigned int v_lastts;          /*!< TX RTP timestamp clock of the bundled video sub-stream (audio keeps rtp->lastts) */
+	unsigned int v_rxssrc;          /*!< Last RX SSRC of the video sub-stream */
+	int v_lastrxseqno;              /*!< Last RX sequence number of the video sub-stream */
+	unsigned short v_seedrxseqno;   /*!< First RX sequence number of the video sub-stream */
+	unsigned int v_rxcount;         /*!< RX packet count of the video sub-stream */
+	unsigned int v_cycles;          /*!< Shifted seqno-cycle count of the video sub-stream */
+	/* WebRTC BUNDLE MID RTP header extension (RFC 8843 §9 MUST / RFC 8285): when mid_ext_id > 0 we stamp the
+	 * one-byte MID header extension (sdes:mid) on every egressing bundled RTP packet so a strict max-bundle
+	 * browser associates the SSRC with the correct m= line. audio -> mid_value_audio, video -> mid_value_video. */
+	int mid_ext_id;                 /*!< negotiated RFC 8285 extmap id for sdes:mid (0 = disabled/non-WebRTC) */
+	char mid_value_audio[17];       /*!< a=mid of the audio m= line stamped in RTP; the RFC 8285 one-byte extension caps a mid at 16 bytes (+NUL) so the stamped value always equals the a=mid we signalled (e.g. Firefox "sdparta_0"). "0" for Chrome/Safari. */
+	char mid_value_video[17];       /*!< a=mid of the bundled video m= line (RFC 8285 one-byte ext: <=16 bytes + NUL) */
 	unsigned int lastts;
 	unsigned int lastrxts;
 	unsigned int lastividtimestamp;
@@ -250,12 +270,21 @@ struct ast_rtp {
 	char local_pwd[28];                /*!< OUR ice-pwd = HMAC key (>=22); CSPRNG-generated */
 	char remote_ufrag[257];            /*!< browser's ice-ufrag (<=256 + NUL); prefix-matched */
 	char remote_pwd[257];              /*!< browser's ice-pwd (<=256 + NUL); stored for symmetry */
-	struct ast_sockaddr ice_peer;      /*!< the SELECTED/nominated peer addr (set on USE-CANDIDATE, RFC 8445 §8.2), not the latest STUN source */
+	struct ast_sockaddr ice_peer;      /*!< validated peer addr learned from the first good check */
 	enum ast_rtp_ice_role ice_role;    /*!< always AST_RTP_ICE_ROLE_CONTROLLED for a lite agent */
 	unsigned int ice_lite:1;           /*!< peer advertised a=ice-lite (recorded only) */
 	unsigned int ice_active:1;         /*!< start() called — the responder is armed (hardening: gate) */
 	unsigned int ice_complete:1;       /*!< a USE-CANDIDATE check passed → selected pair (RFC 8445 §8.2) */
-	unsigned int ice_rx_logged:1;      /*!< rtpicedebug: first post-complete media packet already logged (log once/instance) */
+	/* rtpicedebug ONLY (pure logging, no datapath): first-seen bits + last-* sockaddrs so the debug
+	 * logs fire once / on-change instead of per-packet. Never read outside an `if (rtpicedebug)` guard. */
+	unsigned int latch_seen:1;         /*!< rtpicedebug: first ICE latch already logged */
+	unsigned int rx_seen:1;            /*!< rtpicedebug: first post-complete media packet already logged */
+	unsigned int dtls_drop_seen:1;     /*!< rtpicedebug: first DTLS-record source!=ice_peer drop already logged */
+	unsigned int srtp_rx_logged:1;     /*!< rtpicedebug: first successful SRTP decrypt already logged (B3) */
+	unsigned int srtp_auth_fail;       /*!< rtpicedebug: running count of SRTP unprotect failures (B3, wrong key / replay / forgery) */
+	struct ast_sockaddr last_latch;    /*!< rtpicedebug: last latched source (log latch source CHANGES only) */
+	struct ast_sockaddr last_media;    /*!< rtpicedebug: last media source (log media source CHANGES only) */
+	struct ast_sockaddr last_dtls_drop;/*!< rtpicedebug: last dropped DTLS-record source (log CHANGES only) */
 #endif
 	struct rtp_red *red;
 };
@@ -1094,6 +1123,23 @@ static int dtls_install_srtp(struct ast_rtp_instance *instance, struct ast_rtp *
 		ast_log(LOG_WARNING, "Could not install DTLS-SRTP policies for RTP instance '%p'\n", instance);
 		goto done;
 	}
+	/* WebRTC BUNDLE: the bundled video sub-stream egresses on a SECOND local SSRC (rtp->v_ssrc). The policies
+	 * above cover only the audio SSRC (ssrc_specific outbound) plus the remote inbound wildcard, so without this
+	 * libsrtp has NO outbound context for v_ssrc -> res_srtp->protect() fails -> the video packet is dropped
+	 * before ast_sendto() -> the browser never receives video (chrome://webrtc-internals shows NO inbound-rtp
+	 * video). Add a SECOND specific outbound policy for v_ssrc (specific, not a wildcard, so the libsrtp-2.x
+	 * single-wildcard limit is respected). Mirrors Asterisk's multi-local-SSRC model. */
+	if (rtp->bundle && rtp->v_ssrc) {	/* only a BUNDLE leg muxes video on v_ssrc; gate on rtp->bundle so a knob-OFF leg installs no extra SRTP stream (byte-identical) */
+		struct ast_srtp_policy *video_policy = res_srtp_policy->alloc();
+		if (video_policy) {
+			if (!dtls_set_srtp_policy(video_policy, rtp->suite, local_key_salt, rtp->v_ssrc, 0)
+					&& ast_rtp_instance_add_srtp_stream(instance, video_policy)) {
+				ast_log(LOG_WARNING, "Could not add bundled-video SRTP stream (v_ssrc %u) for RTP instance '%p'\n",
+					rtp->v_ssrc, instance);
+			}
+			res_srtp_policy->destroy(video_policy);
+		}
+	}
 	res = 0;
 done:
 	res_srtp_policy->destroy(local_policy);
@@ -1205,6 +1251,11 @@ static void dtls_srtp_finish_negotiation(struct ast_rtp_instance *instance, stru
 		return;
 	}
 	dtls->connection = AST_RTP_DTLS_CONNECTION_EXISTING;
+	if (rtpicedebug) {	/* B2: the key DTLS/SRTP ordering milestone — handshake done, SRTP keys installed (no keys logged) */
+		char *p_peer = ast_strdupa(ast_sockaddr_stringify(&rtp->ice_peer));
+		ast_verbose("ICE-DTLS established inst=%p rtp=%p setup=%d ice_peer=%s (SRTP installed)\n",
+			instance, rtp, (int)dtls->dtls_setup, p_peer);
+	}
 	ast_debug(1, "DTLS-SRTP negotiated and installed for RTP instance '%p'\n", instance);
 }
 
@@ -1220,18 +1271,6 @@ static int dtls_srtp_handle_record(struct ast_rtp_instance *instance, struct ast
 	if (!dtls->ssl) {
 		return 0;
 	}
-	/* OFFERER pre-answer DTLS race (RFC 5763 §5). We offered a=setup:actpass and sofia_webrtc_provision_offer
-	 * pre-armed DTLS before the answer. A controlling browser (after the 487 role repair) can nominate and
-	 * send its ClientHello BEFORE its SIP 200-OK answer — which carries the a=fingerprint trust anchor — has
-	 * reached and been applied to us. Driving the handshake to completion now would reach
-	 * dtls_srtp_finish_negotiation with NO remote fingerprint, fail closed, and tear the WHOLE call down (the
-	 * read returns -1 -> hangup). DEFER instead: drop the record — DTLS is reliable, the client retransmits
-	 * its ClientHello — until the answer installs the fingerprint; the retransmit then completes and verifies.
-	 * Non-fatal (return 0). The ANSWERER is unaffected: it already holds the offer's a=fingerprint before any
-	 * DTLS record arrives, so remote_fingerprint_len is non-zero and this gate is transparent. */
-	if (!rtp->remote_fingerprint_len) {
-		return 0;
-	}
 	/* An inbound DTLS record at an ACTPASS offerer (provision_offer, before the answer fixes our role)
 	 * means the peer (browser answering a=setup:active) is the DTLS client: commit us to the SERVER role
 	 * NOW so SSL processes the ClientHello as the server (RFC 5763 §5 — an actpass offerer MUST be ready to
@@ -1240,6 +1279,10 @@ static int dtls_srtp_handle_record(struct ast_rtp_instance *instance, struct ast
 	if (dtls->dtls_setup == AST_RTP_DTLS_SETUP_ACTPASS) {
 		dtls->dtls_setup = AST_RTP_DTLS_SETUP_PASSIVE;
 		SSL_set_accept_state(dtls->ssl);
+		if (rtpicedebug) {	/* B2: inbound ClientHello arrived on an actpass offerer -> we commit to DTLS server */
+			ast_verbose("ICE-DTLS role ACTPASS->PASSIVE inst=%p rtp=%p (inbound ClientHello: we are the DTLS server)\n",
+				instance, rtp);
+		}
 	}
 	BIO_write(dtls->read_bio, buf, len);
 
@@ -1294,6 +1337,12 @@ static void dtls_perform_handshake(struct ast_rtp_instance *instance, struct ast
 	if (rtp->dtls.ssl && rtp->dtls.dtls_setup == AST_RTP_DTLS_SETUP_ACTIVE) {
 		SSL_do_handshake(rtp->dtls.ssl);
 		dtls_srtp_start_timeout_timer(instance, rtp);	/* arm the retransmit timer for the ClientHello */
+		if (rtpicedebug) {	/* B2: active-side ClientHello sent */
+			ast_verbose("ICE-DTLS handshake-fired inst=%p rtp=%p (active side, ClientHello sent)\n", instance, rtp);
+		}
+	} else if (rtpicedebug) {	/* B2: not fired (passive side waits for the ClientHello, or no ssl yet) */
+		ast_verbose("ICE-DTLS handshake-skip inst=%p rtp=%p ssl=%d setup=%d\n",
+			instance, rtp, rtp->dtls.ssl ? 1 : 0, (int)rtp->dtls.dtls_setup);
 	}
 	ao2_unlock(instance);
 }
@@ -1457,6 +1506,21 @@ static struct ast_rtp_engine_ice gabpbx_ice = {
 #endif /* HAVE_OPENSSL */
 
 /* RTP Engine Declaration */
+/* RFC 8843 §9 / RFC 8285: configure the MID header extension we stamp on egressing bundled RTP. ext_id 0
+ * disables it; audio_mid/video_mid are the a=mid tokens of the bundled m= lines. */
+static int ast_rtp_set_mid_ext(struct ast_rtp_instance *instance, int ext_id, const char *audio_mid, const char *video_mid)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+
+	if (!rtp) {
+		return -1;
+	}
+	rtp->mid_ext_id = (ext_id > 0 && ext_id <= 14) ? ext_id : 0;	/* one-byte extension ids are 1..14 (RFC 8285) */
+	ast_copy_string(rtp->mid_value_audio, S_OR(audio_mid, ""), sizeof(rtp->mid_value_audio));
+	ast_copy_string(rtp->mid_value_video, S_OR(video_mid, ""), sizeof(rtp->mid_value_video));
+	return 0;
+}
+
 static struct ast_rtp_engine gabpbx_rtp_engine = {
 	.name = "gabpbx",
 	.new = ast_rtp_new,
@@ -1484,6 +1548,7 @@ static struct ast_rtp_engine gabpbx_rtp_engine = {
 	.qos = ast_rtp_qos_set,
 	.sendcng = ast_rtp_sendcng,
 	.activate = ast_rtp_activate,	/* WebRTC A2: drives the active-side DTLS handshake */
+	.set_mid_ext = ast_rtp_set_mid_ext,	/* RFC 8843 §9 / RFC 8285 MID header extension */
 #ifdef HAVE_OPENSSL
 	.dtls = &gabpbx_dtls,		/* WebRTC A2 */
 	.ice = &gabpbx_ice,		/* WebRTC A3 — ICE-lite */
@@ -1529,15 +1594,11 @@ static inline int rtcp_debug_test_addr(struct ast_sockaddr *addr)
 #define ICE_STUN_MAGIC_COOKIE       0x2112a442u
 #define ICE_STUN_BINDING_REQUEST    0x0001
 #define ICE_STUN_BINDING_SUCCESS    0x0101
-#define ICE_STUN_BINDING_ERROR      0x0111
 #define ICE_ATTR_USERNAME           0x0006
 #define ICE_ATTR_MESSAGE_INTEGRITY  0x0008
-#define ICE_ATTR_ERROR_CODE         0x0009
 #define ICE_ATTR_XOR_MAPPED_ADDRESS 0x0020
 #define ICE_ATTR_USE_CANDIDATE      0x0025
 #define ICE_ATTR_FINGERPRINT        0x8028
-#define ICE_ATTR_ICE_CONTROLLED     0x8029
-#define ICE_ATTR_ICE_CONTROLLING    0x802a
 #define ICE_FINGERPRINT_XOR         0x5354554eu
 
 struct ice_stun_hdr {
@@ -1640,7 +1701,7 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 	unsigned char *buf, int len, struct ast_sockaddr *sa)
 {
 	struct ice_stun_hdr *h = (struct ice_stun_hdr *) buf;
-	int mlen, off, mi_off = -1, fp_off = -1, has_use_candidate = 0, has_ice_controlled = 0;
+	int mlen, off, mi_off = -1, fp_off = -1, has_use_candidate = 0;
 	const unsigned char *username = NULL;
 	int username_len = 0;
 	uint8_t calc[20], out[512], xma[20], mi[20];
@@ -1692,14 +1753,6 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 				has_use_candidate = 1;
 			}
 			break;
-		case ICE_ATTR_ICE_CONTROLLED:
-			/* The peer claims the CONTROLLED role too (64-bit tiebreaker value). We are permanently
-			 * ICE-lite/controlled, so this is a role conflict to repair with 487 (step 5b). Honour only
-			 * an authenticated (pre-MI), well-formed attribute, mirroring the USE-CANDIDATE discipline. */
-			if (mi_off < 0 && alen == 8) {
-				has_ice_controlled = 1;
-			}
-			break;
 		default:
 			break;	/* PRIORITY / ICE-CONTROLLING etc.: parsed past, never acted on (we are controlled) */
 		}
@@ -1733,56 +1786,35 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 		return;	/* MI mismatch — silent drop */
 	}
 
-	/* 5b. ROLE-CONFLICT REPAIR (RFC 8445 §6.1.1 + §7.3.1.1). We are permanently ICE-lite, hence controlled
-	 *     (the role is clamped CONTROLLED at instance init). A full peer that ANSWERED our SDP offer can
-	 *     default to the controlled role and send ICE-CONTROLLED, leaving BOTH ends controlled: neither
-	 *     nominates, no USE-CANDIDATE ever arrives, media is never selected → one-way/dead audio. Per RFC
-	 *     8445 §7.2.5.1 a full agent that receives a 487 for a request carrying ICE-CONTROLLED reverses its
-	 *     role to controlling and re-checks (now with USE-CANDIDATE), which the normal path below then
-	 *     nominates and latches. A lite agent can never take the controlling role, so it always answers 487
-	 *     (no tiebreaker comparison). Reply Binding Error + ERROR-CODE(487) + MESSAGE-INTEGRITY(local_pwd) +
-	 *     FINGERPRINT (last) — RFC 5389 §15.6/§15.4/§15.5 — then return: do NOT send success, do NOT latch. */
-	if (has_ice_controlled) {
-		uint8_t ec[4 + 16];
-		int eclen;
-		r = (struct ice_stun_hdr *) out;
-		r->msgtype = htons(ICE_STUN_BINDING_ERROR);
-		r->cookie = htonl(ICE_STUN_MAGIC_COOKIE);
-		memcpy(r->tid, h->tid, sizeof(r->tid));
-		oo = sizeof(*r);
 
-		ec[0] = 0; ec[1] = 0;		/* reserved (RFC 5389 §15.6) */
-		ec[2] = 487 / 100;		/* class */
-		ec[3] = 487 % 100;		/* number */
-		memcpy(ec + 4, "Role Conflict", 13);
-		eclen = 4 + 13;
-		oo = ice_put_attr(out, oo, ICE_ATTR_ERROR_CODE, ec, eclen);
-
-		r->msglen = htons((uint16_t)((oo - 20) + 24));	/* cover through MI before hashing */
-		if (ice_hmac_sha1((const uint8_t *) rtp->local_pwd, strlen(rtp->local_pwd), out, oo, mi)) {
-			return;	/* HMAC failure — do not emit a response with a bad MI */
-		}
-		oo = ice_put_attr(out, oo, ICE_ATTR_MESSAGE_INTEGRITY, mi, 20);
-
-		r->msglen = htons((uint16_t)((oo - 20) + 8));	/* cover through FINGERPRINT before the CRC */
-		fp = htonl(ice_crc32(out, oo) ^ ICE_FINGERPRINT_XOR);
-		oo = ice_put_attr(out, oo, ICE_ATTR_FINGERPRINT, &fp, 4);
-
-		rtp_raw_sendto(rtp, out, oo, sa, 0);
-		if (rtpicedebug) {
-			ast_verbose("ICE-DBG role-conflict inst=%p: peer sent ICE-CONTROLLED; replied 487 Role Conflict (we are lite/controlled)\n", rtp);
-		}
-		return;
+	/* 5. AUTHENTICATED. LATCH the RTP remote address to the live authenticated check source for the WHOLE call
+	 *    (symmetric-RTP, like Asterisk's pjproject aiming at valid_check->rcand->addr). The controlling browser
+	 *    nominates several candidates and then runs RFC 7675 consent freshness ONLY on its SELECTED pair, which
+	 *    can differ from the first/transient USE-CANDIDATE; a WebRTC browser binds its DTLS to that selected pair
+	 *    (RFC 8445 §2.3) and ignores DTLS on any other candidate. Freezing on the first nominated pair misdirects
+	 *    our ServerHello + SRTP to a dead 5-tuple → no audio. Updating on EVERY authenticated check follows the
+	 *    selected pair, and is SAFE because the MESSAGE-INTEGRITY (our secret local_pwd, exchanged only over the
+	 *    secure SIP/WSS signaling) cannot be forged — a spoofer cannot move the tuple.
+	 *    ┌─ DO NOT re-introduce the 1.3.3 USE-CANDIDATE-ONLY latch, and DO NOT add PRIORITY pinning ──────────┐
+	 *    │ Both were TRIED and BROKE AUDIO on the offerer/fork path, so both are REJECTED (after               │
+	 *    │ review, safe to drop). (a) Gating this latch on `has_use_candidate` (the 1.3.3 model) leaves the RTP│
+	 *    │ remote on a stale pair for offerer/fork calls where the browser never re-nominates → ServerHello to │
+	 *    │ a dead 5-tuple → DTLS never completes → DEAF. (b) A PRIORITY non-downgrade guard pins a non-media   │
+	 *    │ candidate for the same reason. KEEP "latest authenticated check wins" (LATCH-ALWAYS). This debug    │
+	 *    │ patch adds ONLY logging below — no datapath change. Use "rtp set debug ice on" to watch the latch.  │
+	 *    └─────────────────────────────────────────────────────────────────────────────────────────────────────┘ */
+	ast_sockaddr_copy(&rtp->ice_peer, sa);
+	ast_rtp_instance_set_remote_address(instance, sa);
+	if (rtpicedebug && (!rtp->latch_seen || ast_sockaddr_cmp(&rtp->last_latch, sa))) {
+		/* first latch + every latch SOURCE CHANGE (the tuple port-flap behind the intermittent/fork bugs) */
+		char *p_new = ast_strdupa(ast_sockaddr_stringify(sa));
+		char *p_old = ast_strdupa(ast_sockaddr_stringify(&rtp->last_latch));
+		ast_verbose("ICE-DBG latch inst=%p rtp=%p src=%s old=%s first=%d use_candidate=%d ice_complete=%d dtls_conn=%d dtls_setup=%d\n",
+			instance, rtp, p_new, p_old, !rtp->latch_seen, has_use_candidate, rtp->ice_complete,
+			(int)rtp->dtls.connection, (int)rtp->dtls.dtls_setup);
+		ast_sockaddr_copy(&rtp->last_latch, sa);
+		rtp->latch_seen = 1;
 	}
-
-
-	/* 5. AUTHENTICATED. Per RFC 8445 §8.1.1, "only the selected pairs will be used for sending and receiving
-	 *    data", and the selected pair is the one the controlling browser NOMINATES with USE-CANDIDATE (§7.3.1.5;
-	 *    lite agent §8.2). So we do NOT move media on every check here: the old LATCH-ALWAYS re-pointed our
-	 *    ServerHello/SRTP at whichever connectivity-check candidate sent the last STUN, so with a browser probing
-	 *    from several candidates the media tuple flapped and only aligned with the browser's real selected pair
-	 *    by luck after ~10-20s. We still answer EVERY authenticated check (step 6) - RFC 7675: a lite agent only
-	 *    responds to consent/connectivity checks - but the media/DTLS latch happens ONLY on nomination, in step 7. */
 
 	/* 6. Build + send the success Binding Response FIRST (MED2 — the browser confirms the pair before
 	 *    our ClientHello arrives): XOR-MAPPED-ADDRESS + MESSAGE-INTEGRITY + FINGERPRINT (last). */
@@ -1807,35 +1839,17 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 
 	rtp_raw_sendto(rtp, out, oo, sa, 0);
 
-	/* 7. USE-CANDIDATE nominates this pair (RFC 8445 §7.3.1.5; lite agent §8.2) → it becomes the SELECTED pair.
-	 *    LATCH media/DTLS to THIS tuple (ice_peer = the nominated peer, not the latest STUN source), re-latching
-	 *    on each nomination so a later/better nomination moves us immediately (RFC 8445 §8.1.1: only selected
-	 *    pairs carry data). Then drive the active-side DTLS to that tuple - on the first nomination to start it,
-	 *    and on a later nomination while the handshake is still in flight so the ClientHello retransmit follows
-	 *    the moved pair (dtls_perform_handshake is a no-op on the passive side; it re-locks ao2 recursively, safe).
-	 *    Non-USE-CANDIDATE checks are answered (step 6) but never move media (RFC 7675: consent is per the
-	 *    selected 5-tuple and does not update ICE).
-	 *    ┌─ DO NOT "HARDEN" THIS WITH PRIORITY PINNING ──────────────────────────────────────────────────┐
-	 *    │ A PRIORITY non-downgrade guard (keep the highest-priority nominated pair, RFC 8445 §8.1.1) was  │
-	 *    │ TRIED 2026-06-29 and BROKE AUDIO on live SIP.js, so it was REVERTED. This browser nominates from │
-	 *    │ several candidate ports and the WORKING (reachable) pair is not necessarily the highest priority;│
-	 *    │ pinning leaves set_remote_address on a non-media port → the passive ServerHello never reaches the│
-	 *    │ browser → DTLS never completes → no audio. RFC 8445 priority selection needs a real valid-list   │
-	 *    │ model we do not have here. KEEP "latest authenticated USE-CANDIDATE wins" (re-latch every        │
-	 *    │ nomination); it is the pragmatic interop rule that gets DTLS/SRTP up.                            │
-	 *    └─────────────────────────────────────────────────────────────────────────────────────────────────┘ */
-	if (has_use_candidate) {
-		int first_nomination = !rtp->ice_complete;
-		ast_sockaddr_copy(&rtp->ice_peer, sa);
-		ast_rtp_instance_set_remote_address(instance, sa);
+	/* 7. USE-CANDIDATE → selected pair → ICE complete; fire the active DTLS handshake AFTER the success
+	 *    reply + remote address are set (MED2). dtls_perform_handshake re-locks ao2 (recursive — safe);
+	 *    no-op on the passive side. */
+	if (has_use_candidate && !rtp->ice_complete) {
 		rtp->ice_complete = 1;
-		if (rtpicedebug) {	/* "rtp set debug ice on": each nomination = the (re)selected pair (latest-wins) */
+		if (rtpicedebug) {	/* the nominated/selected pair — the first USE-CANDIDATE that completes ICE */
 			char *p = ast_strdupa(ast_sockaddr_stringify(sa));
-			ast_verbose("ICE-DBG nominate inst=%p selected_pair=%s first=%d\n", rtp, p, first_nomination);
+			ast_verbose("ICE-DBG nominate inst=%p rtp=%p selected_pair=%s dtls_conn=%d dtls_setup=%d\n",
+				instance, rtp, p, (int)rtp->dtls.connection, (int)rtp->dtls.dtls_setup);
 		}
-		if (first_nomination || (rtp->dtls.ssl && !SSL_is_init_finished(rtp->dtls.ssl))) {
-			dtls_perform_handshake(instance, rtp);
-		}
+		dtls_perform_handshake(instance, rtp);
 	}
 }
 #endif /* HAVE_OPENSSL */
@@ -1853,6 +1867,16 @@ static int __rtp_recvfrom(struct ast_rtp_instance *instance, void *buf, size_t s
 read_again:
 #endif
 	if ((len = ast_recvfrom(rtcp ? rtp->rtcp->s : rtp->s, buf, size, flags, sa)) < 0) {
+#ifdef HAVE_OPENSSL
+		/* B4: classify a non-EAGAIN socket error on a WebRTC leg. A transient ICMP-unreachable during ICE
+		 * probing (ice_complete=0) is benign; the same errno after DTLS is up is real media loss. LOG ONLY —
+		 * the return is unchanged; ast_rtp_read maps only EAGAIN + the selected transient WebRTC errnos to
+		 * ast_null_frame (the 1be4b99 fix), other errnos still hang up. */
+		if (rtpicedebug && errno != EAGAIN && errno != EWOULDBLOCK && rtp->dtls.ssl) {
+			ast_verbose("ICE-DBG recv-err inst=%p rtp=%p errno=%d rtcp=%d ice_active=%d ice_complete=%d dtls_conn=%d\n",
+				instance, rtp, errno, rtcp, rtp->ice_active, rtp->ice_complete, (int)rtp->dtls.connection);
+		}
+#endif
 	   return len;
 	}
 
@@ -1903,6 +1927,18 @@ read_again:
 			int dres;
 			if (rtp->ice_active &&
 				(ast_sockaddr_isnull(&rtp->ice_peer) || ast_sockaddr_cmp(&rtp->ice_peer, sa))) {
+				if (rtpicedebug && (!rtp->dtls_drop_seen || ast_sockaddr_cmp(&rtp->last_dtls_drop, sa))) {
+					/* A DTLS record (rec_first=22 => ClientHello) from a source that is NOT the ICE-latched
+					 * peer is dropped here. If the latch is on the WRONG pair this is exactly why DTLS never
+					 * completes (offerer/fork deaf class). LOG ONLY — the drop behavior is unchanged. */
+					char *p_src = ast_strdupa(ast_sockaddr_stringify(sa));
+					char *p_peer = ast_strdupa(ast_sockaddr_stringify(&rtp->ice_peer));
+					ast_verbose("ICE-DBG dtls-drop inst=%p rtp=%p rec_first=%u rec_src=%s ice_peer=%s peer_null=%d ice_complete=%d dtls_conn=%d\n",
+						instance, rtp, first, p_src, p_peer, ast_sockaddr_isnull(&rtp->ice_peer),
+						rtp->ice_complete, (int)rtp->dtls.connection);
+					ast_sockaddr_copy(&rtp->last_dtls_drop, sa);
+					rtp->dtls_drop_seen = 1;
+				}
 				goto read_again;
 			}
 			ao2_lock(instance);
@@ -1973,8 +2009,30 @@ read_again:
 #endif
 
 	if (res_srtp && srtp && res_srtp->unprotect(srtp, buf, &len, rtcp) < 0) {
+#ifdef HAVE_OPENSSL
+		/* B3: SRTP unprotect failure on a WebRTC leg (wrong key / replay / forgery). Rate-limited. LOG ONLY;
+		 * the return -1 is unchanged. Distinguishes "DTLS up but media not decrypting" from "no media". */
+		if (rtpicedebug && rtp->dtls.ssl) {
+			rtp->srtp_auth_fail++;
+			if (rtp->srtp_auth_fail <= 3 || (rtp->srtp_auth_fail % 100) == 0) {
+				ast_verbose("ICE-DBG srtp-authfail inst=%p rtp=%p rtcp=%d count=%u\n",
+					instance, rtp, rtcp, rtp->srtp_auth_fail);
+			}
+		}
+#endif
 	   return -1;
 	}
+
+#ifdef HAVE_OPENSSL
+	/* B3: first successful SRTP decrypt on a WebRTC leg — proves the SRTP pipeline actually decrypts (distinct
+	 * from ICE-RXDBG, which logs post-parse in ast_rtp_read). One-shot, log only. */
+	if (rtpicedebug && !rtcp && rtp->dtls.ssl && res_srtp && srtp && !rtp->srtp_rx_logged && len >= 12) {
+		unsigned int *rh = (unsigned int *) buf;
+		rtp->srtp_rx_logged = 1;
+		ast_verbose("ICE-DBG srtp-first-decrypt inst=%p rtp=%p pt=%d ssrc=%u len=%d\n",
+			instance, rtp, (int)((ntohl(rh[0]) >> 16) & 0x7f), (unsigned int) ntohl(rh[2]), len);
+	}
+#endif
 
 	return len;
 }
@@ -2148,6 +2206,9 @@ static int ast_rtp_new(struct ast_rtp_instance *instance,
 	/* Set default parameters on the newly created RTP structure */
 	rtp->ssrc = ast_random();
 	rtp->seqno = ast_random() & 0xffff;
+	/* WebRTC BUNDLE: the video sub-stream gets its own SSRC/seqno (used only when rtp->bundle). */
+	rtp->v_ssrc = ast_random();
+	rtp->v_seqno = ast_random() & 0xffff;
 	//rtp->lastrxseqno = rtp->seqno;
 	rtp->lostrtp = 0;
 	rtp->strict_rtp_state = (strictrtp ? STRICT_RTP_LEARN : STRICT_RTP_OPEN);
@@ -2794,6 +2855,7 @@ static int ast_rtp_raw_write(struct ast_rtp_instance *instance, struct ast_frame
 {
 	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
 	int pred, mark = 0;
+	unsigned int *vts;	/* WebRTC BUNDLE: TX video timestamp clock selector (assigned in the video branch). */
 	unsigned int ms = calc_txstamp(rtp, &frame->delivery);
 	struct ast_sockaddr remote_address = { {0,} };
 	int rate = rtp_get_rate(frame->subclass.codec) / 1000;
@@ -2822,18 +2884,21 @@ static int ast_rtp_raw_write(struct ast_rtp_instance *instance, struct ast_frame
 			}
 		}
 	} else if (frame->frametype == AST_FRAME_VIDEO) {
+		/* WebRTC BUNDLE: run the video TX timestamp on a video-local clock (v_lastts) so interleaved video
+		 * does not perturb the audio lastts clock. Non-bundle => vts == &rtp->lastts => byte-identical. */
+		vts = rtp->bundle ? &rtp->v_lastts : &rtp->lastts;
 		mark = frame->subclass.codec & 0x1;
 		pred = rtp->lastovidtimestamp + frame->samples;
 		/* Re-calculate last TS */
-		rtp->lastts = rtp->lastts + ms * 90;
+		*vts = *vts + ms * 90;
 		/* If it's close to our prediction, go for it */
 		if (ast_tvzero(frame->delivery)) {
-			if (abs(rtp->lastts - pred) < 7200) {
-				rtp->lastts = pred;
+			if (abs(*vts - pred) < 7200) {
+				*vts = pred;
 				rtp->lastovidtimestamp += frame->samples;
 			} else {
-				ast_debug(3, "Difference is %d, ms is %d (%d), pred/ts/samples %d/%d/%d\n", abs(rtp->lastts - pred), ms, ms * 90, rtp->lastts, pred, frame->samples);
-				rtp->lastovidtimestamp = rtp->lastts;
+				ast_debug(3, "Difference is %d, ms is %d (%d), pred/ts/samples %d/%d/%d\n", abs(*vts - pred), ms, ms * 90, *vts, pred, frame->samples);
+				rtp->lastovidtimestamp = *vts;
 			}
 		}
 	} else {
@@ -2872,11 +2937,49 @@ static int ast_rtp_raw_write(struct ast_rtp_instance *instance, struct ast_frame
 	/* If we know the remote address construct a packet and send it out */
 	if (!ast_sockaddr_isnull(&remote_address)) {
 		int hdrlen = 12, res;
-		unsigned char *rtpheader = (unsigned char *)(frame->data.ptr - hdrlen);
+		unsigned char *rtpheader;
+		/* WebRTC BUNDLE (RFC 8843): the bundled video sub-stream uses its OWN SSRC/seqno so the RTP egressing
+		 * the shared transport is well-formed (a single SSRC must not mix payload types from different bundled
+		 * m-sections). rtp->bundle==0 => audio path => byte-identical. */
+		int tx_video = rtp->bundle && (frame->subclass.codec & AST_FORMAT_VIDEO_MASK);
+		unsigned int tx_ssrc = tx_video ? rtp->v_ssrc : rtp->ssrc;
+		unsigned short tx_seqno = tx_video ? rtp->v_seqno : rtp->seqno;
+		unsigned int tx_ts = tx_video ? rtp->v_lastts : rtp->lastts;
+		/* RFC 8843 §9 (MUST) / RFC 8285: stamp the one-byte MID header extension on every bundled WebRTC RTP
+		 * packet so a strict max-bundle browser associates this SSRC with the correct m= line (a=ssrc/PT
+		 * association alone is not honored). audio -> mid_value_audio, video -> mid_value_video. mid_ext_id==0
+		 * (non-WebRTC / not negotiated) => no extension => byte-identical (rtpheader stays at data.ptr-12). */
+		const char *tx_mid = NULL;
+		int ext_bytes = 0, ext_words = 0, midlen = 0;
 
-		put_unaligned_uint32(rtpheader, htonl((2 << 30) | (codec << 16) | (rtp->seqno) | (mark << 23)));
-		put_unaligned_uint32(rtpheader + 4, htonl(rtp->lastts));
-		put_unaligned_uint32(rtpheader + 8, htonl(rtp->ssrc));
+		if (rtp->mid_ext_id > 0) {
+			tx_mid = tx_video ? rtp->mid_value_video : rtp->mid_value_audio;
+			if (!ast_strlen_zero(tx_mid)) {
+				midlen = strlen(tx_mid);
+				ext_bytes = 4 + (((1 + midlen) + 3) & ~3);	/* 0xBEDE+len (4) + one-byte element padded to a 4-byte word */
+				ext_words = (ext_bytes - 4) / 4;
+			} else {
+				tx_mid = NULL;
+			}
+		}
+
+		hdrlen = 12 + ext_bytes;
+		rtpheader = (unsigned char *)(frame->data.ptr - hdrlen);	/* headroom: AST_FRIENDLY_OFFSET(64) >= 12+ext */
+
+		put_unaligned_uint32(rtpheader, htonl((2 << 30) | (tx_mid ? (1 << 28) : 0) | (codec << 16) | (tx_seqno) | (mark << 23)));
+		put_unaligned_uint32(rtpheader + 4, htonl(tx_ts));
+		put_unaligned_uint32(rtpheader + 8, htonl(tx_ssrc));
+		if (tx_mid) {
+			rtpheader[12] = 0xBE;	/* RFC 8285 one-byte header extension profile (0xBEDE) */
+			rtpheader[13] = 0xDE;
+			rtpheader[14] = (unsigned char)((ext_words >> 8) & 0xff);	/* length in 32-bit words */
+			rtpheader[15] = (unsigned char)(ext_words & 0xff);
+			rtpheader[16] = (unsigned char)((rtp->mid_ext_id << 4) | (midlen - 1));	/* element: id<<4 | (len-1) */
+			memcpy(rtpheader + 17, tx_mid, midlen);
+			if (ext_bytes - 4 - (1 + midlen) > 0) {
+				memset(rtpheader + 17 + midlen, 0, ext_bytes - 4 - (1 + midlen));	/* zero the word padding */
+			}
+		}
 
 		if ((res = rtp_sendto(instance, (void *)rtpheader, frame->datalen + hdrlen, 0, &remote_address)) < 0) {
 			if (!ast_rtp_instance_get_prop(instance, AST_RTP_PROPERTY_NAT) || (ast_rtp_instance_get_prop(instance, AST_RTP_PROPERTY_NAT) && (ast_test_flag(rtp, FLAG_NAT_ACTIVE) == FLAG_NAT_ACTIVE))) {
@@ -2913,7 +3016,12 @@ static int ast_rtp_raw_write(struct ast_rtp_instance *instance, struct ast_frame
 		}
 	}
 
-	rtp->seqno++;
+	/* WebRTC BUNDLE: advance the sub-stream's own seqno (audio vs bundled video). */
+	if (rtp->bundle && (frame->subclass.codec & AST_FORMAT_VIDEO_MASK)) {
+		rtp->v_seqno++;
+	} else {
+		rtp->seqno++;
+	}
 
 	return 0;
 }
@@ -3469,11 +3577,25 @@ static struct ast_frame *ast_rtcp_read(struct ast_rtp_instance *instance)
 				sizeof(rtcpdata) - sizeof(unsigned int) * AST_FRIENDLY_OFFSET,
 				0, &addr)) < 0) {
 		ast_assert(errno != EBADF);
-		if (errno != EAGAIN) {
-			ast_log(LOG_WARNING, "RTCP Read error: %s.  Hanging up.\n", strerror(errno));
-			return NULL;
+		if (errno == EAGAIN) {
+			return &ast_null_frame;
 		}
-		return &ast_null_frame;
+#ifdef HAVE_OPENSSL
+		{
+			struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+			/* Same transient-ICMP tolerance as the RTP path: an ICMP unreachable (EIO/ECONNREFUSED/
+			 * EHOSTUNREACH/ENETUNREACH) on a WebRTC/DTLS leg's RTCP socket is a bounced datagram during
+			 * ICE probing, not a reason to hang up. rtptimeout still catches truly dead media. */
+			if (rtp && rtp->dtls.ssl && (errno == EIO || errno == ECONNREFUSED
+					|| errno == EHOSTUNREACH || errno == ENETUNREACH)) {
+				ast_debug(1, "%p -- transient RTCP read error (%s) on a WebRTC/DTLS leg; ignoring\n",
+					rtp, strerror(errno));
+				return &ast_null_frame;
+			}
+		}
+#endif
+		ast_log(LOG_WARNING, "RTCP Read error: %s.  Hanging up.\n", strerror(errno));
+		return NULL;
 	}
 
 	return ast_rtcp_interpret(instance, rtcpheader, res, &addr);
@@ -3865,6 +3987,11 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 	struct ast_rtp_payload_type payload;
 	struct ast_sockaddr remote_address = { {0,} };
 	struct frame_list frames;
+	/* WebRTC BUNDLE (RFC 8843): per-sub-stream RX routing, resolved after the SSRC is parsed below. */
+	int is_video = 0;
+	unsigned int *bundle_rxssrc, *bundle_rxcount, *bundle_cycles;
+	int *bundle_lastrxseqno;
+	unsigned short *bundle_seedrxseqno;
 
 	/* If this is actually RTCP let's hop on over and handle it */
 	if (rtcp) {
@@ -3884,11 +4011,25 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 				sizeof(rtp->rawdata) - AST_FRIENDLY_OFFSET, 0,
 				&addr)) < 0) {
 		ast_assert(errno != EBADF);
-		if (errno != EAGAIN) {
-			ast_log(LOG_WARNING, "RTP Read error: %s. Hanging up.\n", strerror(errno));
-			return NULL;
+		if (errno == EAGAIN) {
+			return &ast_null_frame;
 		}
-		return &ast_null_frame;
+#ifdef HAVE_OPENSSL
+		/* A transient ICMP port/host/net-unreachable (surfaced as EIO/ECONNREFUSED/EHOSTUNREACH/
+		 * ENETUNREACH on the next recv) is NORMAL on a WebRTC/DTLS leg: while ICE is still probing, or
+		 * if the browser momentarily stops listening on a candidate, our datagram bounces. Tearing the
+		 * whole call down for it caused "cancel on answer" when a WebRTC browser is the CALLER (media
+		 * setup on the caller leg races ICE). Ignore it — ICE re-latches, and rtptimeout still catches
+		 * genuinely dead media. Plain (non-DTLS) RTP keeps the original hang-up. */
+		if (rtp->dtls.ssl && (errno == EIO || errno == ECONNREFUSED
+				|| errno == EHOSTUNREACH || errno == ENETUNREACH)) {
+			ast_debug(1, "%p -- transient RTP read error (%s) on a WebRTC/DTLS leg; ignoring\n",
+				rtp, strerror(errno));
+			return &ast_null_frame;
+		}
+#endif
+		ast_log(LOG_WARNING, "RTP Read error: %s. Hanging up.\n", strerror(errno));
+		return NULL;
 	}
 
 	/* Make sure the data that was read in is actually enough to make up an RTP packet */
@@ -3903,8 +4044,11 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 		/* For now, we always copy the address. */
 		ast_sockaddr_copy(&rtp->strict_rtp_address, &addr);
 
-		/* Send the rtp and the seqno from header to rtp_learning_rtp_seq_update to see whether we can exit or not*/
-		if (rtp_learning_rtp_seq_update(rtp, ntohl(rtpheader[0]))) {
+		/* Send the rtp and the seqno from header to rtp_learning_rtp_seq_update to see whether we can exit or not.
+		 * WebRTC BUNDLE: audio+video have independent RTP sequence spaces on one socket, so this single-sequence
+		 * probation would be disturbed by interleaving and could drop valid audio. ICE + DTLS-SRTP + the source
+		 * address already authenticate the 5-tuple, so skip the seqno probation and close immediately. */
+		if (!rtp->bundle && rtp_learning_rtp_seq_update(rtp, ntohl(rtpheader[0]))) {
 			ast_debug(1, "%p -- Condition for learning hasn't exited, so reject the frame.\n", rtp);
 			return &ast_null_frame;
 		}
@@ -3958,32 +4102,30 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 	}
 
 #ifdef HAVE_OPENSSL
-	/* WebRTC ICE debug ("rtp set debug ice on"): on the first media packet after ICE completes, show the
-	 * nominated/selected peer vs the ACTUAL media source. This browser sends ICE checks and RTP/DTLS media
-	 * from DIFFERENT source ports (same IP) - cmp!=0 but cmp_addr==0 - which is why an ice_peer-with-port RX
-	 * drop kills audio; the symmetric-RTP block below is what follows media to its real source. LOG ONLY. */
-	if (rtpicedebug && rtp->ice_active && rtp->ice_complete && !rtp->ice_rx_logged) {
+	/* A3: WebRTC ICE debug ("rtp set debug ice on"). On the first media packet after ICE completes AND on
+	 * every media-source CHANGE, log the nominated ice_peer vs the ACTUAL media source. Live browsers send
+	 * ICE/DTLS checks and SRTP media from DIFFERENT source ports (same IP): cmp!=0 but cmp_addr==0 — which is
+	 * why the symmetric-RTP follow below is REQUIRED and an ice_peer host+port RX drop would kill audio. LOG ONLY. */
+	if (rtpicedebug && version == 2 && rtp->ice_active && rtp->ice_complete
+	    && (!rtp->rx_seen || ast_sockaddr_cmp(&rtp->last_media, &addr))) {	/* version==2: skip malformed RTP-like datagrams */
 		char *p_peer = ast_strdupa(ast_sockaddr_stringify(&rtp->ice_peer));
-		char *p_addr = ast_strdupa(ast_sockaddr_stringify(&addr));
-		char *p_strict = ast_strdupa(ast_sockaddr_stringify(&rtp->strict_rtp_address));
-		rtp->ice_rx_logged = 1;
-		ast_verbose("ICE-RXDBG inst=%p ice_peer=%s media_src=%s cmp=%d cmp_addr=%d "
-			"peer_v4mapped=%d src_v4mapped=%d dtls_conn=%d strict_state=%d strict_addr=%s\n",
-			rtp, p_peer, p_addr,
+		char *p_src = ast_strdupa(ast_sockaddr_stringify(&addr));
+		ast_verbose("ICE-RXDBG inst=%p rtp=%p ice_peer=%s media_src=%s cmp=%d cmp_addr=%d dtls_conn=%d strict_state=%d first=%d pt=%d ssrc=%u\n",
+			instance, rtp, p_peer, p_src,
 			ast_sockaddr_cmp(&rtp->ice_peer, &addr), ast_sockaddr_cmp_addr(&rtp->ice_peer, &addr),
-			ast_sockaddr_is_ipv4_mapped(&rtp->ice_peer), ast_sockaddr_is_ipv4_mapped(&addr),
-			(int)rtp->dtls.connection, (int)rtp->strict_rtp_state, p_strict);
+			(int)rtp->dtls.connection, (int)rtp->strict_rtp_state, !rtp->rx_seen,
+			(int)((seqno >> 16) & 0x7f), (unsigned int)ntohl(rtpheader[2]));
+		ast_sockaddr_copy(&rtp->last_media, &addr);
+		rtp->rx_seen = 1;
 	}
 #endif
 
 	/* ┌─ DO NOT ADD AN ICE "SELECTED-PAIR" RX DROP HERE ──────────────────────────────────────────────────┐
 	 * │ A guard like `if (ice_active && ice_complete && ast_sockaddr_cmp(&ice_peer,&addr)) return null;` was │
-	 * │ TRIED 2026-06-29 and DROPPED ALL AUDIO on live SIP.js, so it was REVERTED. Live ICE-RXDBG proved the │
-	 * │ browser sends ICE/DTLS checks and the SRTP MEDIA from DIFFERENT source ports (SAME IP): cmp != 0 but │
-	 * │ cmp_addr == 0. The symmetric-RTP follow BELOW is REQUIRED to move media to its real source; SRTP     │
-	 * │ auth/replay already rejects forged packets. If RX hardening is ever revisited it must be HOST-ONLY   │
-	 * │ (ast_sockaddr_cmp_addr) and log-backed, never host+port — and is probably not worth touching this    │
-	 * │ hot path. Enable "rtp set debug ice on" to see ice_peer vs media_src.                                │
+	 * │ TRIED and DROPPED ALL AUDIO on live SIP.js, so it was REVERTED after review. The                     │
+	 * │ browser sends ICE/DTLS checks and SRTP media from DIFFERENT source ports, SAME IP (cmp!=0, cmp_addr  │
+	 * │ ==0 — see ICE-RXDBG above). The symmetric-RTP follow BELOW is load-bearing (moves media to its real  │
+	 * │ source); SRTP auth/replay already rejects forgeries. Never host+port RX filter here. Log, don't drop.│
 	 * └─────────────────────────────────────────────────────────────────────────────────────────────────────┘ */
 	/* If symmetric RTP is enabled see if the remote side is not what we expected and change where we are sending audio */
 	if (ast_rtp_instance_get_prop(instance, AST_RTP_PROPERTY_NAT)) {
@@ -4022,9 +4164,22 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 	timestamp = ntohl(rtpheader[1]);
 	ssrc = ntohl(rtpheader[2]);
 
+	/* WebRTC BUNDLE: classify this packet's sub-stream by payload type so audio and the bundled video keep
+	 * independent SSRC/seqno/cycle/count state (RFC 8843 PT-demux). rtp->bundle==0 => is_video==0 => every
+	 * pointer below resolves to the existing audio field => byte-identical to the non-bundle path. */
+	if (rtp->bundle) {
+		struct ast_rtp_payload_type vpt = ast_rtp_codecs_payload_lookup(ast_rtp_instance_get_codecs(instance), payloadtype);
+		is_video = vpt.gabpbx_format && (vpt.code & AST_FORMAT_VIDEO_MASK);
+	}
+	bundle_rxssrc = is_video ? &rtp->v_rxssrc : &rtp->rxssrc;
+	bundle_rxcount = is_video ? &rtp->v_rxcount : &rtp->rxcount;
+	bundle_lastrxseqno = is_video ? &rtp->v_lastrxseqno : &rtp->lastrxseqno;
+	bundle_seedrxseqno = is_video ? &rtp->v_seedrxseqno : &rtp->seedrxseqno;
+	bundle_cycles = is_video ? &rtp->v_cycles : &rtp->cycles;
+
 	AST_LIST_HEAD_INIT_NOLOCK(&frames);
 	/* Force a marker bit and change SSRC if the SSRC changes */
-	if (rtp->rxssrc && rtp->rxssrc != ssrc) {
+	if (*bundle_rxssrc && *bundle_rxssrc != ssrc) {
 		struct ast_frame *f, srcupdate = {
 			AST_FRAME_CONTROL,
 			.subclass.integer = AST_CONTROL_SRCCHANGE,
@@ -4041,7 +4196,7 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 		AST_LIST_INSERT_TAIL(&frames, f, frame_list);
 	}
 
-	rtp->rxssrc = ssrc;
+	*bundle_rxssrc = ssrc;
 
 	/* Remove any padding bytes that may be present */
 	if (padding) {
@@ -4073,9 +4228,9 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 		return AST_LIST_FIRST(&frames) ? AST_LIST_FIRST(&frames) : &ast_null_frame;
 	}
 
-	rtp->rxcount++;
-	if (rtp->rxcount == 1) {
-		rtp->seedrxseqno = seqno;
+	(*bundle_rxcount)++;
+	if (*bundle_rxcount == 1) {
+		*bundle_seedrxseqno = seqno;
 	}
 
 	/* Do not schedule RR if RTCP isn't run */
@@ -4088,14 +4243,14 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 			ast_log(LOG_WARNING, "scheduling RTCP transmission failed.\n");
 		}
 	}
-	if ((int)rtp->lastrxseqno - (int)seqno  > 100) /* if so it would indicate that the sender cycled; allow for misordering */
-		rtp->cycles += RTP_SEQ_MOD;
+	if ((int)*bundle_lastrxseqno - (int)seqno  > 100) /* if so it would indicate that the sender cycled; allow for misordering */
+		*bundle_cycles += RTP_SEQ_MOD;
 
-	prev_seqno = rtp->lastrxseqno;
-	rtp->lastrxseqno = seqno;
+	prev_seqno = *bundle_lastrxseqno;
+	*bundle_lastrxseqno = seqno;
 
-	if (!rtp->themssrc) {
-		rtp->themssrc = ntohl(rtpheader[2]); /* Record their SSRC to put in future RR */
+	if (!rtp->themssrc && !is_video) {
+		rtp->themssrc = ntohl(rtpheader[2]); /* Record their SSRC to put in future RR (audio sub-stream only) */
 	}
 
 	if (rtp_debug_test_addr(&addr)) {
@@ -4137,7 +4292,12 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 		return &ast_null_frame;
 	}
 
-	rtp->lastrxformat = rtp->f.subclass.codec = payload.code;
+	rtp->f.subclass.codec = payload.code;
+	/* lastrxformat feeds the audio DTMF (RFC 2833) / CN (RFC 3389) sample-rate calc; on a bundle leg keep it the
+	 * AUDIO format so an interleaved video packet doesn't overwrite it. is_video is always 0 when !rtp->bundle => byte-identical. */
+	if (!is_video) {
+		rtp->lastrxformat = payload.code;
+	}
 	rtp->f.frametype = (rtp->f.subclass.codec & AST_FORMAT_AUDIO_MASK) ? AST_FRAME_VOICE : (rtp->f.subclass.codec & AST_FORMAT_VIDEO_MASK) ? AST_FRAME_VIDEO : AST_FRAME_TEXT;
 
 	rtp->rxseqno = seqno;
@@ -4350,6 +4510,13 @@ static void ast_rtp_prop_set(struct ast_rtp_instance *instance, enum ast_rtp_pro
 		}
 	}
 
+	if (property == AST_RTP_PROPERTY_BUNDLE) {
+		/* WebRTC BUNDLE (RFC 8843): carry audio + a PT-demuxed video sub-stream on this one transport.
+		 * RTX/FEC/NACK and a per-SSRC video RTCP RR are out of scope for v1 (follow-up). */
+		rtp->bundle = value ? 1 : 0;
+		return;
+	}
+
 	return;
 }
 
@@ -4496,6 +4663,24 @@ static int ast_rtp_get_stat(struct ast_rtp_instance *instance, struct ast_rtp_in
 {
 	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
 
+	/* SSRC stats need NO RTCP: serve them BEFORE the rtcp guard so SDP generation (a=ssrc / a=msid), which can
+	 * run before RTCP is set up — e.g. an outbound WebRTC OFFER — reads the real local/video SSRC instead of 0.
+	 * Previously get_stat returned -1 here when rtcp was NULL, so our OFFER emitted NO a=ssrc/a=msid and the
+	 * browser never instantiated an inbound video receiver (no inbound-rtp video -> black). The ANSWER worked
+	 * only because RTCP was already set up by then. */
+	if (stat == AST_RTP_INSTANCE_STAT_LOCAL_SSRC) {
+		stats->local_ssrc = rtp->ssrc;
+		return 0;
+	}
+	if (stat == AST_RTP_INSTANCE_STAT_LOCAL_VIDEO_SSRC) {
+		stats->local_video_ssrc = rtp->v_ssrc;
+		return 0;
+	}
+	if (stat == AST_RTP_INSTANCE_STAT_REMOTE_SSRC) {
+		stats->remote_ssrc = rtp->themssrc;
+		return 0;
+	}
+
 	if (!rtp->rtcp) {
 		return -1;
 	}
@@ -4536,6 +4721,7 @@ static int ast_rtp_get_stat(struct ast_rtp_instance *instance, struct ast_rtp_in
 
 	AST_RTP_STAT_SET(AST_RTP_INSTANCE_STAT_LOCAL_SSRC, -1, stats->local_ssrc, rtp->ssrc);
 	AST_RTP_STAT_SET(AST_RTP_INSTANCE_STAT_REMOTE_SSRC, -1, stats->remote_ssrc, rtp->themssrc);
+	AST_RTP_STAT_SET(AST_RTP_INSTANCE_STAT_LOCAL_VIDEO_SSRC, -1, stats->local_video_ssrc, rtp->v_ssrc);
 
 	return 0;
 }
@@ -4719,10 +4905,12 @@ static char *handle_cli_rtp_set_debug_ice(struct ast_cli_entry *e, int cmd, stru
 		e->command = "rtp set debug ice {on|off}";
 		e->usage =
 			"Usage: rtp set debug ice {on|off}\n"
-			"       Enable/Disable WebRTC ICE/DTLS debugging. Logs each ICE nomination\n"
-			"       (the (re)selected candidate pair, latest-wins) and, on the first media\n"
-			"       packet after ICE completes, the nominated peer vs the actual media\n"
-			"       source (they legitimately differ by port for some browsers).\n";
+			"       Enable/Disable WebRTC ICE/DTLS debugging (pure logging, no media change).\n"
+			"       Logs each ICE latch/nomination (this driver is LATCH-ALWAYS), DTLS records\n"
+			"       dropped as source != the latched peer, and (on the first media packet\n"
+			"       after ICE completes + on every media-source change) the nominated peer\n"
+			"       vs the actual media source - which legitimately differ by port for some\n"
+			"       browsers. Never logs secrets. Default OFF.\n";
 		return NULL;
 	case CLI_GENERATE:
 		return NULL;
