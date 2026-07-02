@@ -63,6 +63,11 @@ de-registers independently, honours its own `;expires` parameter (a per-binding
 own remaining expiry. A per-Contact de-registration is never rejected by the contact
 ACL.
 
+Peer availability now follows Contact expiry as RFC 3261 soft state: `sip show peer
+<name> detail` reports an accurate state — **AVAILABLE**, **EXPIRED**, or **IN-CALL** —
+instead of a blanket "idle", and a call placed to a peer whose every binding has expired
+returns **unavailable** (`CHANUNAVAIL`) rather than being routed to a stale binding.
+
 ### TLS — accept TLS 1.2 by default
 
 The Sofia transport defaults to TLS 1.3-only when no minimum version is set, which
@@ -71,14 +76,31 @@ rejected the many SIP endpoints that cap at TLS 1.2 (the server aborts the
 `tls_min_version` now defaults to **1.2** (enabling TLS 1.2 + 1.3); a deployment can
 still pin `tls_min_version=1.3`. WebRTC/WSS (TLS 1.3) is unaffected.
 
-### Diagnostics — WebRTC media/fork observability
+### Diagnostics — live decrypted SIP capture (Homer / HEP) + media/fork tracing
 
-Two runtime-only, default-off trace facilities aid WebRTC debugging without touching the
-datapath. **`rtp set debug ice`** logs the ICE latch/nomination timeline, the `ice_peer`
-vs media-source comparison, DTLS record handling, and SRTP first-decrypt.
-**`sip set debug fork`** traces the fork lifecycle — child INVITE creation, loser-cancel,
-winner selection with the media/fd hand-off, and registrar flow drops — the window into
-mixed UDP + WSS forking on a shared address-of-record.
+SIP over `ws` / `wss` / `tls` is encrypted on the wire, so a packet capture only sees
+ciphertext. GABPBX can now tap the Sofia-SIP transport layer and export **every SIP
+message, decrypted, in both directions** (`udp` / `tcp` / `tls` / `ws` / `wss`),
+including the SDP body — the WebRTC signalling (`a=candidate` / `a=fingerprint` /
+`a=setup`). It is off by default (zero overhead) and the capture socket is non-blocking,
+so it never stalls the SIP stack.
+
+- **`sip_capture_address`** (`[general]`, e.g. `127.0.0.1:9060`) streams the decrypted
+  messages as **HEP** (Homer Encapsulation Protocol) over UDP to a Homer / `sipcapture`
+  server — read them with `sngrep -H udp:127.0.0.1:9060`, Homer, or the Wireshark HEP
+  dissector. `sip_capture_hep` selects the HEP version (1/2/3, default 3) and
+  `sip_capture_id` the capture-agent id.
+- **`sip_capture_file`** additionally appends every decrypted message to a plain-text
+  file (no Homer needed).
+- Runtime toggles, no reload needed: **`sip set debug capture <host:port>`**
+  (`capture off`) and **`sip set debug file <path>`** (`file off`).
+
+Two further default-off tracers aid WebRTC debugging without touching the datapath.
+**`rtp set debug ice`** logs the ICE latch/nomination timeline, the `ice_peer` vs
+media-source comparison, DTLS record handling, and SRTP first-decrypt. **`sip set debug
+fork`** traces the fork lifecycle — child INVITE creation, loser-cancel, winner selection
+with the media/fd hand-off, and registrar flow drops — the window into mixed UDP + WSS
+forking on a shared address-of-record.
 
 
 ## 1.3.5 — WebRTC inbound (offerer) two-way audio + SIP/SDP diagnostics
