@@ -34,9 +34,10 @@ workaround.
 GABPBX can now negotiate **audio + video over one bundled ICE/DTLS transport**
 (`a=group:BUNDLE`, max-bundle style) as browsers require, demultiplexing the two media
 by payload type and RTP MID header extension (RFC 8285) on a single RTP instance. A new
-option **`webrtc_video_bundle`** (per-peer and `[general]`, default **off**) enables it;
-with it off, behaviour is byte-for-byte unchanged. Video is offered and answered in the
-initial INVITE in both directions.
+option **`webrtc_video_bundle`** (per-peer and `[general]`, default **off**) enables it —
+it takes effect only where `webrtc=yes` is also set; with it off, behaviour is
+byte-for-byte unchanged. Video is offered and answered in the initial INVITE in both
+directions.
 
 ### DTMF — full chan_sip parity
 

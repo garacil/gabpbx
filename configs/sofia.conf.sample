@@ -38,6 +38,13 @@
 ;   sip set debug file <path>         | file off
 ; A `sip reload` re-applies whatever is set above (a runtime toggle not in this file is then cleared).
 ;
+; Companion protocol tracers (runtime, default OFF, no reload, pure logging — zero datapath):
+;   rtp set debug ice        - ICE/DTLS media negotiation: connectivity-check latch, pair
+;                              nomination, DTLS handshake state and SRTP setup (WebRTC audio/video).
+;   sip set debug fork       - per-Contact INVITE forking: which bindings a call forks to, and why
+;                              a leg is added or dropped (mixed udp + ws/wss multi-device debugging).
+; Turn either off with `rtp set debug ice off` / `sip set debug fork off`.
+;
 ; Reload behaviour
 ;
 ; `sip reload` (and the equivalent `module reload chan_sofia.so`) re-reads
@@ -153,9 +160,12 @@ srvlookup=yes
 ; tlscafile    = /etc/gabpbx/keys/ca.crt       ; optional real CA file; soft-linked to <dir>/cafile.pem.
 ;
 ; TLS hardening (TLS listener only — opt-in; each unset knob keeps the sofia-sip default, no change):
-; tls_min_version  = 1.2                       ; minimum TLS version 1.0|1.1|1.2|1.3 (enables that and
-;                                              ; every higher version; TLS1.3 is always available).
-;                                              ; e.g. 1.2 refuses TLS1.0/1.1 handshakes.
+; tls_min_version  = 1.2                       ; minimum TLS version 1.0|1.1|1.2|1.3 (enables that
+;                                              ; version and every higher one). DEFAULT 1.2 — the TLS
+;                                              ; listener accepts TLS 1.2 and 1.3 out of the box. A
+;                                              ; previous 1.3-only default rejected endpoints that cap
+;                                              ; at TLS 1.2; set 1.3 here to refuse 1.2 again, or 1.0/1.1
+;                                              ; to re-admit legacy handshakes.
 ; tls_ciphers      = ECDHE+AESGCM:!aNULL:!MD5  ; OpenSSL cipher list (unset = sofia default
 ;                                              ; "!eNULL:!aNULL:!EXP:!LOW:!MD5:ALL:@STRENGTH").
 ; tls_verify_depth = 3                         ; max peer cert-chain depth (unset/0 = sofia default 2).
@@ -283,6 +293,11 @@ srvlookup=yes
 ;       - DTLS-SRTP (RFC 5763/5764) — SRTP keys from the DTLS handshake
 ;       - ICE-lite (RFC 8445 §2.5) — gabpbx answers connectivity checks; the
 ;         browser is the full-ICE controlling agent
+;       - IMMEDIATE MEDIA LATCH (RFC 8445 §7.3.1 / RFC 7675) — the ICE media
+;         tuple is latched on EVERY integrity-authenticated connectivity check,
+;         not only the nominated pair. This removes the intermittent one-way or
+;         10-20s-delayed audio, and the deaf inbound call to a browser, that a
+;         nominate-only latch could otherwise produce. No configuration needed.
 ;       - BUNDLE + rtcp-mux (RFC 8843 / RFC 5761) — one 5-tuple for RTP+RTCP
 ;       - audio always; VIDEO optional — set allow=vp8 and/or allow=h264 on the peer.
 ;         Accepted video runs on its OWN separate non-BUNDLE DTLS/ICE transport
@@ -391,6 +406,15 @@ srvlookup=yes
 ;
 ;max_contacts   = 6
 
+;
+; --- Per-Contact REGISTER (RFC 3261 §10.3) ---
+; A peer may hold several Contact bindings at once (up to max_contacts). Each
+; Contact is INDEPENDENT: it binds, refreshes and de-registers on its own and
+; honours its own ;expires — a Contact sent with expires=0 removes ONLY that one
+; binding, and the 200 OK reports each binding's own remaining expiry. Inspect the
+; live set with `sip show peer <name> detail`, which shows every binding and its
+; state (AVAILABLE / EXPIRED / IN-CALL). A call to a peer whose bindings have ALL
+; expired returns CHANUNAVAIL instead of routing to a stale binding.
 ;
 ; --- Identity headers (identity-headers parity, RFC 3325 + RFC 3323) ---
 ; chan_sip drop-in defaults — peers omitting callingpres / sendrpid / trustrpid
@@ -2966,6 +2990,19 @@ srvlookup=yes
 ;                 Auto-disabled when nat=force_rport or nat=comedia is set on
 ;                 either peer (NAT'd peers advertise unreachable private IPs).
 ;                 488 Not Acceptable from a peer cleanly falls back to relay mode.
+;
+; dtmfmode detail:
+;   rfc2833  - RFC 4733 telephone-event in the RTP stream (default)
+;   info     - out-of-band SIP INFO, application/dtmf-relay
+;   shortinfo- SIP INFO, application/dtmf, numeric body (chan_sip parity); an
+;              inbound Signal (incl. numeric 10=* / 11=# and hook-flash) is parsed
+;   inband   - audio-band tones, detected by the DSP
+;   auto     - advertise telephone-event and use RFC 2833 when the far end
+;              negotiates it, else fall back to inband DSP detection. The mode is
+;              resolved at SDP commit; telephone-event is advertised in the SDP
+;              only for the RFC 2833 modes, and the DSP is (re)configured
+;              fax-safely when the negotiated mode differs from the configured one.
+; The dialplan app SIPDtmfMode(<mode>) re-syncs the DTMF mode on a live channel.
 ;
 ; --- Registration ---
 ; expiresecs    - registration expiry in seconds (default: 120)
