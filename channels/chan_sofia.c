@@ -17132,6 +17132,32 @@ void sofia_apply_capture(void)
 		return;
 	}
 
+	/* DUMP first, and with TPTAG_CAPT(NULL) in the SAME set. sofia-sip's tport_open_log() re-seeds its
+	 * local `capt` from mr_capt_name (tport_logging.c:124) and, for an unchanged already-open capture,
+	 * early-returns (165-166) BEFORE the dump fopen (302-324) -- so a plain TPTAG_DUMP applied while an
+	 * HEP capture is active never opens the file. Supplying TPTAG_CAPT(NULL) alongside overwrites that
+	 * pre-seed to NULL (tl_gets picks the last matching tag), so the capture block is skipped entirely
+	 * and the dump-open is reached. It also drops the capture socket, which the capture step below
+	 * re-opens on top (no DUMP tag there, so mr_dump_file is left intact). */
+	if (!ast_strlen_zero(sofia_cfg.sip_capture_file)) {
+		/* /dev/null reset: sofia-sip's dump same-name check compares only the NAME, so re-applying the
+		 * same path would skip fopen(); the name change forces the real path to (re)open. */
+		tport_set_params(tports, TPTAG_CAPT(NULL), TPTAG_DUMP("/dev/null"), TAG_END());
+		tport_set_params(tports, TPTAG_CAPT(NULL), TPTAG_DUMP(sofia_cfg.sip_capture_file), TAG_END());
+		sofia_dump_on = 1;
+		sofia_capture_on = 0;	/* the CAPT(NULL) above closed the capture socket; re-applied below if configured */
+		ast_log(LOG_NOTICE, "Sofia: SIP message dump -> file %s\n", sofia_cfg.sip_capture_file);
+	} else if (sofia_dump_on) {
+		/* sofia-sip has no dump-off tag; redirecting to /dev/null closes (flushes) the operator's file.
+		 * CAPT(NULL) here too so the dump closes regardless of capture state; capture re-applied below. */
+		tport_set_params(tports, TPTAG_CAPT(NULL), TPTAG_DUMP("/dev/null"), TAG_END());
+		sofia_dump_on = 0;
+		sofia_capture_on = 0;
+		ast_log(LOG_NOTICE, "Sofia: SIP message dump disabled\n");
+	}
+
+	/* CAPT after: (re-)open the HEP socket on top. No DUMP tag here, so tport_open_log leaves mr_dump_file
+	 * untouched (its dump block is skipped when dump==NULL) -- an already-open dump file stays open. */
 	if (!ast_strlen_zero(sofia_cfg.sip_capture_address)) {
 		char url[192];
 		int hep = (sofia_cfg.sip_capture_hep >= 1 && sofia_cfg.sip_capture_hep <= 3)
@@ -17151,22 +17177,6 @@ void sofia_apply_capture(void)
 		tport_set_params(tports, TPTAG_CAPT(NULL), TAG_END());	/* NULL closes the capture socket */
 		sofia_capture_on = 0;
 		ast_log(LOG_NOTICE, "Sofia: SIP capture disabled\n");
-	}
-
-	if (!ast_strlen_zero(sofia_cfg.sip_capture_file)) {
-		/* Reset first: sofia-sip's dump same-name check compares only the NAME (not the FILE*), so a
-		 * failed first open (e.g. applied too early at startup) is NEVER retried on a plain re-apply.
-		 * Forcing a name change to /dev/null makes the following set re-run fopen() on the real path. */
-		tport_set_params(tports, TPTAG_DUMP("/dev/null"), TAG_END());
-		tport_set_params(tports, TPTAG_DUMP(sofia_cfg.sip_capture_file), TAG_END());
-		sofia_dump_on = 1;
-		ast_log(LOG_NOTICE, "Sofia: SIP message dump -> file %s\n", sofia_cfg.sip_capture_file);
-	} else if (sofia_dump_on) {
-		/* sofia-sip has no dump-off tag; redirecting to /dev/null closes (flushes) the operator's file
-		 * and sends further messages nowhere. */
-		tport_set_params(tports, TPTAG_DUMP("/dev/null"), TAG_END());
-		sofia_dump_on = 0;
-		ast_log(LOG_NOTICE, "Sofia: SIP message dump disabled\n");
 	}
 }
 

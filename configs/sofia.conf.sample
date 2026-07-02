@@ -30,9 +30,12 @@
 ;                                        ; Wireshark HEP dissector. Port must be 1024-65535.
 ;sip_capture_hep = 3                     ; HEP protocol version 1|2|3 (default 3).
 ;sip_capture_id = 200                    ; HEP capture-agent id (default 200).
+;sip_capture_file = /var/log/gabpbx/sip_trace.txt ; ALSO append every decrypted message to this file
+;                                        ; (plain text, no Homer needed); empty = OFF.
 ;
-; Runtime toggle (no reload needed):
+; Runtime toggles (no reload needed):
 ;   sip set debug capture <host:port> | capture off
+;   sip set debug file <path>         | file off
 ; A `sip reload` re-applies whatever is set above (a runtime toggle not in this file is then cleared).
 ;
 ; Reload behaviour

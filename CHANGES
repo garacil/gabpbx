@@ -90,8 +90,10 @@ so it never stalls the SIP stack.
   server — read them with `sngrep -H udp:127.0.0.1:9060`, Homer, or the Wireshark HEP
   dissector. `sip_capture_hep` selects the HEP version (1/2/3, default 3) and
   `sip_capture_id` the capture-agent id.
-- Runtime toggle, no reload needed: **`sip set debug capture <host:port>`**
-  (`capture off`).
+- **`sip_capture_file`** additionally appends every decrypted message to a plain-text
+  file (no Homer needed) — works standalone or alongside HEP.
+- Runtime toggles, no reload needed: **`sip set debug capture <host:port>`**
+  (`capture off`) and **`sip set debug file <path>`** (`file off`).
 
 Two further default-off tracers aid WebRTC debugging without touching the datapath.
 **`rtp set debug ice`** logs the ICE latch/nomination timeline, the `ice_peer` vs
