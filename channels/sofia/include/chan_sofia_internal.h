@@ -187,7 +187,7 @@ int sofia_should_use_externaddr(const struct ast_sockaddr *peer_addr);
 void sofia_change_t38_state(struct sofia_pvt *pvt, int new_state);
 int sofia_t38_abort(const void *data);
 int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_control_t38_parameters *parameters);
-int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip);
+int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer);
 int sofia_dtmf_wants_rfc2833(const struct sofia_pvt *pvt);	/* g1/g3: effective mode carries DTMF as RFC2833/telephone-event (rfc2833 || unresolved-auto || is_webrtc) */
 void sofia_dtmf_reconfigure(struct sofia_pvt *pvt);		/* g2: re-apply RTP property + dtmf mode + fax-safe DSP from pvt->dtmf_effective (call after an AUTO resolution / SIPDtmfMode / DIGIT_DETECT toggle) */
 
@@ -213,7 +213,12 @@ void sofia_dtmf_reconfigure(struct sofia_pvt *pvt);		/* g2: re-apply RTP propert
  *         must fail the call closed (never downgrade a webrtc=yes leg to RTP/AVP).
  */
 int sofia_webrtc_provision_offer(struct sofia_pvt *pvt);
-char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len);
+/* is_answer=1 => we are building the SDP ANSWER to a received offer, so the media
+ * direction MIRRORS the offered per-media mode (RFC 3264 §6.1: sendonly->recvonly,
+ * recvonly->sendonly, inactive->inactive, else sendrecv) using pvt->offered_*_mode.
+ * is_answer=0 => we are building an OFFER; direction is always sendrecv (chan_sofia has
+ * no SIP local-hold-offer path today — AST_CONTROL_HOLD only starts local MOH). */
+char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_answer);
 int sofia_sdp_extract_hold(sip_t const *sip, su_home_t *home);
 
 struct sofia_peer *sofia_find_peer(const char *name);
@@ -468,6 +473,13 @@ struct sofia_pvt {
 	unsigned long sess_id;           /* SDP o= session-id, set ONCE per dialog (RFC 4566 §5.2 / RFC 3264 §8: constant across offers/answers) */
 	unsigned long sess_version;      /* SDP o= session-version, bumped per generated SDP */
 	int hold_state;                  /* 1 = peer holding us (a=sendonly/inactive) */
+	/* RFC 3264 §6.1 answer-direction mirror: the LAST accepted inbound SDP's per-media mode
+	 * (sofia sdp_mode_t: sdp_inactive/sendonly/recvonly/sendrecv). sofia_parse_sdp stages this
+	 * for any accepted inbound SDP (offer OR answer), past every reject gate, but it is ONLY
+	 * consulted by sofia_generate_sdp(is_answer=1) — our own offers (is_answer=0) ignore it and
+	 * always emit sendrecv. Sentinel -1 = "nothing staged" => sendrecv (NOT inactive; sdp_inactive==0 trap). */
+	int offered_audio_mode;
+	int offered_video_mode;
 	struct sofia_srtp *srtp;         /* audio SDES-SRTP context (NULL = plain RTP); freed in destructor */
 	struct sofia_srtp *vsrtp;        /* video SDES-SRTP context; freed in destructor */
 	struct ast_variable *initreq_headers; /* inbound INVITE headers for ${SIP_HEADER()}; freed in destructor */

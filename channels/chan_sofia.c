@@ -1486,7 +1486,7 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	 * failure return -1 (caller treats it as a loser; siblings may still answer with
 	 * valid crypto). Outside fork->lock — parse_sdp touches only child + sip. */
 	if (sip && sip->sip_payload && sip->sip_payload->pl_data) {
-		if (sofia_parse_sdp(child, sip) < 0) {
+		if (sofia_parse_sdp(child, sip, 0 /* answer: fork child 200 OK */) < 0) {
 			ast_log(LOG_NOTICE, "Sofia: fork-child '%s' answer rejected — encryption mismatch (peer=%s)\n",
 				child->fork_branch_id,
 				child->peer ? child->peer->name : "<unknown>");
@@ -1602,6 +1602,12 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	ast_copy_string(master->webrtc_tls_id, child->webrtc_tls_id, sizeof(master->webrtc_tls_id));
 	ast_copy_string(master->webrtc_video_mid, child->webrtc_video_mid, sizeof(master->webrtc_video_mid));
 	ast_copy_string(master->webrtc_video_tls_id, child->webrtc_video_tls_id, sizeof(master->webrtc_video_tls_id));
+	/* Stream identity MUST survive the steal: the child generated cname/msid for the initial offer
+	 * (RFC 7022 cname persistence / RFC 8830 track continuity). Without these the master regenerates
+	 * BOTH at its first re-INVITE answer — the browser sees a brand-new remote stream mid-call and
+	 * drops the old track (post-unhold black video on the fork-winner leg). */
+	ast_copy_string(master->webrtc_cname, child->webrtc_cname, sizeof(master->webrtc_cname));
+	ast_copy_string(master->webrtc_msid, child->webrtc_msid, sizeof(master->webrtc_msid));
 
 	/* Phase 3 WebRTC DataChannel fork-steal: the DC transport rides the just-stolen
 	 * master->rtp (its engine cb_data already moved with the rtp instance above), so we only MOVE the
@@ -2457,6 +2463,11 @@ static struct sofia_pvt *sofia_pvt_alloc(void)
 	pvt->t38_state = SOFIA_T38_DISABLED;
 	pvt->t38id = -1;
 	pvt->defer_bye_sched_id = -1;
+
+	/* RFC 3264 answer-direction: -1 sentinel = "no offer staged" (sdp_inactive==0 would
+	 * otherwise mean an unset field emits a=inactive). Staged in sofia_parse_sdp. */
+	pvt->offered_audio_mode = -1;
+	pvt->offered_video_mode = -1;
 
 	/* Default OUR T.38 caps: v0 (RFC 3362; negotiation MIN-clamps), rate 14400,
 	 * TRANSFERRED_TCF; max_ifp/datagram left zero (UDPTL supplies defaults). */
@@ -4772,7 +4783,7 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 	int have_gruu = 0;
 	int mf = sofia_cfg.default_max_forwards;
 
-	if (!pvt || !pvt->nh || !sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf))) {
+	if (!pvt || !pvt->nh || !sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf), 0 /* offer */)) {
 		/* Nothing sent — release the reinvite gate (pre-set by the directmedia
 		 * marshal) so a guard-fail doesn't leave it stuck. */
 		if (pvt) {
@@ -5381,7 +5392,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 						fork->child_count++;
 						ast_mutex_unlock(&fork->lock);
 						posted_any = 1;
-						if (sofia_generate_sdp(child, sdp_buf, sizeof(sdp_buf))) {
+						if (sofia_generate_sdp(child, sdp_buf, sizeof(sdp_buf), 0 /* offer */)) {
 							nua_invite(child->nh,
 								SIPTAG_FROM_STR(from_buf),
 								SIPTAG_CONTACT_STR(contact_buf),
@@ -5587,7 +5598,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		char nat_proxy_probe[128];
 		int needs_manual_ack = sofia_build_nat_proxy_url_from_peer(pvt->peer,
 			nat_proxy_probe, sizeof(nat_proxy_probe));
-		if (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf))) {
+		if (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf), 0 /* offer */)) {
 			nua_invite(pvt->nh,
 				SIPTAG_FROM_STR(from_buf),
 				SIPTAG_CONTACT_STR(contact_buf),
@@ -5796,7 +5807,7 @@ static int sofia_answer(struct ast_channel *ast)
 		if (pvt->peer) ast_mutex_lock(&pvt->peer->lock);
 		sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
 		if (pvt->peer) ast_mutex_unlock(&pvt->peer->lock);
-		if (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf))) {
+		if (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf), 1 /* answer */)) {
 			nua_respond(pvt->nh, SIP_200_OK,
 				TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
 				TAG_IF(st_seconds >= 0, NUTAG_SESSION_TIMER(st_seconds)),
@@ -6020,7 +6031,7 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 			if (pvt->peer) ast_mutex_lock(&pvt->peer->lock);
 			sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
 			if (pvt->peer) ast_mutex_unlock(&pvt->peer->lock);
-			if (pvt->rtp && sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf))) {
+			if (pvt->rtp && sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf), 1 /* answer */)) {
 				nua_respond(pvt->nh, SIP_183_SESSION_PROGRESS,
 					TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
 					SIPTAG_CONTENT_TYPE_STR("application/sdp"),
@@ -6069,6 +6080,23 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 		 * one-way silence after a REFER blind-transfer swap). */
 		if (pvt->rtp) {
 			ast_rtp_instance_change_source(pvt->rtp);
+		}
+		break;
+	case AST_CONTROL_VIDUPDATE:
+		/* Keyframe request relayed from the bridged peer (its RTCP PSFB PLI/FIR or legacy FUR,
+		 * forwarded by ast_generic_bridge / the rtp_engine local bridge): transmit an RTCP PSFB
+		 * PLI toward OUR video sender via the engine. Bundled WebRTC video rides pvt->rtp;
+		 * separate-transport WebRTC video rides pvt->vrtp — same discriminator as
+		 * sofia_sync_media_fds (vrtp && !webrtc_video_bundled). Non-WebRTC legs: deliberate
+		 * no-op (legacy endpoints would need SIP INFO picture_fast_update, out of scope) — but
+		 * MUST return 0, not -1, so the core does not log "Don't know how to indicate condition
+		 * 18" per relayed PLI. The engine itself also no-ops until DTLS-SRTP is established. */
+		if (pvt->is_webrtc) {
+			if (pvt->webrtc_video_bundled && pvt->rtp) {
+				ast_rtp_instance_video_update(pvt->rtp);
+			} else if (pvt->vrtp && !pvt->webrtc_video_bundled) {
+				ast_rtp_instance_video_update(pvt->vrtp);
+			}
 		}
 		break;
 	case -1:
@@ -6642,7 +6670,7 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 		owner = NULL;
 	}
 	if (sip && sip->sip_payload && sip->sip_payload->pl_data) {
-		if (sofia_parse_sdp(pvt, sip) < 0) {
+		if (sofia_parse_sdp(pvt, sip, 1 /* offer: in-dialog re-INVITE */) < 0) {
 			/* Encryption downgrade — reject 488, leave the live call up (RFC 3261 §14). */
 			ast_mutex_unlock(&pvt->lock);
 			if (owner) {
@@ -6675,7 +6703,7 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 			ast_queue_control(owner, AST_CONTROL_UNHOLD);
 		}
 	}
-	sdp_ok = (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf)) != NULL);
+	sdp_ok = (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf), 1 /* answer */) != NULL);
 	ast_mutex_unlock(&pvt->lock);
 	char contact_buf[1024];	/* sized for an opaque GRUU Contact (RFC 5627), not just sip:user@host */
 	contact_buf[0] = '\0';
@@ -6845,7 +6873,7 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 			nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, TAG_END());
 			return;
 		}
-		if (sofia_parse_sdp(pvt, sip) < 0) {
+		if (sofia_parse_sdp(pvt, sip, 1 /* offer: UPDATE with SDP */) < 0) {
 			/* Unacceptable offer — reject 488, leave the live call untouched (RFC 3261 §14). */
 			ast_mutex_unlock(&pvt->lock);
 			if (owner) {
@@ -6872,7 +6900,7 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 				ast_queue_control(owner, AST_CONTROL_UNHOLD);
 			}
 		}
-		sdp_ok = (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf)) != NULL);
+		sdp_ok = (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf), 1 /* answer */) != NULL);
 	}
 	ast_mutex_unlock(&pvt->lock);
 
@@ -7359,7 +7387,7 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	}
 
 	if (sip->sip_payload && sip->sip_payload->pl_data) {
-		if (sofia_parse_sdp(pvt, sip) < 0) {
+		if (sofia_parse_sdp(pvt, sip, 1 /* offer: initial inbound INVITE */) < 0) {
 			/* Encryption mismatch → 488 (no SIPTAG_REASON_STR; sofia flips it to
 			 * 500). Free srtp/vsrtp explicitly. */
 			ast_log(LOG_NOTICE, "Sofia: 488 reject — encryption mismatch (peer=%s, peer_encryption=%d)\n",
@@ -13707,7 +13735,7 @@ static void sofia_process_ack(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op
 		ast_mutex_unlock(&op->lock);
 		/* For late-offer INVITEs (no SDP in INVITE), the ACK may carry SDP */
 		if (sip && sip->sip_payload && sip->sip_payload->pl_data && op->rtp) {
-			sofia_parse_sdp(op, sip);
+			sofia_parse_sdp(op, sip, 0 /* answer: ACK late-offer answer to our 200 OK */);
 			if (sofia_debug)
 				ast_verbose("Sofia: ACK with SDP, remote RTP set\n");
 		}
@@ -14513,7 +14541,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
 				}
 			} else if (has_sdp) {
-				sdp_rc = sofia_parse_sdp(pvt, sip);
+				sdp_rc = sofia_parse_sdp(pvt, sip, 0 /* answer: directmedia/T38 re-INVITE 2xx */);
 			}
 			if (owner) {
 				/* Release the channel LOCK now (so the relay re-INVITE runs under
@@ -14569,7 +14597,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					 * (sofia_read/write/get_udptl). Recursive mutex → the parse commit
 					 * re-locking the same channel is safe. */
 					if (owner) ast_channel_lock(owner);
-					sofia_parse_sdp(pvt, sip);
+					sofia_parse_sdp(pvt, sip, 0 /* answer: 180 early media */);
 					if (owner) ast_channel_unlock(owner);
 				}
 				if (owner) {
@@ -14586,7 +14614,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				if (sip && sip->sip_payload && sip->sip_payload->pl_data) {
 					/* FIX 4: channel lock across the parse (see status==180). */
 					if (owner) ast_channel_lock(owner);
-					sofia_parse_sdp(pvt, sip);
+					sofia_parse_sdp(pvt, sip, 0 /* answer: 183 progress */);
 					if (owner) ast_channel_unlock(owner);
 				}
 				if (owner) {
@@ -14632,7 +14660,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					 * (sofia_read/write/get_udptl). owner is non-NULL here (orphan guard
 					 * above). Recursive mutex → the parse commit re-locking is safe. */
 					ast_channel_lock(owner);
-					sdp_rc = sofia_parse_sdp(pvt, sip);
+					sdp_rc = sofia_parse_sdp(pvt, sip, 0 /* answer: final 2xx to our INVITE */);
 					ast_channel_unlock(owner);
 				}
 				/* The final 2xx may carry Diversion (downstream redirect). */

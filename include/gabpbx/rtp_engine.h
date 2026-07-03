@@ -542,6 +542,9 @@ struct ast_rtp_engine {
 	int (*sendcng)(struct ast_rtp_instance *instance, int level);
 	/*! Callback to configure the RFC 8285 MID header extension for WebRTC BUNDLE (RFC 8843 §9). NULL = unsupported. */
 	int (*set_mid_ext)(struct ast_rtp_instance *instance, int ext_id, const char *audio_mid, const char *video_mid);
+	/*! Optional callback to transmit a keyframe request (RTCP PSFB PLI, RFC 4585 §6.3.1) toward the remote
+	 * video sender on AST_CONTROL_VIDUPDATE. NULL = unsupported (the indication is then a harmless no-op). */
+	void (*video_update)(struct ast_rtp_instance *instance);
 	/*! Optional ICE support (ICE-lite); NULL if the engine has no ICE (WebRTC A1) */
 	struct ast_rtp_engine_ice *ice;
 	/*! Optional DTLS-SRTP support; NULL if the engine has no DTLS (WebRTC A1) */
@@ -1455,6 +1458,24 @@ void ast_rtp_instance_update_source(struct ast_rtp_instance *instance);
  * \since 1.8
  */
 void ast_rtp_instance_change_source(struct ast_rtp_instance *instance);
+
+/*!
+ * \brief Request a video keyframe (decoder refresh) from the remote video sender
+ *
+ * \param instance The VIDEO RTP instance (or the bundled audio+video instance)
+ *
+ * Example usage:
+ *
+ * \code
+ * ast_rtp_instance_video_update(instance);
+ * \endcode
+ *
+ * Driven by AST_CONTROL_VIDUPDATE (e.g. the bridged peer's decoder was recreated at unhold): the
+ * engine transmits an RTCP PSFB PLI (RFC 4585 §6.3.1) toward the remote video source. Safe no-op
+ * when the engine has no video_update callback, the session is not established yet, or no remote
+ * video has been received.
+ */
+void ast_rtp_instance_video_update(struct ast_rtp_instance *instance);
 
 /*!
  * \brief Set QoS parameters on an RTP session

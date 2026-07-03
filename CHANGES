@@ -7,6 +7,66 @@ that is a drop-in replacement for chan_sip (it registers as channel
 technology SIP). Releases are listed newest first.
 
 
+## 1.4.2 — WebRTC call hold/resume overhaul
+
+This release makes call hold and resume fully functional for WebRTC endpoints. Before it,
+a WebRTC phone pressing Hold had the whole call torn down; after the first round of fixes,
+video still did not recover on resume. 1.4.2 fixes the complete chain: the call survives,
+music on hold plays, and audio AND video both return by themselves on unhold — in every
+combination of WebRTC and desk-phone endpoints, on either side of the call.
+
+**SDP answer direction now mirrors the offer (RFC 3264 §6.1).** The SDP answer always
+declared `a=sendrecv`, even when answering a hold offer (`a=sendonly`). Desk phones
+tolerate the wrong direction, but WebRTC stacks (JSEP, RFC 8829) validate it strictly and
+drop the call with "488 Not Acceptable Here" the moment hold is pressed. The generator now
+derives each media stream's answer direction from the offered direction — sendonly →
+recvonly, recvonly → sendonly, inactive → inactive — for audio and video, on initial
+INVITEs, re-INVITEs and UPDATEs. The offered per-media mode is staged during SDP parsing
+and committed only after every reject gate passes, so a rejected re-INVITE leaves the
+negotiated direction untouched. Outgoing offers are unaffected, and a normal two-way
+call's SDP is byte-identical to before.
+
+**Answers now mirror every offered m-line (current-role fix).** A WebRTC extension that
+had ANSWERED a call could never hold it: its hold re-INVITE got an answer missing the
+offered `m=video` and `m=application` lines, which RFC 3264 §6 requires to be present
+(declined streams at port 0), so the browser rejected the answer with 488 and hung up.
+The SDP code used the dialog's *initial* offerer/answerer role to decide whether to build
+a mirrored answer, but on a mid-call re-INVITE the roles swap. SDP parsing and generation
+now carry the *current transaction* role (is this inbound SDP an offer we must answer, or
+the answer to an offer we sent?), and the answer mirror loop, the BUNDLE group membership
+and the video/data-channel sections all key on it. The initial-role flags remain for what
+they actually own: applying the peer's answer to our own offer.
+
+**Stream identity survives call forking.** When a call forks to an extension registered
+from several devices, the winning leg's SDP identifiers (`cname`, `msid`) were regenerated
+at the first mid-call renegotiation, so the browser saw a brand-new remote stream and
+dropped the old video track. The fork-winner handover now carries the stream identity
+(RFC 7022 cname persistence, RFC 8830 track continuity).
+
+**Video payload type stays stable across renegotiation (RFC 3264 §8.3.2).** A re-INVITE
+offer can list many payload types for the same video codec (browsers offer several H264
+variants); merging them all could silently move the negotiated codec to a different
+payload type mid-session, breaking the far end's decoder. When a video codec has already
+been negotiated and the new offer still includes that payload type, the negotiated mapping
+is now preserved.
+
+**Keyframe feedback: RTCP PSFB PLI/FIR support (RFC 4585 / RFC 5104).** The root cause of
+video not returning after unhold: when a WebRTC receiver is recreated on resume it asks
+the sender for a fresh keyframe with an RTCP PSFB PLI (payload type 206) — and GABPBX
+discarded every one of them (only the long-obsolete PT 192 FUR was understood). Full
+keyframe-feedback support is now implemented, with upstream Asterisk parity:
+- WebRTC video sections advertise `a=rtcp-fb: nack pli` and `a=rtcp-fb: ccm fir`
+  (only implemented feedback is advertised — no REMB/transport-cc).
+- Inbound PSFB PLI (FMT 1) and FIR (FMT 4) map to a video-update indication, surfaced
+  from the rtcp-mux demultiplexer (previously the parsed result was thrown away) and
+  relayed across the bridge to the other call leg.
+- On a video-update indication, chan_sofia transmits an SRTCP-protected RTCP PSFB PLI to
+  its browser over the ICE-negotiated RTP tuple (rtcp-mux aware — protection and socket
+  selection are decoupled), targeting the learned remote video SSRC, throttled to protect
+  against keyframe-request storms.
+- Non-WebRTC calls are untouched: no feedback lines are added to plain video sections and
+  the legacy RTCP path behaves exactly as before.
+
 ## 1.4.1 — WebRTC fork-winner media fix, native peer-to-peer text messaging
 
 This release fixes a WebRTC call-forking media failure and adds native SIP text

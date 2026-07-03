@@ -102,6 +102,13 @@ GABPBX_FILE_VERSION(__FILE__, "$Revision: 366880 $")
 #define RTCP_PT_SDES    202
 #define RTCP_PT_BYE     203
 #define RTCP_PT_APP     204
+/* RFC 4585 RTP feedback classes (WebRTC keyframe feedback): RTPFB = transport-layer feedback
+ * (FMT 1 = generic NACK — consumed, no retransmission support), PSFB = payload-specific feedback
+ * (FMT 1 = PLI RFC 4585 §6.3.1, FMT 4 = FIR RFC 5104 §4.3.1 — both -> AST_CONTROL_VIDUPDATE). */
+#define RTCP_PT_RTPFB   205
+#define RTCP_PT_PSFB    206
+
+#define RTCP_PLI_MIN_INTERVAL_MS 500	/*!< Min ms between PSFB PLIs we transmit (keyframe-storm throttle) */
 
 #define RTP_MTU		1200
 
@@ -286,6 +293,13 @@ struct ast_rtp {
 	struct ast_sockaddr last_media;    /*!< rtpicedebug: last media source (log media source CHANGES only) */
 	struct ast_sockaddr last_dtls_drop;/*!< rtpicedebug: last dropped DTLS-record source (log CHANGES only) */
 #endif
+	/* Keyframe feedback (RTCP PSFB PLI/FIR <-> AST_CONTROL_VIDUPDATE). Zeroed by ast_calloc in
+	 * ast_rtp_new; only ever set on WebRTC rtcp-mux legs, so non-WebRTC stays byte-identical. */
+	unsigned int rtcp_vidupdate_pending;	/*!< the rtcp-mux demux consumed an inbound PSFB PLI/FIR: ast_rtp_read must
+						 * surface AST_CONTROL_VIDUPDATE (set + cleared on the same channel read
+						 * thread; deliberately a full int, NOT a bitfield, so it can never share
+						 * a read-modify-write word with the flag bits above) */
+	struct timeval last_pli;		/*!< when we last TRANSMITTED a PSFB PLI (rate limit, ast_rtp_video_update) */
 	struct rtp_red *red;
 };
 
@@ -397,6 +411,11 @@ static void ast_rtp_stun_request(struct ast_rtp_instance *instance, struct ast_s
 static void ast_rtp_stop(struct ast_rtp_instance *instance);
 static int ast_rtp_qos_set(struct ast_rtp_instance *instance, int tos, int cos, const char* desc);
 static int ast_rtp_sendcng(struct ast_rtp_instance *instance, int level);
+#ifdef HAVE_OPENSSL
+/* Engine .video_update: transmit an RTCP PSFB PLI keyframe request toward the remote video sender
+ * (AST_CONTROL_VIDUPDATE TX half). WebRTC/DTLS-SRTP-only by design; see the definition. */
+static void ast_rtp_video_update(struct ast_rtp_instance *instance);
+#endif
 
 #ifdef HAVE_OPENSSL
 /*
@@ -1552,6 +1571,7 @@ static struct ast_rtp_engine gabpbx_rtp_engine = {
 #ifdef HAVE_OPENSSL
 	.dtls = &gabpbx_dtls,		/* WebRTC A2 */
 	.ice = &gabpbx_ice,		/* WebRTC A3 — ICE-lite */
+	.video_update = ast_rtp_video_update,	/* keyframe request: AST_CONTROL_VIDUPDATE -> RTCP PSFB PLI (RFC 4585 §6.3.1) */
 #endif
 };
 
@@ -1979,13 +1999,30 @@ read_again:
 				goto read_again;
 			}
 			rtcp_srtp = ast_rtp_instance_get_srtp(instance);
-			if (res_srtp && rtcp_srtp
-				&& res_srtp->unprotect(rtcp_srtp, buf, &rtcp_len, 1) < 0) {
+			if (!res_srtp || !rtcp_srtp) {
+				/* Fail CLOSED: no SRTP backend/context on a DTLS-SRTP session — never parse
+				 * what would still be ciphertext (fail-closed hardening, mirrors the TX guard). */
+				goto read_again;
+			}
+			if (res_srtp->unprotect(rtcp_srtp, buf, &rtcp_len, 1) < 0) {
 				/* SRTCP unprotect failed for this datagram (auth/replay) — drop it, keep the call. */
 				goto read_again;
 			}
 			ao2_lock(instance);
-			ast_rtcp_interpret(instance, (unsigned int *) buf, rtcp_len, sa);
+			{
+				/* Keyframe feedback (PSFB PLI/FIR -> AST_CONTROL_VIDUPDATE): this recvfrom API
+				 * returns byte counts, so a control frame produced by muxed RTCP cannot be
+				 * returned from this depth — latch it and let ast_rtp_read (the SAME channel
+				 * read thread running this loop) surface it. Previously the frame was DISCARDED
+				 * here, so a WebRTC browser's post-unhold PLI never produced a VIDUPDATE and the
+				 * holder's remote video stayed black. All other interpret results are stats
+				 * accounting into rtp->rtcp — unchanged. */
+				struct ast_frame *rtcp_frame = ast_rtcp_interpret(instance, (unsigned int *) buf, rtcp_len, sa);
+				if (rtcp_frame && rtcp_frame->frametype == AST_FRAME_CONTROL
+					&& rtcp_frame->subclass.integer == AST_CONTROL_VIDUPDATE) {
+					rtp->rtcp_vidupdate_pending = 1;
+				}
+			}
 			ao2_unlock(instance);
 			goto read_again;
 		}
@@ -2851,6 +2888,111 @@ static int ast_rtcp_write(const void *data)
 	return res;
 }
 
+#ifdef HAVE_OPENSSL
+/*!
+ * \brief Engine .video_update — transmit an RTCP PSFB PLI (Picture Loss Indication, RFC 4585
+ * §6.1/§6.3.1) toward the remote VIDEO sender.
+ *
+ * Driven by AST_CONTROL_VIDUPDATE from the channel driver (sofia_indicate): the bridged peer's
+ * decoder asked for a fresh keyframe (e.g. its receiver was recreated at unhold). Upstream parity:
+ * res_rtp_asterisk intercepts AST_CONTROL_VIDUPDATE in ast_rtp_write and sends a PSFB FIR
+ * (rtp_write_rtcp_fir); we send PLI instead — same decoder refresh, no FIR command-sequence FCI
+ * state (RFC 5104 §4.3.1), a fixed 12-byte packet, and it is the mechanism we advertise
+ * (a=rtcp-fb:<pt> nack pli). Inbound we accept BOTH (see ast_rtcp_interpret).
+ *
+ * WebRTC/DTLS-SRTP-only BY DESIGN: without an ESTABLISHED DTLS context this silently does nothing,
+ * so legacy legs are byte-identical (they would need SIP INFO, out of scope) and nothing is ever
+ * sent pre-handshake (RFC 5763; mirrors the CONNECTION_NEW gate in __rtp_sendto). WebRTC mandates
+ * rtcp-mux (RFC 8834 §4.5), so the PLI is SRTCP-protected via the SAME res_srtp entry point
+ * __rtp_sendto uses (rtcp=1 -> the SRTCP profile; libsrtp keys by SSRC, not socket) and sent from
+ * the RTP socket to the RTP remote address — deliberately NOT rtcp_sendto()/rtp->rtcp->them, which
+ * under mux point at the non-existent remote-RTP-port+1 (black hole; ICE consent would also drop a
+ * datagram sourced from a different port).
+ *
+ * Threading: runs on the channel/bridge thread; takes ao2_lock(instance) (recursive, and below the
+ * chan->pvt ordering) to read ssrc/v_rxssrc/themssrc/dtls state consistently with the demux paths.
+ * Rate-limited per instance (RTCP_PLI_MIN_INTERVAL_MS) so bidirectional VIDUPDATE relay cannot
+ * storm keyframes; browsers repeat the PLI until an IDR lands, so a throttled request is never lost.
+ */
+static void ast_rtp_video_update(struct ast_rtp_instance *instance)
+{
+	struct ast_rtp *rtp;
+	struct ast_srtp *srtp;
+	struct ast_sockaddr remote_address = { {0,} };
+	unsigned int pli[3];
+	unsigned int media_ssrc;
+	void *temp = pli;
+	int len = sizeof(pli);
+	struct timeval now;
+
+	if (!instance || !(rtp = ast_rtp_instance_get_data(instance))) {
+		return;
+	}
+
+	ao2_lock(instance);
+
+	/* WebRTC-only + fail-silent while not established: no SRTCP keys yet, and a cleartext PLI
+	 * would be discarded by the browser anyway. */
+	if (!rtp->dtls.ssl || rtp->dtls.connection != AST_RTP_DTLS_CONNECTION_EXISTING) {
+		ao2_unlock(instance);
+		return;
+	}
+
+	/* Media SSRC the PLI targets = the REMOTE video sender. Bundled audio+video instance: the
+	 * PT-demuxed video sub-stream SSRC (v_rxssrc). Separate-transport WebRTC video instance
+	 * (bundle == 0): every RX packet takes the audio-field path there, so its remote video SSRC
+	 * is themssrc. 0 = no inbound video learned yet -> nothing to refresh; the browser repeats
+	 * its PLI once video flows. */
+	media_ssrc = rtp->bundle ? rtp->v_rxssrc : rtp->themssrc;
+	if (!media_ssrc) {
+		ao2_unlock(instance);
+		return;
+	}
+
+	/* Keyframe-storm throttle: both bridge directions relay VIDUPDATE. */
+	now = ast_tvnow();
+	if (!ast_tvzero(rtp->last_pli) && ast_tvdiff_ms(now, rtp->last_pli) < RTCP_PLI_MIN_INTERVAL_MS) {
+		ao2_unlock(instance);
+		return;
+	}
+
+	ast_rtp_instance_get_remote_address(instance, &remote_address);
+	if (ast_sockaddr_isnull(&remote_address)) {
+		ao2_unlock(instance);
+		return;
+	}
+
+	/* RFC 4585 §6.1/§6.3.1: V=2 P=0 FMT=1(PLI) PT=206(PSFB) length=2 (words-1); sender SSRC,
+	 * media SSRC; PLI has no FCI. Sender SSRC = rtp->ssrc, exactly as the SR/RR builders use. */
+	pli[0] = htonl((2 << 30) | (1 << 24) | (RTCP_PT_PSFB << 16) | 2);
+	pli[1] = htonl(rtp->ssrc);
+	pli[2] = htonl(media_ssrc);
+
+	/* Fail CLOSED (hard security gate): a PLI must leave SRTCP-protected or not at all — a
+	 * cleartext RTCP packet on a DTLS-SRTP session would be dropped by the browser anyway
+	 * and violates the session's security level. DTLS EXISTING (checked above) implies the
+	 * SRTP session was installed at dtls_srtp_finish_negotiation, so this only triggers if
+	 * the backend/context vanished mid-teardown. */
+	srtp = ast_rtp_instance_get_srtp(instance);
+	if (!rtp->rtcp || !res_srtp || !srtp) {
+		ao2_unlock(instance);
+		return;
+	}
+	if (res_srtp->protect(srtp, &temp, &len, 1) < 0) {
+		ao2_unlock(instance);
+		return;
+	}
+	if (ast_sendto(rtp->s, temp, len, 0, &remote_address) > 0) {
+		rtp->last_pli = now;
+		if (rtcp_debug_test_addr(&remote_address)) {
+			ast_verbose("* Sent RTCP PSFB PLI to %s (our SSRC %u, media SSRC %u)\n",
+				ast_sockaddr_stringify(&remote_address), rtp->ssrc, media_ssrc);
+		}
+	}
+	ao2_unlock(instance);
+}
+#endif /* HAVE_OPENSSL */
+
 static int ast_rtp_raw_write(struct ast_rtp_instance *instance, struct ast_frame *frame, int codec)
 {
 	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
@@ -3686,7 +3828,7 @@ static struct ast_frame *ast_rtcp_interpret(struct ast_rtp_instance *instance, u
 		if (rtcp_debug_test_addr(&addr)) {
 			ast_verbose("\n\nGot RTCP from %s\n",
 				    ast_sockaddr_stringify(&addr));
-			ast_verbose("PT: %d(%s)\n", pt, (pt == 200) ? "Sender Report" : (pt == 201) ? "Receiver Report" : (pt == 192) ? "H.261 FUR" : "Unknown");
+			ast_verbose("PT: %d(%s)\n", pt, (pt == 200) ? "Sender Report" : (pt == 201) ? "Receiver Report" : (pt == 192) ? "H.261 FUR" : (pt == 205) ? "RTPFB" : (pt == 206) ? "PSFB" : "Unknown");
 			ast_verbose("Reception reports: %d\n", rc);
 			ast_verbose("SSRC of sender: %u\n", rtcpheader[i + 1]);
 		}
@@ -3886,6 +4028,34 @@ static struct ast_frame *ast_rtcp_interpret(struct ast_rtp_instance *instance, u
 				ast_verbose("Received a BYE from %s\n",
 					    ast_sockaddr_stringify(&rtp->rtcp->them));
 			break;
+		case RTCP_PT_PSFB:
+			/* RFC 4585 §6.3 payload-specific feedback: rc (bits 3-7 of the first byte, parsed
+			 * above) is the FMT field here. FMT 1 = PLI (§6.3.1), FMT 4 = FIR (RFC 5104 §4.3.1):
+			 * both are keyframe requests — the modern equivalent of the legacy FUR (PT 192)
+			 * above — so map them to AST_CONTROL_VIDUPDATE the exact same way (upstream
+			 * res_rtp_asterisk parity). This is what a browser sends when its receiver is
+			 * recreated at unhold; without it the holder's remote video stays black forever.
+			 * We never read past header+SSRC, so the generic §6.4.1 bound check above suffices.
+			 * Other FMTs (e.g. REMB, FMT 15) are consumed silently — no bandwidth logic. */
+			if (rc != 1 && rc != 4) {
+				break;
+			}
+			if (rtcp_debug_test_addr(&addr))
+				ast_verbose("Received an RTCP PSFB %s (keyframe request)\n", rc == 1 ? "PLI" : "FIR");
+			rtp->f.frametype = AST_FRAME_CONTROL;
+			rtp->f.subclass.integer = AST_CONTROL_VIDUPDATE;
+			rtp->f.datalen = 0;
+			rtp->f.samples = 0;
+			rtp->f.mallocd = 0;
+			rtp->f.src = "RTP";
+			f = &rtp->f;
+			break;
+		case RTCP_PT_RTPFB:
+			/* RFC 4585 §6.2 transport-layer feedback (FMT 1 = generic NACK). We implement no RTP
+			 * retransmission (nor offer rtx), so there is nothing to act on; consume silently so
+			 * a routinely lossy browser link does not spam the "Unknown RTCP packet" debug. The
+			 * receiver recovers via PLI, which we DO honor above. */
+			break;
 		default:
 			ast_debug(1, "Unknown RTCP packet (pt=%d) received from %s\n",
 				  pt, ast_sockaddr_stringify(&rtp->rtcp->them));
@@ -3978,6 +4148,28 @@ static int bridge_p2p_rtp_write(struct ast_rtp_instance *instance, unsigned int 
 	return 0;
 }
 
+/*!
+ * \brief Build/return the deferred AST_CONTROL_VIDUPDATE frame latched by the rtcp-mux demux.
+ *
+ * The muxed (S)RTCP branch of __rtp_recvfrom can only return byte counts, so when
+ * ast_rtcp_interpret maps an inbound PSFB PLI/FIR (or a muxed legacy FUR) to a VIDUPDATE control
+ * frame there, it is latched in rtp->rtcp_vidupdate_pending and surfaced here by ast_rtp_read —
+ * restoring parity with the standalone-RTCP-socket path, where ast_rtcp_read returns the frame
+ * directly. Frame fields = exactly the RTCP_PT_FUR template in ast_rtcp_interpret. The flag is set
+ * and consumed on the same channel read thread, so clearing it needs no lock.
+ */
+static struct ast_frame *rtp_vidupdate_pending_frame(struct ast_rtp *rtp)
+{
+	rtp->rtcp_vidupdate_pending = 0;
+	rtp->f.frametype = AST_FRAME_CONTROL;
+	rtp->f.subclass.integer = AST_CONTROL_VIDUPDATE;
+	rtp->f.datalen = 0;
+	rtp->f.samples = 0;
+	rtp->f.mallocd = 0;
+	rtp->f.src = "RTP";
+	return &rtp->f;
+}
+
 static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtcp)
 {
 	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
@@ -4001,6 +4193,15 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 		return &ast_null_frame;
 	}
 
+	/* WebRTC rtcp-mux: a PSFB PLI/FIR consumed by the demux during an earlier drain left a pending
+	 * keyframe request (see __rtp_recvfrom) that a media frame outran — surface it before reading
+	 * more media. The fd stays readable, so poll re-fires for anything still queued. Never set on
+	 * non-mux/non-WebRTC legs; the legacy separate-socket path still returns its frame directly
+	 * through ast_rtcp_read above — unchanged. */
+	if (rtp->rtcp_vidupdate_pending) {
+		return rtp_vidupdate_pending_frame(rtp);
+	}
+
 	/* If we are currently sending DTMF to the remote party send a continuation packet */
 	if (rtp->sending_digit) {
 		ast_rtp_dtmf_continuation(instance);
@@ -4012,6 +4213,12 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 				&addr)) < 0) {
 		ast_assert(errno != EBADF);
 		if (errno == EAGAIN) {
+			/* A LONE muxed PSFB datagram: consumed + latched inside __rtp_recvfrom, then the
+			 * drain hit EAGAIN. Deliver the keyframe request NOW — if the PLI was the only
+			 * datagram there may be no further poll wake to deliver it. */
+			if (rtp->rtcp_vidupdate_pending) {
+				return rtp_vidupdate_pending_frame(rtp);
+			}
 			return &ast_null_frame;
 		}
 #ifdef HAVE_OPENSSL

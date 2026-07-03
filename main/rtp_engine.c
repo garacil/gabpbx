@@ -791,6 +791,17 @@ void ast_rtp_instance_change_source(struct ast_rtp_instance *instance)
 	}
 }
 
+/* Keyframe request (AST_CONTROL_VIDUPDATE -> RTCP PSFB PLI). Optional callback: engines without
+ * video feedback support make this a harmless no-op (upstream parity: chan_pjsip VIDUPDATE ->
+ * res_rtp_asterisk rtp_write_rtcp_fir). No lock here — the update_source/change_source idiom;
+ * the engine implementation locks itself. */
+void ast_rtp_instance_video_update(struct ast_rtp_instance *instance)
+{
+	if (instance && instance->engine->video_update) {
+		instance->engine->video_update(instance);
+	}
+}
+
 int ast_rtp_instance_set_qos(struct ast_rtp_instance *instance, int tos, int cos, const char *desc)
 {
 	return instance->engine->qos ? instance->engine->qos(instance, tos, cos, desc) : -1;
