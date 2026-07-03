@@ -458,6 +458,24 @@ struct sofia_pvt {
 	struct ast_rtp_instance *rtp;
 	struct ast_rtp_instance *vrtp;
 	format_t capability;
+	/* MicroSIP(SIP-video)<->WebRTC bridge: effective video-answer filter for THIS (inbound caller) leg.
+	 * 0 = unset (no constraint). When non-zero, the answer SDP video is emitted as
+	 * (capability & VIDEO_MASK & video_answer_mask) so the caller is only offered the codec(s) the far
+	 * (bridged/fork-winner) leg actually accepted — chan_sofia does not transcode video. It is a PRIVATE
+	 * SDP-only knob: it must NOT be written into capability/nativeformats (those are core/glue-watched and
+	 * a mid-call change triggers re-INVITEs -> the hold-500 storm -> call drop). Set at the caller's answer
+	 * from the answered leg's video; kept until hangup; overwritten on a new far-leg answer. */
+	format_t video_answer_mask;
+	/* SIP-video<->WebRTC H264 fmtp relay (RFC 6184 §8.2.2). H264 media-format config = profile-level-id +
+	 * packetization-mode and MUST be symmetric (only the level byte may differ) or the PT removed —
+	 * mode0<->mode1 cannot be relayed without repacketization. We select ONE H264 config for this leg and
+	 * carry it so both bridged legs use the SAME config: h264_fmtp = the a=fmtp params WITHOUT the leading
+	 * "<pt> " (e.g. "profile-level-id=42e01f;packetization-mode=1"); h264_pmode = parsed packetization-mode
+	 * (0 = absent, §6.2). h264_fmtp_valid gates emit/propagate. Propagated cross-leg (request_call offer,
+	 * fork steal, caller-answer mask) and emitted as a=fmtp wherever H264 is emitted. */
+	int h264_fmtp_valid;
+	int h264_pmode;
+	char h264_fmtp[160];
 	struct ast_codec_pref prefs;
 	int lastinvite;
 	ast_mutex_t lock;

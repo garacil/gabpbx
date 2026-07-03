@@ -129,6 +129,10 @@ static void sofia_sdp_emit_webrtc_video(struct sofia_pvt *pvt, char *buf, size_t
 		if (!(vf & pvt->capability) || !(vf & (AST_FORMAT_VP8 | AST_FORMAT_H264))) {
 			continue;
 		}
+		/* SIP-video<->WebRTC intersection: when set, only offer the codec(s) the far leg accepted. */
+		if (pvt->video_answer_mask && !(vf & pvt->video_answer_mask)) {
+			continue;
+		}
 		vpt = ast_rtp_codecs_payload_code(ast_rtp_instance_get_codecs(pvt->vrtp), 1, vf);
 		if (vpt < 0) {
 			continue;
@@ -147,6 +151,15 @@ static void sofia_sdp_emit_webrtc_video(struct sofia_pvt *pvt, char *buf, size_t
 			*overflow = 1;
 		} else {
 			*overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+		}
+		/* H264 fmtp relay (RFC 6184 §8.2.2): emit the negotiated H264 config so both legs share the same
+		 * profile-level-id + packetization-mode (else the browser won't decode / render). */
+		if ((vf & AST_FORMAT_H264) && pvt->h264_fmtp_valid && !ast_strlen_zero(pvt->h264_fmtp)) {
+			if (snprintf(tmp_buf, tmp_buf_size, "a=fmtp:%d %s\r\n", vpt, pvt->h264_fmtp) >= (int)tmp_buf_size) {
+				*overflow = 1;
+			} else {
+				*overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
+			}
 		}
 		/* RFC 8829 §5.3.1: advertise the keyframe feedback we honor (PSFB PLI RFC 4585 §6.3.1 +
 		 * FIR RFC 5104 §4.3.1 inbound -> AST_CONTROL_VIDUPDATE) and send (PLI outbound). Browsers
@@ -212,7 +225,9 @@ static void sofia_sdp_emit_webrtc_video(struct sofia_pvt *pvt, char *buf, size_t
 			"m=video %d UDP/TLS/RTP/SAVPF %s\r\n"
 			"c=IN %s %s\r\n"
 			"%s",
-			vport, vpayload_buf, sdp_family, host, vmap_buf) >= (int)(len - vblen)) {
+			/* Never emit an m=video with NO payload types (malformed → peer BYE): if the codec filter
+			 * left the list empty (e.g. no shared codec), reject the stream with port 0 (RFC 3264 §6). */
+			vfirst ? 0 : vport, vpayload_buf, sdp_family, host, vmap_buf) >= (int)(len - vblen)) {
 		*overflow = 1;
 	}
 }
@@ -283,6 +298,10 @@ static void sofia_sdp_emit_bundled_video(struct sofia_pvt *pvt, char *buf, size_
 		if (!(bvf & pvt->capability) || !(bvf & (AST_FORMAT_VP8 | AST_FORMAT_H264))) {
 			continue;
 		}
+		/* SIP-video<->WebRTC intersection: when set, only offer the codec(s) the far leg accepted. */
+		if (pvt->video_answer_mask && !(bvf & pvt->video_answer_mask)) {
+			continue;
+		}
 		bvpt = ast_rtp_codecs_payload_code(ast_rtp_instance_get_codecs(pvt->rtp), 1, bvf);	/* PT from the SHARED audio instance */
 		if (bvpt < 0) {
 			continue;
@@ -301,6 +320,15 @@ static void sofia_sdp_emit_bundled_video(struct sofia_pvt *pvt, char *buf, size_
 			*overflow = 1;
 		} else {
 			*overflow |= sofia_sdp_cat(bvmap_buf, sizeof(bvmap_buf), tmp_buf);
+		}
+		/* H264 fmtp relay (RFC 6184 §8.2.2): emit the negotiated H264 config (profile-level-id +
+		 * packetization-mode) so the browser decodes/renders and both legs stay symmetric. */
+		if ((bvf & AST_FORMAT_H264) && pvt->h264_fmtp_valid && !ast_strlen_zero(pvt->h264_fmtp)) {
+			if (snprintf(tmp_buf, tmp_buf_size, "a=fmtp:%d %s\r\n", bvpt, pvt->h264_fmtp) >= (int)tmp_buf_size) {
+				*overflow = 1;
+			} else {
+				*overflow |= sofia_sdp_cat(bvmap_buf, sizeof(bvmap_buf), tmp_buf);
+			}
 		}
 		/* RFC 8829 §5.3.1: keyframe feedback we honor (PLI/FIR inbound -> AST_CONTROL_VIDUPDATE)
 		 * and send (PLI outbound) for the bundled video PTs — see sofia_sdp_emit_webrtc_video.
@@ -342,9 +370,154 @@ static void sofia_sdp_emit_bundled_video(struct sofia_pvt *pvt, char *buf, size_
 			"m=video %d UDP/TLS/RTP/SAVPF %s\r\n"
 			"c=IN %s %s\r\n"
 			"%s",
-			bvport, bvpayload_buf, sdp_family, host, bvmap_buf) >= (int)(len - bvblen)) {
+			/* Never emit an m=video with NO payload types (malformed → peer BYE): reject with port 0. */
+			bvfirst ? 0 : bvport, bvpayload_buf, sdp_family, host, bvmap_buf) >= (int)(len - bvblen)) {
 		*overflow = 1;
 	}
+}
+
+/* Copy the first 4 hex chars of an H264 profile-level-id (profile_idc + profile_iop, RFC 6184 §8.1) into
+ * out[5], lowercased; out[0]='\0' if absent. Per §8.2.2 those bytes MUST match between offer/answer (only
+ * the level byte may differ), so this is the H264 profile-compatibility key. */
+static void sofia_h264_profile4(const char *fmtp, char *out)
+{
+	const char *p = fmtp ? strstr(fmtp, "profile-level-id=") : NULL;
+	int k = 0;
+	out[0] = '\0';
+	if (!p) {
+		return;
+	}
+	p += 17;
+	while (k < 4) {
+		char c = p[k];
+		if (c >= '0' && c <= '9') {
+			out[k] = c;
+		} else if (c >= 'a' && c <= 'f') {
+			out[k] = c;
+		} else if (c >= 'A' && c <= 'F') {
+			out[k] = c - 'A' + 'a';
+		} else {
+			break;
+		}
+		k++;
+	}
+	out[k] = '\0';
+}
+
+/* SIP-video<->WebRTC H264 fmtp relay (RFC 6184 §8.2.2). H264 with a different profile-level-id +
+ * packetization-mode is effectively a DIFFERENT codec (mode0 forbids FU-A §6.2, mode1 allows it §6.3;
+ * §8.1 one config point per PT), and passthrough cannot bridge them without repacketization.
+ *
+ * From an offered/answered video m= line, select ONE H264 config, copy its a=fmtp params (WITHOUT the
+ * leading "<pt> ") to out_fmtp, PRUNE every OTHER H264 PT from `staged` so ast_rtp_codecs_payload_code()
+ * can only return the selected one, and report the packetization-mode.
+ *
+ * When `desired_valid` (a cross-leg config was already propagated into this pvt from request_call / the
+ * fork / the caller mask), CONSTRAIN the choice to a PT COMPATIBLE with it — same packetization-mode and
+ * same profile_idc/profile-iop (level may differ, §8.2.2). If NONE is compatible, remove ALL H264 PTs
+ * (fall back to VP8/audio-only) rather than relay an incompatible config — never bridge mode0<->mode1.
+ * With no desired config, free-select (prefer packetization-mode=1, else the first H264 PT). Returns 1 if
+ * an H264 config was selected. Read-only on `media`. */
+static int sofia_sdp_select_h264(sdp_media_t *media, struct ast_rtp_codecs *staged,
+	int desired_valid, int desired_pmode, const char *desired_fmtp,
+	char *out_fmtp, size_t out_fmtp_sz, int *out_pmode)
+{
+	sdp_rtpmap_t *rm;
+	int h264_pts[24];
+	int npts = 0;
+	int i;
+	int chosen = -1;
+	int chosen_pmode = 0;
+	char chosen_fmtp[160] = "";
+	char desired_prof[8] = "";
+
+	if (desired_valid) {
+		sofia_h264_profile4(desired_fmtp, desired_prof);
+	}
+	for (rm = media->m_rtpmaps; rm && npts < (int)(sizeof(h264_pts) / sizeof(h264_pts[0])); rm = rm->rm_next) {
+		if (rm->rm_encoding && !strcasecmp(rm->rm_encoding, "H264")) {
+			h264_pts[npts++] = rm->rm_pt;
+		}
+	}
+	if (!npts) {
+		return 0;
+	}
+	for (i = 0; i < npts; i++) {
+		int pt = h264_pts[i];
+		int pmode = 0;			/* RFC 6184 §6.2: absent packetization-mode = 0 (Single NAL) */
+		char fmtp[160] = "";
+		char prof[8] = "";
+		const char *pm;
+		sdp_attribute_t *a;
+		for (a = media->m_attributes; a; a = a->a_next) {
+			const char *v;
+			char *end;
+			long apt;
+			if (!a->a_name || !a->a_value || !su_casematch(a->a_name, "fmtp")) {
+				continue;
+			}
+			/* Robust "a=fmtp:<pt> <params>" parse: skip leading whitespace, match the FULL PT integer
+			 * (strtol end-check, not atoi — so "99" != "990"), then the params follow SP or TAB. */
+			v = a->a_value;
+			while (*v == ' ' || *v == '\t') {
+				v++;
+			}
+			apt = strtol(v, &end, 10);
+			/* The PT must be delimited (end-of-string, SP or TAB) — else "a=fmtp:99foo" would match PT 99. */
+			if (end == v || apt != pt || (*end && *end != ' ' && *end != '\t')) {
+				continue;
+			}
+			while (*end == ' ' || *end == '\t') {
+				end++;
+			}
+			ast_copy_string(fmtp, end, sizeof(fmtp));
+			break;
+		}
+		if ((pm = strstr(fmtp, "packetization-mode="))) {
+			pmode = atoi(pm + 19);
+		}
+		sofia_h264_profile4(fmtp, prof);
+		if (desired_valid) {
+			/* §8.2.2: keep only a PT matching the desired config. packetization-mode is STRICT (mode0's
+			 * Single-NAL vs mode1's FU-A are not passthrough-compatible). profile is matched LENIENTLY:
+			 * reject only when BOTH sides carry an explicit profile-level-id and the profile_idc/iop differ
+			 * — a side that omits profile-level-id (e.g. a legacy softswitch) still interoperates in
+			 * practice, and decoders handle Baseline/Constrained-Baseline across (level may differ, §8.2.2).
+			 * (Strict RFC fail-closed on absent profile is deferred — it risks real-world lenient interop.) */
+			if (pmode != desired_pmode) {
+				continue;
+			}
+			if (desired_prof[0] && prof[0] && strcmp(prof, desired_prof) != 0) {
+				continue;
+			}
+			if (chosen < 0) {	/* first compatible in m-line order wins */
+				chosen = pt;
+				chosen_pmode = pmode;
+				ast_copy_string(chosen_fmtp, fmtp, sizeof(chosen_fmtp));
+			}
+		} else if (chosen < 0 || (pmode == 1 && chosen_pmode != 1)) {
+			/* free selection: first H264, upgrade to a packetization-mode=1 variant */
+			chosen = pt;
+			chosen_pmode = pmode;
+			ast_copy_string(chosen_fmtp, fmtp, sizeof(chosen_fmtp));
+		}
+	}
+	if (chosen < 0) {
+		/* No compatible H264 (desired set but nothing matched). RFC 6184 §8.2.2: remove the PT rather than
+		 * relay an incompatible one — drop ALL H264 PTs so the leg falls back to VP8/audio-only. */
+		for (i = 0; i < npts; i++) {
+			ast_rtp_codecs_payloads_unset(staged, NULL, h264_pts[i]);
+		}
+		return 0;
+	}
+	for (i = 0; i < npts; i++) {
+		if (h264_pts[i] != chosen) {
+			ast_rtp_codecs_payloads_unset(staged, NULL, h264_pts[i]);
+		}
+	}
+	ast_copy_string(out_fmtp, chosen_fmtp, out_fmtp_sz);
+	*out_pmode = chosen_pmode;
+	return 1;
 }
 
 /* RFC 3264 §6.1 answer-direction mirror. Returns the "a=<dir>\r\n" attribute to emit for a
@@ -937,6 +1110,9 @@ webrtc_m_lines_done:
 			unsigned int rate;
 			if (!(fmt & pvt->capability) || !(fmt & AST_FORMAT_VIDEO_MASK))
 				continue;
+			/* SIP-video<->WebRTC intersection: when set, only answer the codec(s) the far leg accepted. */
+			if (pvt->video_answer_mask && !(fmt & pvt->video_answer_mask))
+				continue;
 			pt = ast_rtp_codecs_payload_code(ast_rtp_instance_get_codecs(pvt->vrtp), 1, fmt);
 			if (pt < 0)
 				continue;
@@ -949,6 +1125,13 @@ webrtc_m_lines_done:
 			vfirst = 0;
 			snprintf(tmp_buf, sizeof(tmp_buf), "a=rtpmap:%d %s/%u\r\n", pt, enc, rate);
 			overflow |= sofia_sdp_cat(vrtpmap_buf, sizeof(vrtpmap_buf), tmp_buf);
+			/* H264 fmtp relay (RFC 6184 §8.2.2): emit the negotiated H264 config so a SIP video phone
+			 * (e.g. MicroSIP) uses the SAME packetization-mode as the far leg — else it mis-depacketizes
+			 * the relayed NALs (noise) and gives up. */
+			if ((fmt & AST_FORMAT_H264) && pvt->h264_fmtp_valid && !ast_strlen_zero(pvt->h264_fmtp)) {
+				snprintf(tmp_buf, sizeof(tmp_buf), "a=fmtp:%d %s\r\n", pt, pvt->h264_fmtp);
+				overflow |= sofia_sdp_cat(vrtpmap_buf, sizeof(vrtpmap_buf), tmp_buf);
+			}
 			emitted |= fmt;
 		}
 		for (fmt = 1; fmt; fmt <<= 1) {
@@ -957,6 +1140,9 @@ webrtc_m_lines_done:
 			unsigned int rate;
 			if (!(fmt & pvt->capability) || !(fmt & AST_FORMAT_VIDEO_MASK) || (fmt & emitted))
 				continue;
+			/* SIP-video<->WebRTC intersection: when set, only answer the codec(s) the far leg accepted. */
+			if (pvt->video_answer_mask && !(fmt & pvt->video_answer_mask))
+				continue;
 			pt = ast_rtp_codecs_payload_code(ast_rtp_instance_get_codecs(pvt->vrtp), 1, fmt);
 			if (pt < 0)
 				continue;
@@ -969,6 +1155,13 @@ webrtc_m_lines_done:
 			vfirst = 0;
 			snprintf(tmp_buf, sizeof(tmp_buf), "a=rtpmap:%d %s/%u\r\n", pt, enc, rate);
 			overflow |= sofia_sdp_cat(vrtpmap_buf, sizeof(vrtpmap_buf), tmp_buf);
+			/* H264 fmtp relay (RFC 6184 §8.2.2): emit the negotiated H264 config so a SIP video phone
+			 * (e.g. MicroSIP) uses the SAME packetization-mode as the far leg — else it mis-depacketizes
+			 * the relayed NALs (noise) and gives up. */
+			if ((fmt & AST_FORMAT_H264) && pvt->h264_fmtp_valid && !ast_strlen_zero(pvt->h264_fmtp)) {
+				snprintf(tmp_buf, sizeof(tmp_buf), "a=fmtp:%d %s\r\n", pt, pvt->h264_fmtp);
+				overflow |= sofia_sdp_cat(vrtpmap_buf, sizeof(vrtpmap_buf), tmp_buf);
+			}
 			emitted |= fmt;
 		}
 
@@ -1398,6 +1591,26 @@ static void sofia_video_pt_keep_negotiated(struct ast_rtp_codecs *staged, struct
 	}
 }
 
+/* Remove LIVE video payload entries that the new `staged` map does NOT contain (same PT→format). Runs
+ * BEFORE the merge-only ast_rtp_codecs_payloads_copy() (rtp_engine.c:536-549 never clears dest). Without
+ * this, a stale video PT lingers in the live map, and ast_rtp_codecs_payload_code() (scans low-to-high +
+ * static fallback, rtp_engine.c:674-688) picks the stale/lower PT for egress — relaying the far leg a
+ * video PT it never negotiated (e.g. sending PT99 to a browser that offered H264 on PT103) → black video.
+ * Only VIDEO PTs are touched; audio/non-video PTs are preserved (the bundled video shares the audio
+ * instance). Order: keep_negotiated() first (prunes staged to the old live PT for RFC 3264 §8.3.2 PT
+ * stability), THEN this, THEN the copy — so a re-offered PT survives and a dropped one is removed. */
+static void sofia_video_pt_clear_stale(struct ast_rtp_codecs *staged, struct ast_rtp_codecs *live)
+{
+	int p;
+	for (p = 0; p < AST_RTP_MAX_PT; p++) {
+		format_t f = live->payloads[p].code;
+		if (live->payloads[p].gabpbx_format && (f & AST_FORMAT_VIDEO_MASK)
+				&& !(staged->payloads[p].gabpbx_format && staged->payloads[p].code == f)) {
+			ast_rtp_codecs_payloads_unset(live, NULL, p);
+		}
+	}
+}
+
 int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 {
 	sdp_parser_t *parser;
@@ -1546,6 +1759,12 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	struct ast_rtp_codecs staged_video_codecs;
 	int staged_audio_valid = 0;
 	int staged_video_valid = 0;
+	/* SIP-video<->WebRTC H264 fmtp relay: the selected H264 config for THIS offered/answered SDP, staged
+	 * validate-then-commit (committed to pvt->h264_* only when the video is accepted; a rejected SDP leaves
+	 * an established call's H264 config untouched). */
+	int staged_h264_valid = 0;
+	int staged_h264_pmode = 0;
+	char staged_h264_fmtp[160] = "";
 	int audio_te = 0;		/* g2: the remote's m=audio offered telephone-event (noncodec & AST_RTP_DTMF) — used at commit to resolve dtmfmode=auto */
 	int video_is_bundled = 0;	/* BUNDLE: set at the accept-gate when the m=video mid is in a=group:BUNDLE (answerer) */
 	char audio_pt_seen[128] = { 0 };	/* BUNDLE PT-uniqueness input: PTs the peer listed in m=audio */
@@ -1933,6 +2152,11 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 							}
 						}
 					}
+					/* H264 fmtp relay: pick one H264 config, prune the rest, stage its a=fmtp. Direct-assign
+					 * ties staged_h264 to THIS video m-line (reset to 0 when it has no compatible H264). */
+					staged_h264_valid = sofia_sdp_select_h264(media, &staged_video_codecs,
+							pvt->h264_fmtp_valid, pvt->h264_pmode, pvt->h264_fmtp,
+							staged_h264_fmtp, sizeof(staged_h264_fmtp), &staged_h264_pmode);
 					ast_rtp_codecs_payload_formats(&staged_video_codecs, &bvoffered, &bvnoncodec);
 					video_offered_fmts = bvoffered & (AST_FORMAT_VP8 | AST_FORMAT_H264);	/* VP8/H264 scope */
 					if (video_offered_fmts & orig_capability) {
@@ -1991,6 +2215,11 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 							}
 						}
 					}
+					/* H264 fmtp relay: pick one H264 config, prune the rest, stage its a=fmtp. Direct-assign
+					 * ties staged_h264 to THIS video m-line (reset to 0 when it has no compatible H264). */
+					staged_h264_valid = sofia_sdp_select_h264(media, &staged_video_codecs,
+							pvt->h264_fmtp_valid, pvt->h264_pmode, pvt->h264_fmtp,
+							staged_h264_fmtp, sizeof(staged_h264_fmtp), &staged_h264_pmode);
 					ast_rtp_codecs_payload_formats(&staged_video_codecs, &voffered, &vnoncodec);
 					video_offered_fmts = voffered & (AST_FORMAT_VP8 | AST_FORMAT_H264);	/* v1b VP8-first scope: only VP8/H264, never H261/H263/H263+ */
 					/* Review BLOCKER 1: intersect against orig_capability (the pre-:977-clear snapshot), NOT
@@ -2089,6 +2318,11 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 					}
 				}
 
+				/* H264 fmtp relay: pick one H264 config, prune the rest, stage its a=fmtp. Direct-assign
+				 * ties staged_h264 to THIS video m-line (reset to 0 when it has no compatible H264). */
+				staged_h264_valid = sofia_sdp_select_h264(media, &staged_video_codecs,
+						pvt->h264_fmtp_valid, pvt->h264_pmode, pvt->h264_fmtp,
+						staged_h264_fmtp, sizeof(staged_h264_fmtp), &staged_h264_pmode);
 				ast_rtp_codecs_payload_formats(&staged_video_codecs, &offered, &noncodec);
 				if (offered & AST_FORMAT_VIDEO_MASK) {
 					pvt->capability |= offered & AST_FORMAT_VIDEO_MASK;
@@ -3087,6 +3321,10 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 			/* PT stability (RFC 3264 §8.3.2): keep the already-negotiated video PT across renegotiation. */
 			sofia_video_pt_keep_negotiated(&staged_video_codecs,
 				ast_rtp_instance_get_codecs(pvt->rtp));
+			/* Drop stale live video PTs first (merge-copy never clears) so egress can't pick a PT the far
+			 * leg never negotiated — the PT99-to-browser black-video bug. Audio PTs preserved. */
+			sofia_video_pt_clear_stale(&staged_video_codecs,
+				ast_rtp_instance_get_codecs(pvt->rtp));
 			ast_rtp_codecs_payloads_copy(&staged_video_codecs,
 				ast_rtp_instance_get_codecs(pvt->rtp), pvt->rtp);
 			pvt->webrtc_video_bundled = 1;	/* arm the flag HERE, past every reject gate */
@@ -3095,8 +3333,18 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 		/* PT stability (RFC 3264 §8.3.2): same rule on the separate-transport video instance. */
 		sofia_video_pt_keep_negotiated(&staged_video_codecs,
 			ast_rtp_instance_get_codecs(pvt->vrtp));
+		/* Drop stale live video PTs first (merge-copy never clears) so egress uses only negotiated PTs. */
+		sofia_video_pt_clear_stale(&staged_video_codecs,
+			ast_rtp_instance_get_codecs(pvt->vrtp));
 		ast_rtp_codecs_payloads_copy(&staged_video_codecs,
 			ast_rtp_instance_get_codecs(pvt->vrtp), pvt->vrtp);
+	}
+	/* SIP-video<->WebRTC H264 fmtp relay: commit the selected H264 config ONLY when the video was
+	 * accepted (validate-then-commit) — a rejected SDP leaves an established call's H264 config intact. */
+	if (staged_video_valid && staged_h264_valid) {
+		ast_copy_string(pvt->h264_fmtp, staged_h264_fmtp, sizeof(pvt->h264_fmtp));
+		pvt->h264_pmode = staged_h264_pmode;
+		pvt->h264_fmtp_valid = 1;
 	}
 	ast_rtp_codecs_payloads_clear(&staged_audio_codecs, NULL);
 	ast_rtp_codecs_payloads_clear(&staged_video_codecs, NULL);

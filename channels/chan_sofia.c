@@ -497,6 +497,11 @@ enum sofia_call_event {
 	SOFIA_DEC_CALL_RINGING,  /* outbound 200 OK received */
 };
 static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_event event);
+/* MicroSIP(SIP-video)<->WebRTC video-passthrough fix: set the inbound caller leg's video_answer_mask to
+ * the video codec(s) the answered far leg accepted (defined near sofia_find_bridged_channel — sofia_tech,
+ * dialogs and the canonical lock order are in scope there). SDP-only: never mutates capability/nativeformats. */
+static struct ast_channel *sofia_find_inbound_sibling_by_linkedid(struct sofia_pvt *answered);
+static void sofia_set_caller_video_mask_from_answered(struct sofia_pvt *answered);
 
 static int fork_branch_hash_fn(const void *obj, int flags)
 {
@@ -1598,6 +1603,11 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	master->webrtc_video_bundled = child->webrtc_video_bundled;	/* BUNDLE: video-on-audio-transport flag travels to the fork winner */
 	master->webrtc_mid_ext_id = child->webrtc_mid_ext_id;	/* BUNDLE: the negotiated MID extmap id travels too */
 	master->capability = child->capability;
+	/* H264 fmtp relay: the winner child negotiated the H264 config with the browser — carry it to master
+	 * so a later master re-INVITE/answer keeps advertising the same profile-level-id/packetization-mode. */
+	master->h264_fmtp_valid = child->h264_fmtp_valid;
+	master->h264_pmode = child->h264_pmode;
+	ast_copy_string(master->h264_fmtp, child->h264_fmtp, sizeof(master->h264_fmtp));
 	ast_copy_string(master->webrtc_mid, child->webrtc_mid, sizeof(master->webrtc_mid));
 	ast_copy_string(master->webrtc_tls_id, child->webrtc_tls_id, sizeof(master->webrtc_tls_id));
 	ast_copy_string(master->webrtc_video_mid, child->webrtc_video_mid, sizeof(master->webrtc_video_mid));
@@ -1671,6 +1681,10 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 			ast_mutex_unlock(&master->lock);
 			ast_channel_unlock(m_owner);
 		}
+		/* Before answering the caller, mask its answer video to what THIS fork winner accepted
+		 * (master->capability holds the stolen winner video) — chan_sofia does not transcode video.
+		 * SDP-only (video_answer_mask); does not touch the caller channel's nativeformats. */
+		sofia_set_caller_video_mask_from_answered(master);
 		ast_queue_control(m_owner, AST_CONTROL_ANSWER);
 		ast_setstate(m_owner, AST_STATE_UP);
 		ast_channel_unref(m_owner);
@@ -5672,6 +5686,20 @@ static int sofia_write_video(struct ast_channel *ast, struct ast_frame *frame)
 	if (!pvt) {
 		return -1;
 	}
+	/* Egress capability gate. chan_sofia does not transcode video, so never emit a video codec the
+	 * negotiated peer did not accept. allowed = capability & VIDEO, further narrowed by video_answer_mask
+	 * when set (the SIP-video<->WebRTC intersection). Needed because ast_write() does NOT check
+	 * nativeformats and ast_rtp_codecs_payload_code() falls back to static_RTP_PT (a stale PT would
+	 * otherwise egress). frame->subclass.codec==0 (control/no-codec) passes through untouched. */
+	if (frame->subclass.codec) {
+		format_t allowed = pvt->capability & AST_FORMAT_VIDEO_MASK;
+		if (pvt->video_answer_mask) {
+			allowed &= pvt->video_answer_mask;
+		}
+		if (!(frame->subclass.codec & allowed)) {
+			return 0;
+		}
+	}
 	/* BUNDLE (RFC 8843): a bundled WebRTC leg carries video on the AUDIO transport (pvt->rtp) and has NO
 	 * pvt->vrtp (dropped at the parse-commit / never created). res_rtp's ast_rtp_raw_write muxes the video
 	 * onto pvt->rtp (v_ssrc/v_seqno/v_lastts + the MID header extension), so route the egress frame there —
@@ -6090,16 +6118,25 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 		 * forwarded by ast_generic_bridge / the rtp_engine local bridge): transmit an RTCP PSFB
 		 * PLI toward OUR video sender via the engine. Bundled WebRTC video rides pvt->rtp;
 		 * separate-transport WebRTC video rides pvt->vrtp — same discriminator as
-		 * sofia_sync_media_fds (vrtp && !webrtc_video_bundled). Non-WebRTC legs: deliberate
-		 * no-op (legacy endpoints would need SIP INFO picture_fast_update, out of scope) — but
-		 * MUST return 0, not -1, so the core does not log "Don't know how to indicate condition
-		 * 18" per relayed PLI. The engine itself also no-ops until DTLS-SRTP is established. */
+		 * sofia_sync_media_fds (vrtp && !webrtc_video_bundled). A NON-WebRTC video leg gets the request
+		 * as SIP INFO application/media_control+xml picture_fast_update (RFC 5168, chan_sip parity
+		 * chan_sip.c:7723-7728 / add_vidupdate) so a legacy SIP video phone (MicroSIP) sends a fresh
+		 * keyframe — without it the far (browser) side that just requested the keyframe stays black.
+		 * MUST return 0, not -1, so the core does not log "Don't know how to indicate condition 18". */
 		if (pvt->is_webrtc) {
 			if (pvt->webrtc_video_bundled && pvt->rtp) {
 				ast_rtp_instance_video_update(pvt->rtp);
 			} else if (pvt->vrtp && !pvt->webrtc_video_bundled) {
 				ast_rtp_instance_video_update(pvt->vrtp);
 			}
+		} else if (pvt->vrtp && pvt->nh) {
+			/* Mirrors the outbound DTMF INFO path (nua_info inline on the channel thread). */
+			nua_info(pvt->nh,
+				SIPTAG_CONTENT_TYPE_STR("application/media_control+xml"),
+				SIPTAG_PAYLOAD_STR("<?xml version=\"1.0\" encoding=\"utf-8\" ?>"
+					"<media_control><vc_primitive><to_encoder><picture_fast_update/>"
+					"</to_encoder></vc_primitive></media_control>"),
+				TAG_END());
 		}
 		break;
 	case -1:
@@ -6425,6 +6462,30 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 	ast_string_field_set(pvt, exten, exten);
 	ast_string_field_set(pvt, peername, peername ? peername : "unknown");
 
+	/* H264 fmtp relay: snapshot the caller (requestor) leg's negotiated H264 config into locals HERE,
+	 * BEFORE taking peer->lock — the requestor pvt lock must never nest under peer->lock (doctrine order is
+	 * channel→pvt→peer). No peer lock is held yet, so a brief requestor pvt lock is order-safe. */
+	int rq_h264_valid = 0;
+	int rq_h264_pmode = 0;
+	char rq_h264_fmtp[160] = "";
+	if (requestor) {
+		/* Canonical channel→pvt order: lock the requestor channel, then its pvt, to read the caller's
+		 * negotiated H264 config. No peer lock is held here, so this is order-clean. */
+		struct ast_channel *rq_chan = (struct ast_channel *)requestor;
+		ast_channel_lock(rq_chan);
+		if (rq_chan->tech == &sofia_tech && rq_chan->tech_pvt) {
+			struct sofia_pvt *rq = rq_chan->tech_pvt;
+			ast_mutex_lock(&rq->lock);
+			if (rq->h264_fmtp_valid) {
+				rq_h264_valid = 1;
+				rq_h264_pmode = rq->h264_pmode;
+				ast_copy_string(rq_h264_fmtp, rq->h264_fmtp, sizeof(rq_h264_fmtp));
+			}
+			ast_mutex_unlock(&rq->lock);
+		}
+		ast_channel_unlock(rq_chan);
+	}
+
 	if (peer) {
 		/* reload-UAF: hold peer->lock across the whole freeable-stringfield read
 		 * span (runs on the PBX dialing thread vs the reload writer); release it
@@ -6438,6 +6499,24 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 		ast_string_field_set(pvt, fromdomain, peer->fromdomain);
 		pvt->capability = peer->capability;
 		pvt->prefs = peer->prefs;
+		/* Video passthrough (no transcode): OFFER the callee only the VIDEO codecs the CALLER can produce.
+		 * `format` carries the requestor's caps incl. its video mask (main/channel.c preserves videoformat
+		 * and passes it here); peer->capability inherits [general]'s video, so without this the callee may
+		 * answer a codec the caller can't send/recv (e.g. MicroSIP picking H263-1998 vs a WebRTC H264/VP8
+		 * caller) → no/garbled video. Intersect only the video bits; audio/text untouched. Zero requestor
+		 * video ⇒ no m=video offered (chan_sip jointcapability parity). Must run BEFORE sofia_rtp_init
+		 * (which creates vrtp only if the resulting capability still has video). */
+		pvt->capability = (pvt->capability & ~AST_FORMAT_VIDEO_MASK)
+			| (pvt->capability & format & AST_FORMAT_VIDEO_MASK);
+		/* H264 fmtp relay (RFC 6184 §8.2.2): carry the caller's negotiated H264 config (snapshotted into
+		 * rq_h264_* BEFORE peer->lock — see above — to avoid a peer→pvt lock inversion) into THIS outbound
+		 * offer so the callee is offered the SAME profile-level-id/packetization-mode; else a SIP video
+		 * phone answers a mode the WebRTC caller cannot produce and video is garbled/undecodable. */
+		if (rq_h264_valid) {
+			ast_copy_string(pvt->h264_fmtp, rq_h264_fmtp, sizeof(pvt->h264_fmtp));
+			pvt->h264_pmode = rq_h264_pmode;
+			pvt->h264_fmtp_valid = 1;
+		}
 		pvt->dtmfmode = peer->dtmfmode;
 		pvt->dtmf_effective = pvt->dtmfmode;	/* runtime = configured until AUTO resolves at SDP; rtp_init (below) applies the property */
 		pvt->allowtransfer = peer->allowtransfer;
@@ -12828,6 +12907,133 @@ struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op)
 	return bridged;
 }
 
+/* Locate the INBOUND caller Sofia channel that shares this answered leg's linkedid.
+ *
+ * Unlike sofia_find_bridged_channel() Method 3 (returns the FIRST owned linkedid sibling — could be
+ * another OUTBOUND B-leg in a multi-sibling Dial), this CONTINUES the dialogs walk until an INBOUND
+ * (!p->outgoing) Sofia-owned sibling with the same linkedid — the A-leg caller. Returns a +1-reffed
+ * channel (caller unrefs) or NULL. Used by the SIP-video<->WebRTC video-mask fix. */
+static struct ast_channel *sofia_find_inbound_sibling_by_linkedid(struct sofia_pvt *answered)
+{
+	struct ast_channel *self;
+	char linkedid_copy[AST_CHANNEL_NAME + 64];
+	struct ast_channel *found = NULL;
+	struct ao2_iterator it;
+	struct sofia_pvt *p;
+
+	if (!answered) {
+		return NULL;
+	}
+	/* Snapshot+ref the answered leg's owner under its pvt lock (sofia_hangup NULLs owner then frees it),
+	 * then copy the linkedid under the channel lock — mirrors sofia_find_bridged_channel's discipline. */
+	ast_mutex_lock(&answered->lock);
+	self = answered->owner;
+	if (self) {
+		ast_channel_ref(self);
+	}
+	ast_mutex_unlock(&answered->lock);
+	if (!self) {
+		return NULL;
+	}
+	linkedid_copy[0] = '\0';
+	ast_channel_lock(self);
+	if (self->linkedid) {
+		ast_copy_string(linkedid_copy, self->linkedid, sizeof(linkedid_copy));
+	}
+	ast_channel_unlock(self);
+	ast_channel_unref(self);
+	if (ast_strlen_zero(linkedid_copy)) {
+		return NULL;
+	}
+
+	it = ao2_iterator_init(dialogs, 0);
+	while ((p = ao2_iterator_next(&it))) {
+		if (p != answered) {
+			struct ast_channel *po;
+			ast_mutex_lock(&p->lock);
+			po = p->owner;
+			if (!p->outgoing && po && po->tech == &sofia_tech
+					&& po->linkedid && !strcmp(po->linkedid, linkedid_copy)) {
+				found = ast_channel_ref(po);
+			}
+			ast_mutex_unlock(&p->lock);
+		}
+		ao2_ref(p, -1);
+		if (found) {
+			break;
+		}
+	}
+	ao2_iterator_destroy(&it);
+	return found;
+}
+
+/* MicroSIP(SIP-video)<->WebRTC video fix (SDP-only, no channel-state mutation). chan_sofia relays video
+ * WITHOUT transcoding, so the inbound caller leg must answer ONLY the video codec(s) the answered far leg
+ * accepted. Instead of narrowing capability/nativeformats (core/glue-watched -> mid-call re-INVITE -> the
+ * hold-500 storm -> call drop), we record the accepted set in the caller pvt's private video_answer_mask;
+ * the SDP emitters apply it as an effective video filter. Called on the answered outbound/fork-winner pvt,
+ * right before the caller's ANSWER is queued, when NO channel/pvt lock is held. Lock order: answered->lock
+ * (snapshot only, released) then caller channel -> caller pvt (canonical). No peer lock. */
+static void sofia_set_caller_video_mask_from_answered(struct sofia_pvt *answered)
+{
+	format_t answered_video;
+	int answered_h264_valid;
+	int answered_h264_pmode;
+	char answered_h264_fmtp[160];
+	struct ast_channel *caller_chan;
+	struct sofia_pvt *caller_pvt;
+
+	if (!answered) {
+		return;
+	}
+	ast_mutex_lock(&answered->lock);
+	answered_video = answered->capability & AST_FORMAT_VIDEO_MASK;
+	answered_h264_valid = answered->h264_fmtp_valid;
+	answered_h264_pmode = answered->h264_pmode;
+	ast_copy_string(answered_h264_fmtp, answered->h264_fmtp, sizeof(answered_h264_fmtp));
+	ast_mutex_unlock(&answered->lock);
+
+	caller_chan = sofia_find_inbound_sibling_by_linkedid(answered);
+	if (!caller_chan) {
+		return;
+	}
+	ast_channel_lock(caller_chan);
+	caller_pvt = caller_chan->tech_pvt;
+	if (caller_pvt && caller_chan->tech == &sofia_tech) {
+		ast_mutex_lock(&caller_pvt->lock);
+		if (caller_pvt->owner == caller_chan && !caller_pvt->outgoing
+				&& (caller_pvt->capability & AST_FORMAT_VIDEO_MASK)) {
+			format_t common_video = (caller_pvt->capability & AST_FORMAT_VIDEO_MASK) & answered_video;
+			if (common_video) {
+				/* Constrain the caller's answer video to the shared set (SDP-only). */
+				caller_pvt->video_answer_mask = common_video;
+				/* H264 fmtp relay: if H264 is the shared codec, the caller 200 OK must advertise the
+				 * SAME H264 config the far leg accepted (RFC 6184 §8.2.2) — copy it cross-leg. Only when
+				 * the far leg actually carried an a=fmtp (non-empty): a far leg that sent H264 with NO
+				 * fmtp (e.g. a legacy softswitch) must NOT clobber the caller's own parsed config. */
+				if ((common_video & AST_FORMAT_H264) && answered_h264_valid
+						&& !ast_strlen_zero(answered_h264_fmtp)) {
+					ast_copy_string(caller_pvt->h264_fmtp, answered_h264_fmtp, sizeof(caller_pvt->h264_fmtp));
+					caller_pvt->h264_pmode = answered_h264_pmode;
+					caller_pvt->h264_fmtp_valid = 1;
+				}
+				ast_verbose("Sofia: caller '%s' video answer masked to far-leg accepted (0x%llx)\n",
+					caller_chan->name, (unsigned long long)common_video);
+			} else {
+				/* No shared video codec (e.g. the callee picked H263-1998 vs a WebRTC H264/VP8 caller).
+				 * Leave the mask unset: emitting an EMPTY m=video is malformed and the peer BYEs the
+				 * call. Video simply mismatches (no image) but the CALL SURVIVES. The real remedy is
+				 * offering the callee only the caller's codecs (outbound video narrowing). */
+				ast_verbose("Sofia: caller '%s' and far leg share NO video codec; mask left unset (call preserved)\n",
+					caller_chan->name);
+			}
+		}
+		ast_mutex_unlock(&caller_pvt->lock);
+	}
+	ast_channel_unlock(caller_chan);
+	ast_channel_unref(caller_chan);
+}
+
 /* ===================================================================================
  * DataChannel far-leg pairing — sofia_dc_pair_bridged
  * ===================================================================================
@@ -13567,7 +13773,12 @@ static void sofia_process_info(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *o
 	char sigbuf[64] = "";			/* extracted DTMF signal VALUE (may be numeric "10" or literal "*") */
 	unsigned int duration = 250;
 
-	nua_respond(nh, SIP_200_OK, TAG_END());
+	/* Bind the 200 OK to THIS INFO server transaction (NUTAG_WITH_THIS). A bare nua_respond() lets sofia
+	 * pick the handle's "current" request, which after the INVITE completes can be a stale/gone transaction
+	 * -> "Responding to a Non-Existing Request" -> the 200 never reaches the sender -> it retransmits the
+	 * INFO until Timer F (32s) and tears the call down. MicroSIP sends application/media_control+xml
+	 * (picture_fast_update) once video is up, so this bit the whole call. */
+	nua_respond(nh, SIP_200_OK, NUTAG_WITH_THIS(nua), TAG_END());
 
 	if (!sip || !op || !op->owner) {
 		return;
@@ -13590,6 +13801,29 @@ static void sofia_process_info(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *o
 	}
 
 	if (!content_type || !body) {
+		return;
+	}
+
+	/* Video keyframe request bridge (RFC 5168, chan_sip parity chan_sip.c:20062-20066): a legacy SIP video
+	 * endpoint (e.g. MicroSIP) asks the remote encoder for a fast-update via INFO
+	 * application/media_control+xml (picture_fast_update). Surface it as AST_CONTROL_VIDUPDATE on our
+	 * channel so the core bridge relays it to the far leg — which turns it into an RTCP PLI/FIR to a WebRTC
+	 * browser (or another INFO to a legacy leg). Without this, the far leg never sends a fresh keyframe and
+	 * the SIP phone's picture stays black/frozen. (The 200 OK was already sent above.) */
+	if (!strncasecmp(content_type, "application/media_control+xml", 29)) {
+		/* Snapshot+ref op->owner under op->lock (sofia_hangup nulls+frees it off this thread), mirroring
+		 * the DTMF INFO path below — avoids a queue-onto-freed-channel UAF. */
+		struct ast_channel *vu_owner;
+		ast_mutex_lock(&op->lock);
+		vu_owner = op->owner;
+		if (vu_owner) {
+			ast_channel_ref(vu_owner);
+		}
+		ast_mutex_unlock(&op->lock);
+		if (vu_owner) {
+			ast_queue_control(vu_owner, AST_CONTROL_VIDUPDATE);
+			ast_channel_unref(vu_owner);
+		}
 		return;
 	}
 
@@ -14694,6 +14928,11 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				ast_mutex_lock(&pvt->lock);
 				pvt->state = SOFIA_DIALOG_STATE_UP;
 				ast_mutex_unlock(&pvt->lock);
+				/* Mask the inbound caller's answer video to what THIS outbound leg accepted before
+				 * answering the caller — chan_sofia does not transcode video (single-contact path; the
+				 * fork path does the same in sofia_fork_pick_winner). SDP-only; no-op if the caller is
+				 * not a Sofia inbound leg or shares the codec already. */
+				sofia_set_caller_video_mask_from_answered(pvt);
 				ast_queue_control(owner, AST_CONTROL_ANSWER);
 				ast_setstate(owner, AST_STATE_UP);
 				/* Set active contact for the single-contact outbound path. Skip if already
