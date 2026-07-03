@@ -209,6 +209,9 @@
 #define DEFAULT_MAX_FORWARDS    70
 /* RFC 3261 §17.1.1.2 T1 minimum; 100ms (chan_sip parity, vs RFC default 500ms). */
 #define DEFAULT_T1MIN           100
+/* Effective minimum TLS floor when no tls_min_version= is configured (enables TLS 1.2 + 1.3).
+ * Used at BOTH the load-time seed and the reload-check scratch seed so the two can never drift. */
+#define DEFAULT_TLS_MIN_VERSION "1.2"
 /* Outbound REGISTER scheduled-retry interval, seconds. */
 #define DEFAULT_REGISTRATION_TIMEOUT 20
 /* User-Agent / Server header base; composed with ast_get_version() at load. */
@@ -17771,7 +17774,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	 * unset is TLS 1.3-ONLY, which rejects the many SIP endpoints that cap at TLS 1.2 — the server aborts the
 	 * ClientHello with a protocol_version alert and the registration/handshake never completes. A deployment
 	 * can still pin a stricter floor with tls_min_version=1.3. */
-	ast_copy_string(sofia_cfg.tls_min_version, "1.2", sizeof(sofia_cfg.tls_min_version));
+	ast_copy_string(sofia_cfg.tls_min_version, DEFAULT_TLS_MIN_VERSION, sizeof(sofia_cfg.tls_min_version));
 	sofia_cfg.default_language[0] = '\0';
 	/* default "default"; behavior change from the silent-empty baseline (parkinglot= empty restores). */
 	ast_copy_string(sofia_cfg.default_parkinglot, "default", sizeof(sofia_cfg.default_parkinglot));
@@ -18274,7 +18277,11 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 	s.tlsverify = 0;
 	s.tlsverifyclient = 0;
 	s.tls_ciphers[0] = '\0';
-	s.tls_min_version[0] = '\0';
+	/* Must mirror the EFFECTIVE load-time default: sofia_apply_config clears tls_min_version first, then
+	 * seeds it to DEFAULT_TLS_MIN_VERSION later — so the final effective default is 1.2, not empty. If
+	 * this scratch started empty, a config with no tls_min_version= line would read live="1.2" vs
+	 * scratch="" and every reload would flag a phantom listener change, refusing reload until a restart. */
+	ast_copy_string(s.tls_min_version, DEFAULT_TLS_MIN_VERSION, sizeof(s.tls_min_version));
 	s.tls_verify_depth = 0;
 	s.t1min = DEFAULT_T1MIN;
 	s.timer_t1 = 500;

@@ -7,6 +7,28 @@ that is a drop-in replacement for chan_sip (it registers as channel
 technology SIP). Releases are listed newest first.
 
 
+## 1.5.1 — `sip reload` no longer falsely refused on `tls_min_version`
+
+### `sip reload` reliability fix
+
+`sip reload` refuses to hot-apply changes to listener/transport parameters (they are baked into the
+transport listeners at module load) and reports which knob changed, asking for a restart. A defaults
+bug made that refusal fire **on every reload** for a common configuration:
+
+`sofia_listener_config_changed()` re-parses the file into a scratch config seeded with the compiled
+"fresh-load" defaults, then diffs it against the running config. The scratch seeded `tls_min_version`
+to empty, but the load path seeds the effective default `1.2` (the minimum-TLS floor when no
+`tls_min_version=` line is present, as of 1.4.0). So on any config **without an explicit
+`tls_min_version=` line**, the diff compared running `1.2` against scratch `""` and flagged a phantom
+listener change, refusing `sip reload` with `listener config changed (tls_min_version)` until a full
+restart — even though nothing had changed.
+
+The scratch now seeds the same effective default, and the constant is shared between the load path and
+the reload check so the two cannot drift again. A genuine change (e.g. `tls_min_version=1.3`) is still
+correctly detected as a listener change that requires a restart. No workaround is needed after
+upgrading; on an un-upgraded node, adding an explicit `tls_min_version=1.2` line (the value already in
+effect) also silences the false refusal.
+
 ## 1.5.0 — SIP-video ↔ WebRTC video bridging, o= version stickiness, DTMF logging, robustness fixes
 
 ### Video bridging between a legacy SIP video phone and a WebRTC leg (H.264 passthrough)
