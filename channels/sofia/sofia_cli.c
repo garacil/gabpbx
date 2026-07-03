@@ -1074,8 +1074,11 @@ char *sofia_cli_reload(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 			"       trunks and [general] settings without restarting GABPBX.\n"
 			"       chan_sip-parity alias for `module reload chan_sofia.so`.\n"
 			"       Listener-level settings (bindaddr/bindport/tlsbindaddr/\n"
-			"       tlsbindport/tlscertfile/wsbindaddr/wsbindport/wssbindaddr/\n"
-			"       wssbindport/timert1/timerb) are baked into the SIP listener\n"
+			"       tlsbindport/tlsenable/tlscertfile/tlscafile/wsbindaddr/\n"
+			"       wsbindport/wsenable/wssbindaddr/wssbindport/wssenable/\n"
+			"       tcp_keepalive/tcp_pingpong/timert1/timerb/tlsverify/\n"
+			"       tlsverifyclient/tls_ciphers/tls_min_version/tls_verify_depth)\n"
+			"       are baked into the SIP listener\n"
 			"       at module load and require `systemctl restart gabpbx` to\n"
 			"       take effect; the reload reports `listener config changed`\n"
 			"       and aborts if any of these differs from the running value.\n";

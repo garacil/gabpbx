@@ -59,8 +59,10 @@
 ; restart required" and aborts without mutating live state if any of these
 ; differs from the running value:
 ;
-;   bindaddr, bindport, tlsbindaddr, tlsbindport, tlscertfile,
-;   wsbindaddr, wsbindport, wssbindaddr, wssbindport, timert1, timerb
+;   bindaddr, bindport, tlsbindaddr, tlsbindport, tlsenable, tlscertfile,
+;   tlscafile, wsbindaddr, wsbindport, wsenable, wssbindaddr, wssbindport,
+;   wssenable, tcp_keepalive, tcp_pingpong, timert1, timerb, tlsverify,
+;   tlsverifyclient, tls_ciphers, tls_min_version, tls_verify_depth
 ;
 ; Peers removed from this file are removed from the in-memory directory on
 ; reload (mark-and-sweep). Realtime peers are exempt — their lifecycle is
@@ -159,7 +161,8 @@ srvlookup=yes
 ;                                              ; without renaming it.
 ; tlscafile    = /etc/gabpbx/keys/ca.crt       ; optional real CA file; soft-linked to <dir>/cafile.pem.
 ;
-; TLS hardening (TLS listener only — opt-in; each unset knob keeps the sofia-sip default, no change):
+; TLS hardening (TLS listener only): tls_min_version defaults to 1.2 even when unset (see below); every
+; OTHER knob here is opt-in and keeps the sofia-sip default when unset:
 ; tls_min_version  = 1.2                       ; minimum TLS version 1.0|1.1|1.2|1.3 (enables that
 ;                                              ; version and every higher one). DEFAULT 1.2 — the TLS
 ;                                              ; listener accepts TLS 1.2 and 1.3 out of the box. A
@@ -169,6 +172,10 @@ srvlookup=yes
 ; tls_ciphers      = ECDHE+AESGCM:!aNULL:!MD5  ; OpenSSL cipher list (unset = sofia default
 ;                                              ; "!eNULL:!aNULL:!EXP:!LOW:!MD5:ALL:@STRENGTH").
 ; tls_verify_depth = 3                         ; max peer cert-chain depth (unset/0 = sofia default 2).
+; tlsverify         = no                       ; verify the SERVER cert on OUTBOUND TLS connections
+;                                              ; (accepted alias: tlsverifyserver). ORed with
+;                                              ; tlsverifyclient below into one verify policy. Default no;
+;                                              ; uses the same CA material as tlsverifyclient (tlscertfile).
 ; tlsverifyclient  = yes                       ; mutual TLS (mTLS): also verify the CLIENT cert on the
 ;                                              ; INBOUND TLS listener. ORed with tlsverify's outbound
 ;                                              ; server-cert check into ONE policy (both set -> verify
@@ -728,8 +735,9 @@ srvlookup=yes
 ; context, then "default"). Use it to isolate which hints a peer can watch.
 ; Subscriptions are gated by allowsubscribe (above). Event: message-summary still
 ; routes to the MWI handler; unknown event packages are auto-202'd.
-;default_subscribecontext = presence    ; [general] default; peers inherit when their subscribecontext= is unset
-;subscribecontext         = presence    ; per-peer override (in [peer] section)
+;subscribecontext = presence    ; in [general]: the default all peers inherit (the [general] key IS
+;                               ; `subscribecontext` — there is no `default_subscribecontext` key)
+;subscribecontext = presence    ; in a [peer] section: per-peer override
 
 ;
 ; --- SIP instant messaging (SIMPLE, out-of-dialog MESSAGE) ---
@@ -836,8 +844,9 @@ maxexpiry      = 3600      ; maximum REGISTER expires (seconds); over-max silent
 ; chan_sofia extension: 3-state CLI inheritance display ('User=Phone: yes (from [general])'
 ; when peer inherits default; raw 'yes'/'no' when peer-set explicitly).
 ;
-;default_usereqphone = no    ; [general] default; peers inherit when their usereqphone= is unset
-;usereqphone         = no    ; per-peer override (in [peer] section)
+;usereqphone = no    ; in [general]: the default all peers inherit (the [general] key IS `usereqphone`
+;                    ; — there is no `default_usereqphone` key)
+;usereqphone = no    ; in a [peer] section: per-peer override
 
 ;
 ; --- maxforwards (chan_sip parity, RFC 3261 §20.22 Max-Forwards) ---
