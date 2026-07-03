@@ -2761,12 +2761,14 @@ maxexpiry      = 3600      ; maximum REGISTER expires (seconds); over-max silent
 ;   2. Dead-peer detection (crash-mid-call discovery within session-expires/2 interval).
 ; sofia-sip handles wire mechanics (Session-Expires header, refresh re-INVITE
 ; scheduling, 422 Session Interval Too Small generation) — chan_sofia just wires config.
-; Per-peer session-timers= overrides this default; chan_sip default is "accept".
+; Per-peer session-timers= overrides this default. chan_sip's compiled default is "accept"; the
+; values shipped active below mirror the chan_sip sip.conf of a typical trunk-behind-NAT deployment
+; (originate + uac), so long calls keep SIP-layer firewall/NAT state alive from the inside.
 ;
-;session-timers     = accept    ; originate / accept / refuse — chan_sip parity values
-;session-expires    = 1800      ; Session-Expires seconds (RFC 4028 §4 typical; minimum 90)
-;session-minse      = 90        ; Min-SE seconds (RFC 4028 §3 floor; reject peer offers smaller)
-;session-refresher  = auto      ; auto (sofia-sip nua_any_refresher) / uac (we refresh) / uas (peer refreshes)
+session-timers     = originate ; originate / accept / refuse — chan_sip parity values
+session-expires    = 3600      ; Session-Expires seconds (RFC 4028 §4; minimum 90)
+session-minse      = 90        ; Min-SE seconds (RFC 4028 §3 floor; reject peer offers smaller)
+session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we refresh) / uas (peer refreshes)
 
 ;
 ; MWI message-summary defaults (T55, RFC 3842). Per-peer "mailbox = mbox@ctx" lines
