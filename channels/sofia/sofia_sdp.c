@@ -1719,6 +1719,47 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 		return 0;
 	}
 
+	/* RFC 3264 §8 o= version stickiness (chan_sip process_sdp_o parity, chan_sip.c:9684-9690/10343-10354):
+	 * an inbound RE-offer with the SAME origin (username + sess-id) and an UNCHANGED (<=) version is a no-op
+	 * — do NOT re-parse the media / re-apply the RTP remote, else an UPDATE/re-INVITE that re-sends the
+	 * (private/proxy) c= clobbers the symmetric-RTP-latched public source and kills audio (esp. a one-way
+	 * announcement, where no inbound RTP arrives to re-latch). Only for offers
+	 * we RECEIVE (current_offer). The per-peer ignoresdpversion knob (default no) forces reprocess for
+	 * RFC-violating UAs that change media without bumping the version. sofia-sip exposes the parsed origin
+	 * (sdp->sdp_origin, uint64_t o_id/o_version, char* o_username — sdp.h) so there is no string parsing and
+	 * no library change. FreeSWITCH relies on symmetric-RTP re-latch instead, which cannot repair a one-way
+	 * TX-only stream; chan_sip's o= no-op does, so we follow chan_sip. */
+	/* Staged origin — committed to pvt->remote_o_* ONLY on the success path below (validate-then-commit,
+	 * like offered_*_mode / the H264+T.38 staging), so a REJECTED offer does not advance the stored version
+	 * (else a same-version retry from the same origin would wrongly be treated as a no-op and answered from
+	 * stale state). */
+	int staged_remote_o = 0;
+	uint64_t staged_o_id = 0, staged_o_version = 0;
+	char staged_o_user[64] = "";
+	if (current_offer && sdp->sdp_origin
+			&& !(pvt->peer ? pvt->peer->ignoresdpversion : sofia_cfg.default_ignoresdpversion)) {
+		const sdp_origin_t *o = sdp->sdp_origin;
+		const char *ouser = o->o_username ? o->o_username : "";
+		if (pvt->remote_o_valid
+				&& pvt->remote_o_id == o->o_id
+				&& o->o_version <= pvt->remote_o_version
+				&& !strcmp(pvt->remote_o_user, ouser)) {
+			/* Unchanged offer: preserve the current media state (incl the learned RTP remote). The caller
+			 * still generates + sends the answer from the existing pvt state (a no-op offer needs an answer). */
+			if (sofia_debug) {
+				ast_verbose("Sofia: SDP o= unchanged (%s %llu v%llu) — RFC 3264 §8 no-op, preserving media/RTP remote\n",
+					ouser, (unsigned long long)o->o_id, (unsigned long long)o->o_version);
+			}
+			sdp_parser_free(parser);
+			return 0;
+		}
+		/* First offer, new origin identity, or an incremented version → STAGE it; commit on success below. */
+		staged_remote_o = 1;
+		staged_o_id = o->o_id;
+		staged_o_version = o->o_version;
+		ast_copy_string(staged_o_user, ouser, sizeof(staged_o_user));
+	}
+
 	/* Pre-clear config video so only THIS offer's video is re-added (negotiation
 	 * is order-independent; the audio block preserves (local_cap & VIDEO_MASK)).
 	 * Snapshot capability so every reject path restores it — a rejected SDP must
@@ -2258,7 +2299,13 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 			if (!pvt->vrtp) {
 				struct ast_sockaddr bindaddr;
 				ast_sockaddr_parse(&bindaddr, sofia_cfg.bindaddr, 0);
-				pvt->vrtp = ast_rtp_instance_new("gabpbx", NULL, &bindaddr, NULL);
+				/* MUST pass the sofia_sched context (like sofia_rtp_init + the WebRTC video path at :2178):
+				 * we enable RTCP just below, and res_rtp schedules RTCP TX/RR via ast_sched_add(rtp->sched,..)
+				 * (res_rtp_gabpbx.c:3146/4447). ast_sched_add_variable() locks con->lock with NO NULL guard
+				 * (main/sched.c), so a NULL sched here NULL-derefs the first time legacy video RTP/RTCP is
+				 * scheduled (RFC 3550 §6 — RTCP is periodic, not optional). */
+				pvt->vrtp = ast_rtp_instance_new("gabpbx",
+					sofia_sched ? ast_sched_thread_get_context(sofia_sched) : NULL, &bindaddr, NULL);
 				if (pvt->vrtp)
 					ast_rtp_instance_set_prop(pvt->vrtp, AST_RTP_PROPERTY_RTCP, 1);
 			}
@@ -3503,6 +3550,15 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	}
 	if (current_offer && offered_video_mode != -1) {
 		pvt->offered_video_mode = offered_video_mode;
+	}
+	/* o= version stickiness (validate-then-commit): record the ACCEPTED offer's origin only now that every
+	 * reject gate has passed, so a rejected offer never advanced the stored version (a same-version retry
+	 * from the same origin then still gets re-evaluated, not falsely treated as a no-op). */
+	if (staged_remote_o) {
+		pvt->remote_o_valid = 1;
+		pvt->remote_o_id = staged_o_id;
+		pvt->remote_o_version = staged_o_version;
+		ast_copy_string(pvt->remote_o_user, staged_o_user, sizeof(pvt->remote_o_user));
 	}
 
 	return 0;

@@ -53,6 +53,7 @@ extern nua_t *sofia_nua;
 extern su_root_t *sofia_root;
 extern int sofia_debug;
 extern int sofia_forkdebug;	/* B1: fork/flow lifecycle debug ("sip set debug fork on"); pure logging, default OFF */
+extern int sofia_dtmflog;	/* "sip set debug dtmf on": NOTICE per received DTMF digit (all modes); pure logging, default OFF */
 
 /* The Sofia channel tech (chan_sofia.c). The WebRTC DataChannel relay (sofia_datachannel.c)
  * compares a bridged channel's ->tech against this to confirm the far leg is a Sofia channel. */
@@ -322,8 +323,12 @@ int sofia_debug_match(const char *peer_name, const char *src_ip);
 int sofia_reload_request_sync(char *errmsg, size_t errmsglen, int timeout_ms);
 
 /* Push the live SIP-capture state (sip_capture_address/file in sofia_cfg) onto the sofia-sip tport layer
- * (TPTAG_CAPT HEP stream + TPTAG_DUMP file). Called at startup, on reload, and by the CLI subcommands. */
+ * (TPTAG_CAPT HEP stream + TPTAG_DUMP file). sofia_thread-ONLY (mutates the shared tport FILE and socket):
+ * called from the startup su_timer + the (dispatched) reload. NEVER call it from the CLI thread. */
 void sofia_apply_capture(void);
+/* CLI-thread-safe entry: marshals a capture change (is_hep=1 -> HEP address, 0 -> file dump; value ""
+ * disables) onto sofia_thread. Returns 0 on dispatch, -1 on failure (caller reports the CLI error). */
+int sofia_apply_capture_from_cli(int is_hep, const char *value);
 
 /* Fully release a (WebRTC) RTP instance and NULL *inst: stop RTCP + the DTLS retransmit timer (which each
  * hold their own ao2 ref) BEFORE ast_rtp_instance_destroy, so the engine destructor actually runs and the
@@ -476,6 +481,16 @@ struct sofia_pvt {
 	int h264_fmtp_valid;
 	int h264_pmode;
 	char h264_fmtp[160];
+	/* Remote SDP origin (o=) for RFC 3264 §8 version stickiness (chan_sip process_sdp_o parity). A re-offer
+	 * with the SAME origin identity (username + sess-id) and an UNCHANGED (<=) version is a no-op and MUST
+	 * NOT re-apply the media/RTP remote — else an UPDATE that re-sends the private/proxy c= clobbers the
+	 * symmetric-RTP-latched public source and kills audio (esp. one-way announcements: no inbound RTP to
+	 * re-latch). Gated by the per-peer ignoresdpversion knob (yes = force reprocess for RFC-violating UAs).
+	 * o_id/o_version are sofia-sip uint64_t (sdp.h). Recorded only on the offers we actually process. */
+	int remote_o_valid;
+	uint64_t remote_o_id;
+	uint64_t remote_o_version;
+	char remote_o_user[64];
 	struct ast_codec_pref prefs;
 	int lastinvite;
 	ast_mutex_t lock;
@@ -786,10 +801,12 @@ struct sofia_peer {
 	 * message-summary NOTIFY to the registered contact on REGISTER + on mailbox change, no SUBSCRIBE
 	 * needed. 1 = yes = SUBSCRIBE-only (MWI only on an active inbound MWI subscription). Default 0. */
 	int subscribemwi;
-	/* flag to treat every inbound SDP as new, ignoring the o-line session-version
-	 * (chan_sip parity). PARSE-COMPAT-ONLY: chan_sofia has no session-version tracking
-	 * so it ALWAYS behaves as ignoresdpversion=yes — =yes matches, =no is a known
-	 * LIMITATION (noted in sample.conf). Default 0. */
+	/* Treat every inbound SDP as new, ignoring the o= session-version (chan_sip parity). WIRED:
+	 * =no (default) honors RFC 3264 §8 — an inbound re-offer with the same origin + an
+	 * unchanged (<=) o= version is a no-op and the media/RTP remote is NOT re-applied (sofia_parse_sdp),
+	 * which stops an UPDATE/re-INVITE re-sending the private c= from clobbering the symmetric-RTP-latched
+	 * public source (no audio). =yes = the old always-reprocess behavior (escape hatch for RFC-violating
+	 * UAs that change media without bumping the version). Default 0 (=no). */
 	int ignoresdpversion;
 	/* flag to honor 3xx Moved-Temporarily redirects via ast_channel.call_forward
 	 * (chan_sip parity). PARSE-COMPAT-ONLY: chan_sofia has no nua_r_redirect handler
@@ -1021,7 +1038,7 @@ struct sofia_config {
 	int dynamic_exclude_static; /* 1 = append static-peer addrs to contact_ha as DENY so dynamic peers can't claim static names by Contact-IP spoofing. Default 0. */
 	int autocreatepeer;        /* PARSE-COMPAT-ONLY: chan_sofia refuses to auto-create unknown peers (stronger via alwaysauthreject default). Default 0 (chan_sip). */
 	int default_preferred_codec_only; /* codec-offer-list narrowing inherited by peers; default 0 (full list) */
-	int default_ignoresdpversion; /* PARSE-COMPAT-ONLY (chan_sofia processes every SDP unconditionally); default 0 */
+	int default_ignoresdpversion; /* [general] default for peer ignoresdpversion (WIRED: o= version stickiness, RFC 3264 §8); default 0 (=honor version) */
 	int default_promiscredir;  /* PARSE-COMPAT-ONLY (no nua_r_redirect 3xx-honor handler); default 0 */
 	int default_autoframing;   /* PARSE-COMPAT-ONLY (ptime auto-detect not wired); default 0 */
 	int default_faxdetect_mode; /* fax CNG/T.38 detection mode inherited by peers; default NONE(0). Handles DSP CNG + T.38 reINVITE detect when set. */

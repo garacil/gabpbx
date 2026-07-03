@@ -256,6 +256,7 @@ struct sofia_config sofia_cfg;
 
 int sofia_debug;
 int sofia_forkdebug;	/* B1: WebRTC/fork lifecycle debug ("sip set debug fork on"): pure logging, default OFF, ZERO behavior change. Correlates to res_rtp's ICE logs by rtp=%p (=pvt->rtp). */
+int sofia_dtmflog;	/* "sip set debug dtmf on": NOTICE per received DTMF digit (RFC2833/INFO/inband) so operators see keypresses in CLI+messages; default OFF, pure logging (chan_sip parity, but its own toggle). */
 /* Fork/flow lifecycle trace — the ONLY window into the mixed UDP+WSS fork teardown (CAUSA_RAIZ);
  * res_rtp cannot see the nh/rtp/fd steal or the REGISTER-flow drop. Logging only, never datapath. */
 #define SOFIA_FORKDBG(fmt, ...) do { if (sofia_forkdebug) { ast_verbose("FORKDBG " fmt "\n", ##__VA_ARGS__); } } while (0)
@@ -5925,6 +5926,17 @@ static struct ast_frame *sofia_read(struct ast_channel *ast)
 				}
 			}
 		}
+		/* Operator-visible DTMF logging ("sip set debug dtmf on"): NOTICE the completed digit received via
+		 * RFC 2833 (from the RTP read) or inband (from ast_dsp_process) so keypresses show in the CLI +
+		 * messages. DTMF_END only (logged once, not on BEGIN); skip the fax-CNG 'f' marker handled above.
+		 * SIP INFO-mode DTMF is logged in sofia_process_info. Pure logging, gated, default OFF. */
+		if (sofia_dtmflog && f && f->frametype == AST_FRAME_DTMF_END
+				&& f->subclass.integer != 'f') {
+			ast_log(LOG_NOTICE, "Sofia: DTMF '%c' received via %s on %s\n",
+				(int)f->subclass.integer,
+				pvt->dtmf_effective == SOFIA_DTMF_INBAND ? "inband" : "RFC2833",
+				ast->name);
+		}
 		return f;
 	}
 	case 1:
@@ -7568,7 +7580,12 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 static void sofia_process_bye(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
 		sip_t const *sip, tagi_t tags[])
 {
-	nua_respond(nh, SIP_200_OK, TAG_END());
+	/* Do NOT respond here: BYE is NOT in our NUTAG_APPL_METHOD set, so sofia-sip's nua stack ALWAYS sends
+	 * the 200 OK to a BYE itself (nua_server.c:382-384; nua_i_bye carries the already-sent status,
+	 * nua_session.c:3933-3966). nua_i_bye is purely informational. A manual nua_respond() here targets an
+	 * already-finalized transaction -> no-op or the 500 "Responding to a Non-Existing Request" /
+	 * "Already Sent Final Response" path (nua_server.c:432-440). RFC 3261 §15.1.2: a BYE MUST get a 2xx —
+	 * the stack does it. (FreeSWITCH keeps manual BYE behind #ifdef MANUAL_BYE, off by default.) */
 
 	/* Call-counter DEC (flag-gated so the eventual sofia_hangup DEC is a no-op). */
 	if (op) {
@@ -7618,7 +7635,12 @@ static void sofia_process_bye(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op
 static void sofia_process_cancel(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
 		sip_t const *sip, tagi_t tags[])
 {
-	nua_respond(nh, SIP_200_OK, TAG_END());
+	/* Do NOT respond here: CANCEL is NOT in our NUTAG_APPL_METHOD set, so sofia-sip's nua stack answers
+	 * the CANCEL (200) AND sends 487 to the cancelled INVITE itself (nua_server.c:382-384;
+	 * nua_session.c:2718-2751). nua_i_cancel is informational (carries the already-sent 200 status). A
+	 * manual nua_respond() here double-responds an already-finalized transaction (500 "Responding to a
+	 * Non-Existing Request"). RFC 3261 §9.2: the CANCEL is answered + the INVITE gets 487 — the stack
+	 * does both. (FreeSWITCH's nua_i_cancel does bookkeeping only, no nua_respond.) */
 
 	if (op) {
 		/* Q.850 Reason (RFC 3326): use a received cause as the hangup cause, else NORMAL_CLEARING. */
@@ -13928,7 +13950,9 @@ static void sofia_process_info(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *o
 					.src = __PRETTY_FUNCTION__,
 				};
 				ast_queue_frame(owner, &f);
-				if (sofia_debug)
+				if (sofia_dtmflog)
+					ast_log(LOG_NOTICE, "Sofia: DTMF FLASH received via SIP INFO on %s\n", owner->name);
+				else if (sofia_debug)
 					ast_verbose("Sofia: Received DTMF FLASH via SIP INFO\n");
 			} else {
 				struct ast_frame f = {
@@ -13940,7 +13964,11 @@ static void sofia_process_info(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *o
 				f.frametype = AST_FRAME_DTMF_END;
 				f.len = duration;
 				ast_queue_frame(owner, &f);
-				if (sofia_debug)
+				/* "sip set debug dtmf on" → operator-visible NOTICE (CLI + messages); else the legacy
+				 * sofia_debug verbose. Same log family as the RFC2833/inband path in sofia_read. */
+				if (sofia_dtmflog)
+					ast_log(LOG_NOTICE, "Sofia: DTMF '%c' received via SIP INFO on %s\n", out_digit, owner->name);
+				else if (sofia_debug)
 					ast_verbose("Sofia: Received DTMF '%c' via SIP INFO (duration=%u)\n", out_digit, duration);
 			}
 			ast_channel_unref(owner);
@@ -13953,7 +13981,13 @@ static void sofia_process_prack(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 {
 	if (sofia_debug)
 		ast_verbose("Sofia: Received PRACK\n");
-	nua_respond(nh, SIP_200_OK, TAG_END());
+	/* Bind the 200 to THIS PRACK server transaction (RFC 3262 section 3: a matching PRACK MUST get a 2xx).
+	 * A bare nua_respond() has a no-tag fallback ONLY for INVITE (sofia nua_server.c) — during a 100rel
+	 * PRACK callback the INVITE server request is still on the handle (already marked pracked), so the
+	 * bare 200 can select the INVITE and answer it prematurely (no SDP), or emit 500 "Responding to a
+	 * Non-Existing Request". NUTAG_WITH_THIS targets the current event's request = the PRACK. (FreeSWITCH
+	 * binds app responses the same way, NUTAG_WITH_THIS_MSG.) */
+	nua_respond(nh, SIP_200_OK, NUTAG_WITH_THIS(nua), TAG_END());
 }
 
 static void sofia_process_ack(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
@@ -17563,6 +17597,47 @@ void sofia_apply_capture(void)
 	}
 }
 
+/* CLI-thread-safe SIP-capture change: MARSHAL the apply onto sofia_thread.
+ * sofia_apply_capture() runs tport_set_params(TPTAG_DUMP/CAPT), which closes/reopens the SHARED tport
+ * mr_dump_file (FILE*) + mr_capt_sock (sofia-sip tport_logging.c) that sofia_thread writes to per message
+ * with NO locking — applying it from the CLI thread races that write (FILE* use-after-free / wrong-fd
+ * capture / tport corruption), and violates the doctrine (sofia_thread owns mutable signaling state).
+ * FreeSWITCH routes siptrace/capture through nua_set_params, which sofia marshals onto the stack thread
+ * the same way. The startup su_timer + `sofia reload` already run on sofia_thread and keep the direct call.
+ * The task carries a COPY of the new value; the root callback commits sofia_cfg + applies, all on
+ * sofia_thread. Returns 0 on dispatch, -1 on failure (caller reports the CLI error). */
+struct sofia_capture_task {
+	int is_hep;		/* 1 = HEP capture address, 0 = file dump path */
+	char value[512];	/* new path / host:port; "" = disable */
+};
+static void sofia_apply_capture_root(void *data)
+{
+	struct sofia_capture_task *t = data;
+	if (t->is_hep) {
+		ast_copy_string(sofia_cfg.sip_capture_address, t->value, sizeof(sofia_cfg.sip_capture_address));
+	} else {
+		ast_copy_string(sofia_cfg.sip_capture_file, t->value, sizeof(sofia_cfg.sip_capture_file));
+	}
+	sofia_apply_capture();
+	ast_free(t);
+}
+int sofia_apply_capture_from_cli(int is_hep, const char *value)
+{
+	struct sofia_capture_task *t = ast_calloc(1, sizeof(*t));
+	if (!t) {
+		return -1;
+	}
+	t->is_hep = is_hep;
+	if (value) {
+		ast_copy_string(t->value, value, sizeof(t->value));
+	}
+	if (sofia_dispatch_to_root_thread(sofia_apply_capture_root, t) < 0) {
+		ast_free(t);
+		return -1;
+	}
+	return 0;
+}
+
 /* Apply a parsed sofia.conf to the live sofia_cfg + peers state. Shared by the init path
  * (sofia_load_config) and the reload worker. Caller owns cfg — do NOT destroy here. Returns 0,
  * or -1 on a hard failure that leaves live state partially mutated (caller logs + bails). */
@@ -18993,6 +19068,26 @@ static int unload_module(void)
 {
 	ast_verbose("Sofia-SIP channel unloading...\n");
 
+	/* chan_sofia does NOT support runtime unload — three thread-discipline issues make a clean unload
+	 * impossible without a deeper refactor:
+	 *   (1) su_root_destroy() asserts on same-thread-as-su_root_create (SIGABRT from the CLI thread).
+	 *   (2) sofia_reg_thread + sofia_qualify_tid leak past dlclose (sleep(30)/sleep(1) granularity).
+	 *   (3) libsofia-sip-ua spawns its own tport worker threads not reaped by su_root_destroy.
+	 * REFUSE THE UNLOAD IMMEDIATELY, BEFORE any unregister/destroy: the GabPBX loader (main/loader.c
+	 * :567-574) does NOT roll back a failed unload — a nonzero return just fails the operation and leaves
+	 * the module flagged running. Any teardown done here would therefore leave chan_sofia "loaded" but
+	 * GUTTED (sofia_sched destroyed, channel tech / RTP glue / CLI / AMI / apps unregistered), so it can
+	 * create no channels and live calls' scheduled DTLS/RTCP timers UAF the freed sched — until a full
+	 * restart. Operators restart gabpbx for config changes (the reload path uses module reload, not
+	 * unload). FreeSWITCH parity: mod_sofia stops its queues/threads before su_deinit — the safe
+	 * choreography chan_sofia cannot do today, so it must fail before touching any state.
+	 * NB: AST_FORCE_HARD can still dlclose after a failed unload by loader design (restart-only). */
+	ast_log(LOG_NOTICE,
+		"chan_sofia does not support runtime unload — restart gabpbx for config changes\n");
+	return -1;
+
+	/* ---- Everything below is intentionally UNREACHABLE (kept to show the original teardown shape for a
+	 * future clean-unload attempt). It MUST NOT run: see the refusal above. ---- */
 	ast_rtp_glue_unregister(&sofia_rtp_glue);
 	/* Defensive (unload returns -1 below before any teardown runs at runtime). */
 	ast_udptl_proto_unregister(&sofia_udptl);

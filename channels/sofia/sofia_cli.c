@@ -910,7 +910,7 @@ char *sofia_set_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 	if (cmd == CLI_INIT) {
 		e->command = "sip set debug";
 		e->usage =
-			"Usage: sip set debug [on|off|peer <name>|ip <addr>|file <path>|off|capture <host:port>|off|fork {on|off}]\n"
+			"Usage: sip set debug [on|off|peer <name>|ip <addr>|file <path>|off|capture <host:port>|off|fork {on|off}|dtmf {on|off}]\n"
 			"       Show current debug state, or enable/disable Sofia-SIP debug.\n"
 			"       'on'  - enable debug for all peers\n"
 			"       'off' - disable debug\n"
@@ -923,14 +923,16 @@ char *sofia_set_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 			"                       from sip_capture_hep (default 3).\n"
 			"       'fork {on|off}' - fork/flow lifecycle trace (child create/cancel, winner nh/rtp/fd\n"
 			"                       steal, regflow drop + media_error). Correlates to 'rtp set debug ice'\n"
-			"                       by the rtp pointer. Pure logging, default OFF.\n";
+			"                       by the rtp pointer. Pure logging, default OFF.\n"
+			"       'dtmf {on|off}' - NOTICE per received DTMF digit (RFC2833 / SIP INFO / inband) so you\n"
+			"                       can SEE keypresses in the CLI + messages. Pure logging, default OFF.\n";
 		return NULL;
 	} else if (cmd == CLI_GENERATE) {
 		if (a->pos == 3)
-			return ast_cli_complete(a->word, (const char *[]){ "on", "off", "peer", "ip", "file", "capture", "fork", NULL }, a->n);
+			return ast_cli_complete(a->word, (const char *[]){ "on", "off", "peer", "ip", "file", "capture", "fork", "dtmf", NULL }, a->n);
 		if (a->pos == 4 && (!strcasecmp(a->argv[3], "file") || !strcasecmp(a->argv[3], "capture")))
 			return ast_cli_complete(a->word, (const char *[]){ "off", NULL }, a->n);
-		if (a->pos == 4 && !strcasecmp(a->argv[3], "fork"))
+		if (a->pos == 4 && (!strcasecmp(a->argv[3], "fork") || !strcasecmp(a->argv[3], "dtmf")))
 			return ast_cli_complete(a->word, (const char *[]){ "on", "off", NULL }, a->n);
 		return NULL;
 	}
@@ -997,18 +999,39 @@ char *sofia_set_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 			return CLI_SHOWUSAGE;
 		}
 		return CLI_SUCCESS;
+	} else if (!strcasecmp(what, "dtmf")) {
+		/* NOTICE per received DTMF digit (RFC2833 / SIP INFO / inband) so operators can SEE what users
+		 * press, in the CLI + messages file. Own toggle (not tied to full sip debug); pure logging. */
+		if (a->argc != 5)
+			return CLI_SHOWUSAGE;
+		if (!strcasecmp(a->argv[4], "on")) {
+			sofia_dtmflog = 1;
+			ast_cli(a->fd, "Sofia DTMF logging enabled (received digits -> NOTICE)\n");
+		} else if (!strcasecmp(a->argv[4], "off")) {
+			sofia_dtmflog = 0;
+			ast_cli(a->fd, "Sofia DTMF logging disabled\n");
+		} else {
+			return CLI_SHOWUSAGE;
+		}
+		return CLI_SUCCESS;
 	} else if (!strcasecmp(what, "file")) {
 		/* Dump EVERY decrypted SIP message (recv+sent, udp/tcp/tls/ws/wss, incl. SDP) to a file
 		 * via sofia-sip's built-in TPTAG_DUMP. Runtime override; a `sip reload` re-applies sofia.conf. */
 		if (a->argc != 5)
 			return CLI_SHOWUSAGE;
+		/* Thread-safety: the apply mutates the shared tport dump FILE* — marshal it onto sofia_thread
+		 * (sofia_apply_capture_from_cli) instead of touching tport_set_params from the CLI thread. */
 		if (!strcasecmp(a->argv[4], "off")) {
-			sofia_cfg.sip_capture_file[0] = '\0';
-			sofia_apply_capture();
+			if (sofia_apply_capture_from_cli(0, "") < 0) {
+				ast_cli(a->fd, "Sofia: failed to queue capture change (sofia thread unavailable)\n");
+				return CLI_FAILURE;
+			}
 			ast_cli(a->fd, "Sofia: SIP message dump to file disabled\n");
 		} else {
-			ast_copy_string(sofia_cfg.sip_capture_file, a->argv[4], sizeof(sofia_cfg.sip_capture_file));
-			sofia_apply_capture();
+			if (sofia_apply_capture_from_cli(0, a->argv[4]) < 0) {
+				ast_cli(a->fd, "Sofia: failed to queue capture change (sofia thread unavailable)\n");
+				return CLI_FAILURE;
+			}
 			ast_cli(a->fd, "Sofia: dumping decrypted SIP messages to '%s'\n", a->argv[4]);
 		}
 		return CLI_SUCCESS;
@@ -1017,15 +1040,20 @@ char *sofia_set_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 		 * HEP version from sip_capture_hep (default 3). Runtime override; `sip reload` re-applies. */
 		if (a->argc != 5)
 			return CLI_SHOWUSAGE;
+		/* Thread-safety: marshal onto sofia_thread (the apply reopens the shared tport capture socket). */
 		if (!strcasecmp(a->argv[4], "off")) {
-			sofia_cfg.sip_capture_address[0] = '\0';
-			sofia_apply_capture();
+			if (sofia_apply_capture_from_cli(1, "") < 0) {
+				ast_cli(a->fd, "Sofia: failed to queue capture change (sofia thread unavailable)\n");
+				return CLI_FAILURE;
+			}
 			ast_cli(a->fd, "Sofia: SIP HEP capture disabled\n");
 		} else {
 			int hep = (sofia_cfg.sip_capture_hep >= 1 && sofia_cfg.sip_capture_hep <= 3)
 				? sofia_cfg.sip_capture_hep : 3;
-			ast_copy_string(sofia_cfg.sip_capture_address, a->argv[4], sizeof(sofia_cfg.sip_capture_address));
-			sofia_apply_capture();
+			if (sofia_apply_capture_from_cli(1, a->argv[4]) < 0) {
+				ast_cli(a->fd, "Sofia: failed to queue capture change (sofia thread unavailable)\n");
+				return CLI_FAILURE;
+			}
 			ast_cli(a->fd, "Sofia: streaming decrypted SIP as HEPv%d (UDP) to '%s'\n", hep, a->argv[4]);
 		}
 		return CLI_SUCCESS;

@@ -7,6 +7,76 @@ that is a drop-in replacement for chan_sip (it registers as channel
 technology SIP). Releases are listed newest first.
 
 
+## 1.5.0 — SIP-video ↔ WebRTC video bridging, o= version stickiness, DTMF logging, robustness fixes
+
+### Video bridging between a legacy SIP video phone and a WebRTC leg (H.264 passthrough)
+
+chan_sofia now bridges **two-way video** between an RTP/AVP SIP video phone (e.g. a
+pjproject-based softphone offering H.263/H.264/VP8) and a WebRTC leg (bundled DTLS-SRTP),
+by pure relay — no transcoding. Several coordinated pieces make it work:
+
+- **Cross-leg codec intersection.** The caller now answers only the video codec(s) the
+  answered/bridged leg actually accepted, so a phone can't lock onto a codec the WebRTC
+  peer cannot produce (which left both ends black). This is a private SDP-only filter — it
+  never mutates the channel's `nativeformats`/capability, so it does not trigger a bridge
+  re-INVITE.
+- **Outbound offer narrowed to the caller's video** (chan_sip `jointcapability` parity), so
+  a SIP callee is only offered codecs the calling side can produce.
+- **H.264 `a=fmtp` relay** (RFC 6184 §8.2.2). H.264 with a different `profile-level-id` +
+  `packetization-mode` is effectively a different codec (mode 0's Single-NAL vs mode 1's
+  FU-A cannot be relayed without repacketization). chan_sofia now selects one H.264 config
+  per leg, emits its `a=fmtp` in every video m-line, and propagates it across the two legs
+  so both use the same packetization-mode; when no compatible H.264 config exists it falls
+  back to VP8/audio rather than relaying an undecodable stream.
+- **Stale video payload-type clear.** The RTP codec-map copy is merge-only; a stale video
+  PT could shadow the negotiated one and be relayed to a peer that never offered it (black
+  video). Live video PTs not in the negotiated set are now cleared before the copy.
+- **Keyframe-request bridge** (RFC 5168). An inbound SIP INFO `media_control` picture-fast-
+  update is surfaced as a keyframe request to the bridged leg, and an outbound keyframe
+  request to a non-WebRTC video leg is sent as a SIP INFO picture-fast-update — so a browser
+  PLI reaches a legacy phone and vice-versa.
+- **SIP INFO answer binding.** In-dialog INFO responses now bind to the INFO transaction
+  (`NUTAG_WITH_THIS`); a bare response could answer a stale transaction, so the sender never
+  saw the 200 and its retransmissions timed the call out at ~32 s.
+
+### RFC 3264 o= version stickiness (NAT audio after an UPDATE/re-INVITE)
+
+chan_sofia re-applied the RTP remote from the offer `c=` on **every** inbound SDP. For a
+NATed caller, an UPDATE/re-INVITE re-sending the private `c=` clobbered the symmetric-RTP-
+learned public source — killing audio, especially for a one-way announcement where no
+inbound RTP arrives to re-latch. Following `chan_sip`'s `process_sdp_o`, an inbound re-offer
+with the same origin and an unchanged (≤) o= version is now a no-op: the media/RTP remote is
+not re-applied, preserving the learned remote. The `ignoresdpversion` option is now honored
+(default `no` = honor the version, RFC 3264 §8; `yes` restores the always-reprocess
+behavior for RFC-violating endpoints).
+
+### DTMF logging
+
+New `sip set debug dtmf on|off` logs a NOTICE for each received DTMF digit — RFC 2833, SIP
+INFO, and inband — in the CLI and the messages log, so operators can see what callers press
+(`chan_sip` parity, with its own toggle). Default off; DTMF can carry PINs/IVR secrets.
+
+### Robustness / correctness fixes
+
+- **Module unload is refused before any teardown.** `module unload chan_sofia.so` previously
+  unregistered the RTP glue / channel tech / CLI and destroyed the scheduler *before*
+  returning failure; the loader does not roll back a failed unload, so the driver was left
+  running-but-gutted (and live calls could crash on the freed scheduler). It now returns
+  failure first and touches no state — restart to apply config changes.
+- **Legacy video RTP scheduler.** The lazily-created non-WebRTC video RTP instance was
+  created with a NULL scheduler but had RTCP enabled — a NULL-dereference the first time
+  RTCP was scheduled (RFC 3550 §6). It now uses the module scheduler, like every other RTP
+  instance.
+- **PRACK 200 binding.** The 200 to a PRACK now binds to the PRACK transaction
+  (`NUTAG_WITH_THIS`); a bare response could answer the still-pending INVITE prematurely.
+- **CLI SIP-capture thread-safety.** `sip set debug file|capture` mutated the shared
+  transport dump `FILE*`/capture socket directly from the CLI thread, racing the SIP thread
+  that writes them per message (use-after-free). The change is now marshalled onto the SIP
+  thread.
+- **BYE/CANCEL double-response removed.** The stack already sends the final response to BYE
+  and CANCEL; the redundant manual 200 targeted an already-finalized transaction.
+
+
 ## 1.4.3 — NAT correctness: force_rport is signaling-only, [general] nat is inherited
 
 This release fixes calls losing audio when routed through a signaling-only SIP proxy
