@@ -1733,7 +1733,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 				 * use peer->src_addr (registered public IP) with the SDP media port
 				 * (comedia refines the port on the first inbound packet). */
 				if (pvt->peer
-				    && (pvt->peer->nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA))
+				    && (pvt->peer->nat & SOFIA_NAT_COMEDIA)
 				    && !ast_sockaddr_isnull(&pvt->peer->src_addr)) {
 					struct ast_sockaddr nat_remote = pvt->peer->src_addr;
 					ast_sockaddr_set_port(&nat_remote, media->m_port);
@@ -1970,7 +1970,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 							ast_sockaddr_set_port(&vremote, media->m_port);
 						}
 					}
-					if (pvt->peer && (pvt->peer->nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA))
+					if (pvt->peer && (pvt->peer->nat & SOFIA_NAT_COMEDIA)
 							&& !ast_sockaddr_isnull(&pvt->peer->src_addr)) {
 						vremote = pvt->peer->src_addr;
 						ast_sockaddr_set_port(&vremote, media->m_port);
@@ -2060,7 +2060,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 				 * for video — SDP c= from a NAT'd peer typically leaks the
 				 * private LAN IP; use peer->src_addr instead. */
 				if (pvt->peer
-				    && (pvt->peer->nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA))
+				    && (pvt->peer->nat & SOFIA_NAT_COMEDIA)
 				    && !ast_sockaddr_isnull(&pvt->peer->src_addr)) {
 					struct ast_sockaddr nat_remote = pvt->peer->src_addr;
 					ast_sockaddr_set_port(&nat_remote, media->m_port);
@@ -2145,7 +2145,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 				struct ast_sockaddr remote;
 				int have_remote = 1;
 				if (pvt->peer && pvt->peer->t38pt_usertpsource &&
-				    (pvt->peer->nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA)) &&
+				    (pvt->peer->nat & SOFIA_NAT_COMEDIA) &&
 				    pvt->rtp) {
 					ast_rtp_instance_get_remote_address(pvt->rtp, &remote);
 				} else {

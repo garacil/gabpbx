@@ -2910,7 +2910,7 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	peer->prefs = sofia_cfg.prefs;
 	peer->dtmfmode = SOFIA_DTMF_RFC2833;
 	peer->directmedia = 0;
-	peer->nat = SOFIA_NAT_FORCE_RPORT;
+	peer->nat = sofia_cfg.default_nat;	/* inherit [general] nat (chan_sip parity); per-peer nat= overrides after */
 	peer->busy_on_active = sofia_cfg.busy_on_active;
 	peer->max_contacts = sofia_cfg.max_contacts ? sofia_cfg.max_contacts : 6;
 	peer->encryption = 0;
@@ -3898,7 +3898,10 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 					v->name, peer->name, v->value);
 			}
 		} else if (!strcasecmp(v->name, "nat")) {
-			peer->nat = sofia_parse_nat(v->value);
+			/* An empty value (e.g. an empty realtime nat column) INHERITS the [general] default
+			 * already set at sofia_peer_alloc, rather than forcing force_rport. */
+			if (!ast_strlen_zero(v->value))
+				peer->nat = sofia_parse_nat(v->value);
 		} else if (!strcasecmp(v->name, "expiresecs")) {
 			peer->expiresecs = atoi(v->value);
 		} else if (!strcasecmp(v->name, "transport")) {
@@ -16035,6 +16038,10 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			sofia_cfg.allowguest = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "busy_on_active")) {
 			sofia_cfg.busy_on_active = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "nat")) {
+			/* [general] nat default inherited by peers without their own nat= (chan_sip parity).
+			 * force_rport is SIP-response routing only (RFC 3581); media symmetric is comedia-only. */
+			sofia_cfg.default_nat = sofia_parse_nat(v->value);
 		} else if (!strcasecmp(v->name, "max_contacts")) {
 			sofia_cfg.max_contacts = sofia_clamp_max_contacts(atoi(v->value), "general");
 		} else if (!strcasecmp(v->name, "encryption")) {
@@ -17127,7 +17134,10 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 					v->name, peer->name, v->value);
 			}
 		} else if (!strcasecmp(v->name, "nat")) {
-			peer->nat = sofia_parse_nat(v->value);
+			/* An empty value (e.g. an empty realtime nat column) INHERITS the [general] default
+			 * already set at sofia_peer_alloc, rather than forcing force_rport. */
+			if (!ast_strlen_zero(v->value))
+				peer->nat = sofia_parse_nat(v->value);
 		} else if (!strcasecmp(v->name, "expiresecs") || !strcasecmp(v->name, "defaultexpiry")) {
 			peer->expiresecs = atoi(v->value);
 		} else if (!strcasecmp(v->name, "transport")) {
@@ -17367,6 +17377,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.publish_format = SOFIA_SUB_DIALOG_INFO;
 	sofia_cfg.publish_transport[0] = '\0';	/* empty -> udp at use (no-op append), so existing configs stay byte-identical */
 	sofia_cfg.busy_on_active = 0;
+	sofia_cfg.default_nat = SOFIA_NAT_FORCE_RPORT;	/* [general] nat default; force_rport = chan_sip parity, preserves behavior when [general] nat is unset */
 	sofia_cfg.max_contacts = 6;
 	sofia_cfg.encryption = 0;
 	/* WebRTC (DTLS-SRTP + ICE-lite + rtcp-mux) is OFF by default; [general] webrtc=yes opts in and

@@ -7,6 +7,33 @@ that is a drop-in replacement for chan_sip (it registers as channel
 technology SIP). Releases are listed newest first.
 
 
+## 1.4.3 — NAT correctness: force_rport is signaling-only, [general] nat is inherited
+
+This release fixes calls losing audio when routed through a signaling-only SIP proxy
+(for example a Kamailio without an RTP relay in front of the PBX), and makes the
+`nat=` option behave like `chan_sip`'s.
+
+**`force_rport` no longer redirects media.** Per RFC 3581, `force_rport` governs SIP
+*response routing* only — but chan_sofia's SDP parser also rewrote the RTP/media
+destination to the peer's SIP source address whenever the peer had `force_rport` OR
+`comedia`. Since every peer without an explicit `nat=` line defaulted to `force_rport`,
+a trunk fronted by a signaling-only proxy had its audio sent to the *proxy* address
+(which has no media relay) instead of the SDP endpoint — one-way or no audio, while the
+same configuration worked on `chan_sip`. The media-destination override now applies with
+**`comedia` only** (symmetric RTP), across audio, both video paths, and the T.38
+`t38pt_usertpsource` path. `force_rport` remains the default and keeps handling Via
+`rport` response routing exactly as before.
+
+**`[general] nat` is now inherited.** A `nat=` setting in `[general]` becomes the default
+for every peer that does not set its own `nat=` line — previously it was silently ignored
+and peers hard-defaulted to `force_rport`. An **empty** `nat` column in a realtime peer
+row also inherits the `[general]` default instead of forcing `force_rport`. An explicit
+per-peer `nat=` continues to override, and configurations that never set `[general] nat`
+are unchanged (the default is still `force_rport`).
+
+The `nat=` option and the signaling-only-proxy caveat are now documented in
+`configs/sofia.conf.sample`.
+
 ## 1.4.2 — WebRTC call hold/resume overhaul
 
 This release makes call hold and resume fully functional for WebRTC endpoints. Before it,

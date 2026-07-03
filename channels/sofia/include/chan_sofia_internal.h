@@ -857,6 +857,10 @@ struct sofia_config {
 	int tcp_pingpong_ms;      /* tcp_pingpong (cfg seconds, stored ms); 0=OFF. TPTAG_PINGPONG — connection treated dead if no pong after a keepalive ping. Opt-in (aggressive value can tear down a slow-but-alive link). */
 	int allowguest;
 	int busy_on_active;
+	/* [general] nat= default inherited by peers that have no explicit nat= line (SOFIA_NAT_* bitmask).
+	 * chan_sip parity: default force_rport. Previously peers hard-defaulted to force_rport ignoring
+	 * [general] nat, so [general] nat=no never took effect. */
+	int default_nat;
 	int max_contacts;
 	int encryption;                   /* SDES-SRTP general default (0=off, 1=on); soft-zeroed at load if res_srtp absent */
 	int webrtc;                       /* WebRTC general default (0=off,1=on); per-peer webrtc= overrides */

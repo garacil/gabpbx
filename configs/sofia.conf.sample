@@ -742,6 +742,20 @@ srvlookup=yes
 ; path below. The sender is identified/challenged by its digest Authorization username.
 ;message_autorelay = yes                 ; [general] native peer-to-peer MESSAGE relay (default yes)
 ;
+; NAT traversal (chan_sip-compatible). May be set in [general] (inherited by every peer that has
+; no nat= line of its own — an empty realtime nat column inherits too) and overridden per peer.
+;   nat = no                    ; no NAT handling
+;   nat = force_rport           ; (default) honor/force Via rport for SIP RESPONSE ROUTING only
+;                               ; (RFC 3581). Does NOT affect where RTP media is sent.
+;   nat = comedia               ; symmetric RTP: send media to the peer's real packet source
+;                               ; (learned address) instead of the SDP c= address. Use for
+;                               ; NAT'd endpoints whose SDP leaks a private address.
+;   nat = force_rport,comedia   ; both (same as nat=yes)
+; IMPORTANT: only comedia moves media. A trunk fronted by a signaling-only proxy (e.g. a
+; Kamailio without an RTP relay) must NOT have comedia, or media would be sent to the proxy
+; address instead of the SDP endpoint; with the default force_rport, RTP follows the SDP.
+;nat = force_rport
+;
 ; OPT-IN dialplan path (used when the relay is off, or the To-user is not a local hinted
 ; peer): when message_context is set, an out-of-dialog SIP MESSAGE is routed to that
 ; dialplan context (exten = the To-user). With neither a per-peer nor a [general]
