@@ -1454,6 +1454,30 @@ void sofia_split_hostport_from_uri(const char *hostport, char *host, size_t host
 	}
 }
 
+/* Keep a chan_sofia channel's media fds (slots 0..3) a derived cache of the live
+ * pvt->rtp/vrtp: set the live fds, and CLEAR (-1) any slot whose instance is absent.
+ * A bundled WebRTC winner has no separate pvt->vrtp, so slots 2/3 MUST be cleared —
+ * otherwise the closed pre-alloc video fds linger and, being POLLNVAL/always-ready,
+ * win the classic last-ready-wins channel poll over the live audio fd, so the winner's
+ * audio/STUN socket is never serviced and ICE/DTLS never completes ("fork-winner no
+ * audio"). Also corrects a masquerade that copied the clone's stale fds wholesale.
+ * Caller holds the channel lock with a stable pvt (channel->pvt order); does NOT wake
+ * the bridge — call sites already do (fork: AST_CONTROL_ANSWER; fixup: the masquerade). */
+static void sofia_sync_media_fds(struct ast_channel *chan, struct sofia_pvt *pvt)
+{
+	if (!chan || !pvt) {
+		return;
+	}
+	ast_channel_set_fd(chan, 0, pvt->rtp ? ast_rtp_instance_fd(pvt->rtp, 0) : -1);
+	ast_channel_set_fd(chan, 1, pvt->rtp ? ast_rtp_instance_fd(pvt->rtp, 1) : -1);
+	/* Slots 2/3 carry video ONLY for a separate (non-bundled) vrtp. A bundled winner's
+	 * video rides pvt->rtp, so 2/3 must stay -1. The webrtc_video_bundled guard also keeps
+	 * this correct if the helper is ever called before a transient bundled vrtp is torn
+	 * down (e.g. from an SDP-commit path). */
+	ast_channel_set_fd(chan, 2, (pvt->vrtp && !pvt->webrtc_video_bundled) ? ast_rtp_instance_fd(pvt->vrtp, 0) : -1);
+	ast_channel_set_fd(chan, 3, (pvt->vrtp && !pvt->webrtc_video_bundled) ? ast_rtp_instance_fd(pvt->vrtp, 1) : -1);
+}
+
 static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *child, sip_t const *sip)
 {
 	struct sofia_pvt *master;
@@ -1628,12 +1652,10 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 			/* Revalidate: a masquerade could have swapped master->owner since we
 			 * dropped master->lock; write fds[] only if m_owner is still it. */
 			if (master->owner == m_owner) {
-				m_owner->fds[0] = win_fd[0];
-				m_owner->fds[1] = win_fd[1];
-				if (win_fd[2] >= 0) {
-					m_owner->fds[2] = win_fd[2];
-					m_owner->fds[3] = win_fd[3];
-				}
+				/* Install the winner's media fds as a derived cache of the stolen
+				 * rtp/vrtp, clearing the stale bundle-video slots that would otherwise
+				 * mask the audio fd. The AST_CONTROL_ANSWER queued below wakes the poll. */
+				sofia_sync_media_fds(m_owner, master);
 				SOFIA_FORKDBG("fd-move m_owner=%p fds=[%d,%d,%d,%d] (masquerade-gate HIT)",
 					(void *)m_owner, win_fd[0], win_fd[1], win_fd[2], win_fd[3]);
 			} else {
@@ -6103,6 +6125,9 @@ static int sofia_fixup(struct ast_channel *oldchan, struct ast_channel *newchan)
 			newchan->name, oldchan->name, pvt->owner->name);
 	}
 	pvt->owner = newchan;
+	/* Repair: a masquerade may have copied the clone's stale fds over newchan; re-derive
+	 * the media fds from the live rtp/vrtp so the bridge polls the correct sockets. */
+	sofia_sync_media_fds(newchan, pvt);
 	ast_mutex_unlock(&pvt->lock);
 
 	sofia_set_rtp_peer(newchan, NULL, NULL, NULL, 0, 0);
