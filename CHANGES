@@ -7,6 +7,39 @@ that is a drop-in replacement for chan_sip (it registers as channel
 technology SIP). Releases are listed newest first.
 
 
+## 1.4.1 — WebRTC fork-winner media fix, native peer-to-peer text messaging
+
+This release fixes a WebRTC call-forking media failure and adds native SIP text
+messaging between registered users.
+
+**WebRTC fork-winner audio/video fix.** When a call forks to a called extension that has
+both a WebRTC (WSS) contact and a plain-UDP contact and the WebRTC contact wins the fork,
+the call connected but had no audio or video — the winner leg's DTLS never completed. The
+winning WebRTC leg's media socket is stolen onto the surviving channel, but for a bundled
+winner (video riding the audio transport, with no separate video RTP) the channel's stale
+video file descriptors were not cleared; those closed descriptors are always reported
+"ready" by the poller, so the channel's classic last-ready-wins poll kept selecting them
+over the live audio/STUN socket, which was therefore never read — ICE never latched and
+DTLS never started. A new helper now keeps the channel's media fds a strict derived cache
+of the live audio/video RTP instances (setting the live descriptors and clearing absent
+ones), re-asserted after the fork steal and after a channel masquerade, so the winner
+leg's audio is serviced immediately. Physical↔physical, physical↔WebRTC and
+WebRTC↔WebRTC calls all carry two-way audio and video.
+
+**Native peer-to-peer SIP MESSAGE.** An out-of-dialog SIP MESSAGE (text) between two
+registered users was received but never delivered (it was answered 405). GABPBX now
+natively relays it (RFC 3428): an authenticated sender's MESSAGE whose destination
+resolves — through the sender's own subscribe-context hint namespace (the auto-created
+BLF/regexten extension→device hints) — to a registered local peer is re-originated to
+that peer's live contact(s), all of them, answering 202 Accepted (or 480 when the
+destination is registered but currently offline). It still falls through to the opt-in
+`message_context` dialplan for anything that is not a local hinted peer. The sender is
+authenticated by its digest credentials and screened by any per-peer host ACL; the
+relayed message carries the sender's and recipient's short logical extension identities
+and the recipient's per-contact routing (including its RFC 3327 Path). Enabled by default
+(`message_autorelay`, `[general]`).
+
+
 ## 1.4.0 — WebRTC video (BUNDLE), immediate-latch audio, DTMF parity, per-Contact REGISTER
 
 This release brings the WebRTC media path to a reliable baseline: audio latches
