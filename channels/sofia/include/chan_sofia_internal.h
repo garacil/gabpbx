@@ -949,7 +949,6 @@ struct sofia_config {
 	char disallowed_methods[128]; /* PARSE-COMPAT-ONLY string-storage; default empty (sofia-sip NUTAG_APPL_METHOD gates unknown methods natively) */
 	struct ast_ha *contact_ha; /* contactpermit/contactdeny; inherited by peers via ast_duplicate_ha_list when peer omits the key */
 	int srvlookup;
-	int pedantic;
 	char externaddr[128];
 	/* NAT external-address parity fill. */
 	char externhost[256];     /* DDNS hostname; resolved into externaddr at load + lazy-refreshed at sofia_resolve_ourip; empty = no DDNS, externaddr used as-is */
