@@ -1203,9 +1203,9 @@ maxexpiry      = 3600      ; maximum REGISTER expires (seconds); over-max silent
 ; chan_sofia.so` to pick up the new defaults; existing in-flight calls retain
 ; their original socket-level QoS settings until tear-down.
 ;
-;tos_sip = cs3
-;tos_audio = ef
-;tos_video = af41
+tos_sip = cs3
+tos_audio = ef
+tos_video = af41
 ;tos_text = af41
 ;cos_sip = 3
 ;cos_audio = 5
