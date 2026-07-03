@@ -16587,7 +16587,9 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "preferred_codec_only")) {
 			sofia_cfg.default_preferred_codec_only = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "ignoresdpversion")) {
-			/* PARSE-COMPAT-ONLY: chan_sofia processes every SDP unconditionally. */
+			/* WIRED (o= version stickiness, RFC 3264 §8): no (default) honors the SDP o= version
+			 * (a re-offer with the same origin + unchanged version is a no-op, preserving the
+			 * learned media/NAT remote); yes forces reprocessing of every inbound SDP. */
 			sofia_cfg.default_ignoresdpversion = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "promiscredir")) {
 			/* PARSE-COMPAT-ONLY: nua_r_redirect handler ABSENT. */
@@ -17206,7 +17208,8 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "preferred_codec_only")) {
 			peer->preferred_codec_only = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "ignoresdpversion")) {
-			/* PARSE-COMPAT-ONLY: every SDP is processed unconditionally. */
+			/* WIRED (o= version stickiness, RFC 3264 §8): no (default) honors the o= version;
+			 * yes forces reprocessing of every inbound SDP. Overrides the [general] default. */
 			peer->ignoresdpversion = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "promiscredir")) {
 			/* PARSE-COMPAT-ONLY: nua_r_redirect handler ABSENT. */

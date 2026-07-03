@@ -1304,46 +1304,21 @@ maxexpiry      = 3600      ; maximum REGISTER expires (seconds); over-max silent
 ;preferred_codec_only = yes
 
 ;
-; --- ignoresdpversion (chan_sip parity, PARSE-COMPAT-ONLY ship) ---
-; chan_sip semantic: when yes, bypass the inbound SDP o-line session-version
-; skip-on-no-change gate at process_sdp; treat all SDPs as new and re-process
-; regardless of session-version field. Use case: SIP UAs with buggy o= version
-; handling that don't bump version on legitimate media changes (without this
-; flag chan_sip would skip processing, leaving call media in stale state).
+; --- ignoresdpversion (RFC 3264 §8 o= version stickiness; chan_sip process_sdp_o parity) ---
+; Governs how chan_sofia treats an inbound re-offer (UPDATE / re-INVITE) that repeats the same
+; SDP session origin (the o= line):
 ;
-; chan_sip parity citations: chan_sip.c:28199-28201 verbatim parser via
-; handle_common_options indirection (L29544 [general] call site shares parser
-; with L28671 per-peer call site) + chan_sip.c:29539 verbatim default-init
-; via ast_clear_flag(global_flags[1], SIP_PAGE2_IGNORESDPVERSION) + sip.h:325
-; verbatim flag bit (1<<16) + chan_sip.c:10310-10330 verbatim use site at
-; process_sdp.
+;   no  (default) — HONOR the o= version. A re-offer with the same origin and an unchanged (<=)
+;                   session-version is treated as a no-op: the media/RTP remote is NOT re-applied,
+;                   so learned state is preserved. In particular the symmetric-RTP public address
+;                   of a NATed peer survives a keepalive re-offer that re-sends the private c=,
+;                   which would otherwise blackhole audio (this is the o=-stickiness fix, RFC 3264
+;                   §8; mirrors chan_sip's process_sdp_o skip-on-no-change gate).
+;   yes           — IGNORE the version and reprocess EVERY inbound SDP unconditionally. Escape
+;                   hatch for RFC-violating UAs that change media without bumping the o= version.
 ;
-; KNOWN LIMITATION: chan_sofia
-; processes EVERY inbound SDP unconditionally by design — ZERO sessionversion
-; tracking infrastructure exists (chan_sofia delegates SDP parsing to sofia-
-; sip; sofia-sip exposes sdp_origin_t with version field per sdp.h:49+86 but
-; chan_sofia never consumes it for skip-on-no-change). chan_sofia INTRINSIC
-; behavior matches chan_sip ignoresdpversion=yes ALWAYS regardless of flag
-; value. PARSE-COMPAT-ONLY ship: parse + store + AMI/CLI display but NO
-; behavioral wire-in (no gate to bypass).
-;
-; Operator action items:
-;   * ignoresdpversion=yes operators get parse-clean migration matching
-;     chan_sofia intrinsic baseline (no observable change; chan_sofia
-;     already behaves this way)
-;   * ignoresdpversion=no operators expecting chan_sip skip-on-no-change
-;     semantic: KNOWN LIMITATION — chan_sofia infrastructure ABSENT;
-;     chan_sofia will continue to process every SDP unconditionally
-;
-; A production sofia.conf has commented `;ignoresdpversion=yes` (operator-
-; aware-but-not-active) — finally parse-clean on next reload.
-;
-; Future-fix path: implement SDP version-tracking gate at sofia_process_invite
-; SDP handler if operator demand surfaces (~50-100 LoC follow-up).
-;
-; Reload-required note: changing ignoresdpversion= requires
-; `module reload chan_sofia.so` to update parsed value (no behavioral effect
-; until future-fix lands).
+; Per-peer ignoresdpversion= overrides this [general] default. chan_sip parity:
+; SIP_PAGE2_IGNORESDPVERSION (chan_sip.c process_sdp_o). Changing it takes effect on `sip reload`.
 ;
 ;ignoresdpversion = yes
 
@@ -2860,7 +2835,7 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;defaultuser=test
 ;fromuser=test
 ;fromdomain=192.0.2.47
-;transport=udp                ; chan_sofia: sets the OUTBOUND transport for a STATIC peer (tls/tcp/ws/wss/udp; a comma-list like tls,udp uses the first token; udp default, unknown values fall back to udp). Without it an outbound request to a static TLS/TCP/WS/WSS host silently defaults to UDP. This sets only the peer's outbound default; INBOUND server-accepted transports are controlled per-listener at [general] bindport / tcpbindaddr / tlsbindaddr / wsbindaddr / wssbindaddr, and per-Contact transport is derived from the Contact URL at REGISTER-time. For operators who need transport-based security, separate listeners + IP allowlists (host=<ip> / permit / deny) at the peer level are the real gate.
+;transport=udp                ; chan_sofia: sets the OUTBOUND transport for a STATIC peer (tls/tcp/ws/wss/udp; a comma-list like tls,udp uses the first token; udp default, unknown values fall back to udp). Without it an outbound request to a static TLS/TCP/WS/WSS host silently defaults to UDP. This sets only the peer's outbound default; INBOUND server-accepted transports are controlled per-listener at [general] bindport / tlsbindaddr / wsbindaddr / wssbindaddr, and per-Contact transport is derived from the Contact URL at REGISTER-time. For operators who need transport-based security, separate listeners + IP allowlists (host=<ip> / permit / deny) at the peer level are the real gate.
 ;disallow=all                ; Reset codec list
 ;allow=ulaw                  ; Allow specific codecs
 ;allow=alaw
@@ -2941,7 +2916,7 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;subscribemwi=no                 ; per-peer MWI model (chan_sip parity, default no). no = UNSOLICITED MWI: chan_sofia pushes a message-summary NOTIFY to the registered contact on each REGISTER and on every mailbox-count change, no SUBSCRIBE needed (RFC 3842; Subscription-State: active; sent via nua_method NOTIFY because this sofia-sip fork rejects an out-of-dialog nua_notify). yes = SUBSCRIBE-only: MWI is sent only on an active inbound MWI subscription dialog. A subscribing phone keeps its solicited NOTIFYs and is NOT also pushed unsolicited (no double-notify). Requires a peer mailbox= (see the MWI block above). chan_sip parity chan_sip.c:28902-28903 + sip.h:324 SIP_PAGE2_SUBSCRIBEMWIONLY.
 ;mwi_subscribe=100@default        ; OUTBOUND MWI WATCHER — chan_sofia as a SUBSCRIBER (DISTINCT from the inbound subscribemwi bool above). When set, after this trunk's REGISTER 200 (register=> trunks) or at load (static-host peers), chan_sofia sends a SUBSCRIBE for Event: message-summary to this peer/trunk and injects the upstream's Voice-Message: N/M (RFC 3842 simple-message-summary) into the LOCAL ast_event MWI cache as <localmailbox>[@context] (context defaults to "default"), so LOCAL phones watching that mailbox light up from an UPSTREAM voicemail server. SUBSCRIBE Expires = [general] mwi_expiry (default 3600s; sofia-sip auto-refreshes). Honors per-peer/[general] outboundproxy (initial Route). A failed INITIAL SUBSCRIBE (transport/DNS error, timeout, 423, or other final nua declined) is retried with backoff (30s→300s); an ESTABLISHED subscription is refreshed by sofia-sip; a TERMINAL auth rejection (bad/missing secret) is NOT retried (fix the secret + sip reload). A Subscription-State: terminated NOTIFY clears the local lamp (new=0/old=0) unless it carries a body, which is honored. Empty = off. NOTE: this is a chan_sofia capability with NO chan_sip equivalent (chan_sip's mailbox=/mwi=> model differs).
 ;preferred_codec_only=yes        ; preferred_codec_only per-peer parity (chan_sip drop-in): SDP codec-list narrowing — outbound m=audio offers/answers contain ONLY single most-preferred codec instead of full list. Default no. chan_sip parity chan_sip.c:28922-28923 verbatim ast_set2_flag SIP_PAGE2_PREFERRED_CODEC + sip.h:313 flag bit + L10076 use site. chan_sofia extension (Option 6-A): applies narrowing to BOTH initial-INVITE-offer AND response (chan_sip narrows RESPONSE-direction only).
-;ignoresdpversion=yes            ; ignoresdpversion per-peer parity (chan_sip drop-in PARSE-COMPAT-ONLY ship). chan_sip semantic: bypass inbound SDP o-line session-version skip-on-no-change gate. chan_sofia processes EVERY inbound SDP unconditionally by design (ZERO sessionversion-tracking infrastructure); chan_sofia INTRINSIC behavior matches chan_sip ignoresdpversion=yes ALWAYS. ignoresdpversion=yes operators: drop-in compat zero-rewrite. ignoresdpversion=no operators expecting chan_sip skip-on-no-change semantic: KNOWN LIMITATION (chan_sofia infrastructure ABSENT). Future-fix path: implement SDP version-tracking gate at sofia_process_invite (~50-100 LoC). chan_sip parity chan_sip.c:28199-28201 verbatim parser via handle_common_options + sip.h:325 SIP_PAGE2_IGNORESDPVERSION flag bit + chan_sip.c:10310-10330 use site at process_sdp.
+;ignoresdpversion=yes            ; per-peer RFC 3264 §8 o= version handling (chan_sip process_sdp_o parity); overrides the [general] default. no (default) = HONOR the o= version: a re-offer with the same origin + unchanged (<=) session-version is a no-op, preserving the learned media/RTP remote (so a NATed peer's symmetric-RTP public address survives a keepalive re-offer that re-sends the private c=). yes = IGNORE the version and reprocess every inbound SDP unconditionally (escape hatch for UAs that change media without bumping o=). chan_sip parity SIP_PAGE2_IGNORESDPVERSION.
 ;promiscredir=yes                ; promiscredir per-peer parity (chan_sip drop-in PARSE-COMPAT-ONLY ship). chan_sip semantic: when set + outbound INVITE returns 3xx Moved Temporarily → ast_string_field_build call_forward to "SIP/contact_number@host" format (allows remote peer to redirect outbound call via dialplan call-forward mechanism). Default no = chan_sip IGNORES 3xx Contact (security default; prevents un-trusted 3xx hijacking). chan_sofia nua_r_redirect handler ABSENT (sofia-sip exposes nua_r_redirect event in nua.h:151 but chan_sofia doesn't currently handle it); KNOWN LIMITATION promiscredir=yes operators get parse-clean migration but chan_sofia continues to ignore 3xx regardless. Future-fix path: implement nua_r_redirect handler + 3xx Contact parser + ast_channel.call_forward setter (~80-120 LoC). chan_sip parity chan_sip.c:28173-28175 verbatim parser via handle_common_options + sip.h:251 SIP_PROMISCREDIR (1<<11) flag bit + chan_sip.c:20907-20925 use site at 3xx Contact handler.
 ;autoframing=yes                 ; autoframing per-peer parity (chan_sip drop-in PARSE-COMPAT-ONLY ship). chan_sip semantic: when set, honor peer-advertised ptime in SDP via ast_codec_pref_setsize for codec packetization size. Default no = chan_sip uses fixed ptime from format prefs. chan_sofia sofia_parse_sdp infrastructure PRESENT but autoframing wire-in not implemented today; KNOWN LIMITATION autoframing=yes operators get parse-clean migration but chan_sofia continues to use sofia-sip default ptime negotiation regardless. Future-fix path ~50-70 LoC follow-up. chan_sip parity chan_sip.c:28924-28925 verbatim per-peer parser (DIRECT build_peer NOT handle_common_options) + chan_sip.c:10415 use site at SDP parse + chan_sip.c:12663 use site at SDP generate.
 ;faxdetect=yes                   ; faxdetect per-peer multi-mode parity (chan_sip drop-in PARSE-COMPAT-ONLY ship). 4-state values: no (default; NONE) / cng (1; CNG tone only) / t38 (2; T.38 reinvite only) / yes or cng,t38 (3; BOTH). chan_sip semantic: detect inband fax CNG via ast_dsp DSP_FEATURE_FAX_DETECT + T.38 reinvite from peer; auto-switch to fax handling. chan_sofia DSP infrastructure PRESENT (T26 inband DTMF) but T26 doxygen explicit fax-CNG deferral baseline; T.38 LARGE infrastructure ABSENT. KNOWN LIMITATION faxdetect=yes/cng/t38 operators get parse-clean migration but chan_sofia continues to ignore CNG + T.38 reinvites regardless. Future-fix ~150-200+ LoC within T.38 LARGE dedicated task. chan_sip parity chan_sip.c:28202-28221 verbatim multi-mode parser via handle_common_options + sip.h:341-344 verbatim 2-bit flag encoding + 5+ use sites L4945+L6282+L8186-8288+L10196.
@@ -2976,7 +2951,7 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;                 a comma-list like tls,udp uses the first token; udp default, unknown
 ;                 values fall back to udp). chan_sofia does not gate per-peer INBOUND
 ;                 transport: server-accepted transports are controlled per-listener at
-;                 [general] bindport / tcpbindaddr / tlsbindaddr / wsbindaddr /
+;                 [general] bindport / tlsbindaddr / wsbindaddr /
 ;                 wssbindaddr; per-Contact transport is derived from the Contact URL
 ;                 scheme at REGISTER-time. Use separate listeners + IP allowlists for
 ;                 transport-based security.
