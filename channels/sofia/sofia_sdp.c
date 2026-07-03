@@ -413,11 +413,14 @@ static void sofia_h264_profile4(const char *fmtp, char *out)
  * can only return the selected one, and report the packetization-mode.
  *
  * When `desired_valid` (a cross-leg config was already propagated into this pvt from request_call / the
- * fork / the caller mask), CONSTRAIN the choice to a PT COMPATIBLE with it — same packetization-mode and
- * same profile_idc/profile-iop (level may differ, §8.2.2). If NONE is compatible, remove ALL H264 PTs
- * (fall back to VP8/audio-only) rather than relay an incompatible config — never bridge mode0<->mode1.
- * With no desired config, free-select (prefer packetization-mode=1, else the first H264 PT). Returns 1 if
- * an H264 config was selected. Read-only on `media`. */
+ * fork / the caller mask), CONSTRAIN the choice to a PT COMPATIBLE with it. Compatibility policy:
+ * packetization-mode is STRICT (mode0's Single-NAL vs mode1's FU-A are not passthrough-compatible), while
+ * profile-level-id is matched LENIENTLY — an EXPLICIT profile_idc/iop mismatch (both sides carry
+ * profile-level-id) is rejected, but a side that OMITS profile-level-id is accepted for real-world legacy
+ * interop (level may differ per §8.2.2; strict RFC fail-closed on absent profile is deferred). If NONE is
+ * compatible, remove ALL H264 PTs (fall back to VP8/audio-only) rather than relay an incompatible config —
+ * never bridge mode0<->mode1. With no desired config, free-select (prefer packetization-mode=1, else the
+ * first H264 PT). Returns 1 if an H264 config was selected. Read-only on `media`. */
 static int sofia_sdp_select_h264(sdp_media_t *media, struct ast_rtp_codecs *staged,
 	int desired_valid, int desired_pmode, const char *desired_fmtp,
 	char *out_fmtp, size_t out_fmtp_sz, int *out_pmode)
