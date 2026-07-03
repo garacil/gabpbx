@@ -806,8 +806,8 @@ srvlookup=yes
 ; legacy). Operators with chan_sip [general] defaultexpiry configs migrate verbatim;
 ; chan_sofia operators using per-peer alias see no behavior change.
 ;
-;minexpiry      = 60       ; minimum REGISTER expires (seconds); under-min rejected with 423
-;maxexpiry      = 3600     ; maximum REGISTER expires (seconds); over-max silently capped
+minexpiry      = 90        ; minimum REGISTER expires (seconds); under-min rejected with 423 Min-Expires:90
+maxexpiry      = 3600      ; maximum REGISTER expires (seconds); over-max silently capped
 ;defaultexpiry  = 120      ; fallback expires when peer omits Expires header; also peer->expiresecs default
 ;
 ; Typo-tolerance variants accepted (chan_sip parity): minexpirey / maxexpirey / defaultexpirey
