@@ -785,7 +785,7 @@ static int sofia_build_nat_proxy_url_from_peer(const struct sofia_peer *peer,
  * Returns 1 if filled, 0 if no NAT routing override is needed (not NAT/ws-wss, src unknown, or src
  * already == the Contact host:port). Snapshots the refresh-mutable contact fields under ao2_lock(c)
  * and the peer nat flag under peer->lock, mirroring the sibling helpers. */
-static int sofia_build_contact_proxy_url(const struct sofia_peer *peer, struct sofia_contact *c,
+int sofia_build_contact_proxy_url(const struct sofia_peer *peer, struct sofia_contact *c,
                                          char *buf, size_t len)
 {
 	char host_buf[80];
@@ -974,7 +974,7 @@ void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
  * stored RFC 3327 Path (ready "<uri;lr>,..." Route value) for pre-loading on the
  * INVITE. Lock order: takes ONLY the contact ao2 lock (the caller must not hold it).
  */
-static void sofia_build_contact_ruri(struct sofia_contact *c, const char *user,
+void sofia_build_contact_ruri(struct sofia_contact *c, const char *user,
 	char *out, size_t outlen, int path_support, char *path_out, size_t path_outlen)
 {
 	char hbuf[80];
@@ -9604,6 +9604,81 @@ int sofia_message_authenticate(struct sofia_peer *peer, nua_t *nua, nua_handle_t
 	return (auth_res == SOFIA_AUTH_OK) ? 0 : 1;
 }
 
+/* Identify + authenticate the sender of an out-of-dialog MESSAGE (RFC 3261 §22 parity with
+ * INVITE/REGISTER). The sender is keyed by the digest Authorization username, NOT the From-user — in a
+ * numeric-extension deployment the From-user is the dialed number while the peer/auth name differs, so a
+ * From-user lookup would fail and leave no trustworthy subscribecontext. Flow: pick the auth username
+ * (falls back to From-user), find the peer, verify the digest; challenge an unknown/unauthenticated
+ * sender (alwaysauthreject parity) so the UA re-sends with Authorization and is then identified by the
+ * auth username. Returns the authenticated peer (ao2 +1, caller releases) with *challenged=0; on a
+ * 401/4xx it reaps the out-of-dialog handle and returns NULL with *challenged=1; an anonymous, un-
+ * challenged sender returns NULL with *challenged=0 (caller's guest policy decides). sofia_thread. */
+struct sofia_peer *sofia_message_authenticate_sender(nua_t *nua, nua_handle_t *nh, sip_t const *sip,
+		int *challenged)
+{
+	const char *from_user = NULL;
+	char auth_user_buf[128];
+	const char *auth_user;
+	struct sofia_peer *peer;
+
+	if (challenged) {
+		*challenged = 0;
+	}
+	if (sip && sip->sip_from && sip->sip_from->a_url) {
+		from_user = sip->sip_from->a_url->url_user;
+	}
+	auth_user = sofia_pick_auth_username(sip, from_user, auth_user_buf, sizeof(auth_user_buf));
+	peer = (!ast_strlen_zero(auth_user)) ? sofia_find_peer(auth_user) : NULL;
+
+	/* Source-IP ACL (peer->ha) BEFORE the digest, parity with INVITE/REGISTER/SUBSCRIBE. On deny, drop
+	 * the peer and fall to the unknown-peer challenge below (401) rather than 403, so peer existence is
+	 * not leaked (anti-enumeration). sofia_thread: peer->ha is stable during processing. */
+	if (peer && peer->ha) {
+		struct ast_sockaddr src;
+		sofia_get_source_addr(sip, &src);
+		if (ast_apply_ha(peer->ha, &src) != AST_SENSE_ALLOW) {
+			char realm_buf[MAXHOSTNAMELEN];
+			const char *realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
+			ast_log(LOG_NOTICE, "Sofia: MESSAGE from %s rejected by peer '%s' ACL\n",
+				ast_sockaddr_stringify(&src), peer->name);
+			ao2_ref(peer, -1);
+			/* TERMINAL: challenge (401, anti-enumeration) and stop — never fall through to the guest
+			 * message_context path, else a denied peer could inject under allowguest=yes. */
+			sofia_send_auth_challenge(nua, nh, sip, realm, "MESSAGE", "ACLDenied", NULL, 1);
+			if (challenged) {
+				*challenged = 1;
+			}
+			return NULL;
+		}
+	}
+
+	if (peer) {
+		if (sofia_message_authenticate(peer, nua, nh, sip)) {
+			/* verifier already emitted the 401/4xx; reap the fresh out-of-dialog handle */
+			ao2_ref(peer, -1);
+			if (nua_handle_magic(nh) == NULL) {
+				nua_handle_destroy(nh);
+			}
+			if (challenged) {
+				*challenged = 1;
+			}
+			return NULL;
+		}
+		return peer;	/* authenticated; caller releases */
+	}
+
+	if (sofia_cfg.alwaysauthreject) {
+		char realm_buf[MAXHOSTNAMELEN];
+		const char *realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
+		sofia_send_auth_challenge(nua, nh, sip, realm, "MESSAGE", "UnknownPeer", NULL, 1);
+		if (challenged) {
+			*challenged = 1;
+		}
+		return NULL;
+	}
+	return NULL;	/* guest; caller's allowguest policy decides */
+}
+
 /* domainsasrealm (chan_sip parity): when set + domain_list non-empty, check the
  * From-header domain then the To-header domain; if either matches a configured
  * domain, use it as the auth realm. Falls back to sofia_cfg.realm (or "gabpbx")
@@ -15169,6 +15244,9 @@ static void *sofia_thread_func(void *data)
 	 * (no soa) the stack cannot run the UPDATE offer/answer, so chan_sofia owns the SDP (sofia_process_update). */
 	nua_set_params(sofia_nua, NUTAG_APPL_METHOD("UPDATE"), TAG_END());
 	nua_set_params(sofia_nua, NUTAG_APPL_METHOD("REFER"), TAG_END());
+	/* MESSAGE (RFC 3428): APPL_METHOD so chan_sofia owns the FINAL response (401 challenge / native relay
+	 * 202-480 / dialplan) — without it the stack auto-answers 200 OK before our app can challenge or relay. */
+	nua_set_params(sofia_nua, NUTAG_APPL_METHOD("MESSAGE"), TAG_END());
 
 	/* Allow event packages one at a time */
 	nua_set_params(sofia_nua, NUTAG_ALLOW_EVENTS("presence"), TAG_END());
@@ -16049,6 +16127,9 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "message_context")) {
 			/* [general] default context for inbound out-of-dialog MESSAGE -> dialplan; empty = SIP SIMPLE messaging OFF. */
 			ast_copy_string(sofia_cfg.message_context, v->value, sizeof(sofia_cfg.message_context));
+		} else if (!strcasecmp(v->name, "message_autorelay")) {
+			/* native peer-to-peer MESSAGE relay (hint -> registered contact); default on. */
+			sofia_cfg.message_autorelay = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "maxexpiry") || !strcasecmp(v->name, "maxexpirey")) {
 			/* Registration TTL bound + 423 Interval Too Brief; typo-tolerant dual-spelling. */
 			sofia_cfg.max_expiry = atoi(v->value);
@@ -17297,6 +17378,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.regextenonqualify = 0;
 	sofia_cfg.default_subscribecontext[0] = '\0';
 	sofia_cfg.message_context[0] = '\0';   /* SIP SIMPLE messaging OFF by default (opt-in). */
+	sofia_cfg.message_autorelay = 1;       /* native peer-to-peer MESSAGE relay ON by default. */
 	/* registration TTL bounds + 423 Interval Too Brief (60/3600/120). */
 	sofia_cfg.min_expiry     = DEFAULT_MIN_EXPIRY;
 	sofia_cfg.max_expiry     = DEFAULT_MAX_EXPIRY;

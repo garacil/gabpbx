@@ -10,9 +10,11 @@
 /*! \file sofia_message.c
  * \brief chan_sofia out-of-dialog SIP SIMPLE messaging (MESSAGE), split from chan_sofia.c.
  *
- * chan_sofia-native: inbound out-of-dialog MESSAGE -> message_context dialplan (opt-in);
- * outbound via SofiaSendMessage (dialplan) + SofiaMessageSend (AMI). struct sofia_message is the
- * forward-compat seam for a future ast_msg core port. All nua_* on sofia_thread.
+ * chan_sofia-native: inbound out-of-dialog MESSAGE from an authenticated sender is natively RELAYED to a
+ * registered local peer resolved via the sender's subscribecontext hint (exten -> SIP/<peer>), fanned out
+ * to the peer's live contacts (message_autorelay, default on); it otherwise falls through to the opt-in
+ * message_context dialplan. Explicit outbound via SofiaSendMessage (dialplan) + SofiaMessageSend (AMI).
+ * All nua_* on sofia_thread.
  */
 
 #include "gabpbx.h"
@@ -43,6 +45,8 @@ struct sofia_message {
 	char from[256];          /* From URI (sip:user@host) */
 	char from_display[128];  /* From display-name */
 	char to[256];            /* To URI */
+	char route[1024];        /* RFC 3327 Path as a ready Route (NUTAG_INITIAL_ROUTE_STR on the handle); "" = none */
+	char proxy[256];         /* NAT NUTAG_PROXY override on the message op (learned public src); "" = none */
 	char ruri[256];          /* Request-URI */
 	char peer[80];           /* matched local peer name, "" if guest */
 	char context[AST_MAX_CONTEXT];  /* resolved dialplan context (inbound) */
@@ -78,6 +82,13 @@ static void sofia_message_format_url(url_t const *url, char *out, size_t outlen)
 			url->url_host ? url->url_host : "");
 	}
 }
+
+/* Native peer-to-peer relay: resolve exten via the sender's subscribecontext hint (exten -> SIP/<peer>)
+ * and re-originate the MESSAGE to the resolved local peer(s)' live contact(s). Returns the SIP code to
+ * answer the sender: 202 (>=1 contact queued), 480 (hint resolves to a peer with no live contact), or
+ * 0 = "not a local hinted extension" (caller falls through to the message_context/dialplan path). */
+static int sofia_message_relay_local(const char *exten, const char *subscribecontext, const char *to_aor,
+		const char *from, const char *body, const char *content_type);
 
 /* Allocate a media-less channel that runs the dialplan for one inbound out-of-dialog
  * MESSAGE. Keeps the core null_tech (ast_channel_alloc default) - no media, hangs up cleanly. */
@@ -119,67 +130,104 @@ static void sofia_message_respond_and_reap(nua_t *nua, nua_handle_t *nh, int cod
 	}
 }
 
-/* Inbound out-of-dialog MESSAGE -> dialplan (chan_sofia-native SIP SIMPLE). Opt-in:
- * delivers only when a [general] or per-peer message_context resolves; else 405. Runs on
- * sofia_thread (event callback); the launched channel runs the dialplan on its own thread. */
+/* Inbound out-of-dialog MESSAGE (chan_sofia-native SIP SIMPLE). Authenticate the sender (by Authorization
+ * username), then: if message_autorelay and the To-user resolves through the sender's subscribecontext
+ * hint to a registered local peer, natively re-originate the MESSAGE to that peer's live contact(s)
+ * (202/480); otherwise fall through to the opt-in message_context dialplan (405 when no context). Runs on
+ * sofia_thread (event callback); a launched dialplan channel runs on its own thread. */
 static void sofia_message_deliver_inbound(nua_t *nua, nua_handle_t *nh, sip_t const *sip,
 		const char *body)
 {
 	struct sofia_peer *peer;
 	struct sofia_message *m;
 	char context[AST_MAX_CONTEXT] = "";
+	char subscribecontext[AST_MAX_CONTEXT] = "";
 	char peername[80] = "";
 	char exten[AST_MAX_EXTENSION] = "";
-	const char *from_user = NULL;
+	char to_aor[256] = "";
+	char from_uri[256] = "";
+	char from_host[128] = "";
+	char sender_regexten[AST_MAX_EXTENSION] = "";
+	const char *content_type = "text/plain";
+	int challenged = 0;
 
 	if (sip->sip_to && sip->sip_to->a_url && sip->sip_to->a_url->url_user) {
 		ast_copy_string(exten, sip->sip_to->a_url->url_user, sizeof(exten));
 	}
+	if (sip->sip_to && sip->sip_to->a_url) {
+		sofia_message_format_url(sip->sip_to->a_url, to_aor, sizeof(to_aor));	/* original logical To, preserved verbatim */
+	}
+	if (sip->sip_from && sip->sip_from->a_url && sip->sip_from->a_url->url_host) {
+		ast_copy_string(from_host, sip->sip_from->a_url->url_host, sizeof(from_host));
+	}
 	if (sip->sip_from && sip->sip_from->a_url) {
-		from_user = sip->sip_from->a_url->url_user;
+		sofia_message_format_url(sip->sip_from->a_url, from_uri, sizeof(from_uri));	/* fallback (guest) From */
+	}
+	if (sip->sip_content_type && sip->sip_content_type->c_type) {
+		content_type = sip->sip_content_type->c_type;
 	}
 
-	/* Resolve the sender peer (NULL = guest); snapshot its message_context + name.
-	 * The ref is held across the digest gate below (the verifier reads peer fields),
-	 * then released. */
-	peer = from_user ? sofia_find_peer(from_user) : NULL;
+	/* Identify + authenticate the sender by the digest Authorization username (NOT the From-user, which
+	 * in a numeric-extension deployment is the dialed number, not the peer name). Challenges an
+	 * unknown/unauthenticated sender (alwaysauthreject parity); on a challenge the 401/4xx is emitted and
+	 * the out-of-dialog handle reaped. Only an authenticated sender's tenant subscribecontext is trusted. */
+	peer = sofia_message_authenticate_sender(nua, nh, sip, &challenged);
+	if (challenged) {
+		return;
+	}
+	/* peer != NULL => authenticated sender; peer == NULL => un-challenged guest (alwaysauthreject off). */
 	if (peer) {
 		ast_mutex_lock(&peer->lock);
 		if (!ast_strlen_zero(peer->message_context)) {
 			ast_copy_string(context, peer->message_context, sizeof(context));
 		}
+		ast_copy_string(subscribecontext, peer->subscribecontext, sizeof(subscribecontext));
 		ast_copy_string(peername, peer->name, sizeof(peername));
+		ast_copy_string(sender_regexten, peer->regexten, sizeof(sender_regexten));
 		ast_mutex_unlock(&peer->lock);
+		ao2_ref(peer, -1);
 	}
 
-	/* Context: peer override else [general]; both empty -> messaging OFF (405). */
+	/* Relay From = the sender's LOGICAL extension (its regexten, first token), NOT the peer name — some
+	 * UAs (e.g. SIP.js Browser Phone) drop an inbound MESSAGE whose From-user is longer than the extension
+	 * length. Plain URI, no display name: avoids display quoting/sanitization risk and Browser Phone keys
+	 * off the URI user anyway. Guests (no regexten) keep the verbatim From. */
+	if (!ast_strlen_zero(sender_regexten) && !ast_strlen_zero(from_host)) {
+		char *p;
+		if ((p = strchr(sender_regexten, '&'))) {
+			*p = '\0';	/* multi-token regexten -> first */
+		}
+		if ((p = strchr(sender_regexten, '@'))) {
+			*p = '\0';	/* strip a per-token @context */
+		}
+		snprintf(from_uri, sizeof(from_uri), "sip:%s@%s", sender_regexten, from_host);
+	}
+
+	/* Native peer-to-peer relay (RFC 3428 §10): an authenticated sender's MESSAGE whose To-user resolves
+	 * through the sender's OWN subscribecontext hint (exten -> SIP/<peer>, tenant-scoped) is re-originated
+	 * to that registered local peer's live contact(s). Falls through to the message_context dialplan path
+	 * when the extension is not a local hinted peer. */
+	if (sofia_cfg.message_autorelay && !ast_strlen_zero(subscribecontext) && !ast_strlen_zero(exten)) {
+		int code = sofia_message_relay_local(exten, subscribecontext, to_aor, from_uri, body, content_type);
+		if (code == 202) {
+			sofia_message_respond_and_reap(nua, nh, 202, "Accepted");
+			return;
+		}
+		if (code == 480) {
+			sofia_message_respond_and_reap(nua, nh, 480, "Temporarily Unavailable");
+			return;
+		}
+		/* code == 0: not a local hinted extension -> fall through. */
+	}
+
+	/* Fallback: opt-in message_context dialplan. Context = the authenticated peer's override (snapshotted
+	 * above) else [general]; both empty -> messaging OFF (405). */
 	if (ast_strlen_zero(context)) {
 		ast_copy_string(context, sofia_cfg.message_context, sizeof(context));
 	}
 	if (ast_strlen_zero(context)) {
-		if (peer) {
-			ao2_ref(peer, -1);
-		}
 		sofia_message_respond_and_reap(nua, nh, 405, "Method Not Allowed");
 		return;
-	}
-
-	/* DIGEST GATE (RFC 3428): a matched, credentialed sender must pass the SAME
-	 * challenge/verify as INVITE before the From-user is trusted as the peer and
-	 * routed to the dialplan — without this an attacker who only knows a peer name
-	 * could inject messages under that identity. The helper emits the 401/4xx and
-	 * returns nonzero; we reap the out-of-dialog handle (sofia_verify_digest_auth
-	 * does not destroy it) and stop. An unmatched (guest) sender is NOT challenged
-	 * here and still falls to the allowguest policy below. */
-	if (peer && sofia_message_authenticate(peer, nua, nh, sip)) {
-		ao2_ref(peer, -1);
-		if (nua_handle_magic(nh) == NULL) {
-			nua_handle_destroy(nh);	/* reap fresh out-of-dialog handle (the 401/4xx is already sent) */
-		}
-		return;
-	}
-	if (peer) {
-		ao2_ref(peer, -1);
 	}
 
 	/* Known-peer policy: reject anonymous senders when guests are disallowed. */
@@ -315,25 +363,163 @@ static void sofia_message_send_root(void *data)
 {
 	struct sofia_message *m = data;
 	nua_handle_t *nh;
+	const char *url;
 
 	if (!sofia_nua) {
 		sofia_message_free(m);
 		return;
 	}
-	nh = nua_handle(sofia_nua, NULL, NUTAG_URL(m->to), TAG_END());
+	/* Routing target (Request-URI) = the per-contact ruri when relaying (learned WSS/UDP host:port); the
+	 * To header stays the logical AOR (m->to) so the recipient recognizes itself. The SofiaSendMessage
+	 * path leaves ruri empty and routes on m->to as before. */
+	url = !ast_strlen_zero(m->ruri) ? m->ruri : m->to;
+	nh = nua_handle(sofia_nua, NULL, NUTAG_URL(url),
+		TAG_IF(!ast_strlen_zero(m->route), NUTAG_INITIAL_ROUTE_STR(m->route)),	/* RFC 3327 Path as Route (per-contact) */
+		TAG_END());
 	if (!nh) {
 		sofia_message_free(m);
 		return;
 	}
 	nua_handle_bind(nh, SOFIA_OUTMSG_HMAGIC);
 	nua_message(nh,
-		NUTAG_URL(m->to),
+		NUTAG_URL(url),
 		SIPTAG_TO_STR(m->to),
 		TAG_IF(!ast_strlen_zero(m->from), SIPTAG_FROM_STR(m->from)),
+		TAG_IF(!ast_strlen_zero(m->proxy), NUTAG_PROXY(m->proxy)),	/* NAT: steer to the contact's learned public source (operation-level) */
 		SIPTAG_CONTENT_TYPE_STR(m->content_type[0] ? m->content_type : "text/plain"),
 		SIPTAG_PAYLOAD_STR(m->body ? m->body : ""),
 		TAG_END());
 	sofia_message_free(m);
+}
+
+/* Dispatch one out-of-dialog MESSAGE: ruri = the per-contact routing target (Request-URI, learned
+ * source), to_aor = the logical To header (the recipient's AOR, so it recognizes itself), plus the
+ * per-contact RFC 3327 Path (Route) and NAT proxy. Marshalled onto sofia_thread; reaped via the sentinel. */
+static int sofia_message_dispatch(const char *ruri, const char *to_aor, const char *route, const char *proxy,
+		const char *from, const char *body, const char *content_type)
+{
+	struct sofia_message *m;
+
+	if (ast_strlen_zero(ruri)) {
+		return -1;
+	}
+	m = ast_calloc(1, sizeof(*m));
+	if (!m) {
+		return -1;
+	}
+	ast_copy_string(m->ruri, ruri, sizeof(m->ruri));	/* Request-URI = routing target */
+	ast_copy_string(m->to, !ast_strlen_zero(to_aor) ? to_aor : ruri, sizeof(m->to));	/* To header = AOR */
+	if (!ast_strlen_zero(route)) {
+		ast_copy_string(m->route, route, sizeof(m->route));
+	}
+	if (!ast_strlen_zero(proxy)) {
+		ast_copy_string(m->proxy, proxy, sizeof(m->proxy));
+	}
+	if (!ast_strlen_zero(from)) {
+		ast_copy_string(m->from, from, sizeof(m->from));
+	}
+	ast_copy_string(m->content_type, ast_strlen_zero(content_type) ? "text/plain" : content_type,
+		sizeof(m->content_type));
+	m->body = ast_strdup(body ? body : "");
+	if (!m->body) {
+		sofia_message_free(m);
+		return -1;
+	}
+	m->body_len = strlen(m->body);
+	if (sofia_dispatch_to_root_thread(sofia_message_send_root, m) < 0) {
+		sofia_message_free(m);
+		return -1;
+	}
+	return 0;
+}
+
+/* Fan a MESSAGE out to every unexpired registered contact of a resolved local peer, mirroring the fork's
+ * per-contact routing (RURI from the learned source + RFC 3327 Path + NAT proxy). Returns the count of
+ * contacts the send was queued to. Must NOT hold peer->lock (iterates the contacts container). */
+static int sofia_message_relay_to_peer(struct sofia_peer *peer, const char *to_aor, const char *from,
+		const char *body, const char *content_type)
+{
+	struct ao2_iterator ci;
+	struct sofia_contact *c;
+	char user[80];
+	int path_support;
+	int queued = 0;
+	time_t now = time(NULL);
+
+	if (!peer || !peer->contacts) {
+		return 0;
+	}
+	ast_mutex_lock(&peer->lock);
+	ast_copy_string(user, S_OR(peer->defaultuser, peer->name), sizeof(user));
+	path_support = peer->path_support;	/* Path is an opt-in trust decision (mirror the fork/INVITE) */
+	ast_mutex_unlock(&peer->lock);
+
+	/* To header = the ORIGINAL logical To AOR the sender addressed (e.g. sip:200@domain), preserved
+	 * verbatim (RFC 3428 / FreeSWITCH dup_dest) so the recipient UI recognizes it; the Request-URI stays
+	 * the per-contact routing target below. */
+
+	ci = ao2_iterator_init(peer->contacts, 0);
+	while ((c = ao2_iterator_next(&ci))) {
+		char ruri[256] = "";
+		char path[1024] = "";
+		char proxy[256] = "";
+		time_t c_exp;
+
+		ao2_lock(c);
+		c_exp = c->expires;	/* REGISTER refresh mutates expires under the contact ao2 lock — snapshot it */
+		ao2_unlock(c);
+		if (c_exp > now) {	/* routable only while the registration is unexpired (RFC 3261 §10.3) */
+			sofia_build_contact_ruri(c, user, ruri, sizeof(ruri), path_support, path, sizeof(path));
+			sofia_build_contact_proxy_url(peer, c, proxy, sizeof(proxy));
+			if (!ast_strlen_zero(ruri)
+					&& sofia_message_dispatch(ruri, to_aor, path, proxy, from, body, content_type) == 0) {
+				queued++;
+			}
+		}
+		ao2_ref(c, -1);
+	}
+	ao2_iterator_destroy(&ci);
+	return queued;
+}
+
+/* Native peer-to-peer relay: resolve exten through the sender's subscribecontext hint (chan_sofia's own
+ * location service: exten -> "SIP/<peer>") and re-originate to the resolved local peer(s)' live contacts. */
+static int sofia_message_relay_local(const char *exten, const char *subscribecontext, const char *to_aor,
+		const char *from, const char *body, const char *content_type)
+{
+	char hintdev[512] = "";
+	char *devs, *dev;
+	int found = 0, queued = 0;
+
+	if (ast_strlen_zero(exten) || ast_strlen_zero(subscribecontext)) {
+		return 0;	/* no tenant namespace -> fall through */
+	}
+	if (!ast_get_hint(hintdev, sizeof(hintdev), NULL, 0, NULL, subscribecontext, exten)
+			|| ast_strlen_zero(hintdev)) {
+		return 0;	/* no such hinted extension in this tenant -> fall through (dialplan/404) */
+	}
+	devs = ast_strdupa(hintdev);
+	while ((dev = strsep(&devs, "&"))) {
+		struct sofia_peer *dst;
+		dev = ast_strip(dev);
+		if (strncasecmp(dev, "SIP/", 4)) {
+			continue;	/* only our own tech */
+		}
+		dst = sofia_find_peer(dev + 4);
+		if (!dst) {
+			continue;
+		}
+		found++;
+		queued += sofia_message_relay_to_peer(dst, to_aor, from, body, content_type);
+		ao2_ref(dst, -1);
+	}
+	if (queued > 0) {
+		return 202;	/* Accepted: queued to >=1 live contact */
+	}
+	if (found > 0) {
+		return 480;	/* extension resolves but has no live contact (registered-but-offline) */
+	}
+	return 0;	/* hint pointed only at non-SIP/unknown devices -> fall through */
 }
 
 /* Resolve an outbound MESSAGE target. dest = "sip:..." used verbatim; else treated as a

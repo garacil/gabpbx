@@ -733,7 +733,17 @@ srvlookup=yes
 
 ;
 ; --- SIP instant messaging (SIMPLE, out-of-dialog MESSAGE) ---
-; OPT-IN: when message_context is set, an out-of-dialog SIP MESSAGE is routed to that
+; NATIVE PEER-TO-PEER RELAY (default ON): an authenticated sender's out-of-dialog MESSAGE
+; whose To-user resolves — through the SENDER's own subscribecontext hint namespace
+; (exten -> SIP/<peer>, the same auto-created BLF/regexten hints, tenant-scoped) — to a
+; registered local peer is re-originated to that peer's live contact(s) (all of them),
+; answering 202. If the extension resolves but the peer has no live contact: 480. This
+; needs no dialplan. Disable with message_autorelay=no to keep only the message_context
+; path below. The sender is identified/challenged by its digest Authorization username.
+;message_autorelay = yes                 ; [general] native peer-to-peer MESSAGE relay (default yes)
+;
+; OPT-IN dialplan path (used when the relay is off, or the To-user is not a local hinted
+; peer): when message_context is set, an out-of-dialog SIP MESSAGE is routed to that
 ; dialplan context (exten = the To-user). With neither a per-peer nor a [general]
 ; message_context, an out-of-dialog MESSAGE is answered 405 (messaging off). An in-call
 ; MESSAGE always reaches the channel as a TEXT frame regardless of this setting.

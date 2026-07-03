@@ -222,6 +222,19 @@ struct sofia_peer *sofia_find_peer_cached(const char *name);	/* cache-only: no r
  * SAME path as INVITE before dialplan. peer NULL or creds-less -> 0 (proceed; caller's allowguest
  * applies for guests). Returns 0 = proceed, nonzero = 401/4xx already sent, STOP + reap the handle. */
 int sofia_message_authenticate(struct sofia_peer *peer, nua_t *nua, nua_handle_t *nh, sip_t const *sip);
+/* Identify + authenticate the sender of an out-of-dialog MESSAGE by the digest Authorization username
+ * (challenges an unknown/unauthenticated sender, alwaysauthreject parity). Returns the authenticated peer
+ * (ao2 +1, caller releases) with *challenged=0; NULL + *challenged=1 when a 401/4xx was sent (handle
+ * reaped); NULL + *challenged=0 for an un-challenged guest. Used by the native MESSAGE relay. */
+struct sofia_peer *sofia_message_authenticate_sender(nua_t *nua, nua_handle_t *nh, sip_t const *sip,
+		int *challenged);
+/* Per-registered-contact routing (shared with the fork/INVITE path): build this contact's outbound RURI
+ * (ws/wss target the learned src, else host:port; transport appended) and, when path_support, its RFC 3327
+ * Path as a ready Route; and its NAT NUTAG_PROXY override (returns 1 if a proxy override is needed). */
+void sofia_build_contact_ruri(struct sofia_contact *c, const char *user, char *out, size_t outlen,
+		int path_support, char *path_out, size_t path_outlen);
+int sofia_build_contact_proxy_url(const struct sofia_peer *peer, struct sofia_contact *c,
+		char *buf, size_t len);
 /* Normalize peer/[general] outboundproxy into a "sip:HOST[:PORT];lr" Route; buf empty if none.
  * Caller MUST hold peer->lock. Shared by REGISTER + the outbound MWI SUBSCRIBE (sofia_subscribe.c). */
 void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len);
@@ -865,6 +878,7 @@ struct sofia_config {
 	/* default routing context for SUBSCRIBE dispatch, inherited by peers. EFFECT-PENDING: MWI handler uses peer->mailboxes, unknown events auto-202 (no dialplan dispatch yet). */
 	char default_subscribecontext[AST_MAX_CONTEXT];
 	char message_context[AST_MAX_CONTEXT];  /* [general] default context for out-of-dialog inbound MESSAGE -> dialplan; empty = SIP SIMPLE messaging OFF */
+	int message_autorelay;  /* native peer-to-peer MESSAGE relay: an authenticated sender's inbound MESSAGE whose To-user resolves (via the sender's subscribecontext hint, exten -> SIP/<peer>) to a registered local peer is re-originated to that peer's live contact(s). Default 1 (on). 0 = only the message_context dialplan path. */
 	/* registration TTL bounds ([general]-only); typo-tolerant Xexpiry/Xexpirey parse for chan_sip migration. */
 	int min_expiry;     /* default 60s — under this rejects 423 Interval Too Brief + Min-Expires (RFC 3261 §10.2.8) */
 	int max_expiry;     /* default 3600s — over this silently caps */
