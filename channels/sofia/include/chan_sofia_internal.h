@@ -217,8 +217,8 @@ int sofia_webrtc_provision_offer(struct sofia_pvt *pvt);
 /* is_answer=1 => we are building the SDP ANSWER to a received offer, so the media
  * direction MIRRORS the offered per-media mode (RFC 3264 §6.1: sendonly->recvonly,
  * recvonly->sendonly, inactive->inactive, else sendrecv) using pvt->offered_*_mode.
- * is_answer=0 => we are building an OFFER; direction is always sendrecv (chan_sofia has
- * no SIP local-hold-offer path today — AST_CONTROL_HOLD only starts local MOH). */
+ * is_answer=0 => we are building an OFFER; direction reflects pvt->local_hold_mode
+ * (0 sendrecv / 1 sendonly / 2 inactive), driven by the hold_reinvite knob. */
 char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_answer);
 int sofia_sdp_extract_hold(sip_t const *sip, su_home_t *home);
 
@@ -436,6 +436,16 @@ enum sofia_dialog_state {
 	SOFIA_DIALOG_STATE_UP,
 };
 
+/* Why an in-dialog re-INVITE we sent is outstanding — the 2xx/reject handler branches on this so each
+ * purpose only runs its own rollback (directmedia clears redirip + reverts to relay; T.38 drops a stuck
+ * LOCAL_REINVITE; local hold only reverts the offered direction). */
+enum sofia_reinvite_purpose {
+	SOFIA_REINVITE_NONE = 0,
+	SOFIA_REINVITE_DIRECTMEDIA,
+	SOFIA_REINVITE_T38,
+	SOFIA_REINVITE_LOCAL_HOLD,
+};
+
 /* The per-call/dialog object — the central media/signaling state. Shared so the SDP, T.38, register
  * and CLI(show channels) modules can reference it. */
 struct sofia_pvt {
@@ -511,11 +521,14 @@ struct sofia_pvt {
 	char fork_branch_id[SOFIA_FORK_ID_LEN];
 	struct sofia_contact *active_contact;  /* contact this call is on (holds ao2 ref) */
 	struct ast_sockaddr redirip;     /* directmedia: peer's RTP target; zero = relay through PBX */
-	int reinvite_pending;            /* directmedia re-INVITE in flight; gates response handler */
+	int reinvite_pending;            /* an in-dialog re-INVITE we sent is in flight; gates the response handler + glare */
+	int reinvite_purpose;            /* why reinvite_pending is set (sofia_reinvite_purpose): NONE/DIRECTMEDIA/T38/LOCAL_HOLD — the 2xx/reject handler branches on this so a hold re-INVITE does NOT run the directmedia redirip/T.38 rollback */
+	int local_hold_mode_prev;        /* local_hold_mode before the in-flight hold re-INVITE — restored if the peer rejects it */
 	int outbound_invite_auth_attempts; /* 401/407 answered on this outbound INVITE; bounded vs bad-creds loop */
 	unsigned long sess_id;           /* SDP o= session-id, set ONCE per dialog (RFC 4566 §5.2 / RFC 3264 §8: constant across offers/answers) */
 	unsigned long sess_version;      /* SDP o= session-version, bumped per generated SDP */
 	int hold_state;                  /* 1 = peer holding us (a=sendonly/inactive) */
+	int local_hold_mode;             /* WE are holding the peer (hold_reinvite): 0 = not held (offers a=sendrecv); 1 = sendonly; 2 = inactive. Drives the OFFER direction in sofia_generate_sdp; guarded by pvt->lock. */
 	/* RFC 3264 §6.1 answer-direction mirror: the LAST accepted inbound SDP's per-media mode
 	 * (sofia sdp_mode_t: sdp_inactive/sendonly/recvonly/sendrecv). sofia_parse_sdp stages this
 	 * for any accepted inbound SDP (offer OR answer), past every reject gate, but it is ONLY
@@ -951,6 +964,7 @@ struct sofia_config {
 	char message_context[AST_MAX_CONTEXT];  /* [general] default context for out-of-dialog inbound MESSAGE -> dialplan; empty = SIP SIMPLE messaging OFF */
 	int message_autorelay;  /* native peer-to-peer MESSAGE relay: an authenticated sender's inbound MESSAGE whose To-user resolves (via the sender's subscribecontext hint, exten -> SIP/<peer>) to a registered local peer is re-originated to that peer's live contact(s). Default 1 (on). 0 = only the message_context dialplan path. */
 	int fork_early_media;   /* when a parallel-forked call has narrowed to a single live non-WebRTC branch that sends a 18x with SDP, let the master owner hear that branch's early media (receive-only, no pre-winner steal). Default 0 (off) — conservative; forked early media otherwise stays muted until the winner answers. */
+	int hold_reinvite;      /* local-hold offer direction: 0 = MOH-only (default, no re-INVITE); 1 = re-INVITE a=sendonly on AST_CONTROL_HOLD (far end hears our MOH, RFC 6337 §5.3); 2 = a=inactive. Restores a=sendrecv on UNHOLD. */
 	/* registration TTL bounds ([general]-only); typo-tolerant Xexpiry/Xexpirey parse for chan_sip migration. */
 	int min_expiry;     /* default 60s — under this rejects 423 Interval Too Brief + Min-Expires (RFC 3261 §10.2.8) */
 	int max_expiry;     /* default 3600s — over this silently caps */

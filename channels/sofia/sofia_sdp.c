@@ -523,16 +523,21 @@ static int sofia_sdp_select_h264(sdp_media_t *media, struct ast_rtp_codecs *stag
 	return 1;
 }
 
-/* RFC 3264 §6.1 answer-direction mirror. Returns the "a=<dir>\r\n" attribute to emit for a
- * media section. When building an OFFER (is_answer=0) we always send sendrecv (chan_sofia has no
- * SIP local-hold-offer path). When building an ANSWER (is_answer=1) we mirror the offered mode:
- * sendonly->recvonly (remote hold; recvonly NOT inactive, so we do not return held SDP and MOH
- * to the far leg still works), recvonly->sendonly, inactive->inactive, sendrecv/unset->sendrecv.
- * offered_mode is a sofia sdp_mode_t; -1 sentinel ("no offer staged") falls through to sendrecv. */
-static const char *sofia_answer_dir_attr(int is_answer, int offered_mode)
+/* RFC 3264 §6.1 direction attribute. Returns the "a=<dir>\r\n" to emit for a media section.
+ * OFFER (is_answer=0): reflect a locally-initiated hold (local_hold_mode, driven by hold_reinvite):
+ * 1->sendonly (we still send MOH so the far end hears it, RFC 6337 §5.3), 2->inactive, 0->sendrecv.
+ * ANSWER (is_answer=1): mirror the offered mode — sendonly->recvonly (remote hold; recvonly NOT
+ * inactive, so we do not return held SDP and MOH to the far leg still works), recvonly->sendonly,
+ * inactive->inactive, sendrecv/unset->sendrecv. offered_mode is a sofia sdp_mode_t; -1 sentinel
+ * ("no offer staged") falls through to sendrecv. */
+static const char *sofia_answer_dir_attr(int is_answer, int offered_mode, int local_hold_mode)
 {
 	if (!is_answer) {
-		return "a=sendrecv\r\n";
+		switch (local_hold_mode) {
+		case 1:  return "a=sendonly\r\n";
+		case 2:  return "a=inactive\r\n";
+		default: return "a=sendrecv\r\n";
+		}
 	}
 	switch (offered_mode) {
 	case sdp_sendonly: return "a=recvonly\r\n";
@@ -544,8 +549,8 @@ static const char *sofia_answer_dir_attr(int is_answer, int offered_mode)
 
 char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_answer)
 {
-	const char *audio_dir = sofia_answer_dir_attr(is_answer, pvt->offered_audio_mode);
-	const char *video_dir = sofia_answer_dir_attr(is_answer, pvt->offered_video_mode);
+	const char *audio_dir = sofia_answer_dir_attr(is_answer, pvt->offered_audio_mode, pvt->local_hold_mode);
+	const char *video_dir = sofia_answer_dir_attr(is_answer, pvt->offered_video_mode, pvt->local_hold_mode);
 	struct ast_sockaddr rtp_addr;
 	struct ast_sockaddr dest_addr;
 	const char *sdp_family;

@@ -2474,6 +2474,16 @@ tos_video = af41
 ;
 ;fork_early_media = yes
 
+; --- hold_reinvite ([general], default no) ---
+; Controls what chan_sofia does on an AST_CONTROL_HOLD (e.g. a bridged party pressing hold):
+;   no       (default) — start local music-on-hold only, no SIP re-INVITE (chan_sip behavior).
+;   sendonly (or yes)  — additionally re-INVITE the peer to a=sendonly so it stops sending media
+;                        and hears our MOH (RFC 3264 §5.1 / RFC 6337 §5.3). Resumes with a=sendrecv
+;                        on UNHOLD. A rejected hold re-INVITE rolls the offered direction back.
+;   inactive           — re-INVITE the peer to a=inactive (no media either way while held).
+;
+;hold_reinvite = sendonly
+
 ;
 ; --- shrinkcallerid (chan_sip parity, drop-in CID normalization) ---
 ; When yes (default), CID phone-number strings are normalized: strip leading "+"

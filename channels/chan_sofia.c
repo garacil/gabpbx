@@ -5009,6 +5009,7 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 		 * marshal) so a guard-fail doesn't leave it stuck. */
 		if (pvt) {
 			pvt->reinvite_pending = 0;
+			pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
 		}
 		return;
 	}
@@ -5024,6 +5025,10 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 	snprintf(mf_str, sizeof(mf_str), "%d", mf);
 
 	pvt->reinvite_pending = 1;
+	if (pvt->reinvite_purpose == SOFIA_REINVITE_NONE) {
+		/* Untagged caller (e.g. the directmedia relay-revert) → default to directmedia semantics. */
+		pvt->reinvite_purpose = SOFIA_REINVITE_DIRECTMEDIA;
+	}
 	nua_invite(pvt->nh,
 		SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 		SIPTAG_PAYLOAD_STR(sdp_buf),
@@ -5037,9 +5042,11 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 		ast_sockaddr_port(&pvt->redirip));
 }
 
-/* Runs the directmedia re-INVITE on sofia_thread (dispatched by sofia_set_rtp_peer
- * with a +1 pvt ref; the re-INVITE must not run on the bridge thread). */
-static void sofia_directmedia_reinvite_root(void *data)
+/* Runs a re-INVITE on sofia_thread (shared by directmedia, T.38 and local hold; dispatched with a
+ * +1 pvt ref — the re-INVITE must not run on the bridge/channel thread). sofia_send_reinvite builds
+ * the offer from current pvt state (redirip, t38_state, local_hold_mode), so callers just set that
+ * state before dispatching. */
+static void sofia_reinvite_root(void *data)
 {
 	struct sofia_pvt *pvt = data;
 
@@ -5049,6 +5056,7 @@ static void sofia_directmedia_reinvite_root(void *data)
 	 * after teardown began. Clear the gate and bail if gone / not up / nh dropped. */
 	if (pvt->alreadygone || pvt->state != SOFIA_DIALOG_STATE_UP || !pvt->nh) {
 		pvt->reinvite_pending = 0;
+		pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
 		ast_mutex_unlock(&pvt->lock);
 		ao2_ref(pvt, -1);
 		return;
@@ -5056,6 +5064,44 @@ static void sofia_directmedia_reinvite_root(void *data)
 	sofia_send_reinvite(pvt);
 	ast_mutex_unlock(&pvt->lock);
 	ao2_ref(pvt, -1);
+}
+
+/* Local hold/unhold: set pvt->local_hold_mode and, when no re-INVITE is already in flight, marshal a
+ * LOCAL_HOLD re-INVITE onto sofia_thread (shared sofia_reinvite_root -> sofia_send_reinvite builds the
+ * offer with the new direction). Runs on the channel thread from AST_CONTROL_HOLD/UNHOLD. Mode: 0
+ * resume (sendrecv), 1 sendonly, 2 inactive. Saves the prior mode so a rejected re-INVITE rolls back.
+ * If a re-INVITE is already pending we do NOT fire (glare) — the mode is left unchanged so we don't
+ * desync the confirmed state; the operator's next hold/unhold retries. */
+static void sofia_hold_reinvite(struct sofia_pvt *pvt, int mode)
+{
+	int dispatch = 0;
+	if (!pvt) {
+		return;
+	}
+	ast_mutex_lock(&pvt->lock);
+	if (pvt->local_hold_mode == mode) {
+		/* Already in the requested direction — a repeated HOLD or a stray UNHOLD changes nothing,
+		 * so don't emit a pointless in-dialog re-INVITE. */
+		ast_mutex_unlock(&pvt->lock);
+		return;
+	}
+	if (pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh && !pvt->reinvite_pending && !pvt->alreadygone) {
+		pvt->local_hold_mode_prev = pvt->local_hold_mode;	/* for rollback on reject */
+		pvt->local_hold_mode = mode;
+		pvt->reinvite_pending = 1;
+		pvt->reinvite_purpose = SOFIA_REINVITE_LOCAL_HOLD;
+		ao2_ref(pvt, +1);
+		dispatch = 1;
+	}
+	ast_mutex_unlock(&pvt->lock);
+	if (dispatch && sofia_dispatch_to_root_thread(sofia_reinvite_root, pvt) < 0) {
+		ast_mutex_lock(&pvt->lock);
+		pvt->reinvite_pending = 0;
+		pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
+		pvt->local_hold_mode = pvt->local_hold_mode_prev;	/* dispatch failed — undo the optimistic set */
+		ast_mutex_unlock(&pvt->lock);
+		ao2_ref(pvt, -1);
+	}
 }
 
 static int sofia_set_rtp_peer(struct ast_channel *chan, struct ast_rtp_instance *instance,
@@ -5083,10 +5129,14 @@ static int sofia_set_rtp_peer(struct ast_channel *chan, struct ast_rtp_instance 
 		ast_mutex_unlock(&pvt->lock);
 		return 0;
 	}
-	/* Re-INVITE in flight: update target, don't fire a second; the response handler
-	 * picks up the new redirip on the next bridge tick. */
+	/* Re-INVITE in flight: don't fire a second. Only fold the new directmedia target into the
+	 * pending offer when THAT offer is itself a directmedia one (its response handler re-reads
+	 * redirip); for a LOCAL_HOLD or T.38 re-INVITE, leave redirip UNCHANGED so a later bridge tick
+	 * still sees the address change and sends the directmedia re-INVITE normally. */
 	if (pvt->reinvite_pending) {
-		ast_sockaddr_copy(&pvt->redirip, &new_redirip);
+		if (pvt->reinvite_purpose == SOFIA_REINVITE_DIRECTMEDIA) {
+			ast_sockaddr_copy(&pvt->redirip, &new_redirip);
+		}
 		ast_mutex_unlock(&pvt->lock);
 		return 0;
 	}
@@ -5099,11 +5149,13 @@ static int sofia_set_rtp_peer(struct ast_channel *chan, struct ast_rtp_instance 
 	/* Marshal onto sofia_thread: set reinvite_pending (so a concurrent tick takes the
 	 * gate above), +1 pvt ref, drop the lock, dispatch. On failure undo both. */
 	pvt->reinvite_pending = 1;
+	pvt->reinvite_purpose = SOFIA_REINVITE_DIRECTMEDIA;
 	ao2_ref(pvt, +1);
 	ast_mutex_unlock(&pvt->lock);
-	if (sofia_dispatch_to_root_thread(sofia_directmedia_reinvite_root, pvt) < 0) {
+	if (sofia_dispatch_to_root_thread(sofia_reinvite_root, pvt) < 0) {
 		ast_mutex_lock(&pvt->lock);
 		pvt->reinvite_pending = 0;
+		pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
 		ast_mutex_unlock(&pvt->lock);
 		ao2_ref(pvt, -1);
 	}
@@ -6475,9 +6527,18 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 			ast_moh_start(ast, data,
 				!ast_strlen_zero(l_mohinterpret) ? l_mohinterpret : NULL);
 		}
+		/* hold_reinvite (default off): also re-INVITE the peer to a=sendonly/inactive so it
+		 * stops sending media and (sendonly) hears our MOH. Off = MOH-only, chan_sip behavior. */
+		if (sofia_cfg.hold_reinvite) {
+			sofia_hold_reinvite(pvt, sofia_cfg.hold_reinvite);
+		}
 		break;
 	case AST_CONTROL_UNHOLD:
 		ast_moh_stop(ast);
+		/* Resume: re-INVITE back to a=sendrecv (mirrors the hold_reinvite HOLD path). */
+		if (sofia_cfg.hold_reinvite) {
+			sofia_hold_reinvite(pvt, 0);
+		}
 		break;
 	case AST_CONTROL_SRCUPDATE:
 		/* Source changed WITHOUT identity change: marker bit, same SSRC. Must
@@ -6547,10 +6608,43 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 				return -1;
 			}
 			if (t38_rc > 0) {
-				ao2_ref(pvt, +1);	/* dispatch ref; sofia_directmedia_reinvite_root drops it */
-				if (sofia_dispatch_to_root_thread(sofia_directmedia_reinvite_root, pvt) < 0) {
-					ao2_ref(pvt, -1);
-					ast_log(LOG_WARNING, "Sofia: failed to dispatch outbound T.38 re-INVITE on '%s'\n", ast->name);
+				/* Claim the re-INVITE slot ATOMICALLY: set reinvite_pending + purpose=T38 under
+				 * pvt->lock (gated on no re-INVITE already in flight) so a concurrent directmedia/
+				 * hold can't see pending==0 and stomp the purpose. Tag T38 so the 2xx/reject handler
+				 * runs the T.38 rollback (stuck-LOCAL_REINVITE -> DISABLED), not hold/directmedia. */
+				int t38_dispatch = 0;
+				ast_mutex_lock(&pvt->lock);
+				if (pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh && !pvt->alreadygone
+						&& !pvt->reinvite_pending) {
+					pvt->reinvite_pending = 1;
+					pvt->reinvite_purpose = SOFIA_REINVITE_T38;
+					ao2_ref(pvt, +1);	/* dispatch ref; sofia_reinvite_root drops it */
+					t38_dispatch = 1;
+				}
+				ast_mutex_unlock(&pvt->lock);
+				if (t38_dispatch) {
+					if (sofia_dispatch_to_root_thread(sofia_reinvite_root, pvt) < 0) {
+						ast_mutex_lock(&pvt->lock);
+						pvt->reinvite_pending = 0;
+						pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
+						/* No INVITE went out - don't leave T.38 wedged in LOCAL_REINVITE (res_fax would
+						 * hang). Channel lock is held (sofia_indicate), so the state change is safe. */
+						if (pvt->t38_state == SOFIA_T38_LOCAL_REINVITE) {
+							sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
+						}
+						ast_mutex_unlock(&pvt->lock);
+						ao2_ref(pvt, -1);
+						ast_log(LOG_WARNING, "Sofia: failed to dispatch outbound T.38 re-INVITE on '%s'\n", ast->name);
+					}
+				} else {
+					/* Slot busy (a re-INVITE already in flight). interpret_t38 already moved us to
+					 * LOCAL_REINVITE, so roll it back rather than stay stuck with no outbound INVITE. */
+					ast_mutex_lock(&pvt->lock);
+					if (pvt->t38_state == SOFIA_T38_LOCAL_REINVITE) {
+						sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
+					}
+					ast_mutex_unlock(&pvt->lock);
+					ast_log(LOG_WARNING, "Sofia: T.38 re-INVITE on '%s' skipped — a re-INVITE is already in flight\n", ast->name);
 				}
 			}
 		}
@@ -15248,8 +15342,68 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			break;
 		}
 		if (pvt && pvt->reinvite_pending && status >= 200) {
-			/* Direct-media re-INVITE response (call already up). reinvite_pending +
-			 * redirip are shared with the bridge thread; guard with pvt->lock. */
+			int reinvite_purpose;
+			ast_mutex_lock(&pvt->lock);
+			reinvite_purpose = pvt->reinvite_purpose;
+			ast_mutex_unlock(&pvt->lock);
+			if (reinvite_purpose == SOFIA_REINVITE_LOCAL_HOLD) {
+				/* Local hold/unhold re-INVITE response. Unlike directmedia/T.38 this must NOT clear
+				 * redirip, touch T.38 state, or revert to relay — it only applies the peer's answer
+				 * (RTCP keeps flowing, RFC 3264 §5.1) and, on reject, rolls the offered direction back
+				 * to the prior confirmed mode. */
+				int rejected = (status >= 300);
+				int has_sdp = (!rejected && sip && sip->sip_payload && sip->sip_payload->pl_data);
+				int sdp_rc = 0;
+				int rolled_back = 0;
+				struct ast_channel *owner = NULL;
+				ast_mutex_lock(&pvt->lock);
+				for (;;) {	/* re-acquire channel->pvt order for a safe sofia_parse_sdp (set_format) */
+					owner = pvt->owner;
+					if (!owner) {
+						break;
+					}
+					ast_channel_ref(owner);
+					ast_mutex_unlock(&pvt->lock);
+					ast_channel_lock(owner);
+					ast_mutex_lock(&pvt->lock);
+					if (pvt->owner == owner) {
+						break;
+					}
+					ast_channel_unlock(owner);
+					ast_channel_unref(owner);
+					owner = NULL;
+				}
+				pvt->reinvite_pending = 0;
+				pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
+				if (has_sdp) {
+					sdp_rc = sofia_parse_sdp(pvt, sip, 0 /* answer: local-hold re-INVITE 2xx */);
+				}
+				if (rejected || !has_sdp || sdp_rc < 0) {
+					/* Not confirmed (reject / no answer / unusable SDP) - roll the direction back. */
+					pvt->local_hold_mode = pvt->local_hold_mode_prev;
+					rolled_back = 1;
+				}
+				if (owner) {
+					ast_channel_unlock(owner);
+				}
+				ast_mutex_unlock(&pvt->lock);
+				if (owner) {
+					ast_channel_unref(owner);
+				}
+				if (rejected) {
+					ast_log(LOG_NOTICE, "Sofia: local-hold re-INVITE rejected on '%s' (%d %s) — reverted hold direction\n",
+						pvt->callid ? pvt->callid : "(no-callid)", status, phrase ? phrase : "");
+				} else if (rolled_back) {
+					ast_log(LOG_WARNING, "Sofia: local-hold re-INVITE 2xx on '%s' had no usable SDP answer — reverted hold direction\n",
+						pvt->callid ? pvt->callid : "(no-callid)");
+				} else {
+					ast_verbose("Sofia: local-hold re-INVITE accepted on '%s'\n",
+						pvt->callid ? pvt->callid : "(no-callid)");
+				}
+				break;
+				}
+			/* Not LOCAL_HOLD → Direct-media / T.38 re-INVITE response (call already up).
+			 * reinvite_pending + redirip are shared with the bridge thread; guard with pvt->lock. */
 			int rejected = (status >= 300);
 			int has_sdp = (!rejected && sip && sip->sip_payload && sip->sip_payload->pl_data);
 			int sdp_rc = 0;
@@ -15276,6 +15430,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				owner = NULL;
 			}
 			pvt->reinvite_pending = 0;
+			pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
 			if (rejected) {
 				/* Peer refused; revert to PBX relay. */
 				memset(&pvt->redirip, 0, sizeof(pvt->redirip));
@@ -15301,7 +15456,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				/* A 2xx is FINAL — can't 488 it. The directmedia answer was unusable
 				 * (pvt media left unchanged on reject), so revert to PBX relay: clear
 				 * redirip + send a fresh non-directmedia re-INVITE. Same teardown gate
-				 * as sofia_directmedia_reinvite_root. */
+				 * as sofia_reinvite_root. */
 				memset(&pvt->redirip, 0, sizeof(pvt->redirip));
 				sofia_send_reinvite(pvt);
 				reverted_to_relay = 1;
@@ -16920,6 +17075,15 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			ast_copy_string(sofia_cfg.message_context, v->value, sizeof(sofia_cfg.message_context));
 		} else if (!strcasecmp(v->name, "fork_early_media")) {
 			sofia_cfg.fork_early_media = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "hold_reinvite")) {
+			/* Tri-state: no (MOH-only, default) | sendonly/yes | inactive. */
+			if (!strcasecmp(v->value, "inactive")) {
+				sofia_cfg.hold_reinvite = 2;
+			} else if (!strcasecmp(v->value, "sendonly") || ast_true(v->value)) {
+				sofia_cfg.hold_reinvite = 1;
+			} else {
+				sofia_cfg.hold_reinvite = 0;
+			}
 		} else if (!strcasecmp(v->name, "message_autorelay")) {
 			/* native peer-to-peer MESSAGE relay (hint -> registered contact); default on. */
 			sofia_cfg.message_autorelay = ast_true(v->value);
@@ -18252,6 +18416,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.message_context[0] = '\0';   /* SIP SIMPLE messaging OFF by default (opt-in). */
 	sofia_cfg.message_autorelay = 1;       /* native peer-to-peer MESSAGE relay ON by default. */
 	sofia_cfg.fork_early_media = 0;        /* forked single-child early media OFF by default (conservative). */
+	sofia_cfg.hold_reinvite = 0;           /* local hold = MOH-only by default (no re-INVITE), chan_sip behavior. */
 	/* registration TTL bounds + 423 Interval Too Brief (60/3600/120). */
 	sofia_cfg.min_expiry     = DEFAULT_MIN_EXPIRY;
 	sofia_cfg.max_expiry     = DEFAULT_MAX_EXPIRY;

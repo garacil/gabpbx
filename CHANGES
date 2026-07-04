@@ -1,3 +1,22 @@
+## 1.5.11 — local-hold offer direction (experimental, opt-in)
+
+Signaling / media:
+- **Local-hold re-INVITE (experimental, default off).** chan_sofia has always answered a local hold
+  (AST_CONTROL_HOLD) by starting music-on-hold only, never telling the held peer over SIP. With the new
+  `[general] hold_reinvite = sendonly` (or `inactive`), a local hold now also sends the peer an in-dialog
+  re-INVITE offering `a=sendonly` (peer stops sending media and hears our MOH, RFC 3264 §5.1 / RFC 6337)
+  or `a=inactive`, and restores `a=sendrecv` on UNHOLD. A rejected or unanswered hold re-INVITE rolls the
+  offered direction back. Default `no` keeps the prior MOH-only behavior (chan_sip parity).
+
+  Internally this introduces a typed re-INVITE purpose (directmedia / T.38 / local-hold) so each
+  re-INVITE's 2xx/reject handling stays isolated — a hold re-INVITE never disturbs directmedia redirip or
+  T.38 state, and vice versa.
+
+  Shipped **experimental and off by default**: the disabled path is unchanged from prior releases, and the
+  enabled positive path (the emitted `a=sendonly` re-INVITE) was not yet confirmed end to end in the test
+  environment. Validate in your environment before enabling.
+
+
 ## 1.5.10 — forked-call early media (experimental, opt-in)
 
 Media:
