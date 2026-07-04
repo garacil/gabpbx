@@ -123,6 +123,29 @@ realm=gabpbx
 auth_algorithms = md5
 
 ;
+; --- auth_qop (digest challenge qop form; [general] only, GLOBAL) ---
+; Controls the MD5 WWW-Authenticate challenge form. Affects the MD5 challenge ONLY;
+; SHA-256 always keeps qop="auth" (RFC 7616).
+;
+;   no   - chan_sip legacy challenge (RFC 2069): "Digest algorithm=MD5, realm=..., nonce=..."
+;          with NO qop. This is the DEFAULT (built-in), for maximum drop-in chan_sip
+;          compatibility — some older handsets only authenticate against this exact form.
+;   yes  - modern challenge (RFC 2617/7616): "Digest realm=..., nonce=..., qop=\"auth\",
+;          algorithm=MD5", enabling nc/cnonce replay protection.
+;
+; ****************************  SECURITY WARNING  ****************************
+; auth_qop=no (the default) uses RFC 2069 digest, which has NO REPLAY PROTECTION:
+; there is no nc/cnonce and the per-nonce replay gate is bypassed, so a captured
+; Authorization header can be replayed. This matches chan_sip (which is also no-qop).
+; It is only truly confidential when the SIP signaling is itself protected (TLS/WSS/VPN).
+; Set auth_qop=yes if your handsets support it and you want replay protection.
+; With auth_algorithms=md5 + auth_qop=no the challenge is byte-for-byte chan_sip's.
+; ***************************************************************************
+;
+;auth_qop = no      ; (built-in default) chan_sip legacy, no replay protection
+;auth_qop = yes     ; RFC 2617/7616 qop="auth" (replay-protected) — needs handset support
+
+;
 ; Allow guest calls (calls from unknown peers)
 ; Default: yes
 ;

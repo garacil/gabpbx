@@ -9100,6 +9100,26 @@ static void sofia_auth_offered(int *want_md5, int *want_sha256)
 	*want_sha256 = (sofia_cfg.auth_algorithms != SOFIA_AUTH_ALG_MD5);
 }
 
+/* Build the MD5 WWW-Authenticate challenge value, honoring [general] auth_qop. This is the single
+ * choke point for MD5 challenge formatting (used by both the generic challenge and the md5secret
+ * SHA-256->MD5 recovery re-challenge). stale!=0 appends ", stale=true".
+ *   auth_qop=yes -> RFC 2617/7616 form:  Digest realm=..., nonce=..., qop="auth", algorithm=MD5
+ *   auth_qop=no  -> chan_sip legacy RFC 2069 form (byte order per chan_sip transmit_response_with_auth,
+ *                   NO qop -> no nc/cnonce replay protection): Digest algorithm=MD5, realm=..., nonce=... */
+static void sofia_build_md5_challenge(char *buf, size_t sz, const char *realm,
+		const char *nonce, int stale)
+{
+	const char *stale_str = stale ? ", stale=true" : "";
+
+	if (sofia_cfg.auth_qop) {
+		snprintf(buf, sz, "Digest realm=\"%s\", nonce=\"%s\", qop=\"auth\", algorithm=MD5%s",
+			realm, nonce, stale_str);
+	} else {
+		snprintf(buf, sz, "Digest algorithm=MD5, realm=\"%s\", nonce=\"%s\"%s",
+			realm, nonce, stale_str);
+	}
+}
+
 /* Emit the WWW-Authenticate 401 challenge(s) per auth_algorithms (MD5 first for
  * legacy clients). stale!=0 appends ", stale=true". Caller generates the nonce. */
 static void sofia_emit_auth_challenge(nua_t *nua, nua_handle_t *nh,
@@ -9113,9 +9133,7 @@ static void sofia_emit_auth_challenge(nua_t *nua, nua_handle_t *nh,
 	sofia_auth_offered(&want_md5, &want_sha256);
 
 	if (want_md5) {
-		snprintf(hdr_md5, sizeof(hdr_md5),
-			"Digest realm=\"%s\", nonce=\"%s\", qop=\"auth\", algorithm=MD5%s",
-			realm, nonce, stale_str);
+		sofia_build_md5_challenge(hdr_md5, sizeof(hdr_md5), realm, nonce, stale);
 	}
 	if (want_sha256) {
 		snprintf(hdr_sha256, sizeof(hdr_sha256),
@@ -9151,7 +9169,8 @@ static void sofia_emit_auth_challenge(nua_t *nua, nua_handle_t *nh,
  * SELF-VALIDATING (HMAC-SHA256/128 over s1:ts:rand:realm:method:scope keyed by a per-process secret), and
  * nc replay is tracked PER NONCE in a bounded leaf-locked cache, updated ONLY AFTER a valid digest (so
  * unauthenticated floods cannot fill it). RFC 2617 warns strict per-peer nonce tracking breaks
- * pipelined/concurrent requests; this scopes the replay state to a single challenge. Keeps qop="auth". */
+ * pipelined/concurrent requests; this scopes the replay state to a single challenge. Applies only when
+ * qop is in use (auth_qop=yes, or a client that sends qop anyway); auth_qop=no is RFC 2069 (no nc). */
 
 static unsigned char sofia_nonce_secret[32];	/* HMAC key; random, per module load */
 
@@ -9521,10 +9540,12 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 
 	using_qop = (auth_qop && !strcasecmp(auth_qop, "auth"));
 
-	/* We always challenge qop="auth", so a PRESENT non-"auth" qop is a downgrade:
+	/* When auth_qop=yes we challenge qop="auth", so a PRESENT non-"auth" qop is a downgrade:
 	 * accepting it falls through to RFC 2069 no-qop digest, bypassing nc/cnonce
-	 * replay tracking. Check RAW header presence (oversized qop → auth_qop NULL →
-	 * would misread as "no qop"). MISSING qop is still accepted (RFC 2069 compat). */
+	 * replay tracking. (With auth_qop=no we challenge no-qop already; this reject still
+	 * guards against a client offering a bogus non-"auth" qop.) Check RAW header presence
+	 * (oversized qop → auth_qop NULL → would misread as "no qop"). MISSING qop is still
+	 * accepted (RFC 2069 compat). */
 	if (au && msg_header_find_param(au->au_common, "qop") && !using_qop) {
 		nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
 		ast_verbose("Sofia: %s auth rejected for '%s' - unsupported/oversized qop (only qop=auth is offered)\n",
@@ -9630,9 +9651,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 			ast_copy_string(pname, peer->name, sizeof(pname));
 			ast_mutex_unlock(&peer->lock);
 			sofia_make_auth_nonce(pname, realm, method, fresh_nonce, sizeof(fresh_nonce));
-			snprintf(hdr_md5, sizeof(hdr_md5),
-				"Digest realm=\"%s\", nonce=\"%s\", qop=\"auth\", algorithm=MD5, stale=true",
-				realm, fresh_nonce);
+			sofia_build_md5_challenge(hdr_md5, sizeof(hdr_md5), realm, fresh_nonce, /*stale=*/1);
 			nua_respond(nh, SIP_401_UNAUTHORIZED,
 				SIPTAG_WWW_AUTHENTICATE_STR(hdr_md5),
 				NUTAG_WITH_THIS(nua), TAG_END());
@@ -16383,6 +16402,10 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 					"(use both|md5|sha256); using default both\n", v->value);
 				sofia_cfg.auth_algorithms = SOFIA_AUTH_ALG_BOTH;
 			}
+		} else if (!strcasecmp(v->name, "auth_qop")) {
+			/* no (default) = chan_sip legacy no-qop MD5 challenge (RFC 2069, no nc/cnonce replay
+			 * protection); yes = RFC 2617/7616 qop="auth". MD5 challenge form only; SHA-256 keeps qop. */
+			sofia_cfg.auth_qop = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "session-timers")) {
 			/* RFC 4028 session timers: [general] default; chan_sip parity. */
 			if (!strcasecmp(v->value, "originate"))      sofia_cfg.default_session_timers = SESSION_TIMERS_ORIGINATE;
@@ -17722,6 +17745,9 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.nonce_ttl_seconds = 0;
 	/* default BOTH = offer MD5 + SHA-256 (shipped sofia.conf sets md5). */
 	sofia_cfg.auth_algorithms = SOFIA_AUTH_ALG_BOTH;
+	/* default 0 = chan_sip legacy no-qop MD5 challenge (RFC 2069, no replay protection);
+	 * auth_qop=yes restores the RFC 2617/7616 qop="auth" form. */
+	sofia_cfg.auth_qop = 0;
 	/* session timers (RFC 4028). */
 	sofia_cfg.default_session_timers = SESSION_TIMERS_ACCEPT; /* honor inbound; no initiate */
 	sofia_cfg.default_session_expires = 1800;                  /* RFC 4028 §4 typical */

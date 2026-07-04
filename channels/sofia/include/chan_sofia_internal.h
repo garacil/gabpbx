@@ -907,6 +907,7 @@ struct sofia_config {
 	int force_invite_auth;            /* 0 = chan_sip parity (per-peer insecure=invite bypass active) / 1 = global lockdown: ALL inbound INVITEs require digest auth regardless of insecure=invite. [general]-only security override; logs NOTICE when overriding a peer. */
 	int nonce_ttl_seconds;            /* Digest auth nonce TTL override; 0 = SOFIA_NONCE_TTL_SEC_DEFAULT (3600s) */
 	int auth_algorithms;              /* SOFIA_AUTH_ALG_BOTH/MD5/SHA256: which digest algo(s) to OFFER in WWW-Authenticate. GLOBAL, no per-peer override. Verification accepts only what was offered (anti-downgrade). Code default BOTH; shipped sofia.conf sets md5. */
+	int auth_qop;                     /* 1 = emit qop="auth" in the digest challenge (RFC 2617/7616, replay-protected via nc/cnonce); 0 = chan_sip legacy no-qop MD5 challenge (RFC 2069, NO replay protection). [general]-only. Default 0 (chan_sip compatibility). Affects the MD5 challenge form only; SHA-256 always keeps qop="auth". */
 	/* session timers (RFC 4028): chan_sip-parity defaults inherited by peers; sofia-sip handles wire mechanics via NUTAG_SESSION_TIMER/MIN_SE/SESSION_REFRESHER. */
 	int default_session_timers;       /* SESSION_TIMERS_OFF/ACCEPT/ORIGINATE/REFUSE; default=ACCEPT (honor inbound, no initiate) */
 	int default_session_expires;      /* default Session-Expires seconds; chan_sip parity 1800s (RFC 4028 §4) */

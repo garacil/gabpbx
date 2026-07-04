@@ -7,6 +7,33 @@ that is a drop-in replacement for chan_sip (it registers as channel
 technology SIP). Releases are listed newest first.
 
 
+## 1.5.2 — `auth_qop`: chan_sip legacy no-qop MD5 digest challenge
+
+### `auth_qop` (`[general]`, default `no`)
+
+Some legacy handsets only authenticate against the exact chan_sip 401 challenge, which is the RFC 2069
+form `WWW-Authenticate: Digest algorithm=MD5, realm="…", nonce="…"` with **no `qop`**. chan_sofia emitted
+the RFC 2617/7616 form (`… qop="auth", algorithm=MD5`), and those phones would fail the second REGISTER
+with `403 Forbidden`.
+
+New `[general]` knob `auth_qop`:
+
+- `auth_qop = no` (**default**) — emit the chan_sip legacy no-qop MD5 challenge. With
+  `auth_algorithms=md5` this is byte-for-byte chan_sip's challenge, for maximum drop-in handset
+  compatibility.
+- `auth_qop = yes` — emit `qop="auth"` (RFC 2617/7616), enabling `nc`/`cnonce` replay protection.
+
+It affects the **MD5** challenge only; SHA-256 always keeps `qop="auth"` (RFC 7616), and with
+`auth_algorithms=both` two `WWW-Authenticate` headers are sent (MD5 no-qop + SHA-256 qop). The verifier is
+unchanged — it already accepts a no-qop (RFC 2069) response. Applies on `sip reload` (not a listener
+setting).
+
+**Security note:** `auth_qop=no` (the default, matching chan_sip) uses RFC 2069 digest, which has **no
+replay protection** — a captured `Authorization` can be replayed. Set `auth_qop=yes` (if the handsets
+support it) and/or protect the signaling with TLS/WSS for confidentiality. The realtime `secret` column
+continues to be used to compute `HA1 = MD5(username:realm:secret)` (chan_sip parity; a non-empty
+`md5secret` still takes precedence).
+
 ## 1.5.1 — `sip reload` no longer falsely refused on `tls_min_version`
 
 ### `sip reload` reliability fix
