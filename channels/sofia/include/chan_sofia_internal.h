@@ -454,6 +454,7 @@ struct sofia_pvt {
 	int dtmf_effective;		/* RUNTIME/negotiated DTMF mode (SOFIA_DTMF_*): equals dtmfmode until an AUTO offer is resolved at SDP-parse (RFC2833 if the remote offered telephone-event, else INBAND). The send/DSP/property paths consult THIS. */
 	int dtmf_detect_off;		/* runtime AST_OPTION_DIGIT_DETECT override (0 = detect; 1 = core suspended inband digit detection, e.g. native-bridge DTMF features). Honored by sofia_dtmf_reconfigure; fax-CNG DSP is kept regardless. */
 	int alreadygone;
+	int uas_final_sent;		/* 1 = a PRE-ANSWER final reject was already sent to the inbound UAS INVITE (sofia_indicate 486/484/404/503, or the PBX-start-failure 500). NOT set by the normal 200 OK answer path (that reaches SOFIA_DIALOG_STATE_UP, which sofia_hangup handles via BYE). sofia_hangup checks it before sending a hangupcause-mapped final so a pre-answer inbound hangup never double-responds (chan_sip parity). Touched under pvt->lock. */
 	int owner_busy;
 	struct ast_channel *owner;
 	struct sofia_peer *peer;

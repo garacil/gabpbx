@@ -29,7 +29,8 @@
 /* respond_488_root is used only within this module (interpret_t38_parameters dispatches it). */
 static void sofia_t38_respond_488_root(void *data);
 
-/* T.38 4-state machine. Queues an AST_CONTROL_T38_PARAMETERS frame for 3 of 4
+/* T.38 4-state machine. Caller holds pvt->lock, and the channel lock when
+ * pvt->owner is live. Queues an AST_CONTROL_T38_PARAMETERS frame for 3 of 4
  * states (LOCAL_REINVITE is silent, awaiting the peer response). */
 void sofia_change_t38_state(struct sofia_pvt *pvt, int new_state)
 {
@@ -163,9 +164,10 @@ void sofia_change_t38_state(struct sofia_pvt *pvt, int new_state)
  * sofia_directmedia_reinvite_root onto sofia_thread, which builds the m=image
  * offer (sofia_generate_sdp gates on pvt->udptl) and fires nua_invite. For the
  * inbound (PEER_REINVITE) path the SDP answer is on the existing response path
- * (unchanged). Runs under the CHANNEL lock (core tech->indicate), so the lazy
- * udptl create + the pvt->owner->fds[5] attach below are safe; pvt->udptl is also
- * read by the channel thread (sofia_read/write) under that same channel lock. */
+ * (unchanged). Runs under channel->pvt locks (core tech->indicate already holds
+ * the channel lock; the caller takes pvt->lock), so the lazy udptl create, T.38
+ * pvt fields, and the pvt->owner->fds[5] attach are serialized with sofia-thread
+ * SDP generation while staying safe for channel-thread read/write. */
 int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_control_t38_parameters *parameters)
 {
 	int res = 0;

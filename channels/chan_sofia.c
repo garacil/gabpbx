@@ -1697,6 +1697,14 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	ast_verbose("Sofia: Fork winner picked - branch %s for peer '%s' (%s)\n",
 		child->fork_branch_id, master->peername, fork->fork_id);
 
+	/* Fork winner answered (2xx): the master's outbound ring is over — decrement inRinging
+	 * so the peer BLF moves RINGING -> INUSE. Mirrors the non-fork 200 OK path (~15108); the
+	 * call stays in the inUse pool until hangup. Without this the fork case only cleared the
+	 * ring at pvt teardown (the destructor catchall), so BLF showed RINGING for the whole
+	 * answered call. master->lock is released here; the counter helper takes its own locks and
+	 * clears ring_inc_done so the catchall never double-decrements. */
+	sofia_update_call_counter(master, SOFIA_DEC_CALL_RINGING);
+
 	/* Release the master lifetime ref taken under fork->lock above. */
 	ao2_ref(master, -1);
 
@@ -5149,7 +5157,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		ao2_iterator_destroy(&ci);
 		if (any_busy) {
 			ast_verbose("Sofia: busy_on_active — peer '%s' has active call(s), rejecting new call\n",
-				pvt->peer->name);
+				S_OR(pvt->peername, "unknown"));
 			ast_queue_control(ast, AST_CONTROL_BUSY);
 			return 0;
 		}
@@ -5163,6 +5171,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		struct ao2_iterator ci;
 		struct sofia_contact *c;
 		int posted_any = 0;   /* #1: set once any child actually reaches nua_invite */
+		int peer_is_dynamic = 0;
 
 		ci = ao2_iterator_init(pvt->peer->contacts, 0);
 		while ((c = ao2_iterator_next(&ci))) {
@@ -5179,15 +5188,18 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		}
 		ao2_iterator_destroy(&ci);
 
+		ast_mutex_lock(&pvt->peer->lock);
+		peer_is_dynamic = !strcasecmp(pvt->peer->host, "dynamic");
+		ast_mutex_unlock(&pvt->peer->lock);
+
 		/* All-expired no-route guard. request_call classified contacts, but a binding can cross its expiry
 		 * between there and here. When NOTHING is unexpired now and request_call did NOT pin a single per-contact
 		 * route (!active_contact — it had seen live>1 and left the peer-aggregate URI), do NOT route to the stale
 		 * peer->src_addr aggregate (RFC 3261 soft state: expired = unavailable). Fail. Dynamic-only — a static
 		 * peer always keeps its configured target; total==0 (never registered) keeps existing behavior. */
-		if (live == 0 && total > 0 && !pvt->active_contact
-			&& !strcasecmp(pvt->peer->host, "dynamic")) {
+		if (live == 0 && total > 0 && !pvt->active_contact && peer_is_dynamic) {
 			ast_log(LOG_NOTICE, "Sofia: peer '%s' registration expired at call time - %d contact(s), 0 unexpired - no route\n",
-				pvt->peer->name, total);
+				S_OR(pvt->peername, "unknown"), total);
 			return -1;
 		}
 
@@ -5323,7 +5335,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 					if (want_webrtc) {
 						if (sofia_webrtc_provision_offer(child)) {
 							ast_log(LOG_ERROR, "Sofia: fork-child %d WebRTC offer provisioning failed (peer '%s')\n",
-								branch_idx, pvt->peer->name);
+								branch_idx, S_OR(pvt->peername, "unknown"));
 							crypto_ok = 0;
 						}
 					} else
@@ -5348,7 +5360,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 						if (!child->srtp || !(child->srtp->crypto = sdp_crypto_setup())
 								|| sdp_crypto_offer_list(child->srtp->crypto, cipher_list) < 0) {
 							ast_log(LOG_ERROR, "Sofia: fork-child %d crypto setup failed (peer '%s')\n",
-								branch_idx, pvt->peer->name);
+								branch_idx, S_OR(pvt->peername, "unknown"));
 							if (child->srtp) { sofia_srtp_destroy(child->srtp); child->srtp = NULL; }
 							crypto_ok = 0;
 						}
@@ -5357,7 +5369,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 							if (!child->vsrtp || !(child->vsrtp->crypto = sdp_crypto_setup())
 									|| sdp_crypto_offer_list(child->vsrtp->crypto, cipher_list) < 0) {
 								ast_log(LOG_ERROR, "Sofia: fork-child %d video crypto setup failed (peer '%s')\n",
-									branch_idx, pvt->peer->name);
+									branch_idx, S_OR(pvt->peername, "unknown"));
 								if (child->vsrtp) { sofia_srtp_destroy(child->vsrtp); child->vsrtp = NULL; }
 								sofia_srtp_destroy(child->srtp); child->srtp = NULL;
 								crypto_ok = 0;
@@ -5527,7 +5539,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 	if (want_webrtc) {
 		if (sofia_webrtc_provision_offer(pvt)) {
 			ast_log(LOG_ERROR, "Sofia: WebRTC peer '%s' but WebRTC offer provisioning failed - aborting call\n",
-				pvt->peer->name);
+				S_OR(pvt->peername, "unknown"));
 			return -1;
 		}
 	} else
@@ -5550,12 +5562,12 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		pvt->srtp = sofia_srtp_alloc();
 		if (!pvt->srtp || !(pvt->srtp->crypto = sdp_crypto_setup())) {
 			ast_log(LOG_ERROR, "Sofia: encryption=yes for peer '%s' but sdp_crypto_setup failed (res_srtp loaded?)\n",
-				pvt->peer->name);
+				S_OR(pvt->peername, "unknown"));
 			if (pvt->srtp) { sofia_srtp_destroy(pvt->srtp); pvt->srtp = NULL; }
 			return -1;
 		}
 		if (sdp_crypto_offer_list(pvt->srtp->crypto, cipher_list) < 0) {
-			ast_log(LOG_ERROR, "Sofia: sdp_crypto_offer failed for peer '%s'\n", pvt->peer->name);
+			ast_log(LOG_ERROR, "Sofia: sdp_crypto_offer failed for peer '%s'\n", S_OR(pvt->peername, "unknown"));
 			sofia_srtp_destroy(pvt->srtp); pvt->srtp = NULL;
 			return -1;
 		}
@@ -5563,7 +5575,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 			pvt->vsrtp = sofia_srtp_alloc();
 			if (!pvt->vsrtp || !(pvt->vsrtp->crypto = sdp_crypto_setup())
 					|| sdp_crypto_offer_list(pvt->vsrtp->crypto, cipher_list) < 0) {
-				ast_log(LOG_ERROR, "Sofia: video crypto setup failed for peer '%s'\n", pvt->peer->name);
+				ast_log(LOG_ERROR, "Sofia: video crypto setup failed for peer '%s'\n", S_OR(pvt->peername, "unknown"));
 				if (pvt->vsrtp) { sofia_srtp_destroy(pvt->vsrtp); pvt->vsrtp = NULL; }
 				sofia_srtp_destroy(pvt->srtp); pvt->srtp = NULL;
 				return -1;
@@ -5601,7 +5613,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 
 		if (sofia_debug) {
 			ast_verbose("Sofia: outbound INVITE headers to '%s' from=[%s] contact=[%s] addhdr=[%s] rpid=[%s] diversion=[%s]\n",
-				pvt->peer ? pvt->peer->name : "(none)",
+				S_OR(pvt->peername, "(none)"),
 				from_buf, contact_buf,
 				has_addheaders ? addheader_buf : "",
 				rpid_buf, diversion_buf);
@@ -5717,6 +5729,64 @@ static int sofia_write_video(struct ast_channel *ast, struct ast_frame *frame)
 	return ast_rtp_instance_write(pvt->vrtp, frame);
 }
 
+/* Record that a final response was already sent to the inbound UAS INVITE, so a
+ * later pre-answer sofia_hangup does not emit a second (hangupcause-mapped) final.
+ * Takes pvt->lock (the setters run on the channel/SIP thread; sofia_hangup reads it
+ * under the same lock). MUST NOT be called with pvt->lock already held. */
+static void sofia_mark_uas_final_sent(struct sofia_pvt *pvt)
+{
+	if (!pvt) {
+		return;
+	}
+	ast_mutex_lock(&pvt->lock);
+	pvt->uas_final_sent = 1;
+	ast_mutex_unlock(&pvt->lock);
+}
+
+/* Map an Asterisk hangup cause to the SIP failure status a UAS uses to reject an
+ * unanswered inbound INVITE (chan_sip hangup_cause2sip parity). Returns the SIP
+ * status code, or 0 when the cause has no SIP mapping — the caller then falls back
+ * to 603 Decline (chan_sip's default for an unmapped cause). */
+static int sofia_hangup_cause2sip(int cause)
+{
+	switch (cause) {
+	case AST_CAUSE_UNALLOCATED:
+	case AST_CAUSE_NO_ROUTE_DESTINATION:
+	case AST_CAUSE_NO_ROUTE_TRANSIT_NET:
+		return 404;
+	case AST_CAUSE_CONGESTION:
+	case AST_CAUSE_SWITCH_CONGESTION:
+		return 503;
+	case AST_CAUSE_NO_USER_RESPONSE:
+		return 408;
+	case AST_CAUSE_NO_ANSWER:
+	case AST_CAUSE_UNREGISTERED:
+		return 480;
+	case AST_CAUSE_CALL_REJECTED:
+		return 403;
+	case AST_CAUSE_NUMBER_CHANGED:
+		return 410;
+	case AST_CAUSE_NORMAL_UNSPECIFIED:
+		return 480;
+	case AST_CAUSE_INVALID_NUMBER_FORMAT:
+		return 484;
+	case AST_CAUSE_USER_BUSY:
+		return 486;
+	case AST_CAUSE_FAILURE:
+		return 500;
+	case AST_CAUSE_FACILITY_REJECTED:
+		return 501;
+	case AST_CAUSE_CHAN_NOT_IMPLEMENTED:
+		return 503;
+	case AST_CAUSE_DESTINATION_OUT_OF_ORDER:
+		return 502;
+	case AST_CAUSE_BEARERCAPABILITY_NOTAVAIL:
+		return 488;
+	default:
+		return 0;
+	}
+}
+
 static int sofia_hangup(struct ast_channel *ast)
 {
 	struct sofia_pvt *pvt = ast->tech_pvt;
@@ -5797,6 +5867,25 @@ static int sofia_hangup(struct ast_channel *ast)
 				TAG_IF(use_target, NUTAG_PROXY(target_url)),
 				TAG_IF(have_reason, SIPTAG_REASON_STR(reason_buf)),	/* RFC 3326 Q.850 */
 				TAG_END());
+		} else if (!pvt->outgoing) {
+			/* Inbound (UAS) INVITE not yet answered: reject with a FINAL response whose
+			 * status is mapped from the channel hangupcause (chan_sip hangup_cause2sip
+			 * parity) — NOT CANCEL, which is a UAC method for one's OWN outbound INVITE.
+			 * A bare nua_respond binds to the pending INVITE server transaction by default
+			 * (NULL phrase -> sofia stamps the standard reason phrase). Skip when a final
+			 * was already sent (Busy/Congestion/Incomplete via sofia_indicate, or the
+			 * PBX-start failure) so we never emit a double final response. pvt->lock is
+			 * held here, so the uas_final_sent read+set is synchronized with the setters. */
+			if (!pvt->uas_final_sent) {
+				int st = sofia_hangup_cause2sip(ast->hangupcause);
+				if (st <= 0) {
+					st = 603;	/* Decline — chan_sip default for an unmapped cause */
+				}
+				nua_respond(pvt->nh, st, NULL,
+					TAG_IF(have_reason, SIPTAG_REASON_STR(reason_buf)),	/* RFC 3326 Q.850 */
+					TAG_END());
+				pvt->uas_final_sent = 1;
+			}
 		} else {
 			nua_cancel(pvt->nh,
 				TAG_IF(have_reason, SIPTAG_REASON_STR(reason_buf)),	/* RFC 3326 Q.850 */
@@ -6038,6 +6127,7 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 		break;
 	case AST_CONTROL_BUSY:
 		nua_respond(pvt->nh, SIP_486_BUSY_HERE, TAG_END());
+		sofia_mark_uas_final_sent(pvt);
 		break;
 	case AST_CONTROL_INCOMPLETE:
 		/* allowoverlap, pre-UP only: YES → 484; DTMF → wait (no-op); NO/default → 404. */
@@ -6046,18 +6136,21 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 			switch (overlap_mode) {
 			case SOFIA_OVERLAP_YES:
 				nua_respond(pvt->nh, SIP_484_ADDRESS_INCOMPLETE, TAG_END());
+				sofia_mark_uas_final_sent(pvt);
 				break;
 			case SOFIA_OVERLAP_DTMF:
 				/* wait for inband DTMF digits. */
 				break;
 			default:
 				nua_respond(pvt->nh, SIP_404_NOT_FOUND, TAG_END());
+				sofia_mark_uas_final_sent(pvt);
 				break;
 			}
 		}
 		break;
 	case AST_CONTROL_CONGESTION:
 		nua_respond(pvt->nh, SIP_503_SERVICE_UNAVAILABLE, TAG_END());
+		sofia_mark_uas_final_sent(pvt);
 		break;
 	case AST_CONTROL_PROGRESS:
 		/* prematuremedia: INVERTED-SEMANTIC chan_sip quirk preserved — filter TRUE
@@ -6173,7 +6266,10 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 			 * emits m=image because pvt->udptl is set. The LOCAL_REINVITE → ENABLED
 			 * transition happens when the answer's m=image is parsed (sofia_parse_sdp
 			 * commit). */
-			int t38_rc = sofia_interpret_t38_parameters(pvt, (const struct ast_control_t38_parameters *)data);
+			int t38_rc;
+			ast_mutex_lock(&pvt->lock);
+			t38_rc = sofia_interpret_t38_parameters(pvt, (const struct ast_control_t38_parameters *)data);
+			ast_mutex_unlock(&pvt->lock);
 			if (t38_rc < 0) {
 				return -1;
 			}
@@ -6502,6 +6598,8 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 	}
 
 	if (peer) {
+		int peer_is_dynamic = 0;
+
 		/* reload-UAF: hold peer->lock across the whole freeable-stringfield read
 		 * span (runs on the PBX dialing thread vs the reload writer); release it
 		 * right before sofia_resolve_ourip (the only blocking call, reads no
@@ -6541,6 +6639,7 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 		/* GRUU co-req: snapshot gruu under peer->lock; used for NUTAG_SUPPORTED("gruu") on
 		 * the call handle below (RFC 5627 §4.4: advertise Supported: gruu in requests we generate). */
 		int peer_gruu = peer->gruu;
+		peer_is_dynamic = !strcasecmp(peer->host, "dynamic");
 
 		{
 			char url[256];
@@ -6614,7 +6713,7 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 					 * (preferred over the peer-aggregate proxy below). Empty if not NAT / src unknown. */
 					sofia_build_contact_proxy_url(peer, single, contact_proxy_url, sizeof(contact_proxy_url));
 					ao2_ref(single, -1);
-				} else if (n_total > 0 && n_unexpired == 0 && !strcasecmp(peer->host, "dynamic")) {
+				} else if (n_total > 0 && n_unexpired == 0 && peer_is_dynamic) {
 					/* Registration EXPIRED — no re-REGISTER before the granted Contact expiry (RFC 3261 §10.3
 					 * soft state). ignoreregexpire keeps the contact for CLI/BLF/rebind, but an expired binding
 					 * is NOT routable: do NOT fall through to the peer-aggregate src_addr below (the SAME stale
@@ -6916,7 +7015,7 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 	}
 
 	if (!pvt) {
-		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, TAG_END());
+		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
 		return;
 	}
 
@@ -6967,7 +7066,7 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 				ast_channel_unlock(owner);
 				ast_channel_unref(owner);
 			}
-			nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, TAG_END());
+			nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
 			return;
 		}
 		if (sofia_parse_sdp(pvt, sip, 1 /* offer: UPDATE with SDP */) < 0) {
@@ -7041,7 +7140,7 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 				ast_rtp_instance_activate(pvt->vrtp);
 			}
 		} else {
-			nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, TAG_END());
+			nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
 		}
 	} else {
 		/* (2) RFC 3311 §5.1: a no-SDP UPDATE is a target-refresh — 200 OK with NO body. */
@@ -7599,6 +7698,9 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	if (ast_pbx_start(chan)) {
 		ast_log(LOG_ERROR, "Failed to start PBX on incoming Sofia call\n");
 		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, TAG_END());
+		/* A final (500) was just sent to the inbound INVITE; mark it so the ast_hangup
+		 * below (which re-enters sofia_hangup pre-answer) does not emit a second final. */
+		sofia_mark_uas_final_sent(pvt);
 		ast_hangup(chan);
 	}
 }
@@ -12855,12 +12957,12 @@ static void sofia_process_notify(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			ao2_ref(rp, -1);
 		}
 		if (consumed) {
-			nua_respond(nh, SIP_200_OK, TAG_END());
+			nua_respond(nh, SIP_200_OK, NUTAG_WITH_THIS(nua), TAG_END());
 			return;
 		}
 	}
 
-	nua_respond(nh, SIP_200_OK, TAG_END());
+	nua_respond(nh, SIP_200_OK, NUTAG_WITH_THIS(nua), TAG_END());
 }
 
 /* 3-method bridged-channel finder, used by the REFER ATTENDED + BLIND paths.
@@ -14067,7 +14169,17 @@ static void sofia_process_ack(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op
 		ast_mutex_unlock(&op->lock);
 		/* For late-offer INVITEs (no SDP in INVITE), the ACK may carry SDP */
 		if (sip && sip->sip_payload && sip->sip_payload->pl_data && op->rtp) {
+			/* Hold the channel lock across the SDP commit so lazy UDPTL/T.38
+			 * creation and media-format updates cannot race channel-thread
+			 * readers. owner is ref-pinned above; recursive channel locking is
+			 * safe if the parser re-enters channel setters. */
+			if (owner) {
+				ast_channel_lock(owner);
+			}
 			sofia_parse_sdp(op, sip, 0 /* answer: ACK late-offer answer to our 200 OK */);
+			if (owner) {
+				ast_channel_unlock(owner);
+			}
 			if (sofia_debug)
 				ast_verbose("Sofia: ACK with SDP, remote RTP set\n");
 		}

@@ -243,6 +243,22 @@ static int set_crypto_policy(struct ast_srtp_policy *policy, int suite_val, cons
 	return 0;
 }
 
+/* The local master key currently LIVE for outbound SRTP: the per-suite fresh key for the
+ * selected suite when per-suite-keys mode is active and selected_suite_index is in range,
+ * else the shared local_key. sdp_crypto_activate (set_crypto_policy) and the emitted a=crypto
+ * (sdp_crypto_offer_list single-suite path) MUST use this SAME key — otherwise the advertised
+ * key would not match the live outbound policy and the remote would decrypt with the wrong key. */
+static const unsigned char *sdp_crypto_active_local_key(const struct sdp_crypto *p)
+{
+	if (sofia_srtp_per_suite_keys
+	    && p->selected_suite_index >= 0
+	    && p->selected_suite_index < p->suite_count
+	    && p->selected_suite_index < MAX_SDP_CRYPTO_SUITES) {
+		return p->local_key_per_suite[p->selected_suite_index];
+	}
+	return p->local_key;
+}
+
 static int sdp_crypto_activate(struct sdp_crypto *p, int suite_val, unsigned char *remote_key, struct ast_rtp_instance *rtp)
 {
 	struct ast_srtp_policy *local_policy = NULL;
@@ -283,24 +299,10 @@ static int sdp_crypto_activate(struct sdp_crypto *p, int suite_val, unsigned cha
 		stats.local_ssrc = 0;
 	}
 
-	{
-		/* SRTP per-suite-fresh-key option: when per_suite_keys
-		 * mode active AND remote selected a known suite from our offer-list
-		 * (selected_suite_index in [0, suite_count)), pass that suite's
-		 * independent fresh master_key to set_crypto_policy. Defensive 3-
-		 * condition gate (per_suite mode flag + non-negative index + bounds
-		 * check) — falls back to shared p->local_key if any condition fails
-		 * (correctness preservation under degraded conditions). */
-		const unsigned char *active_local_key = p->local_key;
-		if (sofia_srtp_per_suite_keys
-		    && p->selected_suite_index >= 0
-		    && p->selected_suite_index < p->suite_count
-		    && p->selected_suite_index < MAX_SDP_CRYPTO_SUITES) {
-			active_local_key = p->local_key_per_suite[p->selected_suite_index];
-		}
-		if (set_crypto_policy(local_policy, suite_val, active_local_key, stats.local_ssrc, 0) < 0) {
-			goto err;
-		}
+	/* Per-suite fresh key for the selected suite (per_suite mode) or the shared local_key —
+	 * the SAME key the emitted a=crypto advertises (sdp_crypto_active_local_key). */
+	if (set_crypto_policy(local_policy, suite_val, sdp_crypto_active_local_key(p), stats.local_ssrc, 0) < 0) {
+		goto err;
 	}
 
 	if (set_crypto_policy(remote_policy, suite_val, remote_key, 0, 1) < 0) {
@@ -356,7 +358,10 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 	session_params = strsep(&str, " ");
 
 	if (!tag || !suite) {
-		ast_log(LOG_WARNING, "Unrecognized a=%s", attr);
+		/* SECURITY: do NOT echo the raw attribute — a crafted malformed line such as
+		 * "crypto:inline:<key>" (no spaces) leaves suite NULL yet still carries the inline
+		 * master key, so logging the attr would leak it (RFC 4568 §9.1). */
+		ast_log(LOG_WARNING, "Malformed a=crypto line (missing tag/suite) — rejecting\n");
 		return -1;
 	}
 
@@ -369,18 +374,15 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 	 * be valid; out-of-range → -1 sentinel triggers shared-key fallback at
 	 * activate time. atoi accepts numeric prefix; non-numeric tag yields 0
 	 * → -1 sentinel via subtraction. */
-	{
-		int parsed_tag = atoi(tag);
-		int idx = (parsed_tag >= 1 && parsed_tag <= p->suite_count) ? parsed_tag - 1 : -1;
-		/* selected_suite_index feeds sdp_crypto_activate's per-suite key
-		 * pick, so in defer mode STAGE it — do not mutate the live field before the SDP is
-		 * accepted (a rejected re-INVITE must not change key selection). Commit applies it
-		 * just before activation. */
-		if (defer) {
-			p->staged_selected_suite_index = idx;
-		} else {
-			p->selected_suite_index = idx;
-		}
+	int parsed_tag = atoi(tag);
+	int selected_idx = (parsed_tag >= 1 && parsed_tag <= p->suite_count) ? parsed_tag - 1 : -1;
+	/* selected_suite_index feeds sdp_crypto_activate's per-suite key pick. In defer mode STAGE it
+	 * (sdp_crypto_commit applies it just before activation, saving+restoring the live index). In
+	 * IMMEDIATE mode do NOT mutate the live field here — it is set right before sdp_crypto_activate
+	 * below and restored on failure, so a rejected/failed crypto never leaves a stale selected index,
+	 * and the unchanged-key no-op below can compare the incoming index against the live one. */
+	if (defer) {
+		p->staged_selected_suite_index = selected_idx;
 	}
 
 	if (session_params) {
@@ -435,7 +437,12 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 				continue;
 			}
 			if (lifetime) {
-				ast_log(LOG_NOTICE, "Crypto life time unsupported: %s\n", attr);
+				/* SECURITY: do NOT log the full a=crypto attribute — it carries the
+				 * inline master key+salt (RFC 4568 §6.1), and logging it at NOTICE
+				 * leaks the SRTP master key (RFC 4568 §9.1 requires it be kept secret).
+				 * Log only the non-secret suite/tag/lifetime. */
+				ast_log(LOG_NOTICE, "SRTP crypto lifetime parameter unsupported (suite=%s tag=%s lifetime=%s) — skipping this crypto line\n",
+					suite ? suite : "?", tag ? tag : "?", lifetime);
 				continue;
 			}
 
@@ -466,8 +473,15 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 	 * by ast_calloc, so an all-zero inbound master key on the FIRST offer would
 	 * otherwise match and skip activation, leaving an RTP/SAVP session with NO SRTP
 	 * policy installed. With p->tag NULL we always activate on the first crypto. */
-	if (p->tag && !memcmp(p->remote_key, remote_key, sizeof(p->remote_key))) {
-		ast_debug(1, "SRTP remote key unchanged; maintaining current policy\n");
+	if (p->tag
+	    && p->selected_suite_index == selected_idx
+	    && !strcmp(p->suite, suite)
+	    && !memcmp(p->remote_key, remote_key, sizeof(p->remote_key))) {
+		/* Truly unchanged: same tag context, same selected suite index, same suite name, AND
+		 * same remote key. Comparing only the key bytes was wrong — a re-INVITE that switched
+		 * suite (e.g. _80 <-> _32) or the selected per-suite tag while reusing the key would have
+		 * been short-circuited, leaving the old live SRTP policy in place. */
+		ast_debug(1, "SRTP crypto unchanged (suite/index/key); maintaining current policy\n");
 		p->staged_pending = 0;	/* nothing to commit */
 		return 0;
 	}
@@ -489,7 +503,13 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 	ast_copy_string(p->suite, suite, sizeof(p->suite));
 	memcpy(p->remote_key, remote_key, sizeof(p->remote_key));
 
+	/* selected_suite_index is an INPUT to activation (per-suite local-key pick) — apply the
+	 * incoming index just before activating (mirrors sdp_crypto_commit); restore it on failure so
+	 * a failed re-key never leaves a stale selected index behind. */
+	int prev_selected = p->selected_suite_index;
+	p->selected_suite_index = selected_idx;
 	if (sdp_crypto_activate(p, suite_val, remote_key, rtp) < 0) {
+		p->selected_suite_index = prev_selected;
 		return -1;
 	}
 
@@ -616,7 +636,9 @@ int sdp_crypto_offer_list(struct sdp_crypto *p, const char *cipher_list)
 			suite_val = AST_AES_CM_128_HMAC_SHA1_80;
 		}
 		suite_keysalt_len = sdp_crypto_suite_keysalt_len(suite_val);
-		ast_base64encode(suite_local_key64, p->local_key, suite_keysalt_len, sizeof(suite_local_key64));
+		/* Advertise the SAME key that is live for outbound SRTP (per-suite when selected, else
+		 * shared) — otherwise the a=crypto key would not match the installed local policy. */
+		ast_base64encode(suite_local_key64, sdp_crypto_active_local_key(p), suite_keysalt_len, sizeof(suite_local_key64));
 		if (p->a_crypto) {
 			ast_free(p->a_crypto);
 		}

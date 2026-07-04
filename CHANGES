@@ -7,6 +7,45 @@ that is a drop-in replacement for chan_sip (it registers as channel
 technology SIP). Releases are listed newest first.
 
 
+## 1.5.6 — audit hardening: SRTP, T.38, RTCP concurrency, UAS hangup, response binding
+
+A batch of correctness, security, and concurrency fixes from an internal audit of chan_sofia,
+sdp_crypto, sofia_t38 and res_rtp.
+
+Security / SRTP:
+- **Never log the inline SRTP master key** — `sdp_crypto` echoed the caller-controlled `a=crypto`
+  attribute (which carries the inline master key+salt, RFC 4568 §6.1) at NOTICE/WARNING on the
+  "lifetime unsupported" and malformed-line paths, leaking the key (RFC 4568 §9.1). Both now log only
+  non-secret fields.
+- **Per-suite key: advertise the live key** — in per-suite-fresh-key mode the installed local SRTP
+  policy used the per-suite key while the emitted `a=crypto` advertised the shared key, so the remote
+  decrypted with the wrong key. A single selector now feeds both activation and the offered `a=crypto`.
+- **Unchanged-crypto short-circuit tightened** — a re-INVITE that changed the crypto suite
+  (`…_80` ↔ `…_32`) or the selected tag while reusing the key was wrongly treated as a no-op, leaving
+  the stale policy live. It now compares tag context, selected suite index, suite name and key; the
+  immediate path no longer mutates the selected suite index before validation and restores it on
+  activation failure.
+
+Concurrency:
+- **RTCP SR/RR vs PLI on the SRTCP session** — the scheduled RTCP callback protected+sent an SR/RR on
+  the same libsrtp SRTCP session as the video-update PLI without a shared lock; both now serialize
+  under the RTP instance lock.
+- **T.38 parameter interpretation** and the **late-offer ACK SDP parse** now run under the proper lock
+  (pvt lock / channel lock) so channel-thread readers cannot race the media-format/UDPTL writes.
+- **Reload-safe peer reads** — outbound-call paths no longer read freeable peer string fields
+  (`host`, `name`) without the peer lock while a `sip reload` can repopulate them in place.
+
+Protocol / signaling:
+- **Inbound UAS hangup** — an unanswered inbound INVITE was torn down with `CANCEL` (a UAC method);
+  it now sends a final response whose status is mapped from the hangup cause (chan_sip parity), with a
+  guard so a call already rejected (Busy/Congestion) never double-responds.
+- **In-dialog UPDATE and NOTIFY responses** are now bound to their server transaction
+  (`NUTAG_WITH_THIS`), so the 500/200 actually reaches the wire instead of being dropped and
+  retransmitted until timeout.
+- **Fork-winner BLF** — the peer ringing counter is now decremented when a forked call's winner
+  answers, so device state moves RINGING → INUSE instead of staying RINGING for the whole call.
+
+
 ## 1.5.5 — `fromuser` overrides the outbound From user (chan_sip parity)
 
 A peer's `fromuser` was only a *fallback* for the outbound `From` URI user — it applied solely when no

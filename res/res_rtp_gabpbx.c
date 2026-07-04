@@ -2865,24 +2865,41 @@ static int ast_rtcp_write(const void *data)
 	struct ast_rtp_instance *instance = (struct ast_rtp_instance *) data;
 	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
 	int res;
+	int drop_ref = 0;
+
+	/* Serialize the scheduled SR/RR SRTCP protect+send with ast_rtp_video_update's PLI,
+	 * which protects+sends on the SAME libsrtp SRTCP session under ao2_lock(instance).
+	 * Without this, the sofia_sched thread (this callback) and the channel thread (PLI)
+	 * could call res_srtp->protect on one session concurrently. The instance ao2 lock is
+	 * recursive and the ast_rtcp_write_sr/_rr + rtcp_sendto chain does not re-take it;
+	 * main/sched.c drops the scheduler context lock before invoking this callback, so we
+	 * take only the instance lock here (no channel/pvt lock is introduced). The scheduler's
+	 * instance ref is dropped AFTER the unlock (drop_ref) on the non-reschedule paths. */
+	ao2_lock(instance);
 
 	if (!rtp || !rtp->rtcp || rtp->rtcp->schedid == -1) {
-		ao2_ref(instance, -1);
-		return 0;
-	}
-
-	if (rtp->txcount > rtp->rtcp->lastsrtxcount) {
-		res = ast_rtcp_write_sr(instance);
+		drop_ref = 1;
+		res = 0;
 	} else {
-		res = ast_rtcp_write_rr(instance);
+		if (rtp->txcount > rtp->rtcp->lastsrtxcount) {
+			res = ast_rtcp_write_sr(instance);
+		} else {
+			res = ast_rtcp_write_rr(instance);
+		}
+
+		if (!res) {
+			/*
+			 * Not being rescheduled.
+			 */
+			drop_ref = 1;
+			rtp->rtcp->schedid = -1;
+		}
 	}
 
-	if (!res) {
-		/* 
-		 * Not being rescheduled.
-		 */
+	ao2_unlock(instance);
+
+	if (drop_ref) {
 		ao2_ref(instance, -1);
-		rtp->rtcp->schedid = -1;
 	}
 
 	return res;
