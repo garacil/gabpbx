@@ -11,10 +11,10 @@
  * \brief chan_sofia GRUU (RFC 5627/5626) — advertise +sip.instance on the outbound REGISTER and
  * consume the pub-gruu/temp-gruu the registrar mints. Split out of chan_sofia.c to keep it lean.
  *
- * Phase 1 (advertise): per-peer gruu=yes -> sofia_build_instance_feature() builds a stable
+ * Advertise: per-peer gruu=yes -> sofia_build_instance_feature() builds a stable
  * +sip.instance Contact param (urn:uuid from server EID + peer name), emitted via NUTAG_M_FEATURES at
  * the REGISTER sites, plus NUTAG_SUPPORTED("gruu") (RFC 5627 §4.1) on the register handle.
- * Phase 2a (consume): sofia_gruu_consume() learns the pub-gruu/temp-gruu the registrar returns in the
+ * Consume: sofia_gruu_consume() learns the pub-gruu/temp-gruu the registrar returns in the
  * REGISTER 200 Contact bound to OUR instance (RFC 5627 §4.2; wire format §5.2), stored opaque on the
  * peer and shown in `sip show peer`. All called on sofia_thread from the register handler/sites.
  */
@@ -141,7 +141,7 @@ void sofia_contact_parse_instance(sip_contact_t const *m, char *inst, size_t ins
 	}
 }
 
-/* GRUU Phase 2a (gruu=yes): on a REGISTER 200, find the registered Contact bound to OUR +sip.instance
+/* GRUU (gruu=yes): on a REGISTER 200, find the registered Contact bound to OUR +sip.instance
  * and learn the pub-gruu / temp-gruu the registrar minted (RFC 5627 §4.2 UAC behavior; wire format
  * §5.2). Stores them on the peer as OPAQUE URIs (RFC 5627 §4.3/§4.4 — never parsed/rewritten); clears
  * absent ones so the CLI never shows a stale GRUU. Takes peer->lock; caller holds a peer ref. */
@@ -206,7 +206,7 @@ void sofia_gruu_consume(struct sofia_peer *peer, sip_t const *sip)
 	}
 }
 
-/* GRUU Phase 2b: if this peer has a usable learned public GRUU, write it as the dialog Contact
+/* GRUU: if this peer has a usable learned public GRUU, write it as the dialog Contact
  * "<pub-gruu>" (RFC 5627 §4.4 — so the far end routes target-refresh/in-dialog requests back to THIS
  * instance via the registrar) and return 1; else return 0 and the caller keeps the legacy Contact.
  * Gated on an ACTIVE registration (§4.4 MUST have one; §4.4 MUST NOT reuse a lapsed GRUU) and the

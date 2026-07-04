@@ -34,7 +34,7 @@
 #include "include/sdp_crypto.h"
 #include "include/sofia_sdp.h"
 #include "include/sofia_history.h"	/* codec-negotiation history markers (SIP history verbose analysis) */
-#include "include/sofia_datachannel.h"	/* Phase 3: sofia_dc_attach for the accepted m=application (RFC 8841) */
+#include "include/sofia_datachannel.h"	/* sofia_dc_attach for the accepted m=application (RFC 8841) */
 
 static int sofia_sdp_pt_in_use(const char *list, int pt)
 {
@@ -856,9 +856,9 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 	 * match the m=audio a=mid emitted above (both default to "0"). */
 	char group_buf[160] = "";
 	if (pvt->is_webrtc && pvt->webrtc_bundle) {
-		/* Phase 3: when an m=application was ACCEPTED it shares THIS BUNDLE transport, so its mid joins
+		/* when an m=application was ACCEPTED it shares THIS BUNDLE transport, so its mid joins
 		 * the group → "BUNDLE <audio_mid> <dc_mid>" (RFC 8843). Otherwise the group stays audio-only
-		 * (byte-identical to pre-Phase-3). The accepted DataChannel mid is dc_mid (always non-empty when accepted). */
+		 * (byte-identical to the pre-DataChannel path). The accepted DataChannel mid is dc_mid (always non-empty when accepted). */
 		const char *amid = !ast_strlen_zero(pvt->webrtc_mid) ? pvt->webrtc_mid : "0";
 		const char *vmid = !ast_strlen_zero(pvt->webrtc_video_mid) ? pvt->webrtc_video_mid : "1";
 		/* BUNDLE token list in m-line ORDER: audio [video] [DataChannel] (RFC 8843). The video mid joins ONLY
@@ -1661,7 +1661,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	};
 	struct sofia_wrtc_attrs wrtc = { 0 };
 	struct sofia_wrtc_attrs video_wrtc = { 0 };	/* non-BUNDLE video: the m=video section's OWN DTLS/ICE attrs */
-	/* Phase 3 (crash fix): a function-scope COPY of the session a=group:BUNDLE value (e.g. "BUNDLE 0 1"),
+	/* Crash fix: a function-scope COPY of the session a=group:BUNDLE value (e.g. "BUNDLE 0 1"),
 	 * captured below WHILE the sdp is still alive. The sdp parser is freed at sdp_parser_free() before
 	 * the DataChannel accept gate runs, so the gate must NOT dereference sdp->sdp_attributes (use-after-
 	 * free — it segfaulted on the first real DataChannel offer). Empty string = no session BUNDLE. */
@@ -1844,7 +1844,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 		sdp_attribute_t *ga = sdp_attribute_find(sdp->sdp_attributes, "group");
 		if (ga && ga->a_value && !strncasecmp(ga->a_value, "BUNDLE", 6)) {
 			wrtc.have_bundle = 1;
-			/* Phase 3 (crash fix): COPY the BUNDLE token list now, while the sdp is alive, so the
+			/* Crash fix: COPY the BUNDLE token list now, while the sdp is alive, so the
 			 * DataChannel accept gate — which runs AFTER sdp_parser_free() — can test dc_mid membership
 			 * without dereferencing the freed sdp->sdp_attributes. */
 			ast_copy_string(bundle_group, ga->a_value, sizeof(bundle_group));
@@ -2634,7 +2634,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	pvt->webrtc_reject_overflow = 0;
 	pvt->webrtc_video_offered = 0;
 	pvt->webrtc_video_mid[0] = '\0';
-	/* Phase 3 WebRTC DataChannel (RFC 8841): reset the per-SDP m=application state. dc_accepted is
+	/* WebRTC DataChannel (RFC 8841): reset the per-SDP m=application state. dc_accepted is
 	 * (re)decided at the ACCEPT GATE after the audio commit; the offer's sctp-port/mid/max-message-size
 	 * are (re)captured in the loop below. Persistent pvt fields → must clear so a prior offer never
 	 * poisons this parse (mirrors the webrtc_video_* reset).
@@ -2668,8 +2668,8 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	/* dc_accepted: clear only the EMIT decision, NOT the live pvt->dc handle. On a re-INVITE that still
 	 * carries the DataChannel the accept gate re-asserts it (idempotent — pvt->dc is non-NULL so we keep it); on
 	 * one that DROPS the DataChannel it correctly stays 0 → the answer reflects m=application at port 0. The actual
-	 * pvt->dc usrsctp teardown for a withdrawn DataChannel is owned by Phase 2b (the recv-cb stream-reset path) /
-	 * the destructor — Phase 3 SDP does not detach mid-dialog. */
+	 * pvt->dc usrsctp teardown for a withdrawn DataChannel is owned by the recv-cb stream-reset path /
+	 * the destructor — the SDP layer does not detach mid-dialog. */
 	pvt->dc_accepted = 0;
 	if (audio_webrtc_offered) {
 		sdp_media_t *mm;
@@ -2694,7 +2694,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 					break;
 				}
 			}
-			/* Phase 3 WebRTC DataChannel detect (RFC 8841): an m=application
+			/* WebRTC DataChannel detect (RFC 8841): an m=application
 			 * UDP/DTLS/SCTP webrtc-datachannel section. It REUSES the audio BUNDLE
 			 * ICE+DTLS transport (no new transport) — only its SCTP params are read
 			 * here (a=sctp-port, a=max-message-size, a=mid). Recorded on pvt; the
@@ -3173,7 +3173,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 		}
 		pvt->is_webrtc = 1;	/* only here, after full success */
 
-		/* Phase 3 WebRTC DataChannel ACCEPT GATE (RFC 8841). Accept the offered m=application ONLY when
+		/* WebRTC DataChannel ACCEPT GATE (RFC 8841). Accept the offered m=application ONLY when
 		 * ALL hold; otherwise it stays in webrtc_reject_m and is port-0 reflected (exactly like a declined
 		 * m-line). Runs INSIDE the audio-commit block (is_webrtc just set) so "the audio WebRTC leg
 		 * committed OK" is guaranteed. The DataChannel shares THIS BUNDLE ICE+DTLS transport — sofia_dc_attach binds

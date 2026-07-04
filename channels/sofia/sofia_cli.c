@@ -436,11 +436,11 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 	sofia_cli_peer_line(&buf, "AMA flags", "%s", ast_cdr_flags2str(peer->amaflags));
 	sofia_cli_peer_line(&buf, "Subscribe MWI", "%s", AST_CLI_YESNO(peer->subscribemwi));
 	sofia_cli_peer_line(&buf, "Preferred codec", "%s", AST_CLI_YESNO(peer->preferred_codec_only));
-	/* ignoresdpversion: parse-compat-only (every SDP is processed). */
+	/* ignoresdpversion: parse-compatibility only (every SDP is processed). */
 	sofia_cli_peer_line(&buf, "Ignore SDP ver", "%s", AST_CLI_YESNO(peer->ignoresdpversion));
-	/* promiscredir: parse-compat-only (no nua_r_redirect handler). */
+	/* promiscredir: parse-compatibility only (no nua_r_redirect handler). */
 	sofia_cli_peer_line(&buf, "Promisc redir", "%s", AST_CLI_YESNO(peer->promiscredir));
-	/* autoframing: parse-compat-only (ptime gate not wired). */
+	/* autoframing: parse-compatibility only (ptime gate not wired). */
 	sofia_cli_peer_line(&buf, "Auto framing", "%s", AST_CLI_YESNO(peer->autoframing));
 	/* faxdetect per-peer mode (DSP CNG + peer T.38 reINVITE detection). */
 	sofia_cli_peer_line(&buf, "Fax detect", "%s",
@@ -549,7 +549,7 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 	if (!ast_strlen_zero(peer->callbackextension)) {
 		sofia_cli_peer_line(&buf, "Callback ext", "%s", peer->callbackextension);
 	}
-	/* GRUU (RFC 5627): advertisement opt-in + any GRUU the registrar minted (Phase 2). */
+	/* GRUU (RFC 5627): advertisement opt-in + any GRUU the registrar minted. */
 	if (peer->gruu) {
 		sofia_cli_peer_line(&buf, "GRUU", "advertised (+sip.instance)");
 		if (!ast_strlen_zero(peer->pub_gruu)) {
@@ -830,33 +830,33 @@ char *sofia_cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 	} else {
 		ast_cli(a->fd, "  WSS Bind Port:          (disabled)\n");
 	}
-	/* ignoresdpversion: parse-compat-only (every SDP is processed). */
+	/* ignoresdpversion: parse-compatibility only (every SDP is processed). */
 	ast_cli(a->fd, "  Ignore SDP sess. ver.:  %s\n", AST_CLI_YESNO(sofia_cfg.default_ignoresdpversion));
 	/* progressinband: Never/Yes/No (NO degrades to NEVER). */
 	ast_cli(a->fd, "  Progress inband:        %s\n",
 		sofia_cfg.default_progressinband == SOFIA_PROG_INBAND_NEVER ? "Never" :
 		sofia_cfg.default_progressinband == SOFIA_PROG_INBAND_YES ? "Yes" : "No");
-	/* subscribe_network_change_event: parse-compat-only (delegated to sofia-sip/dnsmgr). */
+	/* subscribe_network_change_event: parse-compatibility only (delegated to sofia-sip/dnsmgr). */
 	ast_cli(a->fd, "  Network change subscribe: %s\n",
 		AST_CLI_YESNO(sofia_cfg.subscribe_network_change_event));
 	ast_cli(a->fd, "  Save sys. name:         %s\n", AST_CLI_YESNO(sofia_cfg.rtsave_sysname));
 	ast_cli(a->fd, "  Update:                 %s\n", AST_CLI_YESNO(sofia_cfg.peer_rtupdate));
 	ast_cli(a->fd, "  Q.850 Reason header:    %s\n", AST_CLI_YESNO(sofia_cfg.use_q850_reason));
-	/* rtcachefriends: parse-compat-only (the ao2 registry always caches all peers). */
+	/* rtcachefriends: parse-compatibility only (the ao2 registry always caches all peers). */
 	ast_cli(a->fd, "  Cache Friends:          %s\n", AST_CLI_YESNO(sofia_cfg.rtcachefriends));
-	/* rtautoclear: parse-compat-only (no peer-level auto-clear). */
+	/* rtautoclear: parse-compatibility only (no peer-level auto-clear). */
 	ast_cli(a->fd, "  Auto Clear:             %d (%s)\n", sofia_cfg.rtautoclear,
 		sofia_cfg.rtautoclear_enabled ? "Enabled" : "Disabled");
 	ast_cli(a->fd, "  Use domains as realms:  %s\n", AST_CLI_YESNO(sofia_cfg.domainsasrealm));
 	ast_cli(a->fd, "  Call to non-local dom.: %s\n", AST_CLI_YESNO(sofia_cfg.allow_external_domains));
 	ast_cli(a->fd, "  Auto Domain:            %s\n", AST_CLI_YESNO(sofia_cfg.autodomain));
-	/* promiscredir: parse-compat-only (no nua_r_redirect handler). */
+	/* promiscredir: parse-compatibility only (no nua_r_redirect handler). */
 	ast_cli(a->fd, "  Allow promisc. redir.:  %s\n", AST_CLI_YESNO(sofia_cfg.default_promiscredir));
-	/* matchexternaddrlocally: parse-compat-only. */
+	/* matchexternaddrlocally: parse-compatibility only. */
 	ast_cli(a->fd, "  Match extern locally:   %s\n", AST_CLI_YESNO(sofia_cfg.matchexternaddrlocally));
-	/* autoframing: parse-compat-only (ptime gate not wired). */
+	/* autoframing: parse-compatibility only (ptime gate not wired). */
 	ast_cli(a->fd, "  Auto-Framing:           %s\n", AST_CLI_YESNO(sofia_cfg.default_autoframing));
-	/* faxdetect: 4-state display (CNG + T.38 detection wired). */
+	/* faxdetect: 4-state display (CNG + T.38 detection implemented). */
 	ast_cli(a->fd, "  Fax Detect:             %s\n",
 		sofia_cfg.default_faxdetect_mode == SOFIA_FAX_DETECT_NONE ? "no" :
 		sofia_cfg.default_faxdetect_mode == SOFIA_FAX_DETECT_BOTH ? "cng,t38" :

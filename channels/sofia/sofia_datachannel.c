@@ -8,13 +8,13 @@
  */
 
 /*! \file sofia_datachannel.c
- * \brief chan_sofia WebRTC DataChannel (RFC 8831/8832) usrsctp transport — Phase 2b (DCEP relay).
+ * \brief chan_sofia WebRTC DataChannel (RFC 8831/8832) usrsctp transport — DCEP relay.
  *
  * Verified against /usr/include/usrsctp.h and the relevant RFCs.
  *
  * Architecture:
  *   - One usrsctp AF_CONN socket per Sofia leg, bundled on the AUDIO DTLS (pvt->rtp). No new socket.
- *   - The transport rides the Phase-1 engine seam (include/gabpbx/rtp_engine.h):
+ *   - The transport rides the RTP-engine seam (include/gabpbx/rtp_engine.h):
  *       inbound:  ast_rtp_instance_set_dtls_appdata_cb -> RX cb fires UNDER ao2_lock(instance)
  *                 -> copy+ref+push to a taskprocessor -> usrsctp_conninput() OFF the instance lock.
  *       outbound: usrsctp GLOBAL output cb -> ast_rtp_instance_dtls_write_appdata(pvt->rtp, ...).
@@ -23,7 +23,7 @@
  *     ao2 object whose lifetime WE own (cleared on detach). pvt may be freed first → using pvt as
  *     the token would be a UAF.
  *
- * Phase 2b = gabpbx is a MIDDLEBOX, not an endpoint. It terminates
+ * gabpbx is a MIDDLEBOX, not an endpoint. It terminates
  * TWO independent SCTP associations — one per bridged leg — each with its OWN sofia_datachannel,
  * its OWN DTLS role, its OWN even/odd stream parity. A browser's channel on leg A is re-originated
  * onto leg B with B's parity (so A:sid != B:sid in general): a per-dc stream table + a cross-leg
@@ -48,9 +48,9 @@
  *     the SCTP socket (SO_LINGER 0 → SCTP ABORT, no graceful drain) so no lingering usrsctp timer can
  *     fire the output cb against a freed pvt minutes after teardown (the confirmed teardown-UAF core).
  *
- * SCOPE Phase 2b: notifications (assoc up/down, stream reset, send-failed, shutdown) + the DCEP
+ * Scope: notifications (assoc up/down, stream reset, send-failed, shutdown) + the DCEP
  * responder (PPID 50 OPEN -> ACK) + OPEN-proxying onto the far leg + the bidirectional user-message
- * relay (PPID 51/53/56/57) with PR-SCTP policy per channel type. SDP parse/emit is Phase 3 (done).
+ * relay (PPID 51/53/56/57) with PR-SCTP policy per channel type. SDP parse/emit is implemented.
  */
 
 #include "gabpbx.h"
@@ -183,7 +183,7 @@ static void sofia_dc_engine_rx(struct ast_rtp_instance *instance, const uint8_t 
 	size_t len, void *cb_data);
 static int sofia_dc_rx_task(void *data);
 
-/* Phase 2b internals (all worker-lane only unless noted). */
+/* Internals (all worker-lane only unless noted). */
 static int sofia_dc_send_on(struct sofia_datachannel *dc, uint16_t sid, uint32_t ppid, int ordered,
 	uint8_t channel_type, uint32_t reliability, const void *buf, size_t len);
 static struct sofia_dc_stream *sofia_dc_stream_find(struct sofia_datachannel *dc, uint16_t local_sid);
@@ -216,7 +216,7 @@ int sofia_dc_init(void)
 
 	/* Tuning: WebRTC datachannels never run over real IP here (AF_CONN only), so disable the
 	 * loopback CRC suppression is irrelevant; we DO want the receive/send buffers reasonable and
-	 * the explicit-EOR path. Keep FOUNDATION tuning minimal and safe; deeper tuning is Phase 2b. */
+	 * the explicit-EOR path. Keep tuning minimal and safe; deeper tuning is deferred. */
 #ifdef SCTP_DEBUG
 	usrsctp_sysctl_set_sctp_debug_on(0);
 #endif
@@ -366,7 +366,7 @@ struct sofia_datachannel *sofia_dc_attach(struct sofia_pvt *pvt, uint16_t sctp_p
 	struct sctp_event ev;
 	struct sctp_initmsg initmsg;
 	uint32_t on = 1;
-	/* The full event set Phase 2b acts on (SEND_FAILED + SHUTDOWN
+	/* The full event set the relay acts on (SEND_FAILED + SHUTDOWN
 	 * alongside the existing STREAM_RESET + ASSOC_CHANGE). */
 	const uint16_t sub_events[] = {
 		SCTP_STREAM_RESET_EVENT, SCTP_ASSOC_CHANGE,
@@ -457,7 +457,7 @@ struct sofia_datachannel *sofia_dc_attach(struct sofia_pvt *pvt, uint16_t sctp_p
 		ast_log(LOG_WARNING, "Sofia: DataChannel SCTP_INITMSG failed: %s\n", strerror(errno));
 	}
 
-	/* Subscribe to the notifications Phase 2b acts on: STREAM_RESET (channel close, RFC 8831 §6.7),
+	/* Subscribe to the notifications the relay acts on: STREAM_RESET (channel close, RFC 8831 §6.7),
 	 * ASSOC_CHANGE (up/down, gates OPEN-proxying), SEND_FAILED + SHUTDOWN (debug/teardown). They
 	 * arrive via the recv cb with MSG_NOTIFICATION. Tolerate per-event setsockopt failure. */
 	for (i = 0; i < ARRAY_LEN(sub_events); i++) {
@@ -770,7 +770,7 @@ void sofia_dc_detach(struct sofia_datachannel *dc)
  * documented lock order channel -> pvt -> instance -> peer). This function takes NO additional lock
  * and calls NO usrsctp/pvt/peer/channel API. ast_malloc, memcpy, ao2_ref(+1), and
  * ast_taskprocessor_push are all instance-lock-safe and acquire no chan_sofia lock, so no inversion
- * is possible. All real work (usrsctp_conninput → the synchronous receive cb → Phase-2b DCEP/relay
+ * is possible. All real work (usrsctp_conninput → the synchronous receive cb → DCEP/relay
  * that DOES touch pvt/peer) is deferred to the worker lane, off this lock.
  */
 static void sofia_dc_engine_rx(struct ast_rtp_instance *instance, const uint8_t *data,
@@ -812,7 +812,7 @@ static void sofia_dc_engine_rx(struct ast_rtp_instance *instance, const uint8_t 
  *
  * Runs on the shared "sofia-datachannel" lane with NO instance/pvt/peer lock held. usrsctp_conninput
  * may synchronously invoke sofia_dc_sctp_recv_cb (and, on output, the global output cb) — all off the
- * instance lock, which is exactly why Phase-2b DCEP/relay work may safely run from the receive cb.
+ * instance lock, which is exactly why DCEP/relay work may safely run from the receive cb.
  */
 static int sofia_dc_rx_task(void *data)
 {
@@ -1695,7 +1695,7 @@ static void sofia_dc_handle_notification(struct sofia_datachannel *dc,
 }
 
 /* ======================================================================================
- * usrsctp per-socket receive callback (Phase 2b — DCEP responder + relay)
+ * usrsctp per-socket receive callback (DCEP responder + relay)
  * ====================================================================================== */
 
 /*!

@@ -257,7 +257,7 @@ int sofia_route_serialize(sip_route_t const *list, char *buf, size_t len);	/* Pa
 void sofia_peer_clear_contact_paths(struct sofia_peer *peer);	/* blank RFC 3327 Path on all contacts (path=no) */
 int sofia_reason_build(int hangupcause, char *buf, size_t len);	/* Q.850 Reason RFC 3326, sofia_reason.c */
 int sofia_reason_parse_cause(sip_reason_t const *reason);
-int sofia_gruu_dialog_contact(const struct sofia_peer *peer, char *buf, size_t len);	/* Phase 2b: GRUU as the dialog Contact */
+int sofia_gruu_dialog_contact(const struct sofia_peer *peer, char *buf, size_t len);	/* GRUU as the dialog Contact */
 void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
 		char *out_url, size_t out_len);
 struct sofia_contact *sofia_peer_first_contact(struct sofia_peer *peer);
@@ -617,12 +617,12 @@ struct sofia_pvt {
 		char mid[64];        /* its a=mid (RFC 8843 — must appear in the answer too) */
 		int offer_idx;       /* ABSOLUTE position of THIS section in the offer's m= list (0-based), so the answer mirrors offer order (RFC 3264 §6 / RFC 8829 §5.3) */
 	} webrtc_reject_m[6];
-	/* Phase 2a WebRTC DataChannel (RFC 8831/8832) transport handle, NULL when this leg has no
+	/* WebRTC DataChannel (RFC 8831/8832) transport handle, NULL when this leg has no
 	 * negotiated m=application. An opaque ao2 object owned by sofia_datachannel.c (the usrsctp
 	 * AF_CONN association bundled on pvt->rtp's DTLS). A plain pointer — no #ifdef needed for the
-	 * pointer itself; sofia_dc_attach/detach are no-ops without usrsctp. Implemented in Phase 3 (SDP). */
+	 * pointer itself; sofia_dc_attach/detach are no-ops without usrsctp. Implemented at the SDP layer. */
 	struct sofia_datachannel *dc;
-	/* Phase 3 WebRTC DataChannel SDP negotiation (RFC 8841 m=application). Mirrors the webrtc_video_*
+	/* WebRTC DataChannel SDP negotiation (RFC 8841 m=application). Mirrors the webrtc_video_*
 	 * fields: parsed at sofia_parse_sdp, emitted by sofia_generate_sdp. The m=application shares the
 	 * AUDIO BUNDLE ICE+DTLS transport (NO new transport) — only the SCTP layer is per-m=application.
 	 *   dc_offered:  the browser offered an m=application UDP/DTLS/SCTP webrtc-datachannel section.
@@ -663,8 +663,8 @@ struct sofia_peer {
 		AST_STRING_FIELD(fromdomain);
 		AST_STRING_FIELD(regexten);
 		AST_STRING_FIELD(publish_exten);	/* outbound PUBLISH: explicit exten(s) to publish (ext1&ext2@ctx&...); overrides regexten/name as the publish source. Empty = use regexten/name. */
-		AST_STRING_FIELD(pub_gruu);	/* GRUU Phase 2: public GRUU minted by the registrar for this peer's +sip.instance (RFC 5627 §5.2), learned from the REGISTER 200 Contact. Opaque URI. Empty = none/not-registered. */
-		AST_STRING_FIELD(temp_gruu);	/* GRUU Phase 2: temporary GRUU (rotates per refresh). Opaque URI. Empty = none. */
+		AST_STRING_FIELD(pub_gruu);	/* GRUU: public GRUU minted by the registrar for this peer's +sip.instance (RFC 5627 §5.2), learned from the REGISTER 200 Contact. Opaque URI. Empty = none/not-registered. */
+		AST_STRING_FIELD(temp_gruu);	/* GRUU: temporary GRUU (rotates per refresh). Opaque URI. Empty = none. */
 		AST_STRING_FIELD(service_route);	/* Service-Route (RFC 3608) learned from the REGISTER 200 (service_route=yes), as a ready "<uri;lr>,..." Route value pre-loaded on outbound INVITEs to the registrar domain. Empty = none. */
 		AST_STRING_FIELD(callbackextension);	/* when registering AS a client to an upstream provider, user-portion of our Contact URI telling upstream which local extension to call back; implemented via NUTAG_M_USERNAME at the 3 nua_register sites. Empty = no callback (chan_sip parity). */
 		AST_STRING_FIELD(subscribecontext);	/* SUBSCRIBE-method dispatch context override (chan_sip parity); inherits default_subscribecontext when empty. LIMITATION: per-peer dialplan dispatch not yet implemented (MWI uses peer->mailboxes; unknown events auto-202). */
@@ -701,7 +701,7 @@ struct sofia_peer {
 	int max_contacts;
 	int encryption;                 /* SDES-SRTP per-peer toggle (0/1); default off; encryption=yes enables */
 	int webrtc;                     /* WebRTC per-peer toggle (0/1): the ENABLE/permission for DTLS-SRTP + ICE-lite + rtcp-mux; default off; webrtc=yes enables. The actual media profile is decided by the target's physical transport (sofia_offer_effective_webrtc), so webrtc=yes never forces DTLS onto a non-ws/wss target. */
-	int datachannel;                /* WebRTC DataChannel per-peer toggle (0/1): accept the offered m=application (RFC 8841 SCTP) on the BUNDLE'd audio DTLS; default off; requires webrtc=yes + a usrsctp build (Phase 3). With it off the m=application is port-0 reflected exactly as today. */
+	int datachannel;                /* WebRTC DataChannel per-peer toggle (0/1): accept the offered m=application (RFC 8841 SCTP) on the BUNDLE'd audio DTLS; default off; requires webrtc=yes + a usrsctp build. With it off the m=application is port-0 reflected exactly as today. */
 	int webrtc_video_bundle;        /* WebRTC video BUNDLE per-peer toggle (0/1): ride video on the audio ICE/DTLS transport (RFC 8843 max-bundle) instead of a separate vrtp; default off; requires webrtc=yes. Off = today's separate-transport video. Consumed during BUNDLE video staging. */
 	int flowclose_emit_unregister;  /* RFC 5626 flow-close policy (0/1; default 0): a connection-oriented binding is ALWAYS removed when its flow closes. 0 = remove silently (no external unregister side-effects: no AMI PeerStatus, BLF/devstate, regexten) — avoids a BLF flap on browser F5. 1 = also emit the full unregister side-effects. Per-peer overrides [general]. */
 	int callingpres;                /* AST_PRES_* mask; per-peer default presentation (chan_sip parity); default AST_PRES_ALLOWED_USER_NUMBER_NOT_SCREENED (=0) */
@@ -721,7 +721,7 @@ struct sofia_peer {
 	int allowsubscribe;             /* 0=block / 1=allow SUBSCRIBE (chan_sip parity); gated at sofia_process_mwi_subscribe (per-peer) + sofia_process_subscribe entry (global). Default inherited from default_allowsubscribe (1). */
 	int publish;                    /* outbound PUBLISH (RFC 3903): when 1 and [general] publish_server is set, chan_sofia PUBLISHes this peer's hint (regexten/subscribecontext) dialog-info state to the central server. Default 0. */
 	int gruu;                       /* GRUU/RFC 5626: when 1, the outbound REGISTER advertises a stable +sip.instance (urn:uuid from EID+name) so a GRUU-capable registrar can mint a pub-gruu. Default 0 (opt-in). */
-	int use_gruu_contact;           /* GRUU Phase 2b (RFC 5627 §4.4): when 1 (default) AND gruu=yes AND a pub-gruu was learned, use it as the outbound dialog Contact. Interop kill-switch: set no to keep advertising/learning but not use it as Contact. Default 1. */
+	int use_gruu_contact;           /* GRUU (RFC 5627 §4.4): when 1 (default) AND gruu=yes AND a pub-gruu was learned, use it as the outbound dialog Contact. Interop kill-switch: set no to keep advertising/learning but not use it as Contact. Default 1. */
 	int use_service_route;          /* Service-Route (RFC 3608): when 1, ingest the registrar's Service-Route from the REGISTER 200 and pre-load it on outbound INVITEs to that domain. Default 0 (opt-in; applying it diverts outbound routing). */
 	int path_support;               /* Path (RFC 3327): when 1, as the registrar for this dynamic peer, accept + store the Path from its REGISTER and pre-load it as a Route on requests to its contacts. Default 0 (opt-in; accepting Path is a trust decision, RFC 3327 §7). */
 	int rel100;                     /* 100rel/PRACK (RFC 3262): when 1, send NON-183 provisionals (180 Ringing etc.) to this peer RELIABLY (Require: 100rel + RSeq, await PRACK) via NUTAG_EARLY_MEDIA on the inbound handle. The 183 early-media is already reliable when the caller advertises 100rel. Default 0 (opt-in; some UACs mishandle a reliable 180). */
@@ -901,7 +901,7 @@ struct sofia_config {
 	int max_contacts;
 	int encryption;                   /* SDES-SRTP general default (0=off, 1=on); soft-zeroed at load if res_srtp absent */
 	int webrtc;                       /* WebRTC general default (0=off,1=on); per-peer webrtc= overrides */
-	int datachannel;                  /* WebRTC DataChannel general default (0=off,1=on); per-peer datachannel= overrides. Requires webrtc=yes + a usrsctp build to take effect (Phase 3). */
+	int datachannel;                  /* WebRTC DataChannel general default (0=off,1=on); per-peer datachannel= overrides. Requires webrtc=yes + a usrsctp build to take effect. */
 	int webrtc_video_bundle;          /* WebRTC video BUNDLE general default (0=off,1=on); per-peer webrtc_video_bundle= overrides; requires webrtc=yes. Consumed during BUNDLE video staging. */
 	int flowclose_emit_unregister;    /* RFC 5626 flow-close general default (0=off,1=on); per-peer flowclose_emit_unregister= overrides. 0 = remove a connection-oriented binding silently on flow close (no external unregister side-effects); 1 = emit them (PeerStatus/BLF/devstate/regexten). */
 	char default_srtpcipher[256];     /* srtpcipher: comma-separated cipher preference inherited by peers; empty = sdp_crypto.c default AES_CM_128_HMAC_SHA1_80 */
@@ -1054,7 +1054,7 @@ struct sofia_config {
 	int subscribe_network_change_event; /* parse-compatibility only (sofia-sip sres_resolver + dnsmgr absorb network-change rebinding); default 1 (chan_sip) */
 	int rtsave_sysname;        /* 1 = include regserver=AST_SYSTEM_NAME in realtime writes (multi-server deployments). Restores canonical Asterisk behavior (active chan_sip fork dropped it). Default 0. */
 	int peer_rtupdate;         /* 1 = propagate registration changes to realtime DB (ast_update_realtime); default 1. rtupdate=no skips ALL realtime writes (cached-realtime, avoids churn). */
-	/* Phase 1 bounded REGISTER realtime-DB-write offload pool (kill-switch, default OFF). */
+	/* Bounded REGISTER realtime-DB-write offload pool (kill-switch, default OFF). */
 	int register_pool;          /* offload the realtime REGISTER DB writes to a bounded pool */
 	int register_pool_workers;  /* lane count; 0 = auto = clamp(ncpu/2+1, 2, 16) */
 	int rtcachefriends;        /* parse-compatibility only: chan_sofia ao2 registry always caches all peers (matches rtcachefriends=YES); default 0. No destroy-after-lookup path. */

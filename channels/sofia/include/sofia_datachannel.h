@@ -9,10 +9,10 @@
 
 /*! \file sofia_datachannel.h
  * \brief chan_sofia WebRTC DataChannel (RFC 8831/8832) — usrsctp transport over the BUNDLE'd
- *        audio DTLS association. Public API, Phase 2a FOUNDATION ONLY.
+ *        audio DTLS association. Public API — transport foundation.
  *
  * Design: one usrsctp AF_CONN socket per Sofia leg, bundled on the AUDIO DTLS (pvt->rtp) — no new
- * socket. The transport rides the Phase-1 engine seam (include/gabpbx/rtp_engine.h):
+ * socket. The transport rides the RTP-engine seam (include/gabpbx/rtp_engine.h):
  *   - inbound:  engine RX cb (ast_rtp_instance_set_dtls_appdata_cb) -> usrsctp_conninput()
  *   - outbound: usrsctp GLOBAL output cb -> ast_rtp_instance_dtls_write_appdata(pvt->rtp, ...)
  *
@@ -20,11 +20,11 @@
  * from res_rtp_gabpbx's drain loop. On that lock we do NOTHING but copy+refcount+push to a shared
  * taskprocessor; ALL usrsctp/DCEP/relay work runs on the worker lane with NO instance lock held.
  *
- * SCOPE Phase 2a = FOUNDATION ONLY: module skeleton + usrsctp init/finish + attach/detach + the
+ * Scope: module skeleton + usrsctp init/finish + attach/detach + the
  * transport seam handoff + the output cb + stubs. NOT YET (clear TODOs below):
  *   - DCEP protocol parse (PPID 50) + OPEN responder/initiator + OPEN-proxying to the far leg
  *   - the message relay (PPIDs 51/53/56/57)
- *   - SDP parse/emit (a=sctp-port RFC 8841, a=mid, m=application) — Phase 3
+ *   - SDP parse/emit (a=sctp-port RFC 8841, a=mid, m=application)
  */
 
 #ifndef CHAN_SOFIA_DATACHANNEL_H
@@ -76,7 +76,7 @@ void sofia_dc_finish(void);
  * \retval the new sofia_datachannel* (caller holds the +1 ao2 ref) on success
  * \retval NULL on failure
  * \note Registers sofia_dc_engine_rx on pvt->rtp; the engine then drains DTLS appdata to us.
- *       NOT wired from SDP yet — Phase 3.
+ *       Not wired from SDP yet.
  */
 struct sofia_datachannel *sofia_dc_attach(struct sofia_pvt *pvt, uint16_t sctp_port);
 
@@ -135,7 +135,7 @@ void sofia_dc_detach(struct sofia_datachannel *dc);
  * \param data payload.
  * \param len payload length.
  * \retval 0 success, -1 on error.
- * \note FOUNDATION: stream/PR-SCTP selection + DCEP framing land with the relay (Phase 2b).
+ * \note stream/PR-SCTP selection + DCEP framing land with the relay.
  */
 int sofia_dc_send(struct sofia_datachannel *dc, uint32_t ppid, const void *data, size_t len);
 

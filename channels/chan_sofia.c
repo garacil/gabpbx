@@ -176,7 +176,7 @@
 #include "sofia/include/sofia_transfer.h"
 #include "sofia/include/sofia_subscribe.h"
 #include "sofia/include/sofia_history.h"
-#include "sofia/include/sofia_datachannel.h"  /* WebRTC DataChannel (usrsctp) — Phase 2a foundation */
+#include "sofia/include/sofia_datachannel.h"  /* WebRTC DataChannel (usrsctp) — foundation */
 
 #include <sofia-sip/nua.h>
 #include <sofia-sip/su.h>
@@ -1623,7 +1623,7 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	ast_copy_string(master->webrtc_cname, child->webrtc_cname, sizeof(master->webrtc_cname));
 	ast_copy_string(master->webrtc_msid, child->webrtc_msid, sizeof(master->webrtc_msid));
 
-	/* Phase 3 WebRTC DataChannel fork-steal: the DataChannel transport rides the just-stolen
+	/* WebRTC DataChannel fork-steal: the DataChannel transport rides the just-stolen
 	 * master->rtp (its engine cb_data already moved with the rtp instance above), so we only MOVE the
 	 * dc pointer child->master + the negotiated DataChannel fields, then REPOINT dc->pvt to master (no re-attach).
 	 * Mirrors the webrtc_* steal. sofia_dc_set_pvt is a no-op stub without usrsctp. */
@@ -2396,7 +2396,7 @@ static void sofia_pvt_destructor(void *obj)
 	/* DSP cleanup before pvt->rtp destroy (chan_sip ordering convention). NULL-safe. */
 	sofia_disable_dsp_detect(pvt);
 
-	/* Phase 3 WebRTC DataChannel teardown — BEFORE ast_rtp_instance_destroy(pvt->rtp). sofia_dc_detach
+	/* WebRTC DataChannel teardown — BEFORE ast_rtp_instance_destroy(pvt->rtp). sofia_dc_detach
 	 * clears the engine appdata cb FIRST (instance-lock barrier, anti-UAF), so it MUST
 	 * run while pvt->rtp is still live; destroying the rtp first would leave the cb pointing at freed
 	 * state. No-op stub without usrsctp; NULL-safe (dc is NULL on a non-DataChannel leg). */
@@ -2932,7 +2932,7 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	peer->max_contacts = sofia_cfg.max_contacts ? sofia_cfg.max_contacts : 6;
 	peer->encryption = 0;
 	peer->webrtc = sofia_cfg.webrtc;	/* inherit [general] webrtc (the ENABLE); per-peer webrtc= overrides. The media profile is chosen by the target transport, not this flag - sofia_offer_effective_webrtc */
-	peer->datachannel = sofia_cfg.datachannel;	/* Phase 3: inherit [general] datachannel; per-peer datachannel= overrides */
+	peer->datachannel = sofia_cfg.datachannel;	/* inherit [general] datachannel; per-peer datachannel= overrides */
 	peer->webrtc_video_bundle = sofia_cfg.webrtc_video_bundle;	/* inherit [general]; per-peer webrtc_video_bundle= overrides */
 	peer->flowclose_emit_unregister = sofia_cfg.flowclose_emit_unregister;	/* RFC 5626 flow-close: inherit [general]; per-peer flowclose_emit_unregister= overrides */
 	ast_string_field_set(peer, srtpcipher, S_OR(sofia_cfg.default_srtpcipher, ""));
@@ -2949,7 +2949,7 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	peer->allowsubscribe = sofia_cfg.default_allowsubscribe;
 	peer->publish = 0;	/* outbound PUBLISH opt-in */
 	peer->gruu = 0;		/* GRUU opt-in */
-	peer->use_gruu_contact = 1;	/* GRUU Phase 2b: use a learned pub-gruu as the dialog Contact (default yes; gated by gruu) */
+	peer->use_gruu_contact = 1;	/* GRUU: use a learned pub-gruu as the dialog Contact (default yes; gated by gruu) */
 	peer->use_service_route = 0;	/* Service-Route (RFC 3608): opt-in (applying it diverts outbound routing) */
 	peer->path_support = 0;		/* Path (RFC 3327): opt-in (accepting Path is a trust decision) */
 	peer->rel100 = 0;		/* 100rel/PRACK (RFC 3262): reliable non-183 provisionals, opt-in */
@@ -3618,7 +3618,7 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 		} else if (!strcasecmp(v->name, "webrtc")) {
 			peer->webrtc = ast_true(v->value);	/* WebRTC ENABLE (DTLS-SRTP + ICE-lite + rtcp-mux); the per-contact/static transport picks the actual profile (sofia_offer_effective_webrtc) */
 		} else if (!strcasecmp(v->name, "datachannel")) {
-			peer->datachannel = ast_true(v->value);	/* Phase 3: accept the WebRTC m=application (RFC 8841 SCTP); requires webrtc=yes + usrsctp */
+			peer->datachannel = ast_true(v->value);	/* accept the WebRTC m=application (RFC 8841 SCTP); requires webrtc=yes + usrsctp */
 		} else if (!strcasecmp(v->name, "webrtc_video_bundle")) {
 			peer->webrtc_video_bundle = ast_true(v->value);	/* BUNDLE WebRTC video onto the audio transport (RFC 8843); requires webrtc=yes; consumed during BUNDLE video staging */
 		} else if (!strcasecmp(v->name, "flowclose_emit_unregister")) {
@@ -3856,7 +3856,7 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 				ast_string_field_set(peer, temp_gruu, "");
 			}
 		} else if (!strcasecmp(v->name, "use_gruu_contact")) {
-			peer->use_gruu_contact = ast_true(v->value);	/* Phase 2b interop kill-switch */
+			peer->use_gruu_contact = ast_true(v->value);	/* Interop kill-switch */
 		} else if (!strcasecmp(v->name, "service_route")) {
 			peer->use_service_route = ast_true(v->value);	/* RFC 3608: pre-load the registrar's Service-Route on outbound INVITEs (opt-in) */
 			if (!peer->use_service_route) {	/* knob turned off -> drop any learned route (no stale routing) */
@@ -4812,7 +4812,7 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 		}
 		return;
 	}
-	/* GRUU Phase 2b: a re-INVITE is a target-refresh request (RFC 5627 §4.4 / RFC 3261 §12.2) so it
+	/* GRUU: a re-INVITE is a target-refresh request (RFC 5627 §4.4 / RFC 3261 §12.2) so it
 	 * carries the GRUU Contact too. Snapshot maxforwards + the GRUU Contact under peer->lock (order is
 	 * pvt->peer; canonical), then RELEASE before nua_invite — never hold peer->lock across the stack. */
 	if (pvt->peer) {
@@ -6538,7 +6538,7 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 		ast_string_field_set(pvt, subscribecontext, peer->subscribecontext);
 		ast_string_field_set(pvt, accountcode, peer->accountcode); /* → chan->accountcode via sofia_new */
 		ao2_ref(peer, +1); pvt->peer = peer;
-		/* GRUU Phase 2b co-req: snapshot gruu under peer->lock; used for NUTAG_SUPPORTED("gruu") on
+		/* GRUU co-req: snapshot gruu under peer->lock; used for NUTAG_SUPPORTED("gruu") on
 		 * the call handle below (RFC 5627 §4.4: advertise Supported: gruu in requests we generate). */
 		int peer_gruu = peer->gruu;
 
@@ -6804,7 +6804,7 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	ast_mutex_unlock(&pvt->lock);
 	char contact_buf[1024];	/* sized for an opaque GRUU Contact (RFC 5627), not just sip:user@host */
 	contact_buf[0] = '\0';
-	/* GRUU Phase 2b + reload-UAF: hold peer->lock across sofia_build_contact (reads the pub_gruu /
+	/* GRUU + reload-UAF: hold peer->lock across sofia_build_contact (reads the pub_gruu /
 	 * fromuser stringfields). Order is channel->peer here (pvt->lock already released above). */
 	if (pvt->peer) {
 		ast_mutex_lock(&pvt->peer->lock);
@@ -6892,7 +6892,7 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
  * (1) RFC 3311 §5.2 / RFC 3261 §14.2 glare — if we already have an offer in flight (reinvite_pending),
  *     reject the incoming offer with 491 Request Pending;
  * (2) RFC 3311 §5.1 — a no-SDP UPDATE is a target-refresh, answered with a 200 OK carrying NO body.
- * The 200 carries a GRUU-aware target-refresh Contact (reuses sofia_build_contact / Phase 2b). UPDATE is
+ * The 200 carries a GRUU-aware target-refresh Contact (reuses sofia_build_contact). UPDATE is
  * NUTAG_APPL_METHOD'd, so the stack hands it here instead of auto-answering (chan_sofia owns SDP). */
 static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 		nua_handle_t *nh, sip_t const *sip)
@@ -7319,7 +7319,7 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			ast_string_field_set(pvt, accountcode, caller_peer->accountcode); /* → chan->accountcode via sofia_new */
 			ao2_ref(caller_peer, +1); pvt->peer = caller_peer;
 			ao2_ref(caller_peer, -1);
-			/* GRUU Phase 2b co-req (RFC 5627 §4.4): advertise Supported: gruu on the responses we
+			/* GRUU co-req (RFC 5627 §4.4): advertise Supported: gruu on the responses we
 			 * generate to this inbound INVITE from a GRUU peer. gruu is an int (benign lock-free read);
 			 * nua adds the handle Supported pref to responses that lack one. */
 			if (pvt->peer && pvt->peer->gruu) {
@@ -10417,7 +10417,7 @@ static int sofia_check_lockuseragent(nua_t *nua, nua_handle_t *nh,
 	return -1;
 }
 
-/* === Phase 1: bounded REGISTER realtime-DB-write offload ===================== */
+/* === Bounded REGISTER realtime-DB-write offload ===================== */
 
 struct sofia_rtupdate_ctx {
 	int registered;          /* selects the registered vs cleared ast_update_realtime shape */
@@ -11147,7 +11147,7 @@ static void sofia_build_contact(struct sofia_pvt *pvt, char *buf, size_t len)
 	}
 	buf[0] = '\0';
 
-	/* GRUU Phase 2b: if this peer has a usable learned pub-gruu, use it verbatim as the dialog
+	/* GRUU: if this peer has a usable learned pub-gruu, use it verbatim as the dialog
 	 * Contact (RFC 5627 §4.4) and skip the legacy <sip:user@ourip> build. Caller holds peer->lock. */
 	if (pvt && pvt->peer && sofia_gruu_dialog_contact(pvt->peer, buf, len)) {
 		return;
@@ -14555,7 +14555,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 						 * if mwi_subscribe is configured. No-op otherwise. */
 						sofia_subscribe_on_registered(peer);
 						sofia_eventsub_on_registered(peer);
-						/* GRUU Phase 2a: learn the pub-gruu/temp-gruu the registrar minted for
+						/* GRUU: learn the pub-gruu/temp-gruu the registrar minted for
 						 * our +sip.instance (RFC 5627 §5.2). No-op unless gruu=yes. */
 						sofia_gruu_consume(peer, sip);
 					}
@@ -16369,7 +16369,7 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "webrtc")) {
 			sofia_cfg.webrtc = ast_true(v->value);	/* WebRTC general default */
 		} else if (!strcasecmp(v->name, "datachannel")) {
-			sofia_cfg.datachannel = ast_true(v->value);	/* Phase 3 WebRTC DataChannel general default; per-peer datachannel= overrides */
+			sofia_cfg.datachannel = ast_true(v->value);	/* WebRTC DataChannel general default; per-peer datachannel= overrides */
 		} else if (!strcasecmp(v->name, "webrtc_video_bundle")) {
 			sofia_cfg.webrtc_video_bundle = ast_true(v->value);	/* WebRTC video BUNDLE general default; per-peer webrtc_video_bundle= overrides */
 		} else if (!strcasecmp(v->name, "flowclose_emit_unregister")) {
@@ -16740,7 +16740,7 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			/* Gates the realtime peer updates in sofia_process_register. */
 			sofia_cfg.peer_rtupdate = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "register_pool")) {
-			/* Phase 1 kill-switch: offload realtime REGISTER DB writes to a bounded pool
+			/* Kill-switch: offload realtime REGISTER DB writes to a bounded pool
 			 * (default OFF). Takes effect on reload. */
 			sofia_cfg.register_pool = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "register_pool_workers")) {
@@ -17183,7 +17183,7 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "webrtc")) {
 			peer->webrtc = ast_true(v->value);	/* WebRTC ENABLE (DTLS-SRTP + ICE-lite + rtcp-mux); the per-contact/static transport picks the actual profile (sofia_offer_effective_webrtc) */
 		} else if (!strcasecmp(v->name, "datachannel")) {
-			peer->datachannel = ast_true(v->value);	/* Phase 3: accept the WebRTC m=application (RFC 8841 SCTP); requires webrtc=yes + usrsctp */
+			peer->datachannel = ast_true(v->value);	/* accept the WebRTC m=application (RFC 8841 SCTP); requires webrtc=yes + usrsctp */
 		} else if (!strcasecmp(v->name, "webrtc_video_bundle")) {
 			peer->webrtc_video_bundle = ast_true(v->value);	/* BUNDLE WebRTC video onto the audio transport (RFC 8843); requires webrtc=yes; consumed during BUNDLE video staging */
 		} else if (!strcasecmp(v->name, "flowclose_emit_unregister")) {
@@ -17411,7 +17411,7 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 				ast_string_field_set(peer, temp_gruu, "");
 			}
 		} else if (!strcasecmp(v->name, "use_gruu_contact")) {
-			peer->use_gruu_contact = ast_true(v->value);	/* Phase 2b interop kill-switch */
+			peer->use_gruu_contact = ast_true(v->value);	/* Interop kill-switch */
 		} else if (!strcasecmp(v->name, "service_route")) {
 			peer->use_service_route = ast_true(v->value);	/* RFC 3608: pre-load the registrar's Service-Route on outbound INVITEs (opt-in) */
 			if (!peer->use_service_route) {	/* knob turned off -> drop any learned route (no stale routing) */
@@ -17759,7 +17759,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	 * webrtc=yes from [general] actually disables it — without this the live sofia_cfg.webrtc stayed
 	 * sticky across a reload (peers re-inherit it in sofia_peer_set_defaults; an explicit peer webrtc= still wins). */
 	sofia_cfg.webrtc = 0;
-	/* Phase 3 WebRTC DataChannel general default OFF; RESET here so a `sip reload` that DROPS
+	/* WebRTC DataChannel general default OFF; RESET here so a `sip reload` that DROPS
 	 * datachannel=yes from [general] actually disables it (mirrors sofia_cfg.webrtc above). An
 	 * explicit per-peer datachannel= still wins. */
 	sofia_cfg.datachannel = 0;
@@ -17885,7 +17885,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.rtsave_sysname = 0;
 	/* Gates the realtime peer updates in sofia_process_register. */
 	sofia_cfg.peer_rtupdate = 1;
-	/* Phase 1 register pool: default OFF + auto lane count. */
+	/* Register pool: default OFF + auto lane count. */
 	sofia_cfg.register_pool = 0;
 	sofia_cfg.register_pool_workers = 0;
 	/* parse-compatibility only — the ao2 registry always caches all peers. */
@@ -18010,7 +18010,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 
 	sofia_post_config_derive_allowsubscribe();
 
-	/* Phase 1: create/toggle the bounded REGISTER pool per config. */
+	/* Create/toggle the bounded REGISTER pool per config. */
 	sofia_regpool_update();
 
 	return 0;
@@ -18078,7 +18078,7 @@ static void *sofia_reg_thread_func(void *data)
 				char mf_str_reregister[8];
 				char instance_feature_rereg[120];
 				snprintf(mf_str_reregister, sizeof(mf_str_reregister), "%d", peer->maxforwards);
-				/* GRUU Phase 1: re-advertise +sip.instance. */
+				/* GRUU: re-advertise +sip.instance. */
 				sofia_build_instance_feature(peer, instance_feature_rereg, sizeof(instance_feature_rereg), peer->sip_outbound);
 				/* A reload that toggled gruu/sip_outbound left stale merged Supported/M_FEATURES on
 				 * peer->nh (NUTAG_SUPPORTED only merges); rebuild the handle with the CURRENT tags before
@@ -18951,7 +18951,7 @@ static int load_module(void)
 		goto err_cleanup;
 	}
 
-	/* WebRTC DataChannel (usrsctp) transport — Phase 2a foundation. Non-fatal: a failure (or a
+	/* WebRTC DataChannel (usrsctp) transport — foundation. Non-fatal: a failure (or a
 	 * build without usrsctp) just leaves m=application unsupported (the SDP keeps it port-0). */
 	if (sofia_dc_init()) {
 		ast_log(LOG_WARNING, "Sofia: WebRTC DataChannel init failed — datachannels disabled\n");
