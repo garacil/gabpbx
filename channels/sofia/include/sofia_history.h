@@ -27,6 +27,9 @@ struct sofia_pvt;
 struct ast_cli_entry;
 struct ast_cli_args;
 
+/*! Size of the capture-filter buffer (shared so callers can size a snapshot local). */
+#define SOFIA_HISTORY_FILTER	64
+
 /*! Global recording gate (sip set history on|off + the recordhistory= knob). A new dialog snapshots
  *  this into pvt->do_history at creation, so a call started with history on stays recorded even if the
  *  operator toggles the global off mid-call (chan_sip semantics). */
@@ -36,8 +39,10 @@ extern int sofia_record_history;
  *  AND the optional substring filter). Called once at the INVITE to set pvt->do_history. */
 int sofia_history_should_record(const char *src, const char *dst);
 
-/*! \brief The active capture filter substring ("" = no filter / record all). For status display. */
-const char *sofia_history_filter_str(void);
+/*! \brief Snapshot the active capture filter substring ("" = no filter / record all) into buf under the
+ *  filter lock. Use instead of touching the raw buffer: it is written by the CLI thread and read by the
+ *  sofia_thread datapath (sofia_history_should_record). buf should be SOFIA_HISTORY_FILTER bytes. */
+void sofia_history_filter_copy(char *buf, size_t len);
 
 /*! \brief Append one event to a dialog's live history. No-op unless pvt->do_history. Takes pvt->lock
  *  (recursive) internally, so it is safe to call whether or not the caller holds it. event = short

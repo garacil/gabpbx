@@ -887,9 +887,13 @@ char *sofia_cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 	/* [general] callerid: fallback From identity when nothing else resolves (chan_sip default_callerid). */
 	ast_cli(a->fd, "  Default callerid:       %s\n", S_OR(sofia_cfg.default_callerid, "gabpbx"));
 
-	ast_cli(a->fd, "  Record SIP history:     %s%s%s\n", sofia_record_history ? "Yes" : "No",
-		(sofia_record_history && !ast_strlen_zero(sofia_history_filter_str())) ? ", filter " : "",
-		(sofia_record_history && !ast_strlen_zero(sofia_history_filter_str())) ? sofia_history_filter_str() : "");
+	{
+		char hist_filter[SOFIA_HISTORY_FILTER];
+		sofia_history_filter_copy(hist_filter, sizeof(hist_filter));
+		ast_cli(a->fd, "  Record SIP history:     %s%s%s\n", sofia_record_history ? "Yes" : "No",
+			(sofia_record_history && !ast_strlen_zero(hist_filter)) ? ", filter " : "",
+			(sofia_record_history && !ast_strlen_zero(hist_filter)) ? hist_filter : "");
+	}
 
 	/* Outbound PUBLISH (RFC 3903) — password REDACTED. */
 	ast_cli(a->fd, "  Outbound PUBLISH:       %s\n",
@@ -958,36 +962,48 @@ char *sofia_set_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 
 	what = a->argv[3];
 
+	/* sofia_apply_log_from_cli marshals the tport TPTAG_LOG toggle onto sofia_thread (tport_set_params
+	 * mutates shared stack state). Dispatch FIRST and only mutate sofia_debug / claim success if it
+	 * succeeds — on failure the tport log state is unchanged, so claiming success (esp. peer/ip, which
+	 * turn full logging OFF) would leave the real state disagreeing with the CLI. */
 	if (!strcasecmp(what, "on")) {
+		if (sofia_apply_log_from_cli(1) < 0) {
+			ast_cli(a->fd, "Sofia debug: failed to apply tport log change (dispatch)\n");
+			return CLI_FAILURE;
+		}
 		sofia_debug = 1;
 		sofia_debug_filter[0] = '\0';
-		if (sofia_nua)
-			tport_set_params(nta_agent_tports(nua_get_agent(sofia_nua)), TPTAG_LOG(1), TAG_END());
 		ast_cli(a->fd, "Sofia debug enabled\n");
 		return CLI_SUCCESS;
 	} else if (!strcasecmp(what, "off")) {
+		if (sofia_apply_log_from_cli(0) < 0) {
+			ast_cli(a->fd, "Sofia debug: failed to apply tport log change (dispatch)\n");
+			return CLI_FAILURE;
+		}
 		sofia_debug = 0;
 		sofia_debug_filter[0] = '\0';
-		if (sofia_nua)
-			tport_set_params(nta_agent_tports(nua_get_agent(sofia_nua)), TPTAG_LOG(0), TAG_END());
 		ast_cli(a->fd, "Sofia debug disabled\n");
 		return CLI_SUCCESS;
 	} else if (!strcasecmp(what, "peer")) {
 		if (a->argc != 5)
 			return CLI_SHOWUSAGE;
+		if (sofia_apply_log_from_cli(0) < 0) {
+			ast_cli(a->fd, "Sofia debug: failed to apply tport log change (dispatch)\n");
+			return CLI_FAILURE;
+		}
 		sofia_debug = 2;
 		ast_copy_string(sofia_debug_filter, a->argv[4], sizeof(sofia_debug_filter));
-		if (sofia_nua)
-			tport_set_params(nta_agent_tports(nua_get_agent(sofia_nua)), TPTAG_LOG(0), TAG_END());
 		ast_cli(a->fd, "Sofia debug enabled for peer '%s'\n", sofia_debug_filter);
 		return CLI_SUCCESS;
 	} else if (!strcasecmp(what, "ip")) {
 		if (a->argc != 5)
 			return CLI_SHOWUSAGE;
+		if (sofia_apply_log_from_cli(0) < 0) {
+			ast_cli(a->fd, "Sofia debug: failed to apply tport log change (dispatch)\n");
+			return CLI_FAILURE;
+		}
 		sofia_debug = 3;
 		ast_copy_string(sofia_debug_filter, a->argv[4], sizeof(sofia_debug_filter));
-		if (sofia_nua)
-			tport_set_params(nta_agent_tports(nua_get_agent(sofia_nua)), TPTAG_LOG(0), TAG_END());
 		ast_cli(a->fd, "Sofia debug enabled for IP '%s'\n", sofia_debug_filter);
 		return CLI_SUCCESS;
 	} else if (!strcasecmp(what, "fork")) {
@@ -1206,14 +1222,9 @@ char *sofia_cli_prune_realtime(struct ast_cli_entry *e, int cmd, struct ast_cli_
 				}
 				/* Release dnsmgr + drop its +1 ref BEFORE ao2_unlink, else the dnsmgr ref pins
 				 * the peer at refcount >= 1 and the destructor never runs (peer + res_dnsmgr
-				 * callback leak). NOT under peer->lock: ast_dnsmgr_release blocks on the dnsmgr
-				 * entry-list lock until any in-flight sofia_on_dns_update_peer (peer->lock) returns,
-				 * so locking here would deadlock. */
-				if (pi->dnsmgr) {
-					ast_dnsmgr_release(pi->dnsmgr);
-					pi->dnsmgr = NULL;
-					ao2_ref(pi, -1);
-				}
+				 * callback leak). Atomic detach-under-lock + release-outside guards against a
+				 * concurrent prune/reload double-releasing the same handle. */
+				sofia_peer_release_dnsmgr(pi, 1);
 				/* Drop the realtime-peer dialplan hint (registrar "realtime_peer") — the reload
 				 * sweep uses "sofia_config_peer" + skips realtime peers, so it never reclaims these;
 				 * else the hint dangles at a freed SIP/<name>. */
@@ -1252,12 +1263,8 @@ char *sofia_cli_prune_realtime(struct ast_cli_entry *e, int cmd, struct ast_cli_
 					ast_cli(a->fd, "Peer '%s' is not a Realtime peer, cannot be pruned.\n", name);
 				} else {
 					/* Release dnsmgr + drop its +1 ref BEFORE ao2_unlink (see multi-prune branch).
-					 * No peer->lock — ast_dnsmgr_release is synchronous. */
-					if (peer->dnsmgr) {
-						ast_dnsmgr_release(peer->dnsmgr);
-						peer->dnsmgr = NULL;
-						ao2_ref(peer, -1);
-					}
+					 * Atomic detach-under-lock guards a concurrent prune/reload double-release. */
+					sofia_peer_release_dnsmgr(peer, 1);
 					/* Drop the realtime-peer dialplan hint (registrar "realtime_peer") before unlink
 					 * (see multi-prune branch). */
 					{

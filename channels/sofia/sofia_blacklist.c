@@ -12,6 +12,9 @@
  */
 
 #include "gabpbx.h"
+
+#include <limits.h>
+
 #include "gabpbx/astobj2.h"
 #include "gabpbx/cli.h"
 #include "gabpbx/lock.h"
@@ -431,6 +434,13 @@ void sofia_blacklist_set_ban_minutes(int minutes)
 		sofia_blacklist_enabled = 0;
 	} else {
 		sofia_blacklist_enabled = 1;
+		/* Clamp before *60: ttl is seconds in an int, so a large blacklist_ban (minutes) would
+		 * overflow the multiply and land negative — flipping "ban window" to "never expires"
+		 * (the ttl > 0 gate at the prune above). INT_MAX/60 minutes is ~68 years, past any real
+		 * window, so clamping there is lossless for sane configs and safe for absurd ones. */
+		if (minutes > INT_MAX / 60) {
+			minutes = INT_MAX / 60;
+		}
 		sofia_blacklist_ttl = minutes * 60;
 	}
 }

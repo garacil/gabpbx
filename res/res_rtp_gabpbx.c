@@ -2087,9 +2087,10 @@ static int rtp_recvfrom(struct ast_rtp_instance *instance, void *buf, size_t siz
 static int __rtp_sendto(struct ast_rtp_instance *instance, void *buf, size_t size, int flags, struct ast_sockaddr *sa, int rtcp)
 {
 	int len = size;
+	int res;
 	void *temp = buf;
 	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
-	struct ast_srtp *srtp = ast_rtp_instance_get_srtp(instance);
+	struct ast_srtp *srtp;
 
 #ifdef HAVE_OPENSSL
 	/* WebRTC: never emit media before DTLS-SRTP is established. While the connection is NEW there are no
@@ -2102,11 +2103,24 @@ static int __rtp_sendto(struct ast_rtp_instance *instance, void *buf, size_t siz
 	}
 #endif
 
+	/* Media TX reaches here UNLOCKED — ast_rtp_instance_write (main/rtp_engine.c) dispatches the engine
+	 * .write callback without ao2_lock, unlike the RTCP/PLI paths. Serialize the SRTP protect+send with
+	 * (a) DTLS srtp (re)install on handshake completion and (b) the RTCP TX path (ast_rtcp_write), which
+	 * all mutate the SAME libsrtp session under ao2_lock(instance). Without this, protect() — which
+	 * advances the per-SSRC ROC/replay state — races those writers and can operate on a srtp context being
+	 * swapped underfoot. The instance ao2 lock is recursive, so the rtcp_sendto/ast_rtp_video_update
+	 * callers that already hold it and re-enter here stay safe. Fetch srtp inside the lock so a concurrent
+	 * set_srtp cannot swap the pointer after the NULL check. */
+	ao2_lock(instance);
+	srtp = ast_rtp_instance_get_srtp(instance);
 	if (res_srtp && srtp && res_srtp->protect(srtp, &temp, &len, rtcp) < 0) {
-	   return -1;
+		ao2_unlock(instance);
+		return -1;
 	}
+	res = ast_sendto(rtcp ? rtp->rtcp->s : rtp->s, temp, len, flags, sa);
+	ao2_unlock(instance);
 
-	return ast_sendto(rtcp ? rtp->rtcp->s : rtp->s, temp, len, flags, sa);
+	return res;
 }
 
 static int rtcp_sendto(struct ast_rtp_instance *instance, void *buf, size_t size, int flags, struct ast_sockaddr *sa)
@@ -2404,8 +2418,11 @@ static int ast_rtp_dtmf_begin(struct ast_rtp_instance *instance, char digit)
 		return -1;
 	}
 
-	/* Grab the payload that they expect the RFC2833 packet to be received in */
+	/* Grab the payload that they expect the RFC2833 packet to be received in. Snapshot the live codec
+	 * map under ao2_lock(instance) — a concurrent SDP re-apply mutates payloads[] (#33). */
+	ao2_lock(instance);
 	payload = ast_rtp_codecs_payload_code(ast_rtp_instance_get_codecs(instance), 0, AST_RTP_DTMF);
+	ao2_unlock(instance);
 
 	rtp->dtmfmute = ast_tvadd(ast_tvnow(), ast_tv(0, 500000));
 	rtp->send_duration = 160;
@@ -3280,7 +3297,12 @@ static int ast_rtp_write(struct ast_rtp_instance *instance, struct ast_frame *fr
 	if (frame->frametype == AST_FRAME_VIDEO) {
 		subclass &= ~0x1LL;
 	}
-	if ((codec = ast_rtp_codecs_payload_code(ast_rtp_instance_get_codecs(instance), 1, subclass)) < 0) {
+	/* Snapshot the TX payload under ao2_lock(instance) — concurrent SDP re-apply mutates payloads[] (#33);
+	 * release before the smoother/send work below. */
+	ao2_lock(instance);
+	codec = ast_rtp_codecs_payload_code(ast_rtp_instance_get_codecs(instance), 1, subclass);
+	ao2_unlock(instance);
+	if (codec < 0) {
 		ast_log(LOG_WARNING, "Don't know how to send format %s packets with RTP\n", ast_getformatname(frame->subclass.codec));
 		return -1;
 	}
@@ -3297,7 +3319,12 @@ static int ast_rtp_write(struct ast_rtp_instance *instance, struct ast_frame *fr
 
 	/* If no smoother is present see if we have to set one up */
 	if (!rtp->smoother) {
-		struct ast_format_list fmt = ast_codec_pref_getsize(&ast_rtp_instance_get_codecs(instance)->pref, subclass);
+		struct ast_format_list fmt;
+		/* Snapshot the packetization pref under ao2_lock(instance) — concurrent SDP re-apply mutates the
+		 * codec map (pref lives in the same struct) (#33). */
+		ao2_lock(instance);
+		fmt = ast_codec_pref_getsize(&ast_rtp_instance_get_codecs(instance)->pref, subclass);
+		ao2_unlock(instance);
 
 		switch (subclass) {
 		case AST_FORMAT_SPEEX:
@@ -3823,7 +3850,10 @@ static struct ast_frame *ast_rtcp_interpret(struct ast_rtp_instance *instance, u
 		if (length < 1 || (position + length + 1) > packetwords) {
 			if (option_debug || rtpdebug)
 				ast_log(LOG_DEBUG, "RTCP Read too short\n");
-			return &ast_null_frame;
+			/* Stop parsing at the malformed sub-packet, but preserve any frame already latched by an
+			 * earlier valid sub-packet of this compound (e.g. a PSFB PLI VIDUPDATE) — f is &ast_null_frame
+			 * until something latches it, so returning f discards nothing when nothing was latched. */
+			return f;
 		}
 
 		/* Per-type structural length: the declared length MUST cover the rc reception report blocks
@@ -3834,12 +3864,12 @@ static struct ast_frame *ast_rtcp_interpret(struct ast_rtp_instance *instance, u
 		if (pt == RTCP_PT_SR && length < (unsigned int) (6 + 6 * rc)) {
 			if (option_debug || rtpdebug)
 				ast_log(LOG_DEBUG, "RTCP SR length %u too short for rc=%d\n", length, rc);
-			return &ast_null_frame;
+			return f;	/* preserve an already-latched frame (see the length<1 guard above) */
 		}
 		if (pt == RTCP_PT_RR && length < (unsigned int) (1 + 6 * rc)) {
 			if (option_debug || rtpdebug)
 				ast_log(LOG_DEBUG, "RTCP RR length %u too short for rc=%d\n", length, rc);
-			return &ast_null_frame;
+			return f;	/* preserve an already-latched frame (see the length<1 guard above) */
 		}
 
 		if (rtcp_debug_test_addr(&addr)) {
@@ -4104,18 +4134,24 @@ static int bridge_p2p_rtp_write(struct ast_rtp_instance *instance, unsigned int 
         rtp->lastrxseqno = seqno;
 
 	/* Check what the payload value should be */
+	/* #33: snapshot payload_type from THIS instance's map under ao2_lock(instance). Take the two instance
+	 * locks SEPARATELY (never co-held) — the reverse bridge direction locks them in the opposite order, so
+	 * co-holding would deadlock. */
+	ao2_lock(instance);
 	payload_type = ast_rtp_codecs_payload_lookup(ast_rtp_instance_get_codecs(instance), payload);
+	ao2_unlock(instance);
 
-	/* Otherwise adjust bridged payload to match */
+	/* Adjust bridged payload to match instance1's negotiated map, under ao2_lock(instance1). If no codec
+	 * matched (< 0) or the matched PT is not actually negotiated on instance1 (no .code), things were made
+	 * incompatible mid-bridge — bail so the packet goes to the core, breaking the P2P bridge. */
+	ao2_lock(instance1);
 	bridged_payload = ast_rtp_codecs_payload_code(ast_rtp_instance_get_codecs(instance1), payload_type.gabpbx_format, payload_type.code);
-
-	/* If no codec could be matched between instance and instance1, then somehow things were made incompatible while we were still bridged.  Bail. */
-	if (bridged_payload < 0) {
-		return -1;
+	if (bridged_payload >= 0 && !ast_rtp_instance_get_codecs(instance1)->payloads[bridged_payload].code) {
+		bridged_payload = -1;
 	}
+	ao2_unlock(instance1);
 
-	/* If the payload coming in is not one of the negotiated ones then send it to the core, this will cause formats to change and the bridge to break */
-	if (!(ast_rtp_instance_get_codecs(instance1)->payloads[bridged_payload].code)) {
+	if (bridged_payload < 0) {
 		return -1;
 	}
 
@@ -4388,12 +4424,18 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 	timestamp = ntohl(rtpheader[1]);
 	ssrc = ntohl(rtpheader[2]);
 
+	/* #33: snapshot the payload map ONCE under ao2_lock(instance) — a concurrent SDP re-apply mutates
+	 * payloads[]. This single lookup is reused for the BUNDLE is_video demux below and the special-payload
+	 * handling later, so the whole packet sees one consistent map view. */
+	ao2_lock(instance);
+	payload = ast_rtp_codecs_payload_lookup(ast_rtp_instance_get_codecs(instance), payloadtype);
+	ao2_unlock(instance);
+
 	/* WebRTC BUNDLE: classify this packet's sub-stream by payload type so audio and the bundled video keep
 	 * independent SSRC/seqno/cycle/count state (RFC 8843 PT-demux). rtp->bundle==0 => is_video==0 => every
 	 * pointer below resolves to the existing audio field => byte-identical to the non-bundle path. */
 	if (rtp->bundle) {
-		struct ast_rtp_payload_type vpt = ast_rtp_codecs_payload_lookup(ast_rtp_instance_get_codecs(instance), payloadtype);
-		is_video = vpt.gabpbx_format && (vpt.code & AST_FORMAT_VIDEO_MASK);
+		is_video = payload.gabpbx_format && (payload.code & AST_FORMAT_VIDEO_MASK);
 	}
 	bundle_rxssrc = is_video ? &rtp->v_rxssrc : &rtp->rxssrc;
 	bundle_rxcount = is_video ? &rtp->v_rxcount : &rtp->rxcount;
@@ -4483,7 +4525,7 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 			    payloadtype, seqno, timestamp,res - hdrlen);
 	}
 
-	payload = ast_rtp_codecs_payload_lookup(ast_rtp_instance_get_codecs(instance), payloadtype);
+	/* payload was snapshotted once under ao2_lock(instance) above (#33) — reuse that consistent view. */
 
 	/* If the payload is not actually an GABpbx one but a special one pass it off to the respective handler */
 	if (!payload.gabpbx_format) {
@@ -5029,7 +5071,10 @@ static int ast_rtp_sendcng(struct ast_rtp_instance *instance, int level)
 		return -1;
 	}
 
+	/* Snapshot the CN payload under ao2_lock(instance) — concurrent SDP re-apply mutates payloads[] (#33). */
+	ao2_lock(instance);
 	payload = ast_rtp_codecs_payload_lookup(ast_rtp_instance_get_codecs(instance), AST_RTP_CN);
+	ao2_unlock(instance);
 
 	level = 127 - (level & 0x7f);
 	

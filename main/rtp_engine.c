@@ -1034,10 +1034,10 @@ static enum ast_bridge_result remote_bridge_loop(struct ast_channel *c0, struct 
 	if (!(glue1->update_peer(c1, instance0, vinstance0, tinstance0, codec0, 0))) {
 		ast_rtp_instance_get_remote_address(instance0, &ac0);
 		if (vinstance0) {
-			ast_rtp_instance_get_remote_address(instance0, &vac0);
+			ast_rtp_instance_get_remote_address(vinstance0, &vac0);
 		}
 		if (tinstance0) {
-			ast_rtp_instance_get_remote_address(instance0, &tac0);
+			ast_rtp_instance_get_remote_address(tinstance0, &tac0);
 		}
 	} else {
 		ast_log(LOG_WARNING, "Channel '%s' failed to talk to '%s'\n", c1->name, c0->name);

@@ -1678,6 +1678,26 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 				sofia_sync_media_fds(m_owner, master);
 				SOFIA_FORKDBG("fd-move m_owner=%p fds=[%d,%d,%d,%d] (masquerade-gate HIT)",
 					(void *)m_owner, win_fd[0], win_fd[1], win_fd[2], win_fd[3]);
+				/* The winner's answer was parsed on the owner-LESS fork child, so the non-fork
+				 * set_format path (sofia_parse_sdp) never applied the negotiated codec — master->owner
+				 * keeps sofia_new's pre-fork ULAW read/write format. Apply the winner-negotiated audio
+				 * format now, mirroring that path (same channel lock, master->owner==m_owner revalidated),
+				 * so a winner that negotiated a non-ULAW codec drives the owner's read/write format instead
+				 * of relying on bridge translation to mask it. Audio-scoped: video native format is handled
+				 * by the SDP-only answer mask + the WebRTC nativeformats sync. */
+				if (master->capability & AST_FORMAT_AUDIO_MASK) {
+					format_t chosen_audio = ast_codec_choose(&master->prefs,
+						master->capability & AST_FORMAT_AUDIO_MASK, 1);
+					if (!chosen_audio) {
+						chosen_audio = ast_best_codec(master->capability & AST_FORMAT_AUDIO_MASK);
+					}
+					if (chosen_audio) {
+						m_owner->nativeformats =
+							(m_owner->nativeformats & ~AST_FORMAT_AUDIO_MASK) | chosen_audio;
+						ast_set_read_format(m_owner, chosen_audio);
+						ast_set_write_format(m_owner, chosen_audio);
+					}
+				}
 			} else {
 				SOFIA_FORKDBG("fd-move SKIPPED m_owner=%p master_owner=%p (masquerade swapped owner)",
 					(void *)m_owner, (void *)master->owner);
@@ -2766,11 +2786,9 @@ static void sofia_peer_destructor(void *obj)
 		ast_variables_destroy(peer->chanvars);
 		peer->chanvars = NULL;
 	}
-	/* Defensive dnsmgr release for orphan paths (a path missed ast_dnsmgr_release). */
-	if (peer->dnsmgr) {
-		ast_dnsmgr_release(peer->dnsmgr);
-		peer->dnsmgr = NULL;
-	}
+	/* Defensive dnsmgr release for orphan paths (a path missed ast_dnsmgr_release). drop_ref=0:
+	 * the object is already being reclaimed (refcount 0), so the dnsmgr +1 ref is long gone. */
+	sofia_peer_release_dnsmgr(peer, 0);
 	/* Unsubscribe (synchronous; waits for in-flight mwi_event_cb) BEFORE ast_free,
 	 * closing the race against concurrent event-bus delivery. */
 	while ((mb = AST_LIST_REMOVE_HEAD(&peer->mailboxes, list))) {
@@ -2831,6 +2849,11 @@ static void sofia_peer_destructor(void *obj)
 				"restart)\n", peer->name);
 		}
 	}
+	/* Destroy peer->lock (inited in sofia_peer_alloc). Safe here: the destructor only runs at
+	 * refcount 0, the dnsmgr +1 ref is already dropped (so sofia_on_dns_update_peer cannot be
+	 * mid-flight on peer->lock), and the last lock user in this destructor is the defensive
+	 * sofia_peer_release_dnsmgr above. */
+	ast_mutex_destroy(&peer->lock);
 	ast_string_field_free_memory(peer);
 }
 
@@ -2862,6 +2885,31 @@ static void sofia_on_dns_update_peer(struct ast_sockaddr *old, struct ast_sockad
 		"OldAddr: %s\r\n"
 		"NewAddr: %s\r\n",
 		peer->name, old_buf, new_buf);
+}
+
+/* Atomically detach + release peer->dnsmgr. Several sites did the check-then-release-then-NULL unlocked:
+ * two concurrent releasers (two `sip prune realtime`, or prune vs the reload sweep vs the peer reset)
+ * could both observe a non-NULL peer->dnsmgr and double-release the entry + double-drop the dnsmgr +1
+ * peer ref (premature destruction). Detach the pointer to a local under peer->lock so only one caller
+ * wins it, then release OUTSIDE the lock — ast_dnsmgr_release blocks on the dnsmgr list lock until any
+ * in-flight sofia_on_dns_update_peer (which holds peer->lock) returns, so releasing under peer->lock
+ * would deadlock. drop_ref = 1 drops the +1 ref the lookup took (all live paths); pass 0 only from the
+ * destructor, where the object is already being reclaimed. Callers must NOT hold peer->lock. */
+void sofia_peer_release_dnsmgr(struct sofia_peer *peer, int drop_ref)
+{
+	struct ast_dnsmgr_entry *dnsmgr;
+
+	ast_mutex_lock(&peer->lock);
+	dnsmgr = peer->dnsmgr;
+	peer->dnsmgr = NULL;
+	ast_mutex_unlock(&peer->lock);
+
+	if (dnsmgr) {
+		ast_dnsmgr_release(dnsmgr);
+		if (drop_ref) {
+			ao2_ref(peer, -1);
+		}
+	}
 }
 
 /* Register async DNS lookup at peer-load conclusion (skip IP-literal/empty/dynamic
@@ -5488,6 +5536,13 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 			if (sofia_debug)
 				ast_verbose("Sofia: Forking %d INVITEs to peer '%s' (%s)\n",
 					branch_idx, pvt->peername, fork->fork_id);
+
+			/* Enable inband-DTMF/fax-CNG DSP on the master too (fork parity with the
+			 * single-contact path below): forked media is masqueraded into the master pvt
+			 * and sofia_read runs ast_dsp_process on it, so without this a forked call to an
+			 * INBAND/AUTO or faxdetect=cng peer would have no detection. Idempotent +
+			 * self-gating, so non-inband/non-fax forking peers pay zero cost. */
+			sofia_enable_dsp_detect(pvt);
 
 			return 0;
 		}
@@ -10809,7 +10864,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 	char real_transport[16];
 
 	if (!sip || !sip->sip_from) {
-		nua_respond(nh, SIP_400_BAD_REQUEST, TAG_END());
+		nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
 		return;
 	}
 	/* Authoritative transport from the actual delivering tport (the real connection), threaded into the
@@ -10851,7 +10906,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			sofia_send_auth_challenge(nua, nh, sip, realm, "REGISTER", "UnknownPeer", NULL, 0);
 			ast_verbose("Sofia: REGISTER from unknown peer '%s' — 401 challenge (alwaysauthreject)\n", user);
 		} else {
-			nua_respond(nh, SIP_403_FORBIDDEN, TAG_END());
+			nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
 			ast_verbose("Sofia: Registration rejected for unknown peer '%s'\n", user);
 		}
 		sofia_log_register_outcome("REJECT (unknown peer)", user, sip);
@@ -17100,13 +17155,9 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 	} else {
 		/* Release the existing dnsmgr handle BEFORE the reset re-parses host= (else a host=
 		 * change leaves dnsmgr registered for the OLD host + keeps its +1 ref; the tail
-		 * re-registers fresh). OUTSIDE peer->lock — ast_dnsmgr_release blocks on the dnsmgr
-		 * entry-list lock until any in-flight sofia_on_dns_update_peer (peer->lock) completes. */
-		if (peer->dnsmgr) {
-			ast_dnsmgr_release(peer->dnsmgr);
-			peer->dnsmgr = NULL;
-			ao2_ref(peer, -1);
-		}
+		 * re-registers fresh). The helper detaches under peer->lock then releases outside it
+		 * (below we take peer->lock for the whole reset — this runs before that). */
+		sofia_peer_release_dnsmgr(peer, 1);
 		/* Hold peer->lock across the ENTIRE reset + repopulate + defaults window. The
 		 * ast_string_field_set calls free the old stringfield pool when a value grows, so
 		 * peer->lock readers (sched/reg/qualify, show_peer / SIPpeers) must serialize behind
@@ -17826,6 +17877,32 @@ int sofia_apply_capture_from_cli(int is_hep, const char *value)
 	return 0;
 }
 
+/* Apply the tport TPTAG_LOG toggle on the sofia_thread. tport_set_params mutates the SHARED
+ * nta/tport stack state, so — like the capture toggle above — it must NOT be called from the CLI
+ * thread; sofia_apply_log_from_cli marshals here. */
+static void sofia_apply_log_root(void *data)
+{
+	int on = *(int *)data;
+	ast_free(data);
+	if (sofia_nua) {
+		tport_set_params(nta_agent_tports(nua_get_agent(sofia_nua)), TPTAG_LOG(on), TAG_END());
+	}
+}
+
+int sofia_apply_log_from_cli(int on)
+{
+	int *val = ast_malloc(sizeof(*val));
+	if (!val) {
+		return -1;
+	}
+	*val = on;
+	if (sofia_dispatch_to_root_thread(sofia_apply_log_root, val) < 0) {
+		ast_free(val);
+		return -1;
+	}
+	return 0;
+}
+
 /* Apply a parsed sofia.conf to the live sofia_cfg + peers state. Shared by the init path
  * (sofia_load_config) and the reload worker. Caller owns cfg — do NOT destroy here. Returns 0,
  * or -1 on a hard failure that leaves live state partially mutated (caller logs + bails). */
@@ -18464,8 +18541,9 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 	s.wssbindaddr[0] = '\0';
 	s.wssbindport = 0;
 	s.wss_enable = 1;
-	/* Blacklist ban/decay window resets to the 24h default so a removed `blacklist_ban` reverts. */
-	sofia_blacklist_set_ban_minutes(-1);
+	/* NOTE: blacklist_ban is NOT a listener key and is applied by sofia_apply_config (which resets to the
+	 * 24h default then re-applies) ONLY when the reload proceeds — this compare-only function must not touch
+	 * the live blacklist, else a REFUSED reload (listener change → restart required) would still mutate it. */
 	s.tlsverify = 0;
 	s.tlsverifyclient = 0;
 	s.tls_ciphers[0] = '\0';
@@ -18519,8 +18597,6 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 			s.tlsbindport = atoi(v->value);
 		} else if (!strcasecmp(v->name, "tlsenable")) {
 			s.tls_enable = ast_true(v->value);
-		} else if (!strcasecmp(v->name, "blacklist_ban")) {
-			sofia_blacklist_set_ban_minutes(atoi(v->value));
 		} else if (!strcasecmp(v->name, "tlscertfile") || !strcasecmp(v->name, "tlscertdir")) {
 			ast_copy_string(s.tlscertfile, v->value, sizeof(s.tlscertfile));
 		} else if (!strcasecmp(v->name, "tlscafile")) {
@@ -18712,13 +18788,9 @@ static int sofia_peer_sweep_cb(void *obj, void *arg, int flags)
 		}
 	}
 	/* Release dnsmgr + drop its +1 ref FIRST, else the destructor never runs (its ref pins
-	 * refcount >= 1 after ao2_unlink). ast_dnsmgr_release is synchronous (waits for in-flight
-	 * callbacks), so no UAF window when ao2_unlink runs next. */
-	if (peer->dnsmgr) {
-		ast_dnsmgr_release(peer->dnsmgr);
-		peer->dnsmgr = NULL;
-		ao2_ref(peer, -1);
-	}
+	 * refcount >= 1 after ao2_unlink). Atomic detach-under-lock + release-outside (the helper
+	 * takes peer->lock briefly, before the reg/qualify teardown below re-takes it). */
+	sofia_peer_release_dnsmgr(peer, 1);
 	/* Destroy the REGISTER + qualify handles synchronously — this runs on sofia_thread, so
 	 * the same-thread-as-create constraint holds. bind(NULL) before each destroy detaches
 	 * hmagic so late events skip. Under peer->lock vs the reg/qualify aux readers; bind/destroy
@@ -18745,19 +18817,15 @@ static int sofia_peer_sweep_cb(void *obj, void *arg, int flags)
 
 /* Release dnsmgr + drop its +1 ref for EVERY peer unconditionally (no mark/realtime gate, unlike
  * sofia_peer_sweep_cb). Used only by load_module's err_cleanup: the container ref is about to drop,
- * but a dnsmgr ref would pin refcount >= 1 and leak the peer + res_dnsmgr entry. NOT under peer->lock
- * (ast_dnsmgr_release blocks on the dnsmgr list lock vs the peer->lock-taking callback). Safe after
- * sofia_thread is joined — it touches only res_dnsmgr's list. */
+ * but a dnsmgr ref would pin refcount >= 1 and leak the peer + res_dnsmgr entry. sofia_peer_release_dnsmgr
+ * detaches under peer->lock then releases OUTSIDE it (ast_dnsmgr_release blocks on the dnsmgr list lock
+ * vs the peer->lock-taking callback). Safe after sofia_thread is joined — it touches only res_dnsmgr's list. */
 static int sofia_peer_dnsmgr_release_cb(void *obj, void *arg, int flags)
 {
 	struct sofia_peer *peer = obj;
 	/* Drain MWI unconditionally (a peer may have mailboxes but no dnsmgr). */
 	sofia_peer_drain_mwi(peer);
-	if (peer->dnsmgr) {
-		ast_dnsmgr_release(peer->dnsmgr);
-		peer->dnsmgr = NULL;
-		ao2_ref(peer, -1);
-	}
+	sofia_peer_release_dnsmgr(peer, 1);
 	return 0;
 }
 
@@ -19175,9 +19243,19 @@ static int load_module(void)
 
 	sofia_do_register();
 
-	ast_pthread_create(&sofia_reg_thread, NULL, sofia_reg_thread_func, NULL);
+	/* Auxiliary service threads: check the create result and, on failure, WARN and mark the
+	 * tid AST_PTHREADT_NULL so a later shutdown join never touches an invalid handle. These
+	 * are not load-critical (the module still services calls), so a failure warns rather than
+	 * failing the load — unlike the primary sofia_thread above. */
+	if (ast_pthread_create(&sofia_reg_thread, NULL, sofia_reg_thread_func, NULL)) {
+		ast_log(LOG_WARNING, "Sofia: failed to start the outbound REGISTER refresh thread — outbound registrations will not auto-refresh\n");
+		sofia_reg_thread = AST_PTHREADT_NULL;
+	}
 
-	ast_pthread_create(&sofia_qualify_tid, NULL, sofia_qualify_thread, NULL);
+	if (ast_pthread_create(&sofia_qualify_tid, NULL, sofia_qualify_thread, NULL)) {
+		ast_log(LOG_WARNING, "Sofia: failed to start the peer qualify keepalive thread — peer qualify (OPTIONS) will not run\n");
+		sofia_qualify_tid = AST_PTHREADT_NULL;
+	}
 
 	ast_verbose("Sofia-SIP channel driver loaded successfully\n");
 

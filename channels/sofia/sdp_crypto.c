@@ -169,10 +169,16 @@ static struct sdp_crypto *sdp_crypto_alloc(void)
 
 void sdp_crypto_destroy(struct sdp_crypto *crypto)
 {
+	/* SECURITY: zeroize key material before free so the freed heap block cannot be
+	 * scavenged for the SRTP master keys (RFC 4568 §9.1). The struct holds local_key /
+	 * remote_key / local_key_per_suite / staged_remote_key inline, and a_crypto holds the
+	 * inline key in its string — wipe both. */
+	if (crypto->a_crypto) {
+		memset(crypto->a_crypto, 0, strlen(crypto->a_crypto));
+	}
 	ast_free(crypto->a_crypto);
-	crypto->a_crypto = NULL;
 	ast_free(crypto->tag);
-	crypto->tag = NULL;
+	memset(crypto, 0, sizeof(*crypto));
 	ast_free(crypto);
 }
 
@@ -201,18 +207,23 @@ struct sdp_crypto *sdp_crypto_setup(void)
 
 	if (key_len != SRTP_MASTER_LEN) {
 		ast_log(LOG_ERROR, "base64 encode/decode bad len %d != %d\n", key_len, SRTP_MASTER_LEN);
-		ast_free(p);
+		sdp_crypto_destroy(p);	/* zeroizes the freshly generated local key before free */
+		memset(remote_key, 0, sizeof(remote_key));	/* wipe the decoded stack copy */
 		return NULL;
 	}
 
 	if (memcmp(remote_key, p->local_key, SRTP_MASTER_LEN)) {
 		ast_log(LOG_ERROR, "base64 encode/decode bad key\n");
-		ast_free(p);
+		sdp_crypto_destroy(p);	/* zeroizes the freshly generated local key before free */
+		memset(remote_key, 0, sizeof(remote_key));	/* wipe the decoded stack copy */
 		return NULL;
 	}
 
-	ast_debug(1 , "local_key64 %s len %zu\n", p->local_key64, strlen(p->local_key64));
+	/* SECURITY: never log the local master key (RFC 4568 §9.1) — length only. */
+	ast_debug(1, "local SRTP master key generated (base64 len %zu)\n", strlen(p->local_key64));
 
+	/* Wipe the round-trip verification copy of the key from the stack. */
+	memset(remote_key, 0, sizeof(remote_key));
 	return p;
 }
 
@@ -457,15 +468,22 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 	}
 
 	{
-		/* SRTP cipher expansion: per-suite expected
-		 * master key+salt length. Validates remote-offered key matches the
-		 * suite's required length (RFC 6188 / RFC 7714). */
+		/* SRTP cipher expansion: per-suite expected master key+salt length. Validates the
+		 * remote-offered key matches the suite's required length (RFC 6188 / RFC 7714).
+		 * Decode into a scratch buffer LARGER than any suite's key so an OVER-LONG inline key
+		 * decodes to >expected and is rejected — decoding straight into remote_key
+		 * (SRTP_MASTER_LEN == the 46-byte AES_CM_256 length) would silently CAP an over-long
+		 * key at 46 and accept it for the 46-byte suites. */
 		int expected_len = sdp_crypto_suite_keysalt_len(suite_val);
-		if ((key_len = ast_base64decode(remote_key, key_salt, sizeof(remote_key))) != expected_len) {
+		unsigned char keybuf[SRTP_MASTER_LEN + 4];
+		if ((key_len = ast_base64decode(keybuf, key_salt, sizeof(keybuf))) != expected_len) {
 			ast_log(LOG_WARNING, "SRTP key length %d != expected %d for suite %s\n",
 				key_len, expected_len, suite);
+			memset(keybuf, 0, sizeof(keybuf));
 			return -1;
 		}
+		memcpy(remote_key, keybuf, expected_len);
+		memset(keybuf, 0, sizeof(keybuf));	/* wipe the decode scratch */
 	}
 
 	/* Gate the "unchanged key" short-circuit on a prior activation (p->tag set
@@ -513,13 +531,20 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 		return -1;
 	}
 
-	if (!p->tag) {
-		ast_log(LOG_DEBUG, "Accepting crypto tag %s\n", tag);
-		p->tag = ast_strdup(tag);
-		if (!p->tag) {
+	/* RFC 4568 §5.1.2: the answer MUST echo the offer's accepted tag. Adopt the newly
+	 * accepted tag ALWAYS (not only on the first activation) so a re-INVITE that renumbers
+	 * the crypto tag gets the new tag echoed, not the stale first one. */
+	{
+		char *new_tag = ast_strdup(tag);
+		if (new_tag) {
+			ast_log(LOG_DEBUG, "Accepting crypto tag %s\n", tag);
+			ast_free(p->tag);
+			p->tag = new_tag;
+		} else if (!p->tag) {
 			ast_log(LOG_ERROR, "Could not allocate memory for tag\n");
 			return -1;
 		}
+		/* else (re-key strdup fail): keep the existing tag — degraded but functional. */
 	}
 
 	/* Finally, rebuild the crypto line */
@@ -542,14 +567,14 @@ int sdp_crypto_commit(struct sdp_crypto *p, struct ast_rtp_instance *rtp)
 	}
 	/* Constraint 5: pre-allocate the tag BEFORE the live add_srtp_policy so a post-
 	 * activation allocation failure can never turn an already-committed SDP into a reject.
-	 * A -1 here means nothing live was touched, so the caller may safely reject. */
-	if (!p->tag) {
-		new_tag = ast_strdup(p->staged_tag);
-		if (!new_tag) {
-			ast_log(LOG_ERROR, "Could not allocate memory for staged crypto tag\n");
-			p->staged_pending = 0;
-			return -1;
-		}
+	 * A -1 here means nothing live was touched, so the caller may safely reject. Allocate
+	 * ALWAYS (not only when p->tag is unset) so a re-key that renumbers the tag echoes the
+	 * new accepted tag (RFC 4568 §5.1.2), not the stale first one. */
+	new_tag = ast_strdup(p->staged_tag);
+	if (!new_tag) {
+		ast_log(LOG_ERROR, "Could not allocate memory for staged crypto tag\n");
+		p->staged_pending = 0;
+		return -1;
 	}
 	/* selected_suite_index is an INPUT to activation (per-suite local-key pick), so apply
 	 * the staged value just BEFORE activating (not mutated during validate).
@@ -574,10 +599,11 @@ int sdp_crypto_commit(struct sdp_crypto *p, struct ast_rtp_instance *rtp)
 	 * path never leaves p->suite/p->remote_key mismatched against the live policy. */
 	ast_copy_string(p->suite, p->staged_suite, sizeof(p->suite));
 	memcpy(p->remote_key, p->staged_remote_key, sizeof(p->remote_key));
-	if (new_tag) {
-		ast_log(LOG_DEBUG, "Accepting crypto tag %s\n", new_tag);
-		p->tag = new_tag;
-	}
+	/* Adopt the newly accepted tag (RFC 4568 §5.1.2), replacing any prior tag on a re-key.
+	 * new_tag is always allocated above (or we returned -1), and the -2 path already freed it. */
+	ast_log(LOG_DEBUG, "Accepting crypto tag %s\n", new_tag);
+	ast_free(p->tag);
+	p->tag = new_tag;
 	p->staged_pending = 0;
 	/* Rebuild our local crypto line. A failure here is logged but MUST NOT un-commit the
 	 * SRTP we just activated (constraint 5). */
@@ -647,7 +673,8 @@ int sdp_crypto_offer_list(struct sdp_crypto *p, const char *cipher_list)
 			ast_log(LOG_ERROR, "Could not allocate memory for crypto line\n");
 			return -1;
 		}
-		ast_log(LOG_DEBUG, "Crypto line: %s", p->a_crypto);
+		/* SECURITY: p->a_crypto carries the inline master key — log suite/tag only. */
+		ast_log(LOG_DEBUG, "Crypto line built (suite=%s tag=%s)\n", p->suite, p->tag ? p->tag : "1");
 		return 0;
 	}
 
@@ -743,7 +770,8 @@ int sdp_crypto_offer_list(struct sdp_crypto *p, const char *cipher_list)
 		if (!p->a_crypto) {
 			return -1;
 		}
-		ast_log(LOG_DEBUG, "Crypto offer (%d suites): %s", emitted, p->a_crypto);
+		/* SECURITY: the multi-suite a=crypto carries every inline master key — count only. */
+		ast_log(LOG_DEBUG, "Crypto offer built (%d suites)\n", emitted);
 		return 0;
 	}
 }

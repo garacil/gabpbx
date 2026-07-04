@@ -73,7 +73,7 @@ static int sofia_sdp_cat(char *dst, size_t dstsize, const char *src)
  * bundled m-line by its mid being in the session BUNDLE group (video/DataChannel share one ICE/DTLS transport). */
 static int sofia_sdp_mid_in_bundle(const char *group, const char *mid)
 {
-	char grp[256];
+	char grp[1024];	/* holds the whole a=group:BUNDLE token list (up to 3x 256B mids) — see webrtc_mid */
 	char *tok, *save = NULL;
 
 	if (ast_strlen_zero(group) || ast_strlen_zero(mid) || strncasecmp(group, "BUNDLE", 6)) {
@@ -854,7 +854,7 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 	 * session snprintf via a leading "%s" arg (empty string when not WebRTC/no
 	 * bundle, so non-WebRTC SDP is byte-identical). The mid in the group MUST
 	 * match the m=audio a=mid emitted above (both default to "0"). */
-	char group_buf[160] = "";
+	char group_buf[1024] = "";	/* holds "a=group:BUNDLE <up to 3 256B mids>" + the a=msid-semantic line; fail-closed on overflow */
 	if (pvt->is_webrtc && pvt->webrtc_bundle) {
 		/* when an m=application was ACCEPTED it shares THIS BUNDLE transport, so its mid joins
 		 * the group → "BUNDLE <audio_mid> <dc_mid>" (RFC 8843). Otherwise the group stays audio-only
@@ -864,21 +864,70 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 		/* BUNDLE token list in m-line ORDER: audio [video] [DataChannel] (RFC 8843). The video mid joins ONLY
 		 * when its m=video shares this transport (webrtc_video_bundled + accepted-or-offered). dc_accepted = we
 		 * accepted an INBOUND DataChannel; dc_offerer = we ORIGINATED it — either way its mid joins the group. */
+		/* Offerer re-offer gate: DURABLE on the live video capability, not !webrtc_video_answer_applied —
+		 * that latches false after the first answer applies, so a later locally-originated re-INVITE on an
+		 * offerer video leg would drop m=video forever. On answer-apply, agreed video keeps the cap bits
+		 * while a rejected video clears both webrtc_video_offerer and the cap video bits (see sofia_parse_sdp). */
 		int video_in_grp = pvt->webrtc_video_bundled
 			&& (pvt->webrtc_video_accepted
-				|| (!is_answer && pvt->webrtc_video_offerer && !pvt->webrtc_video_answer_applied));
+				|| (!is_answer && pvt->webrtc_video_offerer && (pvt->capability & AST_FORMAT_VIDEO_MASK)));
 		int dc_in_grp = (is_answer ? pvt->dc_accepted : pvt->dc_offerer) && !ast_strlen_zero(pvt->dc_mid);
-		char grp[200] = "";	/* up to 3 mids (webrtc_video_mid/dc_mid are 64B each); sized for the worst case */
+		char grp[1024] = "";	/* up to 3 mids (webrtc_mid/webrtc_video_mid/dc_mid are 256B each); sized for the worst case */
 		int gw;
-		/* Bounds-checked incremental append (sofia_sdp_cat never overruns): "audio [video] [dc]". */
-		sofia_sdp_cat(grp, sizeof(grp), amid);
-		if (video_in_grp) {
-			sofia_sdp_cat(grp, sizeof(grp), " ");
-			sofia_sdp_cat(grp, sizeof(grp), vmid);
-		}
-		if (dc_in_grp) {
-			sofia_sdp_cat(grp, sizeof(grp), " ");
-			sofia_sdp_cat(grp, sizeof(grp), pvt->dc_mid);
+		/* Bounds-checked incremental append (sofia_sdp_cat never overruns). */
+		if (is_answer) {
+			/* RFC 8843 §7.3.1: the answerer's a=group:BUNDLE MUST list the mids in the OFFERED m-line
+			 * ORDER (the answerer's BUNDLE-tag is the first offered bundled m-line's mid). Walk the offer
+			 * slots in order and append each accepted-bundled mid at its slot — else a video-first offer
+			 * gets an audio-first answer group and a strict UA rejects it. Membership (video_in_grp /
+			 * dc_in_grp) is UNCHANGED; only the ORDER differs from the canonical offer build below.
+			 * Slot map: audio=webrtc_audio_offer_idx; video=reject_m[webrtc_accepted_video_idx].offer_idx;
+			 * DataChannel=the reject_m slot whose mid matches dc_mid (all already used by the m-line emit). */
+			int max_slot = pvt->webrtc_audio_offer_idx, ri2, slot2;
+			int vslot = (video_in_grp && pvt->webrtc_accepted_video_idx >= 0
+					&& pvt->webrtc_accepted_video_idx < pvt->webrtc_reject_m_count)
+				? pvt->webrtc_reject_m[pvt->webrtc_accepted_video_idx].offer_idx : -1;
+			int dslot = -1;
+			for (ri2 = 0; ri2 < pvt->webrtc_reject_m_count; ri2++) {
+				if (pvt->webrtc_reject_m[ri2].offer_idx > max_slot) {
+					max_slot = pvt->webrtc_reject_m[ri2].offer_idx;
+				}
+				if (dc_in_grp && dslot < 0 && !ast_strlen_zero(pvt->webrtc_reject_m[ri2].mid)
+						&& !strcmp(pvt->webrtc_reject_m[ri2].mid, pvt->dc_mid)) {
+					dslot = pvt->webrtc_reject_m[ri2].offer_idx;
+				}
+			}
+			/* Abnormal: offer parse recorded no audio slot — still lead with the audio mid (never drop it). */
+			if (pvt->webrtc_audio_offer_idx < 0) {
+				sofia_sdp_cat(grp, sizeof(grp), amid);
+			}
+			for (slot2 = 0; slot2 <= max_slot; slot2++) {
+				const char *smid = NULL;
+				if (slot2 == pvt->webrtc_audio_offer_idx) {
+					smid = amid;
+				} else if (vslot == slot2) {
+					smid = vmid;
+				} else if (dslot == slot2) {
+					smid = pvt->dc_mid;
+				}
+				if (smid) {
+					if (grp[0]) {
+						sofia_sdp_cat(grp, sizeof(grp), " ");
+					}
+					sofia_sdp_cat(grp, sizeof(grp), smid);
+				}
+			}
+		} else {
+			/* OFFER build: no remote offer to mirror — canonical "audio [video] [DataChannel]". */
+			sofia_sdp_cat(grp, sizeof(grp), amid);
+			if (video_in_grp) {
+				sofia_sdp_cat(grp, sizeof(grp), " ");
+				sofia_sdp_cat(grp, sizeof(grp), vmid);
+			}
+			if (dc_in_grp) {
+				sofia_sdp_cat(grp, sizeof(grp), " ");
+				sofia_sdp_cat(grp, sizeof(grp), pvt->dc_mid);
+			}
 		}
 		gw = snprintf(group_buf, sizeof(group_buf), "a=group:BUNDLE %s\r\n", grp);
 		if (gw >= (int)sizeof(group_buf)) {
@@ -1027,8 +1076,14 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 		goto webrtc_m_lines_done;	/* the WebRTC answer m-lines are fully emitted in offer order */
 	}
 
-	/* Audio section lands first (non-WebRTC leg, and the WebRTC OFFER-build direction below). */
-	{
+	/* Audio section lands first (non-WebRTC leg, and the WebRTC OFFER-build direction below).
+	 * RFC 3264 §6: the answer MUST carry the same m-line set as the offer. Suppress the m=audio ONLY for the
+	 * exact image-only T.38 case: we are ANSWERING a non-WebRTC leg, the offer carried NO m=audio, and we are
+	 * emitting a live T.38 m=image below (same gate as that emitter) — otherwise the answer adds an m=audio the
+	 * offer never had. A normal audio call, or a T.38 re-INVITE that DID offer m=audio (even port 0), still
+	 * emits the audio section unchanged. */
+	if (!(is_answer && !pvt->is_webrtc && !pvt->offer_had_audio
+			&& pvt->udptl && pvt->t38_state != SOFIA_T38_DISABLED)) {
 		int blen = strlen(buf);
 		if (snprintf(buf + blen, len - blen, "%s", audio_m_buf) >= (int)(len - blen)) {
 			overflow = 1;
@@ -1042,7 +1097,7 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 	 * Same accept/offer gate as the former inline accepted-video emit. */
 	if (pvt->is_webrtc && !is_answer
 			&& (pvt->webrtc_video_accepted
-				|| (pvt->webrtc_video_offerer && !pvt->webrtc_video_answer_applied))) {	/* answerer-accepted OR offerer-offered */
+				|| (pvt->webrtc_video_offerer && (pvt->capability & AST_FORMAT_VIDEO_MASK)))) {	/* answerer-accepted OR offerer-offered (durable video-cap gate; see the a=group builder) */
 		/* BUNDLE: emit from pvt->rtp (no vrtp) at the audio port; else the legacy separate-transport m=video. */
 		if (pvt->webrtc_video_bundled) {
 			sofia_sdp_emit_bundled_video(pvt, buf, len, host, sdp_family, tmp_buf, sizeof(tmp_buf), port, video_dir, &overflow);
@@ -1469,6 +1524,9 @@ int sofia_webrtc_provision_offer(struct sofia_pvt *pvt)
 		 * dropped at the answer-parse commit. The engine BUNDLE prop is armed at that commit (rollback-safe).
 		 * This is the offer-generation path — the exception where webrtc_video_bundled is set early. */
 		format_t bvf;
+		/* Live pvt->rtp codec-map read+write — serialize with the media threads under ao2_lock(instance)
+		 * (the payloads[] array has no lock of its own; #33). */
+		ao2_lock(pvt->rtp);
 		for (bvf = 1; bvf; bvf <<= 1) {
 			int bvpt;
 			if (!(bvf & pvt->capability) || !(bvf & (AST_FORMAT_VP8 | AST_FORMAT_H264))) {
@@ -1479,6 +1537,7 @@ int sofia_webrtc_provision_offer(struct sofia_pvt *pvt)
 				ast_rtp_codecs_payloads_set_m_type(ast_rtp_instance_get_codecs(pvt->rtp), pvt->rtp, bvpt);
 			}
 		}
+		ao2_unlock(pvt->rtp);
 		ast_copy_string(pvt->webrtc_video_mid, "1", sizeof(pvt->webrtc_video_mid));
 		pvt->webrtc_video_offerer = 1;
 		pvt->webrtc_video_bundled = 1;
@@ -1621,6 +1680,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	sdp_media_t *media;
 	const char *sdp_data;
 	int audio_offered = 0;
+	int m_audio_present = 0;	/* any m=audio line in the offer (incl. port 0); RFC 3264 §6 answer-mirror gate for T.38 */
 	int video_offered = 0;
 	int audio_secure_offered = 0;
 	int video_secure_offered = 0;
@@ -1655,7 +1715,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 		/* WebRTC interop: offered audio a=mid token (RFC 5888 §4) + whether a session-
 		 * or media-level a=group:BUNDLE was present (RFC 8843). Echoed back in the
 		 * answer's m=audio (a=mid) and at session level (a=group:BUNDLE <mid>). */
-		char mid[64];
+		char mid[256];		/* 256B so a legal long offered mid is not truncated before commit to pvt->webrtc_mid */
 		int have_mid;
 		int have_bundle;	/* a=group:BUNDLE seen (session or media level) */
 	};
@@ -1665,7 +1725,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	 * captured below WHILE the sdp is still alive. The sdp parser is freed at sdp_parser_free() before
 	 * the DataChannel accept gate runs, so the gate must NOT dereference sdp->sdp_attributes (use-after-
 	 * free — it segfaulted on the first real DataChannel offer). Empty string = no session BUNDLE. */
-	char bundle_group[256] = "";
+	char bundle_group[1024] = "";	/* whole a=group:BUNDLE list (up to 3x 256B mids) — must not truncate before membership checks */
 	/* OFFER-side DataChannel answer detect: the far leg's ANSWER carried a nonzero-port m=application
 	 * webrtc-datachannel (RFC 3264 §6: port 0 = the answerer DECLINED our offered DataChannel). Set in the recording
 	 * loop below; consumed by the DataChannel offerer answer-apply (after sdp_parser_free, so it cannot re-read the
@@ -1859,6 +1919,9 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 		pvt->webrtc_video_bundled = 0;	/* BUNDLE: when we ANSWER a CURRENT offer we re-derive bundle from THIS offer (current role, NOT the permanent webrtc_offerer); applying an ANSWER to our own offer (current_offer==0) keeps the flag provision_offer set */
 	}
 	for (media = sdp->sdp_media; media; media = media->m_next) {
+		if (media->m_type == sdp_media_audio) {
+			m_audio_present = 1;	/* offer carried an m=audio line (any port) — see offer_had_audio */
+		}
 		if (media->m_type == sdp_media_audio && media->m_port != 0) {
 			sdp_attribute_t *a;
 			audio_offered = 1;
@@ -2980,7 +3043,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 		 * mirroring the inbound accept gate's sctp-port refusal. */
 		if (answer_dc_active && answer_dc_port_present && !ast_strlen_zero(pvt->dc_mid)
 				&& !strncasecmp(bundle_group, "BUNDLE", 6)) {
-			char grp[256];
+			char grp[1024];	/* holds the whole a=group:BUNDLE token list (up to 3x 256B mids) — see webrtc_mid */
 			char *tok, *save = NULL;
 			ast_copy_string(grp, bundle_group, sizeof(grp));
 			tok = strtok_r(grp, " \t", &save);	/* the literal "BUNDLE" */
@@ -3193,7 +3256,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 			 * here (the original sdp_attribute_find() here was a use-after-free that segfaulted). Empty
 			 * dc_mid (or empty bundle_group) never matches — such a DataChannel cannot be BUNDLE'd, so it reflects. */
 			if (!ast_strlen_zero(pvt->dc_mid) && !strncasecmp(bundle_group, "BUNDLE", 6)) {
-				char grp[256];
+				char grp[1024];	/* holds the whole a=group:BUNDLE token list (up to 3x 256B mids) — see webrtc_mid */
 				char *tok, *save = NULL;
 				ast_copy_string(grp, bundle_group, sizeof(grp));
 				tok = strtok_r(grp, " \t", &save);	/* the literal "BUNDLE" */
@@ -3326,8 +3389,12 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	/* COMMIT: every reject gate passed. Install the staged codec maps into the live
 	 * RTP instances now (a reject returned via sdp_reject before reaching here). */
 	if (staged_audio_valid) {
+		/* Commit the staged audio map into the LIVE pvt->rtp map under ao2_lock(instance) — the media
+		 * threads read payloads[] with the same lock (#33; the map has no lock of its own). */
+		ao2_lock(pvt->rtp);
 		ast_rtp_codecs_payloads_copy(&staged_audio_codecs,
 			ast_rtp_instance_get_codecs(pvt->rtp), pvt->rtp);
+		ao2_unlock(pvt->rtp);
 		/* SIP history: the SDP is ACCEPTED here (every reject gate passed) — record the negotiated
 		 * audio codec NAMES (metadata only, no body) for verbose analysis. */
 		if (pvt->capability & AST_FORMAT_AUDIO_MASK) {
@@ -3368,6 +3435,9 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 			pvt->webrtc_video_accepted = 0;
 			pvt->capability &= ~((format_t)AST_FORMAT_VIDEO_MASK);
 		} else {
+			/* Lock the ENTIRE live-map read+unset+write sequence under ao2_lock(instance) so a media
+			 * thread never observes a half-merged map (#33). */
+			ao2_lock(pvt->rtp);
 			/* PT stability (RFC 3264 §8.3.2): keep the already-negotiated video PT across renegotiation. */
 			sofia_video_pt_keep_negotiated(&staged_video_codecs,
 				ast_rtp_instance_get_codecs(pvt->rtp));
@@ -3377,9 +3447,12 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 				ast_rtp_instance_get_codecs(pvt->rtp));
 			ast_rtp_codecs_payloads_copy(&staged_video_codecs,
 				ast_rtp_instance_get_codecs(pvt->rtp), pvt->rtp);
+			ao2_unlock(pvt->rtp);
 			pvt->webrtc_video_bundled = 1;	/* arm the flag HERE, past every reject gate */
 		}
 	} else if (staged_video_valid && pvt->vrtp) {
+		/* Same full read+unset+write sequence on the separate video instance, under ao2_lock(instance) (#33). */
+		ao2_lock(pvt->vrtp);
 		/* PT stability (RFC 3264 §8.3.2): same rule on the separate-transport video instance. */
 		sofia_video_pt_keep_negotiated(&staged_video_codecs,
 			ast_rtp_instance_get_codecs(pvt->vrtp));
@@ -3388,6 +3461,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 			ast_rtp_instance_get_codecs(pvt->vrtp));
 		ast_rtp_codecs_payloads_copy(&staged_video_codecs,
 			ast_rtp_instance_get_codecs(pvt->vrtp), pvt->vrtp);
+		ao2_unlock(pvt->vrtp);
 	}
 	/* SIP-video<->WebRTC H264 fmtp relay: commit the selected H264 config ONLY when the video was
 	 * accepted (validate-then-commit) — a rejected SDP leaves an established call's H264 config intact. */
@@ -3547,6 +3621,11 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	 * so an audio-only re-INVITE does not wipe the video direction of an ongoing A/V call. */
 	if (current_offer && offered_audio_mode != -1) {
 		pvt->offered_audio_mode = offered_audio_mode;
+	}
+	/* Record whether THIS offer had an m=audio line at all (commit unconditionally on a current offer so an
+	 * image-only T.38 re-INVITE clears a stale 1 from a prior audio offer). RFC 3264 §6 answer-mirror gate. */
+	if (current_offer) {
+		pvt->offer_had_audio = m_audio_present;
 	}
 	if (current_offer && offered_video_mode != -1) {
 		pvt->offered_video_mode = offered_video_mode;

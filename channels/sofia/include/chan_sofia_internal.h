@@ -329,6 +329,7 @@ void sofia_apply_capture(void);
 /* CLI-thread-safe entry: marshals a capture change (is_hep=1 -> HEP address, 0 -> file dump; value ""
  * disables) onto sofia_thread. Returns 0 on dispatch, -1 on failure (caller reports the CLI error). */
 int sofia_apply_capture_from_cli(int is_hep, const char *value);
+int sofia_apply_log_from_cli(int on);	/* marshal the tport TPTAG_LOG toggle onto sofia_thread (CLI-thread safe) */
 
 struct ast_rtp_instance;	/* fwd (also declared below near the pvt fields) — keep the prototype below
 				 * from declaring the type inside its own parameter list. */
@@ -337,6 +338,10 @@ struct ast_rtp_instance;	/* fwd (also declared below near the pvt fields) — ke
  * UDP socket is closed. Use everywhere chan_sofia/sofia_sdp tears down pvt->rtp/vrtp. */
 void sofia_rtp_stop_destroy(struct ast_rtp_instance **inst);
 void sofia_peer_drain_mwi(struct sofia_peer *peer);
+/* Atomically detach + release peer->dnsmgr (fixes the unlocked check/release/NULL TOCTOU). Detaches
+ * under peer->lock, releases outside it; drop_ref=1 drops the dnsmgr +1 peer ref (0 = destructor).
+ * Callers must NOT hold peer->lock. */
+void sofia_peer_release_dnsmgr(struct sofia_peer *peer, int drop_ref);
 /* B perf index (peers_by_ipport): keep the O(1) by-IP+port index in sync. reindex at every peer-address
  * stabilization point (link/REGISTER/dnsmgr/reload); unindex BEFORE every ao2_unlink(peers,peer)/destroy
  * (the index pins a peer ref, so a missed unindex leaks the peer). Both serialized + lock-safe. */
@@ -516,6 +521,9 @@ struct sofia_pvt {
 	 * always emit sendrecv. Sentinel -1 = "nothing staged" => sendrecv (NOT inactive; sdp_inactive==0 trap). */
 	int offered_audio_mode;
 	int offered_video_mode;
+	unsigned int offer_had_audio:1;  /* the last parsed offer carried an m=audio line (ANY port). RFC 3264 §6:
+	                                  * an image-only T.38 re-INVITE (m=image, no m=audio) must be answered
+	                                  * m=image-only — sofia_generate_sdp suppresses the m=audio then. */
 	struct sofia_srtp *srtp;         /* audio SDES-SRTP context (NULL = plain RTP); freed in destructor */
 	struct sofia_srtp *vsrtp;        /* video SDES-SRTP context; freed in destructor */
 	struct ast_variable *initreq_headers; /* inbound INVITE headers for ${SIP_HEADER()}; freed in destructor */
@@ -573,7 +581,10 @@ struct sofia_pvt {
 	unsigned int webrtc_offerer:1;
 	/* WebRTC video offerer: gabpbx OFFERED video over WebRTC. DISTINCT from webrtc_video_accepted (the
 	 * answerer path) — they are mutually exclusive per call. sofia_generate_sdp emits a real m=video when
-	 * webrtc_video_accepted OR (webrtc_video_offerer && !webrtc_video_answer_applied), NEVER both. Set in
+	 * webrtc_video_accepted OR (on an offer build: webrtc_video_offerer && the live video capability,
+	 * pvt->capability & AST_FORMAT_VIDEO_MASK), NEVER both. The offerer emit is gated on the DURABLE video
+	 * capability, not webrtc_video_answer_applied — that flag ONLY guards one-time answer application (see
+	 * below), so gating the emit on it would drop video on a later offerer re-INVITE. Set in
 	 * sofia_webrtc_provision_offer when the effective capability has VP8/H264 and pvt->vrtp already exists
 	 * (sofia_rtp_init created it at chan_sofia.c:1421). */
 	unsigned int webrtc_video_offerer:1;
@@ -587,7 +598,7 @@ struct sofia_pvt {
 	 *   for emitting the answer's session-level a=group:BUNDLE.
 	 * webrtc_tls_id: per-DTLS-association stable id, 16 random bytes as 32 hex chars
 	 *   (RFC 8842 §5.2); generated ONCE at the WebRTC commit, reused on re-INVITE. */
-	char webrtc_mid[64];
+	char webrtc_mid[256];	/* RFC 5888/8843 mid token; 256B so a standards-legal long offered mid is not truncated */
 	unsigned int webrtc_bundle:1;
 	char webrtc_tls_id[40];
 	char webrtc_cname[24];               /* RFC 3550 CNAME for our a=ssrc lines; generated once/dialog, audio+video shared */
@@ -598,7 +609,7 @@ struct sofia_pvt {
 	 * sofia_generate_sdp. The audio-only path accepts audio and port-0 reflects ALL non-audio sections (incl. video) so a
 	 * browser audio+video+datachannel offer is not rejected for an m-line mismatch; the non-BUNDLE video path ACCEPTS video on a
 	 * separate non-BUNDLE pvt->vrtp transport (its own DTLS/ICE), datachannel stays port-0. */
-	char webrtc_video_mid[64];           /* offered m=video a=mid ("" = no video offered) */
+	char webrtc_video_mid[256];          /* offered m=video a=mid ("" = no video offered); 256B — see webrtc_mid */
 	int webrtc_mid_ext_id;               /* RFC 8285/8843 §9: negotiated a=extmap id for sdes:mid (0 = none/non-WebRTC) */
 	unsigned int webrtc_video_offered:1;
 	unsigned int webrtc_video_accepted:1;    /* VP8/H264 intersect + own DTLS/ICE attrs + rtcp-mux + NOT bundle-only */
@@ -615,7 +626,7 @@ struct sofia_pvt {
 		char type_name[16];  /* offered m= media-type STRING (sofia m_type_name), echoed verbatim (RFC 3264 §6) */
 		char proto[40];      /* m= transport proto-name (a port-0 reflect keeps it; RFC 3264) */
 		char fmt[24];        /* first m= format token */
-		char mid[64];        /* its a=mid (RFC 8843 — must appear in the answer too) */
+		char mid[256];       /* its a=mid (RFC 8843 — must appear in the answer too); 256B — see webrtc_mid */
 		int offer_idx;       /* ABSOLUTE position of THIS section in the offer's m= list (0-based), so the answer mirrors offer order (RFC 3264 §6 / RFC 8829 §5.3) */
 	} webrtc_reject_m[6];
 	/* WebRTC DataChannel (RFC 8831/8832) transport handle, NULL when this leg has no
@@ -637,7 +648,7 @@ struct sofia_pvt {
 	unsigned int dc_accepted:1;
 	uint16_t dc_sctp_port;
 	unsigned int dc_max_message_size;
-	char dc_mid[64];
+	char dc_mid[256];	/* m=application a=mid; 256B — see webrtc_mid */
 	/* OFFER-side WebRTC DataChannel (we ORIGINATE the m=application to the far leg, e.g. the bridged
 	 * callee). DISTINCT from dc_offered/dc_accepted, which are INBOUND-answer-only (a peer offered US a
 	 * DataChannel and we accepted). These two own the OUTBOUND offer:

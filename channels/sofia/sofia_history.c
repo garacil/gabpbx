@@ -42,12 +42,17 @@ int sofia_record_history = 0;
 /* Optional capture filter (a case-insensitive substring). When set, only calls whose SOURCE or
  * DESTINATION contains it are recorded — for busy systems where recording every call is too much.
  * Empty = record every call while history is on. */
-#define SOFIA_HISTORY_FILTER	64
+/* SOFIA_HISTORY_FILTER lives in the header (shared with sofia_cli.c). The buffer is written by the CLI
+ * thread (sofia_cli_set_history) and read by the sofia_thread datapath (sofia_history_should_record), so
+ * every access goes through history_filter_lock — a plain char[] with no lock is a torn read/write. */
 static char sofia_history_filter[SOFIA_HISTORY_FILTER];
+static ast_mutex_t history_filter_lock;
 
-const char *sofia_history_filter_str(void)
+void sofia_history_filter_copy(char *buf, size_t len)
 {
-	return sofia_history_filter;
+	ast_mutex_lock(&history_filter_lock);
+	ast_copy_string(buf, sofia_history_filter, len);
+	ast_mutex_unlock(&history_filter_lock);
 }
 
 /* Decide whether to record a call given its source + destination identifiers (e.g. From-user + the
@@ -55,14 +60,19 @@ const char *sofia_history_filter_str(void)
  * contains it; 1 otherwise. Called once per call at the INVITE, to set pvt->do_history. */
 int sofia_history_should_record(const char *src, const char *dst)
 {
+	char filter[SOFIA_HISTORY_FILTER];
+
 	if (!sofia_record_history) {
 		return 0;
 	}
-	if (ast_strlen_zero(sofia_history_filter)) {
+	/* Snapshot the filter under the lock, then match on the local copy — a concurrent CLI
+	 * `sip set history` write must not tear the strcasestr scan. */
+	sofia_history_filter_copy(filter, sizeof(filter));
+	if (ast_strlen_zero(filter)) {
 		return 1;
 	}
-	return (!ast_strlen_zero(src) && strcasestr(src, sofia_history_filter) != NULL)
-		|| (!ast_strlen_zero(dst) && strcasestr(dst, sofia_history_filter) != NULL);
+	return (!ast_strlen_zero(src) && strcasestr(src, filter) != NULL)
+		|| (!ast_strlen_zero(dst) && strcasestr(dst, filter) != NULL);
 }
 
 struct sofia_hist_entry {
@@ -107,6 +117,7 @@ void sofia_history_init(void)
 		return;
 	}
 	ast_rwlock_init(&retained_lock);
+	ast_mutex_init(&history_filter_lock);
 	history_inited = 1;
 }
 
@@ -134,6 +145,7 @@ void sofia_history_destroy(void)
 	}
 	ast_rwlock_unlock(&retained_lock);
 	ast_rwlock_destroy(&retained_lock);
+	ast_mutex_destroy(&history_filter_lock);
 }
 
 /* Core append: store one pre-formatted entry into the dialog ring. pvt->lock is recursive, so locking
@@ -542,21 +554,27 @@ char *sofia_cli_set_history(struct ast_cli_entry *e, int cmd, struct ast_cli_arg
 		return CLI_SHOWUSAGE;
 	}
 	if (!strcasecmp(a->argv[3], "on")) {
+		char shown[SOFIA_HISTORY_FILTER];
+		ast_mutex_lock(&history_filter_lock);
 		if (a->argc == 5) {
 			ast_copy_string(sofia_history_filter, a->argv[4], sizeof(sofia_history_filter));
 		} else {
 			sofia_history_filter[0] = '\0';
 		}
+		ast_copy_string(shown, sofia_history_filter, sizeof(shown));
+		ast_mutex_unlock(&history_filter_lock);
 		sofia_record_history = 1;
-		if (!ast_strlen_zero(sofia_history_filter)) {
+		if (!ast_strlen_zero(shown)) {
 			ast_cli(a->fd, "SIP history recording enabled, filter '%s' (source or destination).\n",
-				sofia_history_filter);
+				shown);
 		} else {
 			ast_cli(a->fd, "SIP history recording enabled, all calls (use 'sip show history').\n");
 		}
 	} else if (!strcasecmp(a->argv[3], "off")) {
 		sofia_record_history = 0;
+		ast_mutex_lock(&history_filter_lock);
 		sofia_history_filter[0] = '\0';
+		ast_mutex_unlock(&history_filter_lock);
 		ast_cli(a->fd, "SIP history recording disabled.\n");
 	} else {
 		return CLI_SHOWUSAGE;
@@ -603,9 +621,11 @@ char *sofia_cli_show_history(struct ast_cli_entry *e, int cmd, struct ast_cli_ar
 		int live = 0;
 
 		if (sofia_record_history) {
-			if (!ast_strlen_zero(sofia_history_filter)) {
+			char shown[SOFIA_HISTORY_FILTER];
+			sofia_history_filter_copy(shown, sizeof(shown));
+			if (!ast_strlen_zero(shown)) {
 				ast_cli(a->fd, "Recording: ON, filter '%s' (source or destination)\n",
-					sofia_history_filter);
+					shown);
 			} else {
 				ast_cli(a->fd, "Recording: ON (all calls)\n");
 			}

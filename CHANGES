@@ -7,6 +7,76 @@ that is a drop-in replacement for chan_sip (it registers as channel
 technology SIP). Releases are listed newest first.
 
 
+## 1.5.7 — audit hardening: RTP/codec-map concurrency, BUNDLE/T.38 SDP correctness, buffer sizing
+
+A batch of correctness, security, concurrency and robustness fixes from an internal audit of
+chan_sofia, sofia_sdp, sdp_crypto, res_rtp and the RTP engine.
+
+Security / SRTP:
+- **Never log the local SRTP master key** — the inline key+salt could reach the log at debug level;
+  those sites now log only non-secret fields (RFC 4568 §9.1).
+- **Zeroize master key material before free** — SRTP key buffers are wiped on teardown rather than left
+  in freed memory (RFC 4568 §9.1).
+- **Reject an over-long inline key** — a malformed `a=crypto` inline key longer than the suite's key
+  length is now rejected instead of being silently truncated and used.
+- **Re-keyed crypto tag echo** — a re-INVITE that re-keys SDES-SRTP now echoes the accepted crypto tag
+  back to the offerer (RFC 4568 §5.1.2).
+
+Concurrency:
+- **RTP codec payload map** — the per-instance codec payload map has no lock of its own, so installing a
+  newly negotiated map on the SIP/SDP thread raced the media threads reading it (payload lookup/code).
+  Every live-map install and every media-thread reader now serializes under the RTP instance lock; the
+  P2P bridge translation takes the two instance locks separately so opposite bridge directions cannot
+  deadlock.
+- **Media-TX SRTP** — the outbound SRTP protect+send ran unlocked while DTLS-SRTP (re)install and the
+  scheduled RTCP transmit mutated the same SRTP session; it now serializes under the RTP instance lock.
+- **`sip set debug` transport logging** — the CLI toggled the shared SIP transport log flag directly from
+  the CLI thread; it is now marshaled onto the SIP stack thread, and the CLI reports failure instead of
+  claiming success when the change cannot be applied.
+- **SIP history filter / peer DNS handle / registered-contact NOTIFY** — the `sip set history` match
+  filter is mutex-guarded (CLI writer vs call-setup reader); the per-peer async-DNS handle is detached
+  and released atomically (concurrent prune/reload could double-release it); and an out-of-dialog NOTIFY
+  reads the registered contact URI and transport together under the contact lock (vs an in-place REGISTER
+  rebind).
+- **Peer lock** — the per-peer lock is now destroyed on peer teardown (was leaked).
+
+SDP / media negotiation:
+- **BUNDLE group order** — a WebRTC answer lists the `a=group:BUNDLE` mids in the offered m-line order
+  (RFC 8843 §7.3.1) instead of a fixed audio-first order, so a video-first offer is not rejected.
+- **BUNDLE mid buffers** — the mid and group buffers are sized for standards-legal long mids end to end
+  (parse, membership match and emit), instead of dropping the whole group line or truncating a mid.
+- **Image-only T.38** — an image-only T.38 re-INVITE (m=image, no m=audio) is answered with m=image only,
+  not m=audio + m=image (RFC 3264 §6).
+- **Offerer video re-offer** — a later re-INVITE on a leg that offered WebRTC video keeps offering
+  m=video; the emit is gated on the live video capability rather than a one-shot answer-applied flag.
+- **Forked-call audio format** — when a forked outbound call's winning branch negotiates a non-default
+  audio codec, that codec is applied to the answered channel's read/write format instead of relying on
+  transcoding.
+
+RTP / RTCP robustness:
+- **Compound RTCP** — a malformed trailing sub-packet no longer discards a picture-fast-update
+  (VIDUPDATE) already latched by an earlier sub-packet of the same compound packet.
+- **Native bridge address baselines** — the second bridged channel's video/text remote-address baselines
+  are taken from the video/text RTP instances (were copied from the audio instance).
+
+Configuration:
+- **`blacklist_ban`** — a very large ban window (minutes) no longer overflows the seconds conversion to a
+  negative value that disabled expiry (an unintended permanent ban); it is clamped.
+- **Refused `sip reload`** — the compare-only listener-change check no longer mutates the live blacklist
+  ban window as a side effect when the reload is refused.
+
+Signaling / robustness:
+- **REGISTER reject binding** — a REGISTER rejected for a missing/unknown From or peer now binds its
+  final response to the request (so the reply reaches the wire instead of being retransmitted until
+  Timer F).
+- **Forked-call DTMF/fax detection** — inband-DTMF and fax-CNG DSP detection is now enabled on forked
+  outbound calls, matching the non-forked path.
+- **Module-load thread checks** — the auxiliary registration/qualify threads created at module load are
+  now checked, logging and failing cleanly instead of using an invalid thread handle.
+- **`sip show peer`** — dropped duplicate/placeholder fields from the peer detail output so it reports
+  the real computed values.
+
+
 ## 1.5.6 — audit hardening: SRTP, T.38, RTCP concurrency, UAS hangup, response binding
 
 A batch of correctness, security, and concurrency fixes from an internal audit of chan_sofia,

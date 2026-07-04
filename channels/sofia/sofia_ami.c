@@ -260,8 +260,8 @@ int manager_sofia_show_peer(struct mansession *s, const struct message *m)
 	ast_str_append(&buf, 0, "RemoteSecretExist: N\r\n");
 	ast_str_append(&buf, 0, "MD5SecretExist: N\r\n");
 	ast_str_append(&buf, 0, "Context: %s\r\n", peer->context);
-	ast_str_append(&buf, 0, "Language: \r\n");
-	ast_str_append(&buf, 0, "AMAflags: Unknown\r\n");
+	/* Language + AMAflags are emitted (computed) further below — no early stub here (was a
+	 * contradictory duplicate key). */
 	ast_str_append(&buf, 0, "CID-CallingPres: Allowed, Not Screened\r\n");
 	if (!ast_strlen_zero(peer->fromuser)) {
 		ast_str_append(&buf, 0, "SIP-FromUser: %s\r\n", peer->fromuser);
@@ -349,7 +349,8 @@ int manager_sofia_show_peer(struct mansession *s, const struct message *m)
 	ast_str_append(&buf, 0, "InUse: %d\r\n", peer->inUse);
 	ast_str_append(&buf, 0, "InRinging: %d\r\n", peer->inRinging);
 	ast_str_append(&buf, 0, "OnHold: %d\r\n", peer->onHold);
-	ast_str_append(&buf, 0, "MaxCallBR: 384 kbps\r\n");
+	/* MaxCallBR is emitted (computed from peer->maxcallbitrate) above; the hardcoded
+	 * "384 kbps" duplicate that used to be here overrode it in AMI (last key wins) — removed. */
 	ast_str_append(&buf, 0, "Dynamic: %s\r\n", !strcasecmp(peer->host, "dynamic") ? "Y" : "N");
 	/* Callerid via ast_callerid_merge; falls back to legacy peer->callerid when both fields empty. */
 	if (!ast_strlen_zero(peer->cid_num) || !ast_strlen_zero(peer->cid_name)) {
@@ -376,7 +377,8 @@ int manager_sofia_show_peer(struct mansession *s, const struct message *m)
 	ast_str_append(&buf, 0, "DnsMgr: %s\r\n", peer->dnsmgr ? "Y" : "N");
 	ast_str_append(&buf, 0, "SIP-CanReinvite: %s\r\n", peer->directmedia ? "Y" : "N");
 	ast_str_append(&buf, 0, "SIP-DirectMedia: %s\r\n", peer->directmedia ? "Y" : "N");
-	ast_str_append(&buf, 0, "SIP-PromiscRedir: N\r\n");
+	/* SIP-PromiscRedir is emitted (computed from peer->promiscredir) above; the hardcoded
+	 * "N" duplicate that used to be here overrode it in AMI (last key wins) — removed. */
 	/* chan_sip parity. */
 	ast_str_append(&buf, 0, "SIP-UserPhone: %s\r\n", peer->usereqphone ? "Y" : "N");
 	ast_str_append(&buf, 0, "SIP-VideoSupport: %s\r\n", (peer->capability & AST_FORMAT_VIDEO_MASK) ? "Y" : "N");
@@ -706,13 +708,21 @@ static void sipnotify_resolve_target(struct sofia_peer *peer, struct sofia_conta
 	char *target_uri, size_t len)
 {
 	struct sofia_contact *contact = sofia_peer_first_contact(peer);
+	char c_transport[8] = "";
+	int have_contact_uri = 0;
 
-	if (contact && !ast_strlen_zero(contact->contact_uri)) {
-		char c_transport[8];
-		ast_copy_string(target_uri, contact->contact_uri, len);
+	if (contact) {
+		/* Snapshot contact_uri + transport TOGETHER under ao2_lock(contact): the REGISTER rebind
+		 * rewrites both in place under this same lock, so the old unlocked contact_uri read (copied
+		 * before the lock) could tear the NOTIFY target URI mid-rewrite. */
 		ao2_lock(contact);
+		ast_copy_string(target_uri, contact->contact_uri, len);
 		ast_copy_string(c_transport, contact->transport, sizeof(c_transport));
 		ao2_unlock(contact);
+		have_contact_uri = !ast_strlen_zero(target_uri);
+	}
+
+	if (have_contact_uri) {
 		sofia_uri_append_transport(target_uri, len, c_transport);
 	} else {
 		char hbuf[80];
