@@ -330,6 +330,8 @@ void sofia_apply_capture(void);
  * disables) onto sofia_thread. Returns 0 on dispatch, -1 on failure (caller reports the CLI error). */
 int sofia_apply_capture_from_cli(int is_hep, const char *value);
 
+struct ast_rtp_instance;	/* fwd (also declared below near the pvt fields) — keep the prototype below
+				 * from declaring the type inside its own parameter list. */
 /* Fully release a (WebRTC) RTP instance and NULL *inst: stop RTCP + the DTLS retransmit timer (which each
  * hold their own ao2 ref) BEFORE ast_rtp_instance_destroy, so the engine destructor actually runs and the
  * UDP socket is closed. Use everywhere chan_sofia/sofia_sdp tears down pvt->rtp/vrtp. */
@@ -1027,6 +1029,7 @@ struct sofia_config {
 	char default_mohsuggest[80];
 	char default_language[MAX_LANGUAGE]; /* default language inherited by peers; empty = gabpbx-core default. MAX_LANGUAGE=40 (matches ast_channel.language). */
 	char default_parkinglot[AST_MAX_CONTEXT]; /* default parkinglot inherited by peers; default "default" (chan_sip). Set empty to restore silent baseline. */
+	char default_callerid[80]; /* [general] callerid: outbound From identity when no channel/peer/fromuser caller-ID resolves (chan_sip default_callerid parity, DEFAULT_CALLERID "gabpbx"); NEVER the peer section name. */
 	int ignore_regexpire;      /* 1 = keep expired registrations in peer->contacts (preserve last-known contact across short trunk outages). Wired at sofia_expire_contacts_cb. Default 0. */
 	int default_maxcallbitrate; /* video bandwidth ceiling inherited by peers; default 384 (negatives clamp back). Emits b=CT line (RFC 4566 §5.8) in video SDP only. */
 	int match_auth_username;   /* 1 = match peer by Authorization digest username instead of From (anti-spoofing / multi-identity); default 0 */

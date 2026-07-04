@@ -2523,6 +2523,17 @@ tos_video = af41
 ;apply_peer_callerid = yes
 
 ;
+; --- callerid ([general] default caller-ID identity, chan_sip default_callerid parity) ---
+; The fallback caller-ID presented in the outbound From when NOTHING else resolves an
+; identity — i.e. no channel/connected-line caller-ID (dialplan or apply_peer_callerid),
+; no peer cid_num, and no fromuser. This mirrors chan_sip's [general] callerid /
+; default_callerid (default "gabpbx"). chan_sofia NEVER uses the peer/section name as a
+; From identity (that would leak the account/auth name); this default is used instead.
+; It does NOT override a real caller-ID — it is only the last-resort fallback.
+;
+;callerid = gabpbx
+
+;
 ; --- legacy_useroption_parsing (chan_sip parity, PARSE-COMPAT-ONLY) ---
 ; chan_sip strips trailing semicolons from URI user-fields post-parse for legacy
 ; SIP UAs that put options in the user field with semicolons. Default no per

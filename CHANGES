@@ -7,6 +7,24 @@ that is a drop-in replacement for chan_sip (it registers as channel
 technology SIP). Releases are listed newest first.
 
 
+## 1.5.4 — outbound From never leaks the peer section name; `[general] callerid` default
+
+The outbound `From` identity resolver used the **peer/section name** as a fallback when no
+caller-ID could be resolved (no channel/connected-line identity, no peer `cid_num`, no `fromuser`),
+so an anonymous inbound call from a peer with no callerid could put the peer's account/auth name in the
+`From`. chan_sip never does this — it falls back to `default_callerid`.
+
+- The `peer->name` fallback is removed from the outbound From resolver — the section name is never used
+  as a caller identity.
+- New `[general] callerid` sets the last-resort fallback From identity (chan_sip `default_callerid`
+  parity, default `gabpbx`). It is only used when nothing else resolves an identity; it does not override
+  a real caller-ID. Shown in `sip show settings` as "Default callerid". Note: chan_sofia previously
+  ignored a `[general] callerid=` line; it is now honored (chan_sip parity).
+
+This completes the empty-callerid parity: with a peer callerid unset, an inbound call's `From` still
+passes through unchanged (as of 1.5.3); only the anonymous/no-identity edge now yields `default_callerid`
+instead of the section name.
+
 ## 1.5.3 — peer callerid on outbound From (chan_sip parity) + `apply_peer_callerid`
 
 ### Peer `callerid` now reaches the caller-ID fields (bug fix)

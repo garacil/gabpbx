@@ -11217,19 +11217,17 @@ static int sofia_resolve_identity(struct sofia_pvt *pvt, char **lid_num_out,
 	}
 
 	if (ast_strlen_zero(lid_num_src) && pvt && pvt->peer) {
-		/* Fallback when connected.id is empty: cid_num -> fromuser -> name -> "asterisk". */
+		/* Fallback when connected.id is empty: peer cid_num -> fromuser. chan_sip parity NEVER uses the
+		 * peer/section name as a From identity (that would leak the auth/account name); the global
+		 * [general] callerid (default_callerid) below is the final fallback (chan_sip initreqprep). */
 		if (!ast_strlen_zero(pvt->peer->cid_num)) {
 			lid_num_src = pvt->peer->cid_num;
 		} else if (!ast_strlen_zero(pvt->peer->fromuser)) {
 			lid_num_src = pvt->peer->fromuser;
-		} else if (!ast_strlen_zero(pvt->peer->name)) {
-			lid_num_src = pvt->peer->name;
-		} else {
-			lid_num_src = "asterisk";
 		}
 	}
 	if (ast_strlen_zero(lid_num_src)) {
-		lid_num_src = "asterisk";
+		lid_num_src = !ast_strlen_zero(sofia_cfg.default_callerid) ? sofia_cfg.default_callerid : "gabpbx";
 	}
 	if (ast_strlen_zero(lid_name_src) && pvt && pvt->peer
 			&& !ast_strlen_zero(pvt->peer->cid_name)) {
@@ -16342,6 +16340,10 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			ast_copy_string(sofia_cfg.context, v->value, sizeof(sofia_cfg.context));
 		} else if (!strcasecmp(v->name, "realm")) {
 			ast_copy_string(sofia_cfg.realm, v->value, sizeof(sofia_cfg.realm));
+		} else if (!strcasecmp(v->name, "callerid")) {
+			/* [general] callerid = default outbound From identity (chan_sip default_callerid parity,
+			 * chan_sip.c:29766-29767) used only when no channel/peer/fromuser caller-ID resolves. */
+			ast_copy_string(sofia_cfg.default_callerid, v->value, sizeof(sofia_cfg.default_callerid));
 		} else if (!strcasecmp(v->name, "tcp_keepalive")) {
 			/* CRLF keepalive SECONDS (chan_sip parity) -> ms for TPTAG_KEEPALIVE; 0 -> OFF. */
 			sofia_cfg.tcp_keepalive_ms = sofia_cfg_seconds_to_ms(v->value);
@@ -17717,6 +17719,8 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.bindport = DEFAULT_SIP_PORT;
 	ast_copy_string(sofia_cfg.context, DEFAULT_CONTEXT, sizeof(sofia_cfg.context));
 	ast_copy_string(sofia_cfg.realm, "gabpbx", sizeof(sofia_cfg.realm));
+	/* chan_sip DEFAULT_CALLERID parity (sip.h:200) — fallback From identity, never the peer name. */
+	ast_copy_string(sofia_cfg.default_callerid, "gabpbx", sizeof(sofia_cfg.default_callerid));
 	/* Default User-Agent e.g. "GABpbx PBX 2.7.1"; [general] useragent= overrides. */
 	snprintf(sofia_cfg.useragent, sizeof(sofia_cfg.useragent), "%s %s",
 		DEFAULT_USERAGENT, ast_get_version());
