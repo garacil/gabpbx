@@ -7,6 +7,28 @@ that is a drop-in replacement for chan_sip (it registers as channel
 technology SIP). Releases are listed newest first.
 
 
+## 1.5.5 — `fromuser` overrides the outbound From user (chan_sip parity)
+
+A peer's `fromuser` was only a *fallback* for the outbound `From` URI user — it applied solely when no
+caller-ID resolved (no connected-line identity and no peer `cid_num`). chan_sip treats `fromuser` as an
+**override** that wins over the resolved caller-ID (`chan_sip.c:12900-12901`). So a peer with no `callerid`
+whose channel carried the inbound SIP username (or any other caller-ID) emitted that value in the outbound
+`From` instead of the configured `fromuser`, which some carriers reject.
+
+- `fromuser`, when set, now overrides the URI user part of the outbound `From`, winning over the resolved
+  caller-ID — in both allowed and restricted presentation (chan_sip applies it after the privacy branch).
+- Only the `From` URI user is affected. The display name, presentation, Contact, and any RPID/PAI headers
+  are unchanged (chan_sip's RPID builder never consumes `fromuser`).
+- Restricted (anonymous) presentation now matches chan_sip exactly: `"Anonymous"
+  <sip:<fromuser>@anonymous.invalid>` when `fromuser` is set, otherwise
+  `"Anonymous" <sip:anonymous@anonymous.invalid>` (the anonymous domain is now `anonymous.invalid`).
+- `usereqphone` now tests the final From user, so a non-numeric `fromuser` no longer inherits `;user=phone`
+  from a numeric caller-ID.
+
+This completes the empty-callerid outbound parity started in 1.5.3/1.5.4: set the peer `fromuser` to present
+a trunk-provisioned identity when the peer has no `callerid`.
+
+
 ## 1.5.4 — outbound From never leaks the peer section name; `[general] callerid` default
 
 The outbound `From` identity resolver used the **peer/section name** as a fallback when no

@@ -3015,7 +3015,14 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;
 ; --- Dialplan ---
 ; context       - dialplan context for incoming calls
-; fromuser      - user to put in From header
+; fromuser      - user to put in From header. When set, it OVERRIDES the URI user
+;                 part of the outbound From, winning over the resolved caller-id /
+;                 peer callerid (chan_sip.c:12900-12901 parity). Use it to present a
+;                 trunk-provisioned identity to a carrier when the peer has no callerid
+;                 (or a callerid you must not leak). Only the From URI user is changed —
+;                 the display name, presentation, and any RPID/PAI are untouched. Under a
+;                 restricted (anonymous) presentation the From stays anonymized but the
+;                 user part still becomes fromuser: "Anonymous" <sip:fromuser@anonymous.invalid>.
 ; fromdomain    - domain to put in From header
 ; insecure      - port, invite, port,invite (or "very")
 ;                 NOTE: insecure flag is PARSED but NOT ENFORCED

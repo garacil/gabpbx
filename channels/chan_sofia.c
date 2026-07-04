@@ -11117,19 +11117,37 @@ static void sofia_build_from(struct sofia_pvt *pvt, char *buf, size_t len)
 		return;
 	}
 
-	/* Privacy: a restricted presentation makes the From anonymous (chan_sip parity). */
+	/* fromuser override (chan_sip.c:12900-12901 parity): a configured peer fromuser overrides
+	 * the URI user part of the outbound From. chan_sip applies it AFTER the privacy branch, so it
+	 * wins in BOTH allowed and restricted presentation. Only the URI user is overridden — the
+	 * display name and presentation are untouched, and RPID/PAI are NOT affected (chan_sip add_rpid
+	 * never consumes fromuser). URI-encode into a local scratch buffer since lid_num arrived
+	 * pre-encoded from sofia_resolve_identity. */
+	const char *final_user = lid_num;
+	char fromuser_enc[128];
+	int have_fromuser = (pvt && pvt->peer && !ast_strlen_zero(pvt->peer->fromuser));
+	if (have_fromuser) {
+		ast_uri_encode(pvt->peer->fromuser, fromuser_enc, sizeof(fromuser_enc), 0);
+		final_user = fromuser_enc;
+	}
+
+	/* Privacy: a restricted presentation makes the From anonymous (chan_sip.c:12876-12881 parity):
+	 * display "Anonymous", domain "anonymous.invalid" (FROMDOMAIN_INVALID), URI user "anonymous" —
+	 * but a configured fromuser still overrides the user part (chan_sip.c:12900). */
 	if ((lid_pres & AST_PRES_RESTRICTION) != AST_PRES_ALLOWED) {
-		snprintf(buf, len, "\"Anonymous\" <sip:anonymous@%s>",
-			sofia_uri_format_host(fromdomain, fbuf, sizeof(fbuf)));
+		snprintf(buf, len, "\"Anonymous\" <sip:%s@anonymous.invalid>",
+			have_fromuser ? final_user : "anonymous");
 		return;
 	}
 
-	/* usereqphone (chan_sip parity): add RFC 3966 ;user=phone when set and lid_num is numeric. */
-	if (pvt && pvt->peer && pvt->peer->usereqphone && sofia_user_looks_like_phone(lid_num)) {
-		snprintf(buf, len, "\"%s\" <sip:%s@%s;user=phone>", lid_name, lid_num,
+	/* usereqphone (chan_sip parity): add RFC 3966 ;user=phone when set and the FINAL From user is
+	 * numeric (test the override result, not the stale callerid — a non-numeric fromuser must not
+	 * inherit ;user=phone from a numeric callerid). */
+	if (pvt && pvt->peer && pvt->peer->usereqphone && sofia_user_looks_like_phone(final_user)) {
+		snprintf(buf, len, "\"%s\" <sip:%s@%s;user=phone>", lid_name, final_user,
 			sofia_uri_format_host(fromdomain, fbuf, sizeof(fbuf)));
 	} else {
-		snprintf(buf, len, "\"%s\" <sip:%s@%s>", lid_name, lid_num,
+		snprintf(buf, len, "\"%s\" <sip:%s@%s>", lid_name, final_user,
 			sofia_uri_format_host(fromdomain, fbuf, sizeof(fbuf)));
 	}
 }
