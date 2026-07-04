@@ -286,7 +286,7 @@ static int policy_set_suite(crypto_policy_t *p, enum ast_srtp_suite suite)
 		crypto_policy_set_aes_cm_128_hmac_sha1_32(p);
 		return 0;
 
-	/* post-T56 SRTP cipher expansion (2026-04-27): RFC 6188 AES-192/256 +
+	/* SRTP cipher expansion: RFC 6188 AES-192/256 +
 	 * RFC 7714 AES-GCM-128/256. libsrtp2 helpers via srtp_compat.h shim. */
 	case AST_AES_CM_192_HMAC_SHA1_80:
 		crypto_policy_set_aes_cm_192_hmac_sha1_80(p);

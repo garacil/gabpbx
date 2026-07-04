@@ -9,7 +9,7 @@
 
 #define crypto_policy_set_aes_cm_128_hmac_sha1_80 srtp_crypto_policy_set_aes_cm_128_hmac_sha1_80
 #define crypto_policy_set_aes_cm_128_hmac_sha1_32 srtp_crypto_policy_set_aes_cm_128_hmac_sha1_32
-/* post-T56 SRTP cipher expansion (2026-04-27): libsrtp 2.x adds AES-192/256
+/* SRTP cipher expansion: libsrtp 2.x adds AES-192/256
  * (RFC 6188) + AES-GCM (RFC 7714) helpers. GCM uses _8_auth (8-byte tag) —
  * only variant in this libsrtp2 version per /usr/include/srtp2/srtp.h L1041
  * + L1064; RFC 7714 §11 allows both 8 + 16-byte tags; 8 is acceptable. */
