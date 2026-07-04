@@ -7,6 +7,35 @@ that is a drop-in replacement for chan_sip (it registers as channel
 technology SIP). Releases are listed newest first.
 
 
+## 1.5.3 — peer callerid on outbound From (chan_sip parity) + `apply_peer_callerid`
+
+### Peer `callerid` now reaches the caller-ID fields (bug fix)
+
+A peer's configured `callerid=` was stored only as an opaque string and never split into the
+`cid_num`/`cid_name` fields the driver actually uses for caller-ID — a duplicate `callerid` config
+handler shadowed the one that performs the split, in both the static and the realtime/`sipregs` peer
+loaders. As a result a peer that authenticates with one SIP username but has `callerid=<number>` would
+present its **SIP username** in the outbound `From` (which upstream proxies may reject) instead of the
+configured number. Both loaders now split `callerid` into `cid_num`/`cid_name` (chan_sip parity) while
+keeping the raw value for CLI/AMI display.
+
+### `apply_peer_callerid` (`[general]`, default `yes`)
+
+New knob controlling whether an inbound INVITE from a matched peer presents that peer's configured
+callerid (chan_sip behavior) or the caller-supplied `From` user:
+
+- `apply_peer_callerid = yes` (**default**, chan_sip parity): when no **trusted** RPID/PAI identity was
+  accepted, the matched peer's `cid_num`/`cid_name`/`callingpres` are forced onto the call before the
+  channel is created — so the configured callerid appears in the outbound `From`. Each field is applied
+  only when non-empty/non-zero; `shrinkcallerid` is honored; a trusted RPID/PAI (`trustrpid=yes`) still
+  wins.
+- `apply_peer_callerid = no`: keep the inbound `From` user as the caller-ID (pass-through).
+
+Mirrors `chan_sip` `check_user_full`. Not a listener setting — applies on `sip reload`. The source of
+truth is the peer `callerid` field; a dialplan `Set(CALLERID(num/name)=...)` remains available as an
+optional later override, but is not the mechanism. The presented value is exactly the peer `callerid` —
+the driver does not transform it (no prefix-stripping).
+
 ## 1.5.2 — `auth_qop`: chan_sip legacy no-qop MD5 digest challenge
 
 ### `auth_qop` (`[general]`, default `no`)

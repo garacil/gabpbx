@@ -1032,6 +1032,7 @@ struct sofia_config {
 	int match_auth_username;   /* 1 = match peer by Authorization digest username instead of From (anti-spoofing / multi-identity); default 0 */
 	int legacy_useroption_parsing; /* PARSE-COMPAT-ONLY (sofia-sip has no post-parse URI semicolon-strip hook); default 0. chan_sofia URI parsing already RFC 3261-compliant. */
 	int shrinkcallerid;        /* 1 = strip leading '+'/parens from CID phone numbers (ast_is_shrinkable_phonenumber); default 1 (chan_sip). Non-phone CIDs unaffected. */
+	int apply_peer_callerid;   /* 1 = on an inbound INVITE from a matched peer, force the peer's configured callerid (cid_num/cid_name/callingpres) onto the call when no trusted RPID/PAI was accepted (chan_sip.c:17113-17124 parity); 0 = keep the inbound From user as caller-ID. Default 1 (chan_sip). */
 	int notifyhold;            /* 1 = gate peer->onHold counter tracking on this flag; default 0 (chan_sip). AMI Hold remains unconditional. */
 	int use_q850_reason;       /* Q.850 Reason header (RFC 3326): when 1, stamp/parse Reason: Q.850;cause=N on BYE/CANCEL. Default 0 (chan_sip parity, opt-in). */
 	int notifyringing;         /* PARSE-COMPAT-ONLY (early-vs-confirmed presence gate; dialog-info NOTIFY infra deferred); default 1 (chan_sip) */

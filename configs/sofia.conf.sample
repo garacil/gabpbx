@@ -2495,6 +2495,34 @@ tos_video = af41
 ;shrinkcallerid = yes
 
 ;
+; --- apply_peer_callerid (post-T56 chan_sip parity, inbound caller-ID policy) ---
+; On an inbound INVITE from a matched/authenticated peer, whether to force that peer's
+; configured `callerid` (number + name) onto the call — overriding the caller-ID the phone
+; put in its From header — when no TRUSTED RPID/PAI identity was accepted. This is the
+; chan_sip behavior (chan_sip.c:17113-17124): a peer that logs in with one SIP username but
+; has callerid=<number> presents <number> on its outbound calls, instead of leaking its SIP
+; username into the From (which upstream proxies may reject).
+;
+;   yes  - (DEFAULT, chan_sip parity) force the peer's callerid on inbound. A trusted
+;          RPID/PAI (trustrpid=yes + a valid P-Asserted-Identity/Remote-Party-ID) still
+;          wins and is NOT overridden. shrinkcallerid still applies. Peers with no callerid
+;          configured are unchanged.
+;   no   - keep the inbound From user as the caller-ID (pass-through).
+;
+; SOURCE OF TRUTH is the peer `callerid` field (config or realtime):
+;   1. peer `callerid` populates the peer's cid_num / cid_name (ast_callerid_split);
+;   2. on the inbound leg, apply_peer_callerid copies those into the channel caller-ID
+;      (when no trusted RPID/PAI was accepted);
+;   3. the outbound From then presents that channel caller-ID.
+; Set the presented number/name in the peer `callerid` (or `cid_number`/`cid_name`). The
+; driver does NOT transform the value (no prefix-stripping).
+;
+; A dialplan `Set(CALLERID(num/name)=...)` is an OPTIONAL later override only (it runs after
+; the inbound channel is created); it is not the mechanism — the peer `callerid` is.
+;
+;apply_peer_callerid = yes
+
+;
 ; --- legacy_useroption_parsing (chan_sip parity, PARSE-COMPAT-ONLY) ---
 ; chan_sip strips trailing semicolons from URI user-fields post-parse for legacy
 ; SIP UAs that put options in the user field with semicolons. Default no per

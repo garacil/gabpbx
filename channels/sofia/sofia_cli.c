@@ -882,6 +882,8 @@ char *sofia_cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 	ast_cli(a->fd, "  Auth algorithms:        MD5, SHA-256\n");
 	/* auth_qop: yes = RFC 2617/7616 qop="auth" MD5 challenge; no = chan_sip legacy no-qop (RFC 2069). */
 	ast_cli(a->fd, "  Auth qop:               %s\n", AST_CLI_YESNO(sofia_cfg.auth_qop));
+	/* apply_peer_callerid: yes = force matched-peer callerid on inbound (chan_sip parity); no = keep From. */
+	ast_cli(a->fd, "  Apply peer callerid:    %s\n", AST_CLI_YESNO(sofia_cfg.apply_peer_callerid));
 
 	ast_cli(a->fd, "  Record SIP history:     %s%s%s\n", sofia_record_history ? "Yes" : "No",
 		(sofia_record_history && !ast_strlen_zero(sofia_history_filter_str())) ? ", filter " : "",

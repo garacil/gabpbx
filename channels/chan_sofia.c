@@ -3528,7 +3528,15 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			/* Generic outbound SUBSCRIBE (RFC 6665): <event>[;<accept-mime>][;<expires>]. */
 			ast_string_field_set(peer, subscribe_event, v->value);
 		} else if (!strcasecmp(v->name, "callerid")) {
+			/* Keep the raw string (CLI/AMI display + the realtime callerid helper) AND split it into
+			 * cid_num/cid_name (chan_sip.c:28779-28784 parity) — those are the functional fields read
+			 * by apply_peer_callerid and sofia_resolve_identity. The duplicate split-only handler later
+			 * in this same else-if chain was dead code (this "callerid" always matched here first). */
+			char cid_name_buf[80] = "", cid_num_buf[80] = "";
 			ast_string_field_set(peer, callerid, v->value);
+			ast_callerid_split(v->value, cid_name_buf, sizeof(cid_name_buf), cid_num_buf, sizeof(cid_num_buf));
+			ast_string_field_set(peer, cid_name, cid_name_buf);
+			ast_string_field_set(peer, cid_num, cid_num_buf);
 		} else if (!strcasecmp(v->name, "regexten")) {
 			ast_string_field_set(peer, regexten, v->value);
 		} else if (!strcasecmp(v->name, "publish_exten")) {
@@ -3823,13 +3831,6 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 					peer->name, v->value);
 				peer->rtpkeepalive = sofia_cfg.default_rtpkeepalive;
 			}
-		} else if (!strcasecmp(v->name, "callerid")) {
-			/* ast_callerid_split → cid_name + cid_num. */
-			char cid_name_buf[80] = "", cid_num_buf[80] = "";
-			ast_callerid_split(v->value, cid_name_buf, sizeof(cid_name_buf),
-				cid_num_buf, sizeof(cid_num_buf));
-			ast_string_field_set(peer, cid_name, cid_name_buf);
-			ast_string_field_set(peer, cid_num, cid_num_buf);
 		} else if (!strcasecmp(v->name, "fullname")
 				|| !strcasecmp(v->name, "cid_name")) {
 			/* cid_name is a chan_sofia alias for fullname. */
@@ -7429,12 +7430,35 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	/* Enable inband DTMF after pvt->dtmfmode is bound; gates on INBAND/AUTO. */
 	sofia_enable_dsp_detect(pvt);
 
-	/* Inbound RPID/PAI/Privacy (trust-gated by peer->trustrpid; PAI fallback).
-	 * Peer-side callingpres OVERRIDES received presentation. Before sofia_new so
+	/* Inbound RPID/PAI/Privacy (trust-gated by peer->trustrpid; PAI fallback). Before sofia_new so
 	 * chan->caller.id picks it up via ast_set_callerid below. */
-	sofia_get_rpid(pvt, sip);
-	if (pvt->peer && pvt->peer->callingpres) {
-		pvt->callingpres = pvt->peer->callingpres;
+	int rpid_updated = sofia_get_rpid(pvt, sip);
+
+	/* apply_peer_callerid (chan_sip.c:17113-17124 parity): when no trusted RPID/PAI was accepted,
+	 * force the matched peer's configured caller-id (cid_num / cid_name / callingpres) onto the call,
+	 * overriding the inbound From seeded above. Each field is applied only when non-empty/non-zero, and
+	 * all three are gated on !rpid exactly like chan_sip (a trusted RPID/PAI wins). Default on (chan_sip).
+	 * Peer stringfields are freeable → snapshot under peer->lock (leaf; owner not yet allocated). */
+	if (sofia_cfg.apply_peer_callerid && !rpid_updated && pvt->peer) {
+		char pc_num[80] = "", pc_name[80] = "";
+		int pc_pres;
+		ast_mutex_lock(&pvt->peer->lock);
+		ast_copy_string(pc_num, S_OR(pvt->peer->cid_num, ""), sizeof(pc_num));
+		ast_copy_string(pc_name, S_OR(pvt->peer->cid_name, ""), sizeof(pc_name));
+		pc_pres = pvt->peer->callingpres;
+		ast_mutex_unlock(&pvt->peer->lock);
+		if (!ast_strlen_zero(pc_num)) {
+			if (sofia_cfg.shrinkcallerid && ast_is_shrinkable_phonenumber(pc_num)) {
+				ast_shrink_phone_number(pc_num);
+			}
+			ast_string_field_set(pvt, cid_num, pc_num);
+		}
+		if (!ast_strlen_zero(pc_name)) {
+			ast_string_field_set(pvt, cid_name, pc_name);
+		}
+		if (pc_pres) {
+			pvt->callingpres = pc_pres;
+		}
 	}
 
 	/* Inbound call-limit enforcement → 480. The reason text trailing space is
@@ -16591,6 +16615,10 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 				ast_log(LOG_WARNING, "Sofia: shrinkcallerid value '%s' is not valid; ignoring\n",
 					v->value);
 			}
+		} else if (!strcasecmp(v->name, "apply_peer_callerid")) {
+			/* yes (default) = chan_sip parity: force matched-peer callerid on inbound when no trusted
+			 * RPID/PAI; no = keep the inbound From user as caller-ID. */
+			sofia_cfg.apply_peer_callerid = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "notifyhold")) {
 			/* Gates the peer->onHold counter update. */
 			sofia_cfg.notifyhold = ast_true(v->value);
@@ -17075,7 +17103,14 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "port")) {
 			peer->port = atoi(v->value);
 		} else if (!strcasecmp(v->name, "callerid")) {
+			/* Keep raw (CLI/AMI display) AND split into cid_num/cid_name (chan_sip.c:28779-28784
+			 * parity) — the functional fields. The duplicate split-only handler later in this
+			 * chain was dead code (this "callerid" always matched here first). */
+			char cid_name_buf[80] = "", cid_num_buf[80] = "";
 			ast_string_field_set(peer, callerid, v->value);
+			ast_callerid_split(v->value, cid_name_buf, sizeof(cid_name_buf), cid_num_buf, sizeof(cid_num_buf));
+			ast_string_field_set(peer, cid_name, cid_name_buf);
+			ast_string_field_set(peer, cid_num, cid_num_buf);
 		} else if (!strcasecmp(v->name, "regexten")) {
 			ast_string_field_set(peer, regexten, v->value);
 		} else if (!strcasecmp(v->name, "publish_exten")) {
@@ -17352,13 +17387,6 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 					peer->name, v->value);
 				peer->rtpkeepalive = sofia_cfg.default_rtpkeepalive;
 			}
-		} else if (!strcasecmp(v->name, "callerid")) {
-			/* ast_callerid_split -> cid_name + cid_num. */
-			char cid_name_buf[80] = "", cid_num_buf[80] = "";
-			ast_callerid_split(v->value, cid_name_buf, sizeof(cid_name_buf),
-				cid_num_buf, sizeof(cid_num_buf));
-			ast_string_field_set(peer, cid_name, cid_name_buf);
-			ast_string_field_set(peer, cid_num, cid_num_buf);
 		} else if (!strcasecmp(v->name, "fullname")
 				|| !strcasecmp(v->name, "cid_name")) {
 			ast_string_field_set(peer, cid_name, v->value);
@@ -17816,6 +17844,8 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.legacy_useroption_parsing = 0;
 	/* default 1; behavior change from the no-normalization baseline. */
 	sofia_cfg.shrinkcallerid = 1;
+	/* default 1 = chan_sip parity: force matched-peer callerid on inbound when no trusted RPID/PAI. */
+	sofia_cfg.apply_peer_callerid = 1;
 	/* gates the peer->onHold counter update; AMI Hold emission is unconditional. */
 	sofia_cfg.notifyhold = 0;
 	sofia_cfg.use_q850_reason = 0;	/* RFC 3326 Q.850 Reason on BYE/CANCEL; opt-in (chan_sip parity) */
