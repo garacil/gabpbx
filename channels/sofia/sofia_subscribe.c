@@ -613,33 +613,57 @@ int sofia_subscribe_on_subscribe_response(nua_handle_t *nh, sip_t const *sip, in
 	return 1;
 }
 
-/* Parse the simple-message-summary body into new/old message counts. Falls back to
- * "Messages-Waiting: yes/no" when no Voice-Message line is present. */
+/* Parse the application/simple-message-summary body into new/old message counts.
+ * RFC 3842 §2.2 allows zero or more per-class "msg-summary-line" entries, one for
+ * each message-context-class (Voice-Message, Fax-Message, Pager-Message,
+ * Multimedia-Message, Text-Message, None). Aggregate the "new/old" counts across
+ * every class present (not just Voice-Message), then fall back to the
+ * "Messages-Waiting: yes/no" summary line only when no per-class counts were found. */
 static void mwisub_parse_summary(const char *body, int *newmsgs, int *oldmsgs)
 {
+	static const char *const classes[] = {
+		"Voice-Message:", "Fax-Message:", "Pager-Message:",
+		"Multimedia-Message:", "Text-Message:", "None:", NULL,
+	};
 	const char *p;
+	long total_new = 0, total_old = 0;
+	int found = 0;
+	int i;
 
 	*newmsgs = 0;
 	*oldmsgs = 0;
 
-	if ((p = strcasestr(body, "Voice-Message:"))) {
+	for (i = 0; classes[i]; i++) {
 		char *end = NULL;
 		long n, m;
 
-		p += strlen("Voice-Message:");
+		if (!(p = strcasestr(body, classes[i]))) {
+			continue;
+		}
+		p += strlen(classes[i]);
 		n = strtol(p, &end, 10);
+		/* Clamp EACH class to [0, 65535] BEFORE summing so a bogus body with huge
+		 * per-class values cannot overflow the signed accumulator (the final clamp
+		 * below runs after the sum). Bounded total = classes * 65535, well within long. */
 		if (end && *end == '/') {
 			m = strtol(end + 1, NULL, 10);
-			/* Clamp to [0, 65535]: <0 -> 0, and cap so a bogus huge value cannot poison the cache. */
-			*newmsgs = (n < 0) ? 0 : (n > 65535 ? 65535 : (int) n);
-			*oldmsgs = (m < 0) ? 0 : (m > 65535 ? 65535 : (int) m);
-			return;
+			total_new += (n < 0) ? 0 : (n > 65535 ? 65535 : n);
+			total_old += (m < 0) ? 0 : (m > 65535 ? 65535 : m);
+		} else {
+			/* Malformed N/M — treat any positive count as "new waiting". */
+			total_new += (n <= 0) ? 0 : (n > 65535 ? 65535 : n);
 		}
-		/* Malformed N/M — treat any positive count as "new waiting". */
-		*newmsgs = (n <= 0) ? 0 : (n > 65535 ? 65535 : (int) n);
+		found = 1;
+	}
+
+	if (found) {
+		/* Saturate to [0, 65535] so a bogus huge value cannot poison the cache. */
+		*newmsgs = (total_new > 65535) ? 65535 : (int) total_new;
+		*oldmsgs = (total_old > 65535) ? 65535 : (int) total_old;
 		return;
 	}
-	/* No Voice-Message line: fall back to Messages-Waiting. */
+
+	/* No per-class summary line: fall back to Messages-Waiting. */
 	if ((p = strcasestr(body, "Messages-Waiting:"))) {
 		p += strlen("Messages-Waiting:");
 		while (*p == ' ' || *p == '\t') {

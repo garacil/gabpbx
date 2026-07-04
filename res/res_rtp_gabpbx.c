@@ -3903,7 +3903,21 @@ static struct ast_frame *ast_rtcp_interpret(struct ast_rtp_instance *instance, u
 				break;
 			/* Intentional fall through */
 		case RTCP_PT_RR:
-			/* Don't handle multiple reception reports (rc > 1) yet */
+			/* RFC 3550 §6.4.1: a compound SR/RR can carry rc>1 reception report blocks
+			 * (6 words each), one per SSRC the sender receives. Our RTT/jitter/loss stats
+			 * only concern the block reporting on OUR SSRC, so select it instead of blindly
+			 * using block[0]. The per-type length guard above already proved all rc blocks
+			 * lie inside the datagram, so this indexing is in-bounds. No match (single-stream
+			 * peers, or a mixer not reporting us) → keep block[0], preserving prior behaviour. */
+			if (rc > 1) {
+				int rr;
+				for (rr = 0; rr < rc; rr++) {
+					if (ntohl(rtcpheader[i + (rr * 6)]) == rtp->ssrc) {
+						i += rr * 6;
+						break;
+					}
+				}
+			}
 			/* Calculate RTT per RFC */
 			gettimeofday(&now, NULL);
 			timeval2ntp(now, &msw, &lsw);

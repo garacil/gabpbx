@@ -524,6 +524,9 @@ struct sofia_pvt {
 	unsigned int offer_had_audio:1;  /* the last parsed offer carried an m=audio line (ANY port). RFC 3264 §6:
 	                                  * an image-only T.38 re-INVITE (m=image, no m=audio) must be answered
 	                                  * m=image-only — sofia_generate_sdp suppresses the m=audio then. */
+	unsigned int progress_sent:1;    /* a 183 Session Progress was emitted on this call (chan_sip SIP_PROGRESS_SENT
+	                                  * parity): lets progressinband=no degrade RINGING to in-band ringback once
+	                                  * early media exists, instead of collapsing onto NEVER. */
 	struct sofia_srtp *srtp;         /* audio SDES-SRTP context (NULL = plain RTP); freed in destructor */
 	struct sofia_srtp *vsrtp;        /* video SDES-SRTP context; freed in destructor */
 	struct ast_variable *initreq_headers; /* inbound INVITE headers for ${SIP_HEADER()}; freed in destructor */

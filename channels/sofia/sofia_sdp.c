@@ -112,7 +112,7 @@ static void sofia_sdp_emit_webrtc_video(struct sofia_pvt *pvt, char *buf, size_t
 	struct ast_sockaddr vla;
 	int vport = 0;
 	char vpayload_buf[128] = "";
-	char vmap_buf[1536] = "";
+	char vmap_buf[2048] = "";	/* multi-PT rtcp-fb (~92B/PT) + ICE-lite candidate + fingerprint + ufrag/pwd + ssrc can exceed 1536 → fail-closed before the outer buffer */
 	int vfirst = 1;
 	format_t vf;
 	int vblen;
@@ -286,7 +286,7 @@ static void sofia_sdp_emit_bundled_video(struct sofia_pvt *pvt, char *buf, size_
 	const char *host, const char *sdp_family, char *tmp_buf, size_t tmp_buf_size, int audio_port, const char *dir_attr, int *overflow)
 {
 	char bvpayload_buf[128] = "";
-	char bvmap_buf[1536] = "";
+	char bvmap_buf[2048] = "";	/* bundled-video accumulator: same multi-PT rtcp-fb + ICE headroom as vmap_buf (was 1536, could fail-closed before the outer buffer) */
 	int bvfirst = 1;
 	int bvblen;
 	int bvport = audio_port;	/* shared audio port; NO a=bundle-only (port-0 stopped browsers creating a video receiver) */

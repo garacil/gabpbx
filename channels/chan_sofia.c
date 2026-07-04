@@ -4854,7 +4854,7 @@ static void sofia_session_timer_values(const struct sofia_peer *peer, int is_out
  * writes reinvite_pending; both also touched by the sofia event-loop thread). */
 static void sofia_send_reinvite(struct sofia_pvt *pvt)
 {
-	char sdp_buf[2048];
+	char sdp_buf[4096];	/* WebRTC video (multi-PT rtcp-fb + ICE candidates) can exceed 2048 → SDP dropped fail-closed; RFC 8843/6184 headroom */
 	char mf_str[8];	/* RFC 3261 §20.22 Max-Forwards */
 	char gruu_contact[1024] = "";	/* sized for an opaque GRUU (RFC 5627) */
 	int have_gruu = 0;
@@ -5155,7 +5155,7 @@ static int sofia_offer_effective_webrtc(const struct sofia_peer *peer, const cha
 static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 {
 	struct sofia_pvt *pvt = ast->tech_pvt;
-	char sdp_buf[2048];
+	char sdp_buf[4096];	/* WebRTC video (multi-PT rtcp-fb + ICE candidates) can exceed 2048 → SDP dropped fail-closed; RFC 8843/6184 headroom */
 	char addheader_buf[2048];
 	int has_addheaders;
 
@@ -5964,7 +5964,7 @@ static int sofia_answer(struct ast_channel *ast)
 {
 	struct sofia_pvt *pvt = ast->tech_pvt;
 	/* 2048 (not 1024): T.38 emission adds ~250 bytes that would otherwise truncate. */
-	char sdp_buf[2048];
+	char sdp_buf[4096];	/* WebRTC video (multi-PT rtcp-fb + ICE candidates) can exceed 2048 → SDP dropped fail-closed; RFC 8843/6184 headroom */
 
 	if (!pvt || !pvt->nh) {
 		return -1;
@@ -6174,9 +6174,16 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 			TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
 			TAG_END());
 	}
-		/* progressinband: YES → -1 (force core in-band); NEVER/NO → 0. LIMITATION:
-		 * NO degrades to NEVER (no SIP_PROGRESS_SENT tracking). */
+		/* progressinband (chan_sip.c AST_CONTROL_RINGING parity, chan_sip.c:7639-7645):
+		 *   YES   → always force core in-band ringback (-1);
+		 *   NO    → in-band ONLY once a 183 was already sent (progress_sent), so early
+		 *           media keeps flowing; otherwise plain 180 out-of-band (break);
+		 *   NEVER → always 180 out-of-band, never in-band (break).
+		 * NO is now a real distinct state instead of collapsing onto NEVER. */
 		if (pvt->peer && pvt->peer->progressinband == SOFIA_PROG_INBAND_YES) {
+			return -1;
+		}
+		if (pvt->peer && pvt->peer->progressinband == SOFIA_PROG_INBAND_NO && pvt->progress_sent) {
 			return -1;
 		}
 		break;
@@ -6218,7 +6225,7 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 			 * OK and the UAC BYEs on no media. Including SDP settles offer/answer in
 			 * the 183 (NUTAG_MEDIA_ENABLE(0) reads the body from the response), so the
 			 * 200 no longer fires and PRACK is RFC-3262-correct. */
-			char sdp_buf[2048];
+			char sdp_buf[4096];	/* WebRTC video (multi-PT rtcp-fb + ICE candidates) can exceed 2048 → SDP dropped fail-closed; RFC 8843/6184 headroom */
 			/* Contact from pvt->ourip (see sofia_answer); reload-UAF: hold peer->lock
 			 * across sofia_build_contact (reads freeable fromuser). */
 			char contact_buf[1024];	/* sized for an opaque GRUU Contact (RFC 5627), not just sip:user@host */
@@ -6237,6 +6244,7 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 					TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
 					TAG_END());
 			}
+			pvt->progress_sent = 1;	/* chan_sip SIP_PROGRESS_SENT parity: a 183 went out (see RINGING) */
 		}
 		break;
 	case AST_CONTROL_ANSWER:
@@ -6871,7 +6879,7 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 		nua_handle_t *nh, sip_t const *sip)
 {
-	char sdp_buf[2048];
+	char sdp_buf[4096];	/* WebRTC video (multi-PT rtcp-fb + ICE candidates) can exceed 2048 → SDP dropped fail-closed; RFC 8843/6184 headroom */
 	struct ast_channel *owner = NULL;
 	char own_name[80] = "";
 	char own_uniqueid[150] = "";
@@ -7051,7 +7059,7 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 		nua_handle_t *nh, sip_t const *sip)
 {
-	char sdp_buf[2048];
+	char sdp_buf[4096];	/* WebRTC video (multi-PT rtcp-fb + ICE candidates) can exceed 2048 → SDP dropped fail-closed; RFC 8843/6184 headroom */
 	struct ast_channel *owner = NULL;
 	char own_name[80] = "";
 	char own_uniqueid[150] = "";

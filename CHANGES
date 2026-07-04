@@ -7,6 +7,37 @@ that is a drop-in replacement for chan_sip (it registers as channel
 technology SIP). Releases are listed newest first.
 
 
+## 1.5.8 — SDP buffer headroom, progressinband parity, MWI multi-class, RTCP multi-report
+
+A batch of correctness fixes continuing the internal audit follow-up, covering SDP body sizing,
+early-media signaling parity with chan_sip, MWI summary parsing completeness and RTCP report handling.
+
+SDP / media:
+- **Larger SDP build buffers.** WebRTC video with BUNDLE, several H.264/VP8 payload types and their
+  per-payload `a=rtcp-fb` lines plus ICE candidates could exceed the fixed 2048-byte SDP body buffers,
+  making `sofia_generate_sdp` fail closed and emit no SDP at all. The six response/offer SDP buffers grow
+  to 4096 bytes, and the internal video attribute accumulators grow to 2048 bytes (those can fill before
+  the outer buffer on a rich video m-line), so a valid video answer is no longer silently dropped
+  (RFC 8843, RFC 6184).
+
+Signaling:
+- **progressinband=no is now distinct from never.** With `progressinband=no`, a RINGING indication now
+  degrades to in-band ringback once a 183 Session Progress has already been sent (i.e. early media
+  exists), matching chan_sip; previously `no` collapsed onto `never` and never produced in-band ringback.
+
+Messaging / MWI:
+- **Parse every message class in an MWI summary.** The `application/simple-message-summary` parser
+  (RFC 3842 §2.2) now aggregates the new/old counts across all message-context classes (Voice, Fax,
+  Pager, Multimedia, Text), each saturated to avoid overflow, instead of reading only `Voice-Message`;
+  the `Messages-Waiting` summary line remains the fallback when no per-class counts are present.
+
+RTCP:
+- **Handle multi-block reception reports.** An RTCP SR/RR carrying more than one reception report block
+  (RFC 3550 §6.4.1) previously used only the first block for RTT/jitter/loss statistics. The report block
+  that concerns our own SSRC is now selected; single-stream peers are unaffected (the first block is kept
+  when no block matches).
+
+
 ## 1.5.7 — audit hardening: RTP/codec-map concurrency, BUNDLE/T.38 SDP correctness, buffer sizing
 
 A batch of correctness, security, concurrency and robustness fixes from an internal audit of
