@@ -313,11 +313,11 @@ int manager_sofia_show_peer(struct mansession *s, const struct message *m)
 	ast_str_append(&buf, 0, "SubscribeMWI: %s\r\n", peer->subscribemwi ? "yes" : "no");
 	/* chan_sip parity. */
 	ast_str_append(&buf, 0, "PreferredCodec: %s\r\n", peer->preferred_codec_only ? "yes" : "no");
-	/* PARSE-COMPAT-ONLY: chan_sofia processes every SDP unconditionally. */
+	/* parse-compatibility only: chan_sofia processes every SDP unconditionally. */
 	ast_str_append(&buf, 0, "IgnoreSDPVersion: %s\r\n", peer->ignoresdpversion ? "yes" : "no");
 	/* chan_sip parity. */
 	ast_str_append(&buf, 0, "SIP-PromiscRedir: %s\r\n", peer->promiscredir ? "Y" : "N");
-	/* PARSE-COMPAT-ONLY: the sofia_parse_sdp ptime gate is not wired today. */
+	/* parse-compatibility only: the sofia_parse_sdp ptime gate is not implemented today. */
 	ast_str_append(&buf, 0, "Autoframing: %s\r\n", peer->autoframing ? "yes" : "no");
 	/* FaxDetect: runtime mode for DSP CNG detection + peer T.38 reINVITE detection. */
 	ast_str_append(&buf, 0, "FaxDetect: %s\r\n",
@@ -330,7 +330,7 @@ int manager_sofia_show_peer(struct mansession *s, const struct message *m)
 	ast_str_append(&buf, 0, "Timer-T1: %d\r\n", peer->timer_t1);
 	/* chan_sip parity. */
 	ast_str_append(&buf, 0, "OverlapDial: %s\r\n", sofia_allowoverlap_str(peer->allowoverlap_mode));
-	/* Tri-state, partial wire-in: NEVER + YES exact; NO degrades to NEVER. */
+	/* Tri-state, partial implementation: NEVER + YES exact; NO degrades to NEVER. */
 	ast_str_append(&buf, 0, "ProgressInband: %s\r\n",
 		peer->progressinband == SOFIA_PROG_INBAND_NEVER ? "never" :
 		peer->progressinband == SOFIA_PROG_INBAND_YES ? "yes" : "no");

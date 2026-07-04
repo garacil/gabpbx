@@ -20,7 +20,7 @@
  * Config file: sofia.conf (compatible with sip.conf format)
  *
  * ============================================================
- * DROP-IN chan_sip COMPATIBILITY POLICY (2026-04-27)
+ * DROP-IN chan_sip COMPATIBILITY POLICY
  * ============================================================
  * chan_sofia is intentionally drop-in-compatible with chan_sip
  * configurations and dialplans. Operators can swap the loaded
@@ -33,13 +33,13 @@
  *   - Realtime family:       "sippeers" (chan_sip default)
  *     extconfig.conf: sippeers => pgsql,general,voip_sip_conf
  *   - Dialplan functions:    SIPPEER / SIPCHANINFO / SIP_HEADER /
- *                            CHECKSIPDOMAIN  (T46 — chan_sip-parity
+ *                            CHECKSIPDOMAIN  (chan_sip-parity
  *                            names, drop-in for existing dialplans).
  *   - AMI actions:           SIPpeers / SIPshowpeer / SIPqualifypeer /
- *                            SIPshowregistry / SIPnotify  (T47 —
- *                            chan_sip-parity names).
- *   - AMI events:            PeerStatus / Registry / Hold  (T35 —
- *                            chan_sip-parity names).
+ *                            SIPshowregistry / SIPnotify  (chan_sip-parity
+ *                            names).
+ *   - AMI events:            PeerStatus / Registry / Hold  (chan_sip-parity
+ *                            names).
  *   - CLI commands:          "sip show peers" / "sip show channels" /
  *                            "sip show peer <name>" / "sip set debug"
  *                            (chan_sip-compat — operators retrain zero
@@ -1270,7 +1270,7 @@ static struct sofia_contact *sofia_peer_find_contact_by_host_port(struct sofia_p
 	}
 	/* Pass 2: match the registered src_addr. A WSS/NAT peer's Contact host is a placeholder (SIP.js
 	 * .invalid / TEST-NET, RFC 7118 §8.1) or a private LAN IP, so an outbound request whose host:port was
-	 * built from the registered src_addr (BUG1/2) never matches c->host in pass 1 — leaving active_contact
+	 * built from the registered src_addr never matches c->host in pass 1 — leaving active_contact
 	 * NULL, which broke in-dialog ACK/BYE NAT routing (the caller never learned the call ended → 15s RTP
 	 * timeout). Pass 1 wins whenever the Contact host is routable, so this is zero-regression for udp/tcp/tls.
 	 * With multiple contacts the src_addr is unique per registration, so only the right one matches.
@@ -1592,7 +1592,7 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	master->vsrtp = child->vsrtp;
 	child->vsrtp = NULL;
 
-	/* Review MED (pre-existing, predates v1c but widened by it): carry the WebRTC pvt state that BELONGS
+	/* Carry the WebRTC pvt state that BELONGS
 	 * to the just-stolen rtp/vrtp/srtp instances onto master. Otherwise a forked WebRTC(-video) winner keeps
 	 * the media instances but master->is_webrtc stays 0 and master->capability/mids/tls-ids are unset, so a
 	 * later master re-INVITE/hold would emit plain RTP/AVP on a DTLS-SRTP leg and lose video. */
@@ -1623,15 +1623,15 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	ast_copy_string(master->webrtc_cname, child->webrtc_cname, sizeof(master->webrtc_cname));
 	ast_copy_string(master->webrtc_msid, child->webrtc_msid, sizeof(master->webrtc_msid));
 
-	/* Phase 3 WebRTC DataChannel fork-steal: the DC transport rides the just-stolen
+	/* Phase 3 WebRTC DataChannel fork-steal: the DataChannel transport rides the just-stolen
 	 * master->rtp (its engine cb_data already moved with the rtp instance above), so we only MOVE the
-	 * dc pointer child->master + the negotiated DC fields, then REPOINT dc->pvt to master (no re-attach).
+	 * dc pointer child->master + the negotiated DataChannel fields, then REPOINT dc->pvt to master (no re-attach).
 	 * Mirrors the webrtc_* steal. sofia_dc_set_pvt is a no-op stub without usrsctp. */
 	master->dc = child->dc;
 	child->dc = NULL;
 	master->dc_offered = child->dc_offered;
 	master->dc_accepted = child->dc_accepted;
-	master->dc_offerer = child->dc_offerer;		/* OFFER-side: the winner child provisioned its own outbound DC offer; carry the emit/answer-apply state */
+	master->dc_offerer = child->dc_offerer;		/* OFFER-side: the winner child provisioned its own outbound DataChannel offer; carry the emit/answer-apply state */
 	master->dc_answer_applied = child->dc_answer_applied;
 	master->dc_sctp_port = child->dc_sctp_port;
 	master->dc_max_message_size = child->dc_max_message_size;
@@ -1959,7 +1959,7 @@ static int sofia_defer_bye_cb(const void *data)
  * DSP allocation requires inband/auto DTMF mode or fax CNG detection; fax-CNG
  * reuses the same DSP instance with DSP_FEATURE_FAX_DETECT.
  *
- * Caller must ensure pvt->rtp is bound (wire-in AFTER rtp_init in
+ * Caller must ensure pvt->rtp is bound (bound after rtp_init in
  * sofia_call/sofia_process_invite). Defensive NULL-check kept for safety. */
 static void sofia_enable_dsp_detect(struct sofia_pvt *pvt)
 {
@@ -2147,7 +2147,7 @@ static int sofia_rtp_init(struct sofia_pvt *pvt)
 	}
 
 	ast_sockaddr_parse(&addr, sofia_cfg.bindaddr, 0);
-	/* A4 OQ3 (crash fix): ALWAYS give the RTP instance the module-global sofia_sched context when
+	/* Crash fix: ALWAYS give the RTP instance the module-global sofia_sched context when
 	 * it exists — NOT gated on pvt->peer->webrtc. Inbound INVITEs create the RTP instance BEFORE the peer
 	 * is resolved (sofia_rtp_init precedes the pvt->peer assignment), so a peer->webrtc gate here is
 	 * racy/false for real inbound calls and would leave a WebRTC leg with rtp->sched==NULL, segfaulting
@@ -2182,13 +2182,12 @@ static int sofia_rtp_init(struct sofia_pvt *pvt)
 		}
 	}
 
-	/* post-T56 tos/cos bundle [general] parity (2026-04-28): chan_sip parity at
+	/* tos/cos [general] parity: chan_sip parity at
 	 * chan_sip.c:5888 verbatim — apply audio QoS markings (TOS/DSCP at L3 +
 	 * 802.1p CoS at L2) to RTP audio instance via gabpbx-core API
 	 * ast_rtp_instance_set_qos (rtp_engine.h:1311). Same for video on pvt->vrtp.
 	 * tos/cos values are unsigned int; ast_rtp_instance_set_qos signature accepts
-	 * int — cast for API conformance. production sofia.conf line tos_audio=ef
-	 * + tos_video=af41 finally honored on next reload (REAL OPERATOR DRIVER). */
+	 * int — cast for API conformance. tos_audio/tos_video are applied on reload. */
 	if (sofia_cfg.tos_audio || sofia_cfg.cos_audio) {
 		ast_rtp_instance_set_qos(pvt->rtp, (int)sofia_cfg.tos_audio,
 			(int)sofia_cfg.cos_audio, "Sofia RTP audio");
@@ -2198,13 +2197,13 @@ static int sofia_rtp_init(struct sofia_pvt *pvt)
 			(int)sofia_cfg.cos_video, "Sofia RTP video");
 	}
 
-	/* post-T56 rtp-timeout bundle per-peer parity (2026-04-28): chan_sip parity at
+	/* rtp-timeout per-peer parity: chan_sip parity at
 	 * chan_sip.c:5862-5864 + L5880-5882 verbatim — apply per-peer RTP timeouts +
 	 * keepalive via gabpbx-core APIs (rtp_engine.h:1671/1689/1707). Each non-zero
 	 * value enables the respective behavior on the RTP instance: rtptimeout drops
 	 * stream after N seconds with no inbound RTP; rtpholdtimeout same but for
-	 * on-hold state; rtpkeepalive sends periodic keepalive packets. production
-	 * sofia.conf rtptimeout=30 + rtpholdtimeout=300 finally honored on next reload. */
+	 * on-hold state; rtpkeepalive sends periodic keepalive packets.
+	 * rtptimeout/rtpholdtimeout are applied on reload. */
 	if (pvt->peer) {
 		if (pvt->peer->rtptimeout > 0) {
 			ast_rtp_instance_set_timeout(pvt->rtp, pvt->peer->rtptimeout);
@@ -2932,7 +2931,7 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	peer->busy_on_active = sofia_cfg.busy_on_active;
 	peer->max_contacts = sofia_cfg.max_contacts ? sofia_cfg.max_contacts : 6;
 	peer->encryption = 0;
-	peer->webrtc = sofia_cfg.webrtc;	/* A4: inherit [general] webrtc (the ENABLE); per-peer webrtc= overrides. The media profile is chosen by the target transport, not this flag - sofia_offer_effective_webrtc */
+	peer->webrtc = sofia_cfg.webrtc;	/* inherit [general] webrtc (the ENABLE); per-peer webrtc= overrides. The media profile is chosen by the target transport, not this flag - sofia_offer_effective_webrtc */
 	peer->datachannel = sofia_cfg.datachannel;	/* Phase 3: inherit [general] datachannel; per-peer datachannel= overrides */
 	peer->webrtc_video_bundle = sofia_cfg.webrtc_video_bundle;	/* inherit [general]; per-peer webrtc_video_bundle= overrides */
 	peer->flowclose_emit_unregister = sofia_cfg.flowclose_emit_unregister;	/* RFC 5626 flow-close: inherit [general]; per-peer flowclose_emit_unregister= overrides */
@@ -3617,11 +3616,11 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 		} else if (!strcasecmp(v->name, "encryption")) {
 			peer->encryption = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "webrtc")) {
-			peer->webrtc = ast_true(v->value);	/* WebRTC A4 ENABLE (DTLS-SRTP + ICE-lite + rtcp-mux); the per-contact/static transport picks the actual profile (sofia_offer_effective_webrtc) */
+			peer->webrtc = ast_true(v->value);	/* WebRTC ENABLE (DTLS-SRTP + ICE-lite + rtcp-mux); the per-contact/static transport picks the actual profile (sofia_offer_effective_webrtc) */
 		} else if (!strcasecmp(v->name, "datachannel")) {
 			peer->datachannel = ast_true(v->value);	/* Phase 3: accept the WebRTC m=application (RFC 8841 SCTP); requires webrtc=yes + usrsctp */
 		} else if (!strcasecmp(v->name, "webrtc_video_bundle")) {
-			peer->webrtc_video_bundle = ast_true(v->value);	/* BUNDLE WebRTC video onto the audio transport (RFC 8843); requires webrtc=yes; consumed in STAGE 2 */
+			peer->webrtc_video_bundle = ast_true(v->value);	/* BUNDLE WebRTC video onto the audio transport (RFC 8843); requires webrtc=yes; consumed during BUNDLE video staging */
 		} else if (!strcasecmp(v->name, "flowclose_emit_unregister")) {
 			peer->flowclose_emit_unregister = ast_true(v->value);	/* RFC 5626 flow-close: yes = emit unregister side-effects on flow close; no (default) = silent removal */
 		} else if (!strcasecmp(v->name, "srtpcipher")) {
@@ -3715,7 +3714,7 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			/* Parse-compat only — chan_sofia has no nua_r_redirect handler. */
 			peer->promiscredir = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "autoframing")) {
-			/* Parse-compat only — the sofia_parse_sdp ptime gate is not wired yet. */
+			/* Parse-compatibility only — the sofia_parse_sdp ptime gate is not implemented yet. */
 			peer->autoframing = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "timerb")) {
 			/* clamp-to-default on invalid or <200ms. */
@@ -4402,7 +4401,7 @@ struct sofia_peer *sofia_find_peer_cached(const char *name)
 /* chan_sip parity: IP-based fallback peer match.
  * Used by sofia_process_invite after the From-username lookup fails — typical
  * for trunk gateways whose From-user is the caller-ID number, not the peer
- * name (e.g. Huawei SoftX3000 sending From: <sip:621120700@…> while the peer
+ * name (e.g. a carrier softswitch sending From: <sip:USER@…> while the peer
  * is configured as [mytrunk] host=192.0.2.10). Matches peer->src_addr
  * (set both by dnsmgr for static host=<ip> peers and by REGISTER for dynamic
  * peers) or, if that is unset, peer->defaddr. Ranked, EXACT-FIRST (chan_sip peer_ipcmp_cb
@@ -5298,7 +5297,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				/* Init RTP + (if encryption=yes) per-child SRTP, then SDP. */
 				if (child->nh && sofia_rtp_init(child) == 0) {
 					int crypto_ok = 1;
-					/* A5: each fork child gets its own DTLS cert + ICE creds for an
+					/* Each fork child gets its own DTLS cert + ICE creds for an
 					 * independent WebRTC offer (mirrors the per-child SDES keys below).
 					 * child->rtp exists from sofia_rtp_init(child) above. Mutually
 					 * exclusive with the per-child a=crypto block. Fail per child (skip
@@ -5862,15 +5861,15 @@ static int sofia_answer(struct ast_channel *ast)
 		}
 	}
 
-	/* A4 OQ6: activate the RTP instance AFTER the 200 OK is dispatched (the browser
+	/* Activate the RTP instance AFTER the 200 OK is dispatched (the browser
 	 * starts ICE only once it has our answer). For a WebRTC leg this arms the
-	 * ICE/DTLS state machine; A3 also fires DTLS from the authenticated USE-CANDIDATE
-	 * path, so an early/duplicate activate is a no-op. Harmless for plain SIP. */
+	 * ICE/DTLS state machine; the authenticated USE-CANDIDATE path also fires DTLS,
+	 * so an early/duplicate activate is a no-op. Harmless for plain SIP. */
 	if (pvt->is_webrtc && pvt->rtp) {
 		ast_rtp_instance_activate(pvt->rtp);
 	}
 	if (pvt->is_webrtc && pvt->webrtc_video_accepted && pvt->vrtp) {
-		ast_rtp_instance_activate(pvt->vrtp);	/* v1b: arm the non-BUNDLE video ICE/DTLS state machine (mirrors the audio rtp) */
+		ast_rtp_instance_activate(pvt->vrtp);	/* arm the non-BUNDLE video ICE/DTLS state machine (mirrors the audio rtp) */
 	}
 
 	ast_mutex_lock(&pvt->lock);
@@ -6835,7 +6834,7 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 			SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 			SIPTAG_PAYLOAD_STR(sdp_buf),
 			TAG_END());
-		/* Review HIGH 2: this re-INVITE may have armed a fresh vrtp in sofia_parse_sdp (STEP 5) for an
+		/* This re-INVITE may have armed a fresh vrtp in sofia_parse_sdp (the non-BUNDLE video arm step) for an
 		 * added/updated video, but — unlike sofia_answer — never activated it. For an a=setup:passive video
 		 * offer our DTLS role is ACTIVE and the ClientHello only fires on activate, so video DTLS would never
 		 * start. Activate now the 200 OK is out, mirroring sofia_answer; a duplicate activate is a no-op. */
@@ -7035,7 +7034,7 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 				SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 				SIPTAG_PAYLOAD_STR(sdp_buf),
 				TAG_END());
-			/* Review HIGH 2: like the re-INVITE path — activate the freshly armed vrtp after the 200 OK so an
+			/* Like the re-INVITE path — activate the freshly armed vrtp after the 200 OK so an
 			 * added-video UPDATE actually starts video DTLS (ACTIVE role fires its ClientHello on activate).
 			 * Mirrors sofia_answer; a duplicate activate is a no-op. */
 			if (pvt->is_webrtc && pvt->webrtc_video_accepted && pvt->vrtp) {
@@ -13162,7 +13161,7 @@ void *sofia_dc_pair_bridged(struct sofia_pvt *self_pvt, void *self_dc)
 		return NULL;
 	}
 
-	/* STEP 1: pin self_pvt->owner under self_pvt->lock (anti-UAF vs sofia_hangup). */
+	/* First: pin self_pvt->owner under self_pvt->lock (anti-UAF vs sofia_hangup). */
 	ast_mutex_lock(&self_pvt->lock);
 	self_chan = self_pvt->owner;
 	if (self_chan) {
@@ -13173,11 +13172,11 @@ void *sofia_dc_pair_bridged(struct sofia_pvt *self_pvt, void *self_dc)
 		return NULL;
 	}
 
-	/* STEP 2: WITH self LOCKED do ONLY the lock-internal work — Method 1 (ast_bridged_channel
+	/* Next, WITH self LOCKED do ONLY the lock-internal work — Method 1 (ast_bridged_channel
 	 * contract) and copying BRIDGEPEER + linkedid into locals. We take NO channel-container lock
 	 * here: ast_channel_get_by_name_prefix (Method 2) takes the channels container and would invert
 	 * the documented container->channel order (channel.h:1319-1322) if called under a channel lock,
-	 * so it is deferred to STEP 2b below, off the self lock. */
+	 * so it is deferred to the next stage below, off the self lock. */
 	bridgepeer_copy[0] = '\0';
 	linkedid_copy[0] = '\0';
 	ast_channel_lock(self_chan);
@@ -13199,7 +13198,7 @@ void *sofia_dc_pair_bridged(struct sofia_pvt *self_pvt, void *self_dc)
 	}
 	ast_channel_unlock(self_chan);
 
-	/* STEP 2b (NO channel lock held — review fix). Methods 2 and 3 both
+	/* With NO channel lock held (review fix), Methods 2 and 3 both
 	 * touch the global channels container (Method 2 directly via ast_channel_get_by_name_prefix;
 	 * Method 3 via the dialogs container + per-sibling pvt locks). They MUST run with self_chan
 	 * UNLOCKED to honor channel.h:1319-1322 (container BEFORE channel, never channel->container). */
@@ -13249,7 +13248,7 @@ void *sofia_dc_pair_bridged(struct sofia_pvt *self_pvt, void *self_dc)
 	}
 	ast_channel_unref(self_chan);	/* self_chan no longer needed past the identity check */
 
-	/* STEP 3: trylock the FAR channel (NEVER block — the ABBA defense). On contention, drop. */
+	/* Then trylock the FAR channel (NEVER block — the ABBA defense). On contention, drop. */
 	if (ast_channel_trylock(far_chan)) {
 		ast_channel_unref(far_chan);
 		return NULL;
@@ -13259,7 +13258,7 @@ void *sofia_dc_pair_bridged(struct sofia_pvt *self_pvt, void *self_dc)
 	if (far_chan->tech == &sofia_tech) {
 		struct sofia_pvt *far_pvt = far_chan->tech_pvt;
 		if (far_pvt && far_pvt != self_pvt) {
-			/* STEP 4: take far_pvt->lock (channel -> pvt order) before reading + ao2_ref'ing dc. */
+			/* Finally take far_pvt->lock (channel -> pvt order) before reading + ao2_ref'ing dc. */
 			ast_mutex_lock(&far_pvt->lock);
 			if (far_pvt->dc && (void *)far_pvt->dc != self_dc) {
 				far_dc = far_pvt->dc;
@@ -13794,7 +13793,7 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 			/* SIP_DEFER_BYE_ON_TRANSFER (chan_sip / RFC 5589 §6.1): after the terminal
 			 * NOTIFY 200 OK the transferer's UA owns the dialog teardown via BYE. Our own
 			 * nua_bye now would race+drop the pending NOTIFY (UA stuck, no audio — observed
-			 * vs MicroSIP 3.21.4). So set defer_bye (sofia_hangup skips its nua_bye) and arm
+			 * vs MicroSIP). So set defer_bye (sofia_hangup skips its nua_bye) and arm
 			 * a SOFIA_DEFER_BYE_TIMEOUT_MS safety-net timer in case the UA never BYEs us. */
 			ast_mutex_lock(&op->lock);
 			if (sofia_sched && op->defer_bye_sched_id == -1) {
@@ -14313,7 +14312,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				if (became_empty) {
 					/* Internal routing state is ALWAYS corrected regardless of policy. */
 					sofia_peer_ipport_reindex(peer);
-					/* External unregister side-effects only when flowclose_emit_unregister=yes (option 1);
+					/* External unregister side-effects only when flowclose_emit_unregister=yes;
 					 * default (no) stays silent so a browser F5 does not flap the BLF. NOT under peer->lock. */
 					if (emit_unregister) {
 						struct sofia_register_update upd = { 0 };
@@ -16351,7 +16350,7 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			/* pong-timeout SECONDS -> ms for TPTAG_PINGPONG; 0 -> OFF. */
 			sofia_cfg.tcp_pingpong_ms = sofia_cfg_seconds_to_ms(v->value);
 		} else if (!strcasecmp(v->name, "useragent")) {
-			/* User-Agent override (chan_sip parity); empty ALLOWED — wire-in skips
+			/* User-Agent override (chan_sip parity); empty ALLOWED — the implementation skips
 			 * SIPTAG_USER_AGENT_STR so sofia-sip uses its library default. */
 			ast_copy_string(sofia_cfg.useragent, v->value, sizeof(sofia_cfg.useragent));
 			ast_debug(1, "Sofia: Setting SIP channel User-Agent to %s\n", sofia_cfg.useragent);
@@ -16368,7 +16367,7 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "encryption")) {
 			sofia_cfg.encryption = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "webrtc")) {
-			sofia_cfg.webrtc = ast_true(v->value);	/* A4 WebRTC general default */
+			sofia_cfg.webrtc = ast_true(v->value);	/* WebRTC general default */
 		} else if (!strcasecmp(v->name, "datachannel")) {
 			sofia_cfg.datachannel = ast_true(v->value);	/* Phase 3 WebRTC DataChannel general default; per-peer datachannel= overrides */
 		} else if (!strcasecmp(v->name, "webrtc_video_bundle")) {
@@ -16548,7 +16547,7 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			/* Scheduled-retry attempt-cap; 0 = unlimited. */
 			sofia_cfg.register_attempts = atoi(v->value);
 		} else if (!strcasecmp(v->name, "directrtpsetup")) {
-			/* PARSE-COMPAT-ONLY (default DISABLED): early-RTP-bridge wire-in deferred. */
+			/* parse-compatibility only (default DISABLED): early-RTP-bridge not implemented. */
 			sofia_cfg.directrtpsetup = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "alwaysauthreject")) {
 			/* Security-critical RFC 3261 §22.4 username-enumeration prevention —
@@ -16556,10 +16555,10 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			 * 401 challenge instead of 403/404 disclosure. Default TRUE (chan_sip parity). */
 			sofia_cfg.alwaysauthreject = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "compactheaders")) {
-			/* PARSE-COMPAT-ONLY: sofia-sip native compact-emit gate ABSENT; effect deferred. */
+			/* parse-compatibility only: sofia-sip native compact-emit gate ABSENT; effect deferred. */
 			sofia_cfg.compactheaders = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "disallowed_methods")) {
-			/* PARSE-COMPAT-ONLY string-storage; dynamic NUTAG_ALLOW generation deferred. */
+			/* parse-compatibility only string-storage; dynamic NUTAG_ALLOW generation deferred. */
 			ast_copy_string(sofia_cfg.disallowed_methods, v->value, sizeof(sofia_cfg.disallowed_methods));
 		} else if (!strcasecmp(v->name, "contactpermit") || !strcasecmp(v->name, "contactdeny")) {
 			/* ast_append_ha(v->name + 7, ...) skips "contact"; remainder is the permit/deny sense. */
@@ -16605,7 +16604,7 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			/* When yes, peer-lookup uses the Authorization username (sofia_pick_auth_username). */
 			sofia_cfg.match_auth_username = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "legacy_useroption_parsing")) {
-			/* PARSE-COMPAT-ONLY: URI per-component semicolon-strip deferred. */
+			/* parse-compatibility only: URI per-component semicolon-strip deferred. */
 			sofia_cfg.legacy_useroption_parsing = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "shrinkcallerid")) {
 			/* Tri-state; invalid warns + preserves current value. */
@@ -16628,32 +16627,32 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			/* Q.850 Reason header (RFC 3326) on BYE/CANCEL, both directions. */
 			sofia_cfg.use_q850_reason = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "notifyringing")) {
-			/* PARSE-COMPAT-ONLY: effect deferred until presence/dialog-info NOTIFY lands. */
+			/* parse-compatibility only: effect deferred until presence/dialog-info NOTIFY lands. */
 			sofia_cfg.notifyringing = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "dynamic_exclude_static")
 				|| !strcasecmp(v->name, "dynamic_excludes_static")) {
 			/* Security hardening; both spellings accepted. */
 			sofia_cfg.dynamic_exclude_static = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "autocreatepeer")) {
-			/* PARSE-COMPAT-ONLY: chan_sofia refuses to auto-create unknown peers. */
+			/* parse-compatibility only: chan_sofia refuses to auto-create unknown peers. */
 			sofia_cfg.autocreatepeer = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "preferred_codec_only")) {
 			sofia_cfg.default_preferred_codec_only = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "ignoresdpversion")) {
-			/* WIRED (o= version stickiness, RFC 3264 §8): no (default) honors the SDP o= version
+			/* Implemented (o= version stickiness, RFC 3264 §8): no (default) honors the SDP o= version
 			 * (a re-offer with the same origin + unchanged version is a no-op, preserving the
 			 * learned media/NAT remote); yes forces reprocessing of every inbound SDP. */
 			sofia_cfg.default_ignoresdpversion = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "promiscredir")) {
-			/* PARSE-COMPAT-ONLY: nua_r_redirect handler ABSENT. */
+			/* parse-compatibility only: nua_r_redirect handler ABSENT. */
 			sofia_cfg.default_promiscredir = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "autoframing")) {
-			/* PARSE-COMPAT-ONLY: sofia_parse_sdp ptime gate not wired. */
+			/* parse-compatibility only: sofia_parse_sdp ptime gate not implemented. */
 			sofia_cfg.default_autoframing = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "timerb")) {
 			/* CORRECTS a chan_sip bug: chan_sip only assigns global_timer_b in the invalid
 			 * (< 500) branch, so valid values never take effect. We add the missing else.
-			 * Wire-in via NTATAG_SIP_T1X64; sofia_timerb_set feeds the timer cross-validation. */
+			 * Implemented via NTATAG_SIP_T1X64; sofia_timerb_set feeds the timer cross-validation. */
 			int tmp_b = atoi(v->value);
 			if (tmp_b < 500) {
 				ast_log(LOG_WARNING, "Sofia: invalid [general] timerb '%s' (< 500ms); using default %d\n",
@@ -16716,7 +16715,7 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 				sofia_cfg.default_allowoverlap_mode = SOFIA_OVERLAP_NO;
 			}
 		} else if (!strcasecmp(v->name, "progressinband")) {
-			/* Tri-state yes/no/never. Partial wire-in at sofia_indicate AST_CONTROL_RINGING. */
+			/* Tri-state yes/no/never. Partial implementation at sofia_indicate AST_CONTROL_RINGING. */
 			if (ast_true(v->value)) {
 				sofia_cfg.default_progressinband = SOFIA_PROG_INBAND_YES;
 			} else if (strcasecmp(v->value, "never")) {
@@ -16725,7 +16724,7 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 				sofia_cfg.default_progressinband = SOFIA_PROG_INBAND_NEVER;
 			}
 		} else if (!strcasecmp(v->name, "subscribe_network_change_event")) {
-			/* PARSE-COMPAT-ONLY (network-change handled by sofia-sip + dnsmgr); invalid warns. */
+			/* parse-compatibility only (network-change handled by sofia-sip + dnsmgr); invalid warns. */
 			if (ast_true(v->value)) {
 				sofia_cfg.subscribe_network_change_event = 1;
 			} else if (ast_false(v->value)) {
@@ -16735,7 +16734,7 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 					v->value, v->lineno);
 			}
 		} else if (!strcasecmp(v->name, "rtsavesysname")) {
-			/* Wired at the sofia_process_register ast_update_realtime callsites. */
+			/* Implemented at the sofia_process_register ast_update_realtime callsites. */
 			sofia_cfg.rtsave_sysname = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "rtupdate")) {
 			/* Gates the realtime peer updates in sofia_process_register. */
@@ -16747,10 +16746,10 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "register_pool_workers")) {
 			sofia_cfg.register_pool_workers = atoi(v->value);
 		} else if (!strcasecmp(v->name, "rtcachefriends")) {
-			/* PARSE-COMPAT-ONLY: the ao2 registry already caches all peers. */
+			/* parse-compatibility only: the ao2 registry already caches all peers. */
 			sofia_cfg.rtcachefriends = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "rtautoclear")) {
-			/* PARSE-COMPAT-ONLY: no peer-level auto-clear infra. Numeric > 0 sets seconds; flag
+			/* parse-compatibility only: no peer-level auto-clear infra. Numeric > 0 sets seconds; flag
 			 * enabled when numeric > 0 OR ast_true. */
 			int i = atoi(v->value);
 			if (i > 0) {
@@ -16760,17 +16759,17 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			}
 			sofia_cfg.rtautoclear_enabled = (i || ast_true(v->value)) ? 1 : 0;
 		} else if (!strcasecmp(v->name, "domainsasrealm")) {
-			/* Wired via sofia_get_realm_for_dialog at the auth-challenge callsites. */
+			/* Implemented via sofia_get_realm_for_dialog at the auth-challenge callsites. */
 			sofia_cfg.domainsasrealm = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "allowexternaldomains")) {
-			/* Wired via sofia_check_sip_domain at the invite/refer gates. */
+			/* Implemented via sofia_check_sip_domain at the invite/refer gates. */
 			sofia_cfg.allow_external_domains = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "autodomain")) {
 			/* Auto-add fires at sofia_load_config conclusion. */
 			sofia_cfg.autodomain = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "matchexternaddrlocally")
 		           || !strcasecmp(v->name, "matchexterniplocally")) {
-			/* PARSE-COMPAT-ONLY (sofia_should_use_externaddr signature diverges); both spellings. */
+			/* parse-compatibility only (sofia_should_use_externaddr signature diverges); both spellings. */
 			sofia_cfg.matchexternaddrlocally = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "rtptimeout")) {
 			if ((sscanf(v->value, "%30d", &sofia_cfg.default_rtptimeout) != 1)
@@ -16791,42 +16790,42 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 				sofia_cfg.default_rtpkeepalive = 0;
 			}
 		} else if (!strcasecmp(v->name, "tos_sip")) {
-			/* Wired via TPTAG_TOS at nua_create. */
+			/* Implemented via TPTAG_TOS at nua_create. */
 			if (ast_str2tos(v->value, &sofia_cfg.tos_sip)) {
 				ast_log(LOG_WARNING, "Sofia: invalid tos_sip value '%s'; refer to QoS documentation\n", v->value);
 			}
 		} else if (!strcasecmp(v->name, "tos_audio")) {
-			/* Wired via ast_rtp_instance_set_qos. */
+			/* Implemented via ast_rtp_instance_set_qos. */
 			if (ast_str2tos(v->value, &sofia_cfg.tos_audio)) {
 				ast_log(LOG_WARNING, "Sofia: invalid tos_audio value '%s'; refer to QoS documentation\n", v->value);
 			}
 		} else if (!strcasecmp(v->name, "tos_video")) {
-			/* Wired via ast_rtp_instance_set_qos. */
+			/* Implemented via ast_rtp_instance_set_qos. */
 			if (ast_str2tos(v->value, &sofia_cfg.tos_video)) {
 				ast_log(LOG_WARNING, "Sofia: invalid tos_video value '%s'; refer to QoS documentation\n", v->value);
 			}
 		} else if (!strcasecmp(v->name, "tos_text")) {
-			/* PARSE-COMPAT-ONLY: text-RTP infra absent (no pvt->trtp). */
+			/* parse-compatibility only: text-RTP infra absent (no pvt->trtp). */
 			if (ast_str2tos(v->value, &sofia_cfg.tos_text)) {
 				ast_log(LOG_WARNING, "Sofia: invalid tos_text value '%s'; refer to QoS documentation\n", v->value);
 			}
 		} else if (!strcasecmp(v->name, "cos_sip")) {
-			/* PARSE-COMPAT-ONLY: sofia-sip TPTAG_COS absent. */
+			/* parse-compatibility only: sofia-sip TPTAG_COS absent. */
 			if (ast_str2cos(v->value, &sofia_cfg.cos_sip)) {
 				ast_log(LOG_WARNING, "Sofia: invalid cos_sip value '%s'; refer to QoS documentation\n", v->value);
 			}
 		} else if (!strcasecmp(v->name, "cos_audio")) {
-			/* Wired via ast_rtp_instance_set_qos. */
+			/* Implemented via ast_rtp_instance_set_qos. */
 			if (ast_str2cos(v->value, &sofia_cfg.cos_audio)) {
 				ast_log(LOG_WARNING, "Sofia: invalid cos_audio value '%s'; refer to QoS documentation\n", v->value);
 			}
 		} else if (!strcasecmp(v->name, "cos_video")) {
-			/* Wired via ast_rtp_instance_set_qos. */
+			/* Implemented via ast_rtp_instance_set_qos. */
 			if (ast_str2cos(v->value, &sofia_cfg.cos_video)) {
 				ast_log(LOG_WARNING, "Sofia: invalid cos_video value '%s'; refer to QoS documentation\n", v->value);
 			}
 		} else if (!strcasecmp(v->name, "cos_text")) {
-			/* PARSE-COMPAT-ONLY: text-RTP infra absent (no pvt->trtp). */
+			/* parse-compatibility only: text-RTP infra absent (no pvt->trtp). */
 			if (ast_str2cos(v->value, &sofia_cfg.cos_text)) {
 				ast_log(LOG_WARNING, "Sofia: invalid cos_text value '%s'; refer to QoS documentation\n", v->value);
 			}
@@ -17133,7 +17132,7 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "accountcode")) {
 			ast_string_field_set(peer, accountcode, v->value);
 		} else if (!strcasecmp(v->name, "disallowed_methods")) {
-			/* PARSE-COMPAT-ONLY string-storage. */
+			/* parse-compatibility only string-storage. */
 			ast_string_field_set(peer, disallowed_methods, v->value);
 		} else if (!strcasecmp(v->name, "maxforwards")) {
 			if (sscanf(v->value, "%30d", &peer->maxforwards) != 1
@@ -17182,11 +17181,11 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "encryption")) {
 			peer->encryption = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "webrtc")) {
-			peer->webrtc = ast_true(v->value);	/* WebRTC A4 ENABLE (DTLS-SRTP + ICE-lite + rtcp-mux); the per-contact/static transport picks the actual profile (sofia_offer_effective_webrtc) */
+			peer->webrtc = ast_true(v->value);	/* WebRTC ENABLE (DTLS-SRTP + ICE-lite + rtcp-mux); the per-contact/static transport picks the actual profile (sofia_offer_effective_webrtc) */
 		} else if (!strcasecmp(v->name, "datachannel")) {
 			peer->datachannel = ast_true(v->value);	/* Phase 3: accept the WebRTC m=application (RFC 8841 SCTP); requires webrtc=yes + usrsctp */
 		} else if (!strcasecmp(v->name, "webrtc_video_bundle")) {
-			peer->webrtc_video_bundle = ast_true(v->value);	/* BUNDLE WebRTC video onto the audio transport (RFC 8843); requires webrtc=yes; consumed in STAGE 2 */
+			peer->webrtc_video_bundle = ast_true(v->value);	/* BUNDLE WebRTC video onto the audio transport (RFC 8843); requires webrtc=yes; consumed during BUNDLE video staging */
 		} else if (!strcasecmp(v->name, "flowclose_emit_unregister")) {
 			peer->flowclose_emit_unregister = ast_true(v->value);	/* RFC 5626 flow-close: yes = emit unregister side-effects on flow close; no (default) = silent removal */
 		} else if (!strcasecmp(v->name, "srtpcipher")) {
@@ -17268,14 +17267,14 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "preferred_codec_only")) {
 			peer->preferred_codec_only = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "ignoresdpversion")) {
-			/* WIRED (o= version stickiness, RFC 3264 §8): no (default) honors the o= version;
+			/* Implemented (o= version stickiness, RFC 3264 §8): no (default) honors the o= version;
 			 * yes forces reprocessing of every inbound SDP. Overrides the [general] default. */
 			peer->ignoresdpversion = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "promiscredir")) {
-			/* PARSE-COMPAT-ONLY: nua_r_redirect handler ABSENT. */
+			/* parse-compatibility only: nua_r_redirect handler ABSENT. */
 			peer->promiscredir = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "autoframing")) {
-			/* PARSE-COMPAT-ONLY: sofia_parse_sdp ptime gate not wired. */
+			/* parse-compatibility only: sofia_parse_sdp ptime gate not implemented. */
 			peer->autoframing = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "timerb")) {
 			/* sscanf %30d; clamp to default if invalid or < 200. */
@@ -17299,7 +17298,7 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			}
 		} else if (!strcasecmp(v->name, "faxdetect")) {
 			/* faxdetect parser: yes -> cng+t38, no -> none, or a
-			 * comma-separated cng/t38 set. Runtime wire-in handles DSP
+			 * comma-separated cng/t38 set. The runtime implementation handles DSP
 			 * CNG detection and peer T.38 reINVITE detection. */
 			if (ast_true(v->value)) {
 				peer->faxdetect_mode = SOFIA_FAX_DETECT_BOTH;
@@ -17363,7 +17362,7 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 				peer->allowoverlap_mode = SOFIA_OVERLAP_NO;
 			}
 		} else if (!strcasecmp(v->name, "progressinband")) {
-			/* tri-state yes/no/never. Partial wire-in at sofia_indicate AST_CONTROL_RINGING. */
+			/* tri-state yes/no/never. Partial implementation at sofia_indicate AST_CONTROL_RINGING. */
 			if (ast_true(v->value)) {
 				peer->progressinband = SOFIA_PROG_INBAND_YES;
 			} else if (strcasecmp(v->value, "never")) {
@@ -17810,11 +17809,11 @@ static int sofia_apply_config(struct ast_config *cfg)
 	/* register_timeout=20s; register_attempts=0 (unlimited). */
 	sofia_cfg.register_timeout = DEFAULT_REGISTRATION_TIMEOUT;
 	sofia_cfg.register_attempts = 0;
-	/* PARSE-COMPAT-ONLY — experimental, effect-deferred. */
+	/* parse-compatibility only — experimental, effect-deferred. */
 	sofia_cfg.directrtpsetup = 0;
 	/* default TRUE: RFC 3261 §22.4 username-enumeration prevention active out-of-the-box. */
 	sofia_cfg.alwaysauthreject = 1;
-	/* PARSE-COMPAT-ONLY — native compact-emit gate absent. */
+	/* parse-compatibility only — native compact-emit gate absent. */
 	sofia_cfg.compactheaders = 0;
 	/* empty default (chan_sofia uses NUTAG_APPL_METHOD for unknown-method gating). */
 	sofia_cfg.disallowed_methods[0] = '\0';
@@ -17844,7 +17843,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	/* default 384 kbps — every video SDP emits b=CT:384 (maxcallbitrate=0 restores no-b=CT). */
 	sofia_cfg.default_maxcallbitrate = 384;
 	sofia_cfg.match_auth_username = 0;
-	/* PARSE-COMPAT-ONLY. */
+	/* parse-compatibility only. */
 	sofia_cfg.legacy_useroption_parsing = 0;
 	/* default 1; behavior change from the no-normalization baseline. */
 	sofia_cfg.shrinkcallerid = 1;
@@ -17853,54 +17852,54 @@ static int sofia_apply_config(struct ast_config *cfg)
 	/* gates the peer->onHold counter update; AMI Hold emission is unconditional. */
 	sofia_cfg.notifyhold = 0;
 	sofia_cfg.use_q850_reason = 0;	/* RFC 3326 Q.850 Reason on BYE/CANCEL; opt-in (chan_sip parity) */
-	/* PARSE-COMPAT-ONLY — effect deferred until presence/dialog-info NOTIFY lands. */
+	/* parse-compatibility only — effect deferred until presence/dialog-info NOTIFY lands. */
 	sofia_cfg.notifyringing = 1;
 	/* Security hardening: peer-build appends static IPs as deny rules to contact_ha. */
 	sofia_cfg.dynamic_exclude_static = 0;
-	/* PARSE-COMPAT-ONLY — refuses to auto-create unknown peers. */
+	/* parse-compatibility only — refuses to auto-create unknown peers. */
 	sofia_cfg.autocreatepeer = 0;
-	/* codec-list-narrowing wired at sofia_generate_sdp, direction-symmetric. */
+	/* codec-list-narrowing implemented at sofia_generate_sdp, direction-symmetric. */
 	sofia_cfg.default_preferred_codec_only = 0;
-	/* default NEVER. Partial wire-in at sofia_indicate AST_CONTROL_RINGING (YES state). */
+	/* default NEVER. Partial implementation at sofia_indicate AST_CONTROL_RINGING (YES state). */
 	sofia_cfg.default_progressinband = SOFIA_PROG_INBAND_NEVER;
-	/* PARSE-COMPAT-ONLY — nua_r_redirect handler absent. */
+	/* parse-compatibility only — nua_r_redirect handler absent. */
 	sofia_cfg.default_promiscredir = 0;
-	/* PARSE-COMPAT-ONLY — sofia_parse_sdp ptime gate not wired. */
+	/* parse-compatibility only — sofia_parse_sdp ptime gate not implemented. */
 	sofia_cfg.default_autoframing = 0;
 	/* default NONE; covers DSP CNG + peer T.38 reINVITE detection. */
 	sofia_cfg.default_faxdetect_mode = SOFIA_FAX_DETECT_NONE;
 	/* T38FaxMaxDatagram sentinel -1 = use built-in 200-byte default. */
 	sofia_cfg.default_t38_maxdatagram = SOFIA_T38_MAXDATAGRAM_SENTINEL;
-	/* default 32000ms (= 64 * DEFAULT_TIMER_T1); wire-in via NTATAG_SIP_T1X64. */
+	/* default 32000ms (= 64 * DEFAULT_TIMER_T1); implemented via NTATAG_SIP_T1X64. */
 	sofia_cfg.default_timer_b = 32000;
-	/* default 500ms; wire-in via NTATAG_SIP_T1. */
+	/* default 500ms; implemented via NTATAG_SIP_T1. */
 	sofia_cfg.default_timer_t1 = 500;
 	/* cleared here; set when the key is parsed; consumed at the timer cross-validation below. */
 	sofia_timerb_set = 0;
 	sofia_timert1_set = 0;
-	/* default YES; wire-in at 3 sites (process_invite + indicate INCOMPLETE + nua_r_invite 484). */
+	/* default YES; implemented at 3 sites (process_invite + indicate INCOMPLETE + nua_r_invite 484). */
 	sofia_cfg.default_allowoverlap_mode = SOFIA_OVERLAP_YES;
-	/* PARSE-COMPAT-ONLY — network-change handled by sofia-sip + per-peer dnsmgr. */
+	/* parse-compatibility only — network-change handled by sofia-sip + per-peer dnsmgr. */
 	sofia_cfg.subscribe_network_change_event = 1;
-	/* Wired at the sofia_process_register ast_update_realtime callsites. */
+	/* Implemented at the sofia_process_register ast_update_realtime callsites. */
 	sofia_cfg.rtsave_sysname = 0;
 	/* Gates the realtime peer updates in sofia_process_register. */
 	sofia_cfg.peer_rtupdate = 1;
 	/* Phase 1 register pool: default OFF + auto lane count. */
 	sofia_cfg.register_pool = 0;
 	sofia_cfg.register_pool_workers = 0;
-	/* PARSE-COMPAT-ONLY — the ao2 registry always caches all peers. */
+	/* parse-compatibility only — the ao2 registry always caches all peers. */
 	sofia_cfg.rtcachefriends = 0;
-	/* PARSE-COMPAT-ONLY — no peer-level auto-clear. */
+	/* parse-compatibility only — no peer-level auto-clear. */
 	sofia_cfg.rtautoclear = 120;
 	sofia_cfg.rtautoclear_enabled = 0;
-	/* Wired at the auth-challenge callsites via sofia_get_realm_for_dialog. */
+	/* Implemented at the auth-challenge callsites via sofia_get_realm_for_dialog. */
 	sofia_cfg.domainsasrealm = 0;
 	/* default TRUE; safety-net auto-set at the end of sofia_load_config. */
 	sofia_cfg.allow_external_domains = 1;
 	/* Auto-add fires at sofia_load_config conclusion, AFTER the allowexternaldomains special-case. */
 	sofia_cfg.autodomain = 0;
-	/* PARSE-COMPAT-ONLY — sofia_should_use_externaddr signature diverges. */
+	/* parse-compatibility only — sofia_should_use_externaddr signature diverges. */
 	sofia_cfg.matchexternaddrlocally = 0;
 	/* Reset the externaddr/externhost NAT bundle + localnet so a REMOVED line doesn't keep the
 	 * stale public IP/port (calls would advertise the old NAT address). localha is freed+rebuilt
@@ -17924,7 +17923,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.default_rtpholdtimeout = 0;
 	sofia_cfg.default_rtpkeepalive = 0;
 	/* tos/cos bundle: default 0 (no QoS). tos_sip via TPTAG_TOS; audio/video via set_qos.
-	 * cos_sip + tos_text + cos_text are PARSE-COMPAT-ONLY (TPTAG_COS + text-RTP absent). */
+	 * cos_sip + tos_text + cos_text are parse-compatibility only (TPTAG_COS + text-RTP absent). */
 	sofia_cfg.tos_sip = 0;
 	sofia_cfg.tos_audio = 0;
 	sofia_cfg.tos_video = 0;

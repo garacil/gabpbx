@@ -48,7 +48,7 @@ GABPBX_FILE_VERSION(__FILE__, "$Revision: 380347 $")
 #include "gabpbx/utils.h"
 #include "include/sdp_crypto.h"
 
-/* post-T56 SRTP cipher expansion (2026-04-27): SRTP_MASTER_LEN is the largest
+/* SRTP cipher expansion: SRTP_MASTER_LEN is the largest
  * key+salt tuple across supported suites (AES-CM-256: 32+14). Shorter suites use
  * a prefix of this random buffer based on their suite-specific key/salt lengths. */
 #define SRTP_MASTER_LEN 46
@@ -97,16 +97,15 @@ static int sdp_crypto_suite_keysalt_len(int suite_val)
 extern struct ast_srtp_res *res_srtp;
 extern struct ast_srtp_policy_res *res_srtp_policy;
 
-/* post-T56 Task 7b SRTP per-suite-fresh-key option (2026-04-28, deferred from
- * #7a 612759d R4 strategy (b)): module-scope flag mirror of sofia_cfg.srtp_per_
+/* SRTP per-suite-fresh-key option: module-scope flag mirror of sofia_cfg.srtp_per_
  * suite_keys defined in chan_sofia.c. Set by sofia_load_config after parsing
- * the [general] srtp_per_suite_keys key. Default 0 = shared-key mode (current
- * behavior; #7a 612759d strategy (a)); 1 = per-suite-fresh-key mode (forensic-
+ * the [general] srtp_per_suite_keys key. Default 0 = shared-key mode (baseline
+ * behavior); 1 = per-suite-fresh-key mode (forensic-
  * grade key separation). Mirrors sofia_debug + sofia_timerb_set + sofia_timert1
  * _set extern-visibility pattern. */
 extern int sofia_srtp_per_suite_keys;
 
-/* post-T56 Task 7b SRTP per-suite-fresh-key option (2026-04-28): static cap on
+/* SRTP per-suite-fresh-key option: static cap on
  * per-suite key arrays in struct sdp_crypto. Current 8 supported ciphers per
  * sdp_crypto_suite_name_to_val (AES_CM_128/192/256 × _80/_32 + 2 GCM); 16
  * provides 2× headroom for future cipher additions without breaking per-suite
@@ -121,16 +120,15 @@ struct sdp_crypto {
 	char local_key64[SRTP_MASTER_LEN64];
 	unsigned char remote_key[SRTP_MASTER_LEN];
 	char suite[64];
-	/* post-T56 Task 7b SRTP per-suite-fresh-key option (2026-04-28, deferred
-	 * from #7a 612759d R4 strategy (b) — chan_sofia surpass dimension: feature-
+	/* SRTP per-suite-fresh-key option — a chan_sofia extension: feature-
 	 * not-in-chan_sip-at-all; chan_sip has no multi-suite SRTP offer mechanism
-	 * baseline therefore no chan_sip equivalent). When sofia_srtp_per_suite_
+	 * baseline therefore no chan_sip equivalent. When sofia_srtp_per_suite_
 	 * keys is 1 AND multi-cipher offer mode active (cipher_list non-empty),
 	 * sdp_crypto_offer_list generates an independent fresh master_key for each
 	 * suite in the offer list (forensic-grade key separation; key material
 	 * recovery from one suite cannot decrypt others). Empty arrays = per-suite
 	 * mode disabled OR cipher_list empty (single-suite path); shared local_key
-	 * used per #7a strategy (a) baseline. selected_suite_index tracks which
+	 * used as the baseline. selected_suite_index tracks which
 	 * suite the remote answered on (set in sdp_crypto_process from parsed
 	 * a=crypto:N tag minus 1; consumed in sdp_crypto_activate to select the
 	 * correct per-suite local_key to feed set_crypto_policy). suite_count
@@ -140,7 +138,7 @@ struct sdp_crypto {
 	char local_key64_per_suite[MAX_SDP_CRYPTO_SUITES][SRTP_MASTER_LEN64];
 	int suite_count;
 	int selected_suite_index;
-	/* Round5 C5 (crypto staging transaction): when sdp_crypto_process() is called in
+	/* Crypto staging transaction: when sdp_crypto_process() is called in
 	 * `defer` mode it VALIDATES the inbound a=crypto and stashes the accepted parameters
 	 * here WITHOUT touching the live RTP (no add_srtp_policy) or the committed
 	 * p->suite/p->remote_key/p->tag. sdp_crypto_commit() then applies them to the live RTP
@@ -160,7 +158,7 @@ static struct sdp_crypto *sdp_crypto_alloc(void)
 {
 	struct sdp_crypto *p = ast_calloc(1, sizeof(struct sdp_crypto));
 	if (p) {
-		/* post-T56 Task 7b SRTP per-suite-fresh-key option (2026-04-28): -1
+		/* SRTP per-suite-fresh-key option: -1
 		 * sentinel for selected_suite_index — sdp_crypto_activate's defensive
 		 * gate falls through to shared local_key when index < 0. ast_calloc
 		 * zeroes the rest (per-suite arrays + suite_count). */
@@ -286,8 +284,7 @@ static int sdp_crypto_activate(struct sdp_crypto *p, int suite_val, unsigned cha
 	}
 
 	{
-		/* post-T56 Task 7b SRTP per-suite-fresh-key option (2026-04-28,
-		 * deferred from #7a 612759d R4 strategy (b)): when per_suite_keys
+		/* SRTP per-suite-fresh-key option: when per_suite_keys
 		 * mode active AND remote selected a known suite from our offer-list
 		 * (selected_suite_index in [0, suite_count)), pass that suite's
 		 * independent fresh master_key to set_crypto_policy. Defensive 3-
@@ -363,7 +360,7 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 		return -1;
 	}
 
-	/* post-T56 Task 7b SRTP per-suite-fresh-key option (2026-04-28): track
+	/* SRTP per-suite-fresh-key option: track
 	 * which suite the remote answered on. The numeric tag (RFC 4568 §6.1
 	 * a=crypto:N) maps to our offer-list iteration index minus 1 (zero-based
 	 * array slot). When per_suite_keys mode active, sdp_crypto_activate uses
@@ -375,7 +372,7 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 	{
 		int parsed_tag = atoi(tag);
 		int idx = (parsed_tag >= 1 && parsed_tag <= p->suite_count) ? parsed_tag - 1 : -1;
-		/* Round5 C5: selected_suite_index feeds sdp_crypto_activate's per-suite key
+		/* selected_suite_index feeds sdp_crypto_activate's per-suite key
 		 * pick, so in defer mode STAGE it — do not mutate the live field before the SDP is
 		 * accepted (a rejected re-INVITE must not change key selection). Commit applies it
 		 * just before activation. */
@@ -395,7 +392,7 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 		suite_val = AST_AES_CM_128_HMAC_SHA1_80;
 	} else if (!strcmp(suite, "AES_CM_128_HMAC_SHA1_32")) {
 		suite_val = AST_AES_CM_128_HMAC_SHA1_32;
-	/* post-T56 SRTP cipher expansion (2026-04-27): RFC 6188 AES-192/256 +
+	/* SRTP cipher expansion: RFC 6188 AES-192/256 +
 	 * RFC 7714 AES-GCM-128/256 suite-name parse. SDP suite-name spelling per
 	 * libsrtp2 doxygen + RFC 6188 §3 verified: CM-BEFORE-NUMBER order (e.g.,
 	 * AES_CM_192_HMAC_SHA1_80 NOT AES_192_CM_HMAC_SHA1_80). */
@@ -453,7 +450,7 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 	}
 
 	{
-		/* post-T56 SRTP cipher expansion (2026-04-27): per-suite expected
+		/* SRTP cipher expansion: per-suite expected
 		 * master key+salt length. Validates remote-offered key matches the
 		 * suite's required length (RFC 6188 / RFC 7714). */
 		int expected_len = sdp_crypto_suite_keysalt_len(suite_val);
@@ -471,12 +468,12 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 	 * policy installed. With p->tag NULL we always activate on the first crypto. */
 	if (p->tag && !memcmp(p->remote_key, remote_key, sizeof(p->remote_key))) {
 		ast_debug(1, "SRTP remote key unchanged; maintaining current policy\n");
-		p->staged_pending = 0;	/* Round5 C5: nothing to commit */
+		p->staged_pending = 0;	/* nothing to commit */
 		return 0;
 	}
 
 	if (defer) {
-		/* Round5 C5: validation passed and the key changed — STAGE the accepted crypto
+		/* Validation passed and the key changed — STAGE the accepted crypto
 		 * but do NOT touch the live RTP or the committed p->suite/p->remote_key/p->tag.
 		 * sdp_crypto_commit() applies it once sofia_parse_sdp's reject gates have passed,
 		 * so a re-INVITE that is ultimately rejected never re-keys active SRTP. */
@@ -509,7 +506,7 @@ int sdp_crypto_process(struct sdp_crypto *p, const char *attr, struct ast_rtp_in
 	return sdp_crypto_offer(p);
 }
 
-/* Round5 C5: commit a previously-staged a=crypto (sdp_crypto_process with defer=1) onto the
+/* Commit a previously-staged a=crypto (sdp_crypto_process with defer=1) onto the
  * LIVE RTP. Called only after sofia_parse_sdp's reject gates pass, so active SRTP is re-keyed
  * solely for an SDP we actually accept.
  *   \retval 1  committed onto live RTP
@@ -542,7 +539,7 @@ int sdp_crypto_commit(struct sdp_crypto *p, struct ast_rtp_instance *rtp)
 	int prev_selected = p->selected_suite_index;
 	p->selected_suite_index = p->staged_selected_suite_index;
 	if (sdp_crypto_activate(p, p->staged_suite_val, p->staged_remote_key, rtp) < 0) {
-		/* Round5 C5: ast_rtp_instance_add_srtp_policy / ast_srtp_replace can
+		/* ast_rtp_instance_add_srtp_policy / ast_srtp_replace can
 		 * mutate/destroy the existing SRTP BEFORE failing, so an activation failure means
 		 * the live media may already be half-changed. Return -2 (NOT -1) so the caller does
 		 * NOT 488 after a possible live mutation (that would leave the media corrupted AND
@@ -570,7 +567,7 @@ int sdp_crypto_commit(struct sdp_crypto *p, struct ast_rtp_instance *rtp)
 	return 1;	/* committed live */
 }
 
-/* Round5 C5: drop any pending staged crypto (called at parse-start and on every reject path
+/* Drop any pending staged crypto (called at parse-start and on every reject path
  * so a rejected SDP can never leave a staged key for a later parse to commit by accident). */
 void sdp_crypto_clear_staged(struct sdp_crypto *p)
 {
@@ -579,10 +576,9 @@ void sdp_crypto_clear_staged(struct sdp_crypto *p)
 	}
 }
 
-/* post-T56 srtpcipher operator option (2026-04-27): map suite spelling -> enum.
+/* srtpcipher operator option: map suite spelling -> enum.
  * Returns 0 if name is not recognized (caller checks for explicit non-zero).
- * Spellings are libsrtp2 doxygen / chan_sip emit canonical (CM-BEFORE-NUMBER per
- * Pattern 14 sources-as-arbiter). */
+ * Spellings are libsrtp2 doxygen / chan_sip emit canonical (CM-BEFORE-NUMBER). */
 static int sdp_crypto_suite_name_to_val(const char *name)
 {
 	if (!strcmp(name, "AES_CM_128_HMAC_SHA1_80")) return AST_AES_CM_128_HMAC_SHA1_80;
@@ -609,7 +605,7 @@ int sdp_crypto_offer_list(struct sdp_crypto *p, const char *cipher_list)
 
 	/* Answerer / single-suite path: cipher_list NULL or empty → mirror p->suite
 	 * (set by inbound sdp_crypto_process) or default to AES_CM_128_HMAC_SHA1_80.
-	 * post-T56 SRTP cipher expansion key-truncation invariant preserved: emit
+	 * SRTP cipher expansion key-truncation invariant preserved: emit
 	 * per-suite-prefix base64 of the 46-byte local_key. */
 	if (ast_strlen_zero(cipher_list)) {
 		if (ast_strlen_zero(p->suite)) {
@@ -635,7 +631,7 @@ int sdp_crypto_offer_list(struct sdp_crypto *p, const char *cipher_list)
 
 	/* Outbound multi-cipher offer: parse comma-list, emit a=crypto:N per RFC
 	 * 4568 §6.1 in operator-supplied order; lenient skip+WARN on unknown names.
-	 * Shared 46-byte local_key with per-suite truncation (R4 strategy (a)) —
+	 * Shared 46-byte local_key with per-suite truncation —
 	 * peer picks ONE suite so unused suite-line key material discards on answer. */
 	{
 		char *list_dup;
@@ -669,8 +665,7 @@ int sdp_crypto_offer_list(struct sdp_crypto *p, const char *cipher_list)
 				continue;
 			}
 			suite_keysalt_len = sdp_crypto_suite_keysalt_len(suite_val);
-			/* post-T56 Task 7b SRTP per-suite-fresh-key option (2026-04-28,
-			 * deferred from #7a 612759d R4 strategy (b)): when sofia_srtp_per_
+			/* SRTP per-suite-fresh-key option: when sofia_srtp_per_
 			 * suite_keys is set AND slot available within MAX_SDP_CRYPTO_SUITES,
 			 * generate independent fresh master_key for this suite via res_srtp
 			 * ->get_random; emit per-suite key64. Defensive overflow gate falls
@@ -678,7 +673,7 @@ int sdp_crypto_offer_list(struct sdp_crypto *p, const char *cipher_list)
 			 * cipher_list longer than MAX_SDP_CRYPTO_SUITES) or when get_random
 			 * fails (entropy exhaustion edge case) — preserves call-completion
 			 * even under degraded conditions. Default branch (per_suite_keys
-			 * mode disabled) emits shared local_key per #7a strategy (a)
+			 * mode disabled) emits shared local_key as the
 			 * baseline — backwards-compat ABSOLUTE for existing operators. */
 			if (sofia_srtp_per_suite_keys && (tag - 1) < MAX_SDP_CRYPTO_SUITES) {
 				if (res_srtp->get_random(p->local_key_per_suite[tag - 1], SRTP_MASTER_LEN) < 0) {
