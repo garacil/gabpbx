@@ -2464,6 +2464,16 @@ tos_video = af41
 ;
 ;use_q850_reason = yes
 
+; --- fork_early_media ([general], default no) ---
+; When a call to a peer forks to multiple registered contacts, chan_sofia keeps the caller muted
+; until one branch answers (200 OK). With fork_early_media=yes, once the fork has narrowed to a
+; single live non-WebRTC branch and that branch sends a 180/183 with SDP, the caller hears that
+; branch's early media (ringback/announcement), receive-only. It is conservative on purpose: it
+; never binds while two or more branches are still live (only one early-media stream can reach the
+; one caller), never sends media upstream before answer, and is a no-op for WebRTC branches.
+;
+;fork_early_media = yes
+
 ;
 ; --- shrinkcallerid (chan_sip parity, drop-in CID normalization) ---
 ; When yes (default), CID phone-number strings are normalized: strip leading "+"

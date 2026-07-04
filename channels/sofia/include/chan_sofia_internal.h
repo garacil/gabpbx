@@ -950,6 +950,7 @@ struct sofia_config {
 	char default_subscribecontext[AST_MAX_CONTEXT];
 	char message_context[AST_MAX_CONTEXT];  /* [general] default context for out-of-dialog inbound MESSAGE -> dialplan; empty = SIP SIMPLE messaging OFF */
 	int message_autorelay;  /* native peer-to-peer MESSAGE relay: an authenticated sender's inbound MESSAGE whose To-user resolves (via the sender's subscribecontext hint, exten -> SIP/<peer>) to a registered local peer is re-originated to that peer's live contact(s). Default 1 (on). 0 = only the message_context dialplan path. */
+	int fork_early_media;   /* when a parallel-forked call has narrowed to a single live non-WebRTC branch that sends a 18x with SDP, let the master owner hear that branch's early media (receive-only, no pre-winner steal). Default 0 (off) — conservative; forked early media otherwise stays muted until the winner answers. */
 	/* registration TTL bounds ([general]-only); typo-tolerant Xexpiry/Xexpirey parse for chan_sip migration. */
 	int min_expiry;     /* default 60s — under this rejects 423 Interval Too Brief + Min-Expires (RFC 3261 §10.2.8) */
 	int max_expiry;     /* default 3600s — over this silently caps */

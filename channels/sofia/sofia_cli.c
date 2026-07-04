@@ -842,6 +842,7 @@ char *sofia_cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 	ast_cli(a->fd, "  Save sys. name:         %s\n", AST_CLI_YESNO(sofia_cfg.rtsave_sysname));
 	ast_cli(a->fd, "  Update:                 %s\n", AST_CLI_YESNO(sofia_cfg.peer_rtupdate));
 	ast_cli(a->fd, "  Q.850 Reason header:    %s\n", AST_CLI_YESNO(sofia_cfg.use_q850_reason));
+	ast_cli(a->fd, "  Fork early media:       %s\n", AST_CLI_YESNO(sofia_cfg.fork_early_media));
 	/* rtcachefriends: parse-compatibility only (the ao2 registry always caches all peers). */
 	ast_cli(a->fd, "  Cache Friends:          %s\n", AST_CLI_YESNO(sofia_cfg.rtcachefriends));
 	/* rtautoclear: parse-compatibility only (no peer-level auto-clear). */

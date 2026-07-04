@@ -464,8 +464,13 @@ struct sofia_fork {
 	enum sofia_fork_state state;
 	time_t fork_start;                /* timestamp when fork was initiated */
 	char fork_id[SOFIA_FORK_ID_LEN]; /* unique ID for debug logging */
-	ast_mutex_t lock;                 /* guards winner_picked, winner, child_count, children, state */
+	ast_mutex_t lock;                 /* guards winner_picked, winner, child_count, children, state, posting_done, early_media_child */
 	int child_count;                  /* live children remaining */
+	int posting_done;                 /* 1 once the INVITE posting loop has forked every contact — child_count is only
+	                                   * authoritative after this (a 18x can arrive before all branches are posted). */
+	struct sofia_pvt *early_media_child; /* fork_early_media: the single-child branch whose rtp the master owner reads
+	                                   * receive-only for early media (ref'd). NULL unless a bind is live. Guarded by lock;
+	                                   * cleared BEFORE any child->rtp steal/NULL so sofia_read stops reading it. */
 };
 
 /* MWI per-peer mailbox node; defined before struct sofia_peer (which embeds the
@@ -1342,6 +1347,12 @@ const char *sofia_uri_format_host(const char *host, char *out_buf, size_t out_le
 static void sofia_fork_destructor(void *obj)
 {
 	struct sofia_fork *fork = obj;
+	/* defensively drop a still-held early-media bind ref (winner-pick / child-fail / master
+	 * hangup normally clear it first; this covers any teardown order). */
+	if (fork->early_media_child) {
+		ao2_ref(fork->early_media_child, -1);
+		fork->early_media_child = NULL;
+	}
 	if (fork->children) {
 		ao2_ref(fork->children, -1);
 		fork->children = NULL;
@@ -1487,9 +1498,124 @@ static void sofia_sync_media_fds(struct ast_channel *chan, struct sofia_pvt *pvt
 	ast_channel_set_fd(chan, 3, (pvt->vrtp && !pvt->webrtc_video_bundled) ? ast_rtp_instance_fd(pvt->vrtp, 1) : -1);
 }
 
+/* Forked early-media receive-only helpers. bind/unbind/winner-pick/child-fail all run on the
+ * single sofia_thread (NUA event loop) so they never race each other; the only concurrent reader is
+ * the master channel thread in sofia_read, which snapshots fork->early_media_child + refs its rtp
+ * under fork->lock. Video is out of scope for v1 (audio-only, slots 2/3 cleared). */
+
+/* Tear down a live early-media bind (idempotent). Clears the ref'd early_media_child under
+ * fork->lock and restores the master owner's media fds off the child, back onto the master's own
+ * (empty pre-alloc) rtp — brief silence until the winner steal re-syncs. MUST run before any code
+ * that re-parses or steals the bound child's rtp (winner-pick entry, early-child failure), so no
+ * reader touches child->rtp during that mutation. */
+static void sofia_fork_early_media_unbind(struct sofia_fork *fork)
+{
+	struct sofia_pvt *emc, *master;
+	struct ast_channel *m_owner = NULL;
+
+	ast_mutex_lock(&fork->lock);
+	emc = fork->early_media_child;
+	fork->early_media_child = NULL;
+	master = fork->master;
+	if (master) {
+		ao2_ref(master, +1);
+	}
+	ast_mutex_unlock(&fork->lock);
+
+	if (!emc) {
+		if (master) {
+			ao2_ref(master, -1);
+		}
+		return;
+	}
+
+	if (master) {
+		ast_mutex_lock(&master->lock);
+		m_owner = master->owner;
+		if (m_owner) {
+			ast_channel_ref(m_owner);
+		}
+		ast_mutex_unlock(&master->lock);
+	}
+	if (m_owner) {
+		/* Restore the owner fds off the child under channel->pvt order, revalidating that a
+		 * masquerade did not swap master->owner while master->lock was dropped (same discipline
+		 * as the winner-steal fd-move). */
+		ast_channel_lock(m_owner);
+		ast_mutex_lock(&master->lock);
+		if (master->owner == m_owner) {
+			sofia_sync_media_fds(m_owner, master);	/* off child->rtp, back onto master->rtp */
+		}
+		ast_mutex_unlock(&master->lock);
+		ast_channel_unlock(m_owner);
+		ast_channel_unref(m_owner);
+	}
+	SOFIA_FORKDBG("early-media unbind branch=%s", emc->fork_branch_id);
+	ao2_ref(emc, -1);	/* drop the bind ref */
+	if (master) {
+		ao2_ref(master, -1);
+	}
+}
+
+/* Attempt a receive-only early-media bind for a fork child that sent a 18x with SDP. Gated on the
+ * fork_early_media knob, a single live non-WebRTC branch (posting_done + child_count==1), no winner
+ * yet and no existing bind. Parses the child SDP, refs the child as fork->early_media_child, and
+ * aliases the master owner's audio fds onto child->rtp so sofia_read services it receive-only.
+ * master + m_owner are ref'd by the caller. Runs on sofia_thread. */
+static void sofia_fork_try_early_media(struct sofia_fork *fork, struct sofia_pvt *child,
+		struct sofia_pvt *master, struct ast_channel *m_owner, sip_t const *sip)
+{
+	int eligible;
+
+	if (!sofia_cfg.fork_early_media || !master || !m_owner || child->is_webrtc) {
+		return;
+	}
+	if (!sip || !sip->sip_payload || !sip->sip_payload->pl_data) {
+		return;	/* 18x with no SDP → nothing to hear */
+	}
+	ast_mutex_lock(&fork->lock);
+	eligible = fork->posting_done && fork->child_count == 1
+		&& !fork->winner_picked && !fork->early_media_child;
+	ast_mutex_unlock(&fork->lock);
+	if (!eligible) {
+		return;
+	}
+	/* Parse the child early-media SDP into child->rtp BEFORE any reader is attached (no owner
+	 * reads child->rtp until early_media_child is set below). */
+	if (sofia_parse_sdp(child, sip, 0 /* answer: fork child early media */) < 0 || !child->rtp) {
+		return;
+	}
+	/* Commit under channel -> master -> fork order, revalidating master->owner == m_owner
+	 * (a masquerade could have swapped it) before aliasing the owner audio fds onto
+	 * child->rtp (receive-only; clear video 2/3). */
+	ast_channel_lock(m_owner);
+	ast_mutex_lock(&master->lock);
+	if (master->owner == m_owner) {
+		ast_mutex_lock(&fork->lock);
+		if (fork->posting_done && fork->child_count == 1
+				&& !fork->winner_picked && !fork->early_media_child) {
+			ao2_ref(child, +1);
+			fork->early_media_child = child;
+			ast_channel_set_fd(m_owner, 0, ast_rtp_instance_fd(child->rtp, 0));
+			ast_channel_set_fd(m_owner, 1, ast_rtp_instance_fd(child->rtp, 1));
+			ast_channel_set_fd(m_owner, 2, -1);
+			ast_channel_set_fd(m_owner, 3, -1);
+			SOFIA_FORKDBG("early-media bind branch=%s child_rtp=%p", child->fork_branch_id, (void *)child->rtp);
+		}
+		ast_mutex_unlock(&fork->lock);
+	}
+	ast_mutex_unlock(&master->lock);
+	ast_channel_unlock(m_owner);
+}
+
 static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *child, sip_t const *sip)
 {
 	struct sofia_pvt *master;
+
+	/* Quiesce: if an early-media bind is live, tear it down BEFORE the 2xx parse below mutates
+	 * the child rtp — otherwise the master channel thread (sofia_read) could read the bound child's
+	 * rtp concurrently. Idempotent (no-op when nothing is bound, i.e. knob off). */
+	sofia_fork_early_media_unbind(fork);
 
 	/* Validate the child's answer SDP BEFORE claiming winner: on encryption-policy
 	 * failure return -1 (caller treats it as a loser; siblings may still answer with
@@ -1579,10 +1705,16 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	 * pre-fork instances leak. Stop RTCP/DTLS refs first (sofia_rtp_stop_destroy) so the socket closes. */
 	sofia_rtp_stop_destroy(&master->rtp);
 	sofia_rtp_stop_destroy(&master->vrtp);
+	/* NULL child->rtp/vrtp under child->lock so a concurrent early-media reader in sofia_read
+	 * (which snapshots child->rtp under the same lock, ref'ing the instance) never reads a
+	 * half-swapped pointer. The instances move to master (not freed), so an in-flight read that
+	 * already ref'd one stays valid. master->lock is held (master->* writes stay serialized). */
+	ast_mutex_lock(&child->lock);
 	master->rtp = child->rtp;
 	child->rtp = NULL;
 	master->vrtp = child->vrtp;
 	child->vrtp = NULL;
+	ast_mutex_unlock(&child->lock);
 	SOFIA_FORKDBG("rtp-steal master_nh=%p master_rtp=%p master_vrtp=%p (rtp=%p = res_rtp inst join key)",
 		(void *)master->nh, (void *)master->rtp, (void *)master->vrtp, (void *)master->rtp);
 
@@ -1747,6 +1879,18 @@ static int sofia_fork_child_failed(struct sofia_fork *fork, struct sofia_pvt *pv
 {
 	int empty, picked, remaining;
 	struct sofia_pvt *m;
+	struct sofia_pvt *emc;
+
+	/* if the failing branch is the one feeding early media, tear the bind down FIRST so the
+	 * master owner stops reading its rtp before this child is unlinked/destroyed. Same-thread as
+	 * bind/winner-pick (sofia_thread), so the check + unbind cannot race. */
+	ast_mutex_lock(&fork->lock);
+	emc = fork->early_media_child;
+	ast_mutex_unlock(&fork->lock);
+	if (emc == pvt) {
+		sofia_fork_early_media_unbind(fork);
+	}
+
 	ast_mutex_lock(&fork->lock);
 	fork->child_count--;
 	ao2_unlink(fork->children, pvt);
@@ -5524,6 +5668,13 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				return -1;
 			}
 
+			/* fork_early_media: the posting loop is complete, so fork->child_count is
+			 * now authoritative. A 18x that raced in before this point saw a partial count,
+			 * so the single-live-child early-media gate requires posting_done. */
+			ast_mutex_lock(&fork->lock);
+			fork->posting_done = 1;
+			ast_mutex_unlock(&fork->lock);
+
 			ast_mutex_lock(&pvt->lock);
 			/* A fast winner may already have advanced master->state during the loop.
 			 * Don't clobber UP/RINGING back to TRYING — a later hangup would then
@@ -5876,17 +6027,25 @@ static int sofia_hangup(struct ast_channel *ast)
 		struct sofia_fork *fork = pvt->fork;
 		int picked;
 		struct sofia_pvt *fork_master;
+		struct sofia_pvt *emc;
 
 		/* Clear fork->master under fork->lock and drop the ref taken at fork
 		 * creation. A fork-child event still in flight reads fork->master under
 		 * fork->lock; once cleared it reads NULL and skips the master deref. The
 		 * dropped ref only removes the lifetime anchor — pvt stays alive below via
-		 * its alloc/dialogs refs (released at the end of this function). */
+		 * its alloc/dialogs refs (released at the end of this function).
+		 * Also drop any live early-media bind ref here (owner is going away, so no fd
+		 * restore is needed — the aliased fds die with the channel). */
 		ast_mutex_lock(&fork->lock);
 		picked = fork->winner_picked;
 		fork_master = fork->master;
 		fork->master = NULL;
+		emc = fork->early_media_child;
+		fork->early_media_child = NULL;
 		ast_mutex_unlock(&fork->lock);
+		if (emc) {
+			ao2_ref(emc, -1);
+		}
 
 		if (!picked) {
 			ao2_callback(fork->children, OBJ_UNLINK | OBJ_MULTIPLE | OBJ_NODATA,
@@ -6034,11 +6193,46 @@ static struct ast_frame *sofia_read(struct ast_channel *ast)
 
 	if (pvt->is_fork_master && pvt->fork) {
 		int picked;
+		struct sofia_pvt *emc = NULL;
 		ast_mutex_lock(&pvt->fork->lock);
 		picked = pvt->fork->winner_picked;
+		/* Forked early media: before a winner is picked, a single bound child feeds
+		 * receive-only audio (fds 0/1). Ref the child under fork->lock; its rtp is then
+		 * snapshot+ref'd under the child's own lock below (the winner steal NULLs child->rtp
+		 * under the same lock), so the instance cannot be freed mid-read. */
+		if (!picked && pvt->fork->early_media_child
+				&& (ast->fdno == 0 || ast->fdno == 1)) {
+			emc = pvt->fork->early_media_child;
+			ao2_ref(emc, +1);
+		}
 		ast_mutex_unlock(&pvt->fork->lock);
-		if (!picked)
-			return &ast_null_frame;
+		if (!picked) {
+			struct ast_frame *f = &ast_null_frame;
+			if (emc) {
+				struct ast_rtp_instance *r = NULL;
+				ast_mutex_lock(&emc->lock);
+				if (emc->rtp) {
+					r = emc->rtp;
+					ao2_ref(r, +1);	/* pin the instance across the unlocked read */
+				}
+				ast_mutex_unlock(&emc->lock);
+				if (r) {
+					struct ast_frame *raw = ast_rtp_instance_read(r, ast->fdno);
+					/* res_rtp returns a frame backed by the instance's rawdata. Isolate it
+					 * (independent copy) WHILE the ref is held — a loser/failure race can drop the
+					 * last child pvt ref right after we return, dangling a non-isolated frame. */
+					if (raw && raw != &ast_null_frame) {
+						f = ast_frisolate(raw);
+						if (!f) {
+							f = &ast_null_frame;
+						}
+					}
+					ao2_ref(r, -1);
+				}
+				ao2_ref(emc, -1);
+			}
+			return f;
+		}
 	}
 
 	switch (ast->fdno) {
@@ -15018,6 +15212,11 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					}
 					ast_mutex_unlock(&m->lock);
 					if (m_owner) {
+						/* try a receive-only early-media bind for the single live child
+						 * (180/183 carrying SDP), aliasing the owner's audio fds onto child->rtp
+						 * before the PROGRESS/RINGING queue below wakes the bridge. No-op unless
+						 * fork_early_media is on and this is the sole live non-WebRTC branch. */
+						sofia_fork_try_early_media(fork, pvt, m, m_owner, sip);
 						if (status == 183) {
 							ast_queue_control(m_owner, AST_CONTROL_PROGRESS);
 						} else {
@@ -16719,6 +16918,8 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "message_context")) {
 			/* [general] default context for inbound out-of-dialog MESSAGE -> dialplan; empty = SIP SIMPLE messaging OFF. */
 			ast_copy_string(sofia_cfg.message_context, v->value, sizeof(sofia_cfg.message_context));
+		} else if (!strcasecmp(v->name, "fork_early_media")) {
+			sofia_cfg.fork_early_media = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "message_autorelay")) {
 			/* native peer-to-peer MESSAGE relay (hint -> registered contact); default on. */
 			sofia_cfg.message_autorelay = ast_true(v->value);
@@ -18050,6 +18251,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.default_subscribecontext[0] = '\0';
 	sofia_cfg.message_context[0] = '\0';   /* SIP SIMPLE messaging OFF by default (opt-in). */
 	sofia_cfg.message_autorelay = 1;       /* native peer-to-peer MESSAGE relay ON by default. */
+	sofia_cfg.fork_early_media = 0;        /* forked single-child early media OFF by default (conservative). */
 	/* registration TTL bounds + 423 Interval Too Brief (60/3600/120). */
 	sofia_cfg.min_expiry     = DEFAULT_MIN_EXPIRY;
 	sofia_cfg.max_expiry     = DEFAULT_MAX_EXPIRY;

@@ -1,3 +1,20 @@
+## 1.5.10 — forked-call early media (experimental, opt-in)
+
+Media:
+- **Forked-call early media (experimental, default off).** When a call to a peer forks to multiple
+  registered contacts, chan_sofia keeps the caller muted until one branch answers. With the new
+  `[general] fork_early_media = yes`, once the fork has narrowed to a single live non-WebRTC branch and
+  that branch sends a 180/183 with SDP, the caller now hears that branch's early media (ringback or
+  announcement), receive-only. It never binds while two or more branches are still live (only one
+  early-media stream can reach the single caller), never sends media upstream before answer, is a no-op
+  for WebRTC branches, and cleanly hands the media over to the winner (or restores silence) when a branch
+  answers or fails. Gated by `fork_early_media` (default `no`).
+
+  This is shipped **experimental and off by default**: the disabled path is unchanged from prior releases,
+  but the enabled positive path has not yet been validated end to end. Validate in your environment before
+  enabling it.
+
+
 GABPBX Changelog
 ================
 
