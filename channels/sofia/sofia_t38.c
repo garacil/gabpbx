@@ -324,7 +324,11 @@ static void sofia_t38_respond_488_root(void *data)
 
 	ast_mutex_lock(&pvt->lock);
 	if (pvt->nh) {
-		nua_respond(pvt->nh, 488, "Not Acceptable Here", TAG_END());
+		/* RFC 3326 Q.850 Reason (chan_sip parity). A well-formed SIPTAG_REASON_STR is
+		 * delivered as a Reason header on a UAS reject response. */
+		char rb[128] = "";
+		int hr = sofia_cfg.use_q850_reason && sofia_reason_build_for_status(488, rb, sizeof(rb));
+		nua_respond(pvt->nh, 488, "Not Acceptable Here", TAG_IF(hr, SIPTAG_REASON_STR(rb)), TAG_END());
 	}
 	ast_mutex_unlock(&pvt->lock);
 	ao2_ref(pvt, -1);
@@ -380,7 +384,8 @@ int sofia_t38_abort(const void *data)
 			/* Emit 488 Not Acceptable Here to the peer when aborting
 			 * T38_PEER_REINVITE. Only fires for PEER_REINVITE, not LOCAL_REINVITE
 			 * (there we sent the re-INVITE — peer either responds or we time out).
-			 * Plain status-phrase: SIPTAG_REASON_STR causes a 500 in sofia-sip. */
+			 * The 488 carries a Q.850 Reason when use_q850_reason is on (chan_sip
+			 * parity); SIPTAG_REASON_STR on a response is NOT flipped to 500. */
 			if (was_peer_reinvite && pvt->nh) {
 				/* Marshal the nua_respond onto sofia_thread with a FRESH +1 pvt ref (the
 				 * scheduler ref stays with this callback for its ao2_ref(-1) below);

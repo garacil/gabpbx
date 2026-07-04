@@ -11,14 +11,17 @@
  * \brief chan_sofia Q.850 Reason header (RFC 3326) — build + parse. Split out of chan_sofia.c.
  *
  * Outbound: when use_q850_reason is on, chan_sofia stamps a "Reason: Q.850;cause=N;text=..." header on
- * the BYE/CANCEL it sends (built from the channel hangup cause) so the far end / billing sees the real
- * Q.850 cause. Inbound: a Reason header on a received BYE/CANCEL is mapped back to the AST hangup cause.
- * Only on REQUESTS — SIPTAG_REASON_STR on a sofia-sip RESPONSE is misread as an error and flipped to
- * 500, so Reason on INVITE-rejection responses is deliberately NOT done (documented limitation).
+ * the BYE/CANCEL it sends AND on INVITE-rejection responses (4xx/5xx/6xx), built from the channel hangup
+ * cause or, for pre-channel rejects, mapped from the SIP status via sofia_reason_status2cause (chan_sip
+ * parity, chan_sip.c hangup_sip2cause). Inbound: a Reason header on a received BYE/CANCEL is mapped back
+ * to the AST hangup cause. A well-formed SIPTAG_REASON_STR is valid on a UAS reject RESPONSE (sofia-sip
+ * forces a 500 only on a generic header/tag serialization failure in nua_server_respond, never for a
+ * valid Reason), so the Reason is emitted directly on the reject.
  */
 
 #include "gabpbx.h"
 #include "gabpbx/channel.h"	/* ast_cause2str */
+#include "gabpbx/causes.h"	/* AST_CAUSE_* for the SIP-status -> Q.850 map */
 #include "gabpbx/strings.h"
 
 #include <ctype.h>
@@ -58,6 +61,58 @@ int sofia_reason_build(int hangupcause, char *buf, size_t len)
 		return 0;
 	}
 	return 1;
+}
+
+/* Map a SIP INVITE-rejection status (4xx/5xx/6xx) to an ITU-T Q.850 hangup cause, mirroring
+ * chan_sip hangup_sip2cause (chan_sip.c:6840) so a Reason header stamped on a chan_sofia reject
+ * response carries the same cause chan_sip would emit for that status. Returns 0 for a status with
+ * no meaningful cause (e.g. <400), so callers can suppress the Reason. */
+int sofia_reason_status2cause(int status)
+{
+	switch (status) {
+	case 401: case 403: case 407: return AST_CAUSE_CALL_REJECTED;
+	case 404:                     return AST_CAUSE_UNALLOCATED;
+	case 405:                     return AST_CAUSE_INTERWORKING;
+	case 408:                     return AST_CAUSE_NO_USER_RESPONSE;
+	case 409:                     return AST_CAUSE_NORMAL_TEMPORARY_FAILURE;
+	case 410:                     return AST_CAUSE_NUMBER_CHANGED;
+	case 411: case 413: case 414: case 415:
+	                              return AST_CAUSE_INTERWORKING;
+	case 420:                     return AST_CAUSE_NO_ROUTE_DESTINATION;
+	case 480:                     return AST_CAUSE_NO_ANSWER;
+	case 481: case 482:           return AST_CAUSE_INTERWORKING;
+	case 483:                     return AST_CAUSE_NO_ANSWER;
+	case 484:                     return AST_CAUSE_INVALID_NUMBER_FORMAT;
+	case 485:                     return AST_CAUSE_UNALLOCATED;
+	case 486:                     return AST_CAUSE_BUSY;
+	case 487:                     return AST_CAUSE_INTERWORKING;
+	case 488:                     return AST_CAUSE_BEARERCAPABILITY_NOTAVAIL;
+	case 491: case 493:           return AST_CAUSE_INTERWORKING;
+	case 500:                     return AST_CAUSE_FAILURE;
+	case 501:                     return AST_CAUSE_FACILITY_REJECTED;
+	case 502:                     return AST_CAUSE_DESTINATION_OUT_OF_ORDER;
+	case 503:                     return AST_CAUSE_CONGESTION;
+	case 504:                     return AST_CAUSE_RECOVERY_ON_TIMER_EXPIRE;
+	case 505:                     return AST_CAUSE_INTERWORKING;
+	case 600:                     return AST_CAUSE_USER_BUSY;
+	case 603:                     return AST_CAUSE_CALL_REJECTED;
+	case 604:                     return AST_CAUSE_UNALLOCATED;
+	case 606:                     return AST_CAUSE_BEARERCAPABILITY_NOTAVAIL;
+	default:
+		if (status >= 400 && status < 500) return AST_CAUSE_INTERWORKING;
+		if (status >= 500 && status < 600) return AST_CAUSE_CONGESTION;
+		if (status >= 600)                 return AST_CAUSE_INTERWORKING;
+		return 0;
+	}
+}
+
+/* Build the Q.850 Reason VALUE (SIPTAG_REASON_STR value) for a SIP reject status: maps the status to
+ * its chan_sip-parity Q.850 cause, then formats via sofia_reason_build. Returns 1 if a usable Reason
+ * was built, 0 otherwise. A well-formed SIPTAG_REASON_STR is delivered as a Reason header on a UAS
+ * reject response (a 500 is forced only by a generic header/tag serialization failure). */
+int sofia_reason_build_for_status(int status, char *buf, size_t len)
+{
+	return sofia_reason_build(sofia_reason_status2cause(status), buf, len);
 }
 
 /* Walk a received Reason header list; return the Q.850 cause (masked to 0x7f) of the first

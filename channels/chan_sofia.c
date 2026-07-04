@@ -6188,7 +6188,11 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 		}
 		break;
 	case AST_CONTROL_BUSY:
-		nua_respond(pvt->nh, SIP_486_BUSY_HERE, TAG_END());
+		{
+			char rb[128] = "";	/* RFC 3326 Q.850 Reason (chan_sip parity); status->cause map */
+			int hr = sofia_cfg.use_q850_reason && sofia_reason_build_for_status(486, rb, sizeof(rb));
+			nua_respond(pvt->nh, SIP_486_BUSY_HERE, TAG_IF(hr, SIPTAG_REASON_STR(rb)), TAG_END());
+		}
 		sofia_mark_uas_final_sent(pvt);
 		break;
 	case AST_CONTROL_INCOMPLETE:
@@ -6197,21 +6201,33 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 			int overlap_mode = pvt->peer ? pvt->peer->allowoverlap_mode : sofia_cfg.default_allowoverlap_mode;
 			switch (overlap_mode) {
 			case SOFIA_OVERLAP_YES:
-				nua_respond(pvt->nh, SIP_484_ADDRESS_INCOMPLETE, TAG_END());
+				{
+					char rb[128] = "";
+					int hr = sofia_cfg.use_q850_reason && sofia_reason_build_for_status(484, rb, sizeof(rb));
+					nua_respond(pvt->nh, SIP_484_ADDRESS_INCOMPLETE, TAG_IF(hr, SIPTAG_REASON_STR(rb)), TAG_END());
+				}
 				sofia_mark_uas_final_sent(pvt);
 				break;
 			case SOFIA_OVERLAP_DTMF:
 				/* wait for inband DTMF digits. */
 				break;
 			default:
-				nua_respond(pvt->nh, SIP_404_NOT_FOUND, TAG_END());
+				{
+					char rb[128] = "";
+					int hr = sofia_cfg.use_q850_reason && sofia_reason_build_for_status(404, rb, sizeof(rb));
+					nua_respond(pvt->nh, SIP_404_NOT_FOUND, TAG_IF(hr, SIPTAG_REASON_STR(rb)), TAG_END());
+				}
 				sofia_mark_uas_final_sent(pvt);
 				break;
 			}
 		}
 		break;
 	case AST_CONTROL_CONGESTION:
-		nua_respond(pvt->nh, SIP_503_SERVICE_UNAVAILABLE, TAG_END());
+		{
+			char rb[128] = "";
+			int hr = sofia_cfg.use_q850_reason && sofia_reason_build_for_status(503, rb, sizeof(rb));
+			nua_respond(pvt->nh, SIP_503_SERVICE_UNAVAILABLE, TAG_IF(hr, SIPTAG_REASON_STR(rb)), TAG_END());
+		}
 		sofia_mark_uas_final_sent(pvt);
 		break;
 	case AST_CONTROL_PROGRESS:
@@ -6938,8 +6954,12 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 			}
 			ast_log(LOG_NOTICE, "Sofia: in-dialog re-INVITE rejected — encryption mismatch on '%s'\n",
 				pvt->callid ? pvt->callid : "(no-callid)");
-			nua_respond(nh, SIP_488_NOT_ACCEPTABLE,
-				NUTAG_WITH_THIS(nua), TAG_END());
+			{
+				char rb[128] = "";	/* RFC 3326 Q.850 Reason (chan_sip parity); sofia_cfg read is lock-free */
+				int hr = sofia_cfg.use_q850_reason && sofia_reason_build_for_status(488, rb, sizeof(rb));
+				nua_respond(nh, SIP_488_NOT_ACCEPTABLE,
+					NUTAG_WITH_THIS(nua), TAG_IF(hr, SIPTAG_REASON_STR(rb)), TAG_END());
+			}
 			return;
 		}
 	}
@@ -7141,7 +7161,11 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 			}
 			ast_log(LOG_NOTICE, "Sofia: in-dialog UPDATE rejected — SDP not acceptable on '%s'\n",
 				pvt->callid ? pvt->callid : "(no-callid)");
-			nua_respond(nh, SIP_488_NOT_ACCEPTABLE, NUTAG_WITH_THIS(nua), TAG_END());
+			{
+				char rb[128] = "";	/* RFC 3326 Q.850 Reason (chan_sip parity) */
+				int hr = sofia_cfg.use_q850_reason && sofia_reason_build_for_status(488, rb, sizeof(rb));
+				nua_respond(nh, SIP_488_NOT_ACCEPTABLE, NUTAG_WITH_THIS(nua), TAG_IF(hr, SIPTAG_REASON_STR(rb)), TAG_END());
+			}
 			return;
 		}
 		/* Offer accepted — commit the deferred hold state + MOH (same as re-INVITE). */
@@ -7628,25 +7652,31 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	if (sofia_update_call_counter(pvt, SOFIA_INC_CALL_LIMIT) == -1) {
 		ast_log(LOG_NOTICE, "Sofia: inbound INVITE from peer '%s' rejected — call_limit %d reached\n",
 			pvt->peer->name, pvt->peer->call_limit);
-		nua_respond(nh, 480, "Temporarily Unavailable (Call limit) ",
-			NUTAG_WITH_THIS(nua), TAG_END());
+		{
+			char rb[128] = "";	/* RFC 3326 Q.850 Reason (chan_sip parity) */
+			int hr = sofia_cfg.use_q850_reason && sofia_reason_build_for_status(480, rb, sizeof(rb));
+			nua_respond(nh, 480, "Temporarily Unavailable (Call limit) ",
+				NUTAG_WITH_THIS(nua), TAG_IF(hr, SIPTAG_REASON_STR(rb)), TAG_END());
+		}
 		ao2_ref(pvt, -1);
 		return;
 	}
 
 	/* allowoverlap=YES + partial (canmatch but not exact) extension → 484 before
-	 * sofia_new. DTMF/NO fall through (the PBX 404s if truly absent). No
-	 * SIPTAG_REASON_STR (sofia flips it to 500). pvt not yet in dialogs → ao2_ref drop. */
+	 * sofia_new. DTMF/NO fall through (the PBX 404s if truly absent). pvt not yet in
+	 * dialogs → ao2_ref drop. */
 	{
 		int overlap_mode = pvt->peer ? pvt->peer->allowoverlap_mode : sofia_cfg.default_allowoverlap_mode;
 		if (overlap_mode == SOFIA_OVERLAP_YES
 		    && !ast_strlen_zero(pvt->exten)
 		    && !ast_exists_extension(NULL, pvt->context, pvt->exten, 1, S_OR(pvt->cid_num, NULL))
 		    && ast_canmatch_extension(NULL, pvt->context, pvt->exten, 1, S_OR(pvt->cid_num, NULL))) {
+			char rb[128] = "";	/* RFC 3326 Q.850 Reason (chan_sip parity) */
+			int hr = sofia_cfg.use_q850_reason && sofia_reason_build_for_status(484, rb, sizeof(rb));
 			ast_log(LOG_NOTICE, "Sofia: inbound INVITE exten '%s'@'%s' partial-match — 484 Address Incomplete (overlap=yes)\n",
 				pvt->exten, pvt->context);
 			nua_respond(nh, SIP_484_ADDRESS_INCOMPLETE,
-				NUTAG_WITH_THIS(nua), TAG_END());
+				NUTAG_WITH_THIS(nua), TAG_IF(hr, SIPTAG_REASON_STR(rb)), TAG_END());
 			ao2_ref(pvt, -1);
 			return;
 		}
@@ -7663,20 +7693,30 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			sofia_blacklist_add_sip(sip, "INVITE unknown extension in default context");
 		}
 		sofia_update_call_counter(pvt, SOFIA_DEC_CALL_LIMIT);
-		nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
+		{
+			/* RFC 3326 Q.850 Reason on the 404 reject (chan_sip parity). A well-formed
+			 * SIPTAG_REASON_STR is delivered as a Reason header on a UAS reject response. */
+			char reason_buf[128] = "";
+			int have_reason = sofia_cfg.use_q850_reason
+				&& sofia_reason_build_for_status(404, reason_buf, sizeof(reason_buf));
+			nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua),
+				TAG_IF(have_reason, SIPTAG_REASON_STR(reason_buf)), TAG_END());
+		}
 		ao2_ref(pvt, -1);
 		return;
 	}
 
 	if (sip->sip_payload && sip->sip_payload->pl_data) {
 		if (sofia_parse_sdp(pvt, sip, 1 /* offer: initial inbound INVITE */) < 0) {
-			/* Encryption mismatch → 488 (no SIPTAG_REASON_STR; sofia flips it to
-			 * 500). Free srtp/vsrtp explicitly. */
+			/* Encryption/codec mismatch → 488. RFC 3326 Q.850 Reason (chan_sip parity).
+			 * Free srtp/vsrtp explicitly. */
+			char rb[128] = "";
+			int hr = sofia_cfg.use_q850_reason && sofia_reason_build_for_status(488, rb, sizeof(rb));
 			ast_log(LOG_NOTICE, "Sofia: 488 reject — encryption mismatch (peer=%s, peer_encryption=%d)\n",
 				pvt->peer ? pvt->peer->name : "<unknown>",
 				pvt->peer ? pvt->peer->encryption : 0);
 			nua_respond(nh, SIP_488_NOT_ACCEPTABLE,
-				NUTAG_WITH_THIS(nua), TAG_END());
+				NUTAG_WITH_THIS(nua), TAG_IF(hr, SIPTAG_REASON_STR(rb)), TAG_END());
 			if (pvt->srtp) {
 				sofia_srtp_destroy(pvt->srtp);
 				pvt->srtp = NULL;
@@ -18066,7 +18106,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.apply_peer_callerid = 1;
 	/* gates the peer->onHold counter update; AMI Hold emission is unconditional. */
 	sofia_cfg.notifyhold = 0;
-	sofia_cfg.use_q850_reason = 0;	/* RFC 3326 Q.850 Reason on BYE/CANCEL; opt-in (chan_sip parity) */
+	sofia_cfg.use_q850_reason = 0;	/* RFC 3326 Q.850 Reason on BYE/CANCEL + INVITE rejects; opt-in (chan_sip parity) */
 	/* parse-compatibility only — effect deferred until presence/dialog-info NOTIFY lands. */
 	sofia_cfg.notifyringing = 1;
 	/* Security hardening: peer-build appends static IPs as deny rules to contact_ha. */

@@ -7,6 +7,19 @@ that is a drop-in replacement for chan_sip (it registers as channel
 technology SIP). Releases are listed newest first.
 
 
+## 1.5.9 — Q.850 Reason on INVITE-rejection responses (chan_sip parity)
+
+Signaling:
+- **Q.850 Reason on rejects.** With `use_q850_reason = yes`, chan_sofia now stamps an RFC 3326
+  `Reason: Q.850;cause=N;text="..."` header on INVITE-rejection responses (404, 480, 484, 486, 488, 503,
+  and the in-dialog re-INVITE/UPDATE/T.38 488 rejects), not only on the BYE/CANCEL requests it already
+  handled — matching chan_sip, so upstream proxies and billing see the real Q.850 cause behind a rejected
+  call. The cause is taken from the channel hangup cause when available, or mapped from the SIP status via
+  a port of chan_sip's `hangup_sip2cause` for pre-channel rejects. A well-formed `SIPTAG_REASON_STR` is
+  valid on a UAS reject response (sofia-sip forces a 500 only on a generic header/tag serialization
+  failure), so the Reason is emitted directly on the reject. Gated by `use_q850_reason` (default no).
+
+
 ## 1.5.8 — SDP buffer headroom, progressinband parity, MWI multi-class, RTCP multi-report
 
 A batch of correctness fixes continuing the internal audit follow-up, covering SDP body sizing,

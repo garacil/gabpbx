@@ -2457,11 +2457,10 @@ tos_video = af41
 
 ;
 ; --- use_q850_reason (RFC 3326 Q.850 Reason header — [general], both directions) ---
-; When yes, chan_sofia stamps a "Reason: Q.850;cause=N;text=..." header (built from the channel hangup
-; cause) on the BYE/CANCEL it sends, and maps a received Q.850 Reason on an inbound BYE/CANCEL back to
-; the AST hangup cause (for CDR/billing fidelity). chan_sip parity. Default no. Note: chan_sofia cannot
-; add the Reason to INVITE-rejection responses (a sofia-sip SIPTAG_REASON-on-response limitation), so it
-; is applied to BYE/CANCEL requests only.
+; When yes, chan_sofia stamps a "Reason: Q.850;cause=N;text=..." header on the BYE/CANCEL it sends AND on
+; INVITE-rejection responses (404/480/484/486/488/503, etc.), built from the channel hangup cause or, for
+; pre-channel rejects, mapped from the SIP status (chan_sip parity). It also maps a received Q.850 Reason
+; on an inbound BYE/CANCEL back to the AST hangup cause (for CDR/billing fidelity). Default no.
 ;
 ;use_q850_reason = yes
 

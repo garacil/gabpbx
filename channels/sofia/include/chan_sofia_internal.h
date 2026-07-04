@@ -256,6 +256,8 @@ void sofia_service_route_store(struct sofia_peer *peer, sip_t const *sip);	/* Se
 int sofia_route_serialize(sip_route_t const *list, char *buf, size_t len);	/* Path/Service-Route hop list -> Route value; 0 ok, -1 overflow */
 void sofia_peer_clear_contact_paths(struct sofia_peer *peer);	/* blank RFC 3327 Path on all contacts (path=no) */
 int sofia_reason_build(int hangupcause, char *buf, size_t len);	/* Q.850 Reason RFC 3326, sofia_reason.c */
+int sofia_reason_status2cause(int status);	/* SIP reject status -> Q.850 cause (chan_sip parity) */
+int sofia_reason_build_for_status(int status, char *buf, size_t len);	/* Reason value for a reject status */
 int sofia_reason_parse_cause(sip_reason_t const *reason);
 int sofia_gruu_dialog_contact(const struct sofia_peer *peer, char *buf, size_t len);	/* GRUU as the dialog Contact */
 void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
@@ -1052,7 +1054,7 @@ struct sofia_config {
 	int shrinkcallerid;        /* 1 = strip leading '+'/parens from CID phone numbers (ast_is_shrinkable_phonenumber); default 1 (chan_sip). Non-phone CIDs unaffected. */
 	int apply_peer_callerid;   /* 1 = on an inbound INVITE from a matched peer, force the peer's configured callerid (cid_num/cid_name/callingpres) onto the call when no trusted RPID/PAI was accepted (chan_sip.c:17113-17124 parity); 0 = keep the inbound From user as caller-ID. Default 1 (chan_sip). */
 	int notifyhold;            /* 1 = gate peer->onHold counter tracking on this flag; default 0 (chan_sip). AMI Hold remains unconditional. */
-	int use_q850_reason;       /* Q.850 Reason header (RFC 3326): when 1, stamp/parse Reason: Q.850;cause=N on BYE/CANCEL. Default 0 (chan_sip parity, opt-in). */
+	int use_q850_reason;       /* Q.850 Reason header (RFC 3326): when 1, stamp Reason: Q.850;cause=N on the BYE/CANCEL and on INVITE-rejection responses, and parse an inbound BYE/CANCEL Reason. Default 0 (chan_sip parity, opt-in). */
 	int notifyringing;         /* parse-compatibility only (early-vs-confirmed presence gate; dialog-info NOTIFY infra deferred); default 1 (chan_sip) */
 	int dynamic_exclude_static; /* 1 = append static-peer addrs to contact_ha as DENY so dynamic peers can't claim static names by Contact-IP spoofing. Default 0. */
 	int autocreatepeer;        /* parse-compatibility only: chan_sofia refuses to auto-create unknown peers (stronger via alwaysauthreject default). Default 0 (chan_sip). */
