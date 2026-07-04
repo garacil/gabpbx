@@ -67,8 +67,8 @@ struct ast_srtp_res {
 enum ast_srtp_suite {
 	AST_AES_CM_128_HMAC_SHA1_80 = 1,
 	AST_AES_CM_128_HMAC_SHA1_32 = 2,
-	AST_F8_128_HMAC_SHA1_80     = 3,  /* dead-stub; reserved for future Kasumi/F8 support; not implemented in res_srtp.c today (Pattern 1 cleanup candidate) */
-	/* post-T56 SRTP cipher expansion (2026-04-27): RFC 6188 AES-192/256 + RFC 7714 AES-GCM-128/256 */
+	AST_F8_128_HMAC_SHA1_80     = 3,  /* dead-stub; reserved for future Kasumi/F8 support; not implemented in res_srtp.c today */
+	/* SRTP cipher expansion: RFC 6188 AES-192/256 + RFC 7714 AES-GCM-128/256 */
 	AST_AES_CM_192_HMAC_SHA1_80 = 4,
 	AST_AES_CM_192_HMAC_SHA1_32 = 5,
 	AST_AES_CM_256_HMAC_SHA1_80 = 6,
