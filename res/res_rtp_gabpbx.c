@@ -1816,8 +1816,8 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 	 *    selected pair, and is SAFE because the MESSAGE-INTEGRITY (our secret local_pwd, exchanged only over the
 	 *    secure SIP/WSS signaling) cannot be forged — a spoofer cannot move the tuple.
 	 *    ┌─ DO NOT re-introduce the 1.3.3 USE-CANDIDATE-ONLY latch, and DO NOT add PRIORITY pinning ──────────┐
-	 *    │ Both were TRIED and BROKE AUDIO on the offerer/fork path, so both are REJECTED (after               │
-	 *    │ review, safe to drop). (a) Gating this latch on `has_use_candidate` (the 1.3.3 model) leaves the RTP│
+	 *    │ Both were tried and BROKE AUDIO on offerer/fork calls, so both are REJECTED.                        │
+	 *    │ (a) Gating this latch on `has_use_candidate` (the 1.3.3 model) leaves the RTP                       │
 	 *    │ remote on a stale pair for offerer/fork calls where the browser never re-nominates → ServerHello to │
 	 *    │ a dead 5-tuple → DTLS never completes → DEAF. (b) A PRIORITY non-downgrade guard pins a non-media   │
 	 *    │ candidate for the same reason. KEEP "latest authenticated check wins" (LATCH-ALWAYS). This debug    │
@@ -2001,7 +2001,7 @@ read_again:
 			rtcp_srtp = ast_rtp_instance_get_srtp(instance);
 			if (!res_srtp || !rtcp_srtp) {
 				/* Fail CLOSED: no SRTP backend/context on a DTLS-SRTP session — never parse
-				 * what would still be ciphertext (fail-closed hardening, mirrors the TX guard). */
+				 * what would still be ciphertext (mirrors the TX guard). */
 				goto read_again;
 			}
 			if (res_srtp->unprotect(rtcp_srtp, buf, &rtcp_len, 1) < 0) {
@@ -2985,7 +2985,7 @@ static void ast_rtp_video_update(struct ast_rtp_instance *instance)
 	pli[1] = htonl(rtp->ssrc);
 	pli[2] = htonl(media_ssrc);
 
-	/* Fail CLOSED (hard security gate): a PLI must leave SRTCP-protected or not at all — a
+	/* Fail CLOSED: a PLI must leave SRTCP-protected or not at all — a
 	 * cleartext RTCP packet on a DTLS-SRTP session would be dropped by the browser anyway
 	 * and violates the session's security level. DTLS EXISTING (checked above) implies the
 	 * SRTP session was installed at dtls_srtp_finish_negotiation, so this only triggers if
@@ -4346,7 +4346,7 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 
 	/* ┌─ DO NOT ADD AN ICE "SELECTED-PAIR" RX DROP HERE ──────────────────────────────────────────────────┐
 	 * │ A guard like `if (ice_active && ice_complete && ast_sockaddr_cmp(&ice_peer,&addr)) return null;` was │
-	 * │ TRIED and DROPPED ALL AUDIO on live SIP.js, so it was REVERTED after review. The                     │
+	 * │ tried and DROPPED ALL AUDIO with a live WebRTC browser, so it was reverted. The                     │
 	 * │ browser sends ICE/DTLS checks and SRTP media from DIFFERENT source ports, SAME IP (cmp!=0, cmp_addr  │
 	 * │ ==0 — see ICE-RXDBG above). The symmetric-RTP follow BELOW is load-bearing (moves media to its real  │
 	 * │ source); SRTP auth/replay already rejects forgeries. Never host+port RX filter here. Log, don't drop.│
@@ -5130,7 +5130,7 @@ static char *handle_cli_rtp_set_debug_ice(struct ast_cli_entry *e, int cmd, stru
 		e->usage =
 			"Usage: rtp set debug ice {on|off}\n"
 			"       Enable/Disable WebRTC ICE/DTLS debugging (pure logging, no media change).\n"
-			"       Logs each ICE latch/nomination (this driver is LATCH-ALWAYS), DTLS records\n"
+			"       Logs each ICE latch/nomination (latch-always), DTLS records\n"
 			"       dropped as source != the latched peer, and (on the first media packet\n"
 			"       after ICE completes + on every media-source change) the nominated peer\n"
 			"       vs the actual media source - which legitimately differ by port for some\n"
