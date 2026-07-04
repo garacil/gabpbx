@@ -104,7 +104,7 @@ sipregs-split need NO data-migration step:
 2. Add `sipregs => …` line to extconfig.conf
 3. Reload chan_sofia (or restart gabpbx)
 4. On first successful register after the wiring change, registration state
-   writes naturally to sipregs (R3 ternary path detects the family + targets it)
+   writes naturally to sipregs (the ternary path detects the family + targets it)
 
 Existing sippeers registration data becomes stale-but-harmless until natural
 overwrite. Optional cleanup: clear sippeers.ipaddr/port/regseconds/fullcontact
@@ -181,21 +181,22 @@ Known Limitations
 =================
 
 - IP-based auth-bypass via insecure=port + sipregs IP-match: NOT implemented in
-  chan_sofia (deferred future task per post-T56 sipregs Phase 1 R6 option-(b)).
+  chan_sofia.
   Operators using insecure=port + dynamic peer IPs should defer migration until
-  the standalone post-T56 insecure-auth-bypass parity fix lands; static-host
+  the standalone insecure-auth-bypass parity fix lands; static-host
   peers with insecure=port work today.
-- get_insecure_variable_from_sipregs equivalent helper deferred to same future
-  task. chan_sofia today does NOT walk sipregs by IP for auth-bypass.
+- get_insecure_variable_from_sipregs equivalent helper is also not implemented.
+  chan_sofia today does NOT walk sipregs by IP for auth-bypass.
 - Cluster-shared sipregs writes are last-write-wins; gabpbx core does not provide
   multi-master conflict resolution. Use clustered DB locking if multiple gabpbx
   nodes can register the same peer simultaneously.
-- INVITE digest auth: chan_sofia enforces inbound INVITE digest authentication
-  using the `secret` / `md5secret` / `insecure` fields in sippeers. MD5 and
-  SHA-256 algorithms are supported, `qop=auth` is honored with nonce-count
-  replay protection, and a global `force_invite_auth` switch in `[general]`
-  can override per-peer `insecure=invite` bypass. Peer ACL (permit/deny) plus
-  a frontend SIP proxy with TLS are still recommended additional defenses.
+- INVITE auth NOT IMPLEMENTED: the sipregs table provides registration
+  state for inbound auth lookups, but chan_sofia today does not authenticate
+  inbound INVITEs at SIP level (REGISTER auth IS implemented). The `insecure`
+  + `secret` fields in sippeers are parsed but unenforced for INVITE. Use peer
+  ACL + frontend SIP proxy + TLS for inbound INVITE protection. The related
+  sofia_get_insecure_from_sipregs IP-based auth-bypass helper depends on
+  INVITE digest auth and cannot be added independently of it.
 - Transition-window stale-state risk: when an operator enables sipregs on a
   deployment that previously stored registration state in sippeers, peers that
   registered BEFORE the enable have populated sippeers.ipaddr/port/regseconds.
