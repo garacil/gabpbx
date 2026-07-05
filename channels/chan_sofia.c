@@ -353,7 +353,7 @@ static void sofia_send_auth_challenge(nua_t *nua, nua_handle_t *nh, sip_t const 
 		const char *realm, const char *method, const char *reason,
 		struct sofia_pvt *pvt_ref, int reap_handle_on_fire);
 static void sofia_emit_auth_challenge(nua_t *nua, nua_handle_t *nh,
-		const char *realm, const char *nonce, int stale);
+		const char *realm, const char *nonce, int stale, msg_t *with_msg);
 
 /* ===================================================================
  *  Async timing-equalized reject (anti-enumeration jitter, NON-blocking)
@@ -400,6 +400,12 @@ struct sofia_delay_reject_ctx {
 	int reap_handle_on_fire;     /* unbound-SUBSCRIBE paths: reap the orphaned (UNBOUND) server handle
 	                              * AFTER we emit the deferred 401 (sofia_subscribe_reject_reap), so the
 	                              * timer wins the race against nta_incoming_destroy's immediate 500. */
+	nua_saved_event_t saved[1];  /* the saved nua_i_* request event (nua_save_event at arm time). The
+	                              * deferred emit binds the 401/403 to THIS request (nua_saved_event_request)
+	                              * because nua_current_request() is NULL in the timer callback — without it
+	                              * the response is dropped as a "Non-Existing Request" and never sent.
+	                              * NULL on the synchronous/immediate paths. Freed (nua_destroy_event) once
+	                              * in the deferred cleanup or the unload sweep. */
 	/* 401 path snapshot (sip_t* is freed after the event callback returns — copy everything): */
 	char realm[128];
 	char nonce[64];
@@ -9661,13 +9667,21 @@ static void sofia_build_md5_challenge(char *buf, size_t sz, const char *realm,
 
 /* Emit the WWW-Authenticate 401 challenge(s) per auth_algorithms (MD5 first for
  * legacy clients). stale!=0 appends ", stale=true". Caller generates the nonce. */
+/* with_msg: the specific request this 401 answers. Pass NULL for a SYNCHRONOUS emit (inside the
+ * live nua_i_* handler) — we then use nua_current_request(nua), i.e. exactly NUTAG_WITH_THIS(nua).
+ * A DEFERRED emit (from the su_timer callback) MUST pass the saved request msg
+ * (nua_saved_event_request(ctx->saved)): in a timer context nua_current_request(nua) is NULL, so
+ * NUTAG_WITH_THIS would leave nutag_with=NULL and nua_respond drops the 401 as a "Non-Existing
+ * Request" (it never reaches the wire). Binding to the saved msg is what makes the deferred
+ * anti-enumeration challenge actually transmit. */
 static void sofia_emit_auth_challenge(nua_t *nua, nua_handle_t *nh,
-		const char *realm, const char *nonce, int stale)
+		const char *realm, const char *nonce, int stale, msg_t *with_msg)
 {
 	int want_md5, want_sha256;
 	char hdr_md5[256];
 	char hdr_sha256[256];
 	const char *stale_str = stale ? ", stale=true" : "";
+	msg_t *req = with_msg ? with_msg : nua_current_request(nua);
 
 	sofia_auth_offered(&want_md5, &want_sha256);
 
@@ -9684,17 +9698,17 @@ static void sofia_emit_auth_challenge(nua_t *nua, nua_handle_t *nh,
 		nua_respond(nh, SIP_401_UNAUTHORIZED,
 			SIPTAG_WWW_AUTHENTICATE_STR(hdr_md5),
 			SIPTAG_WWW_AUTHENTICATE_STR(hdr_sha256),
-			NUTAG_WITH_THIS(nua),
+			NUTAG_WITH(req),
 			TAG_END());
 	} else if (want_sha256) {
 		nua_respond(nh, SIP_401_UNAUTHORIZED,
 			SIPTAG_WWW_AUTHENTICATE_STR(hdr_sha256),
-			NUTAG_WITH_THIS(nua),
+			NUTAG_WITH(req),
 			TAG_END());
 	} else {
 		nua_respond(nh, SIP_401_UNAUTHORIZED,
 			SIPTAG_WWW_AUTHENTICATE_STR(hdr_md5),
-			NUTAG_WITH_THIS(nua),
+			NUTAG_WITH(req),
 			TAG_END());
 	}
 }
@@ -9964,7 +9978,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	if (!au) {
 		char nonce[96];
 		sofia_make_auth_nonce(peer->name, realm, method, nonce, sizeof(nonce));
-		sofia_emit_auth_challenge(nua, nh, realm, nonce, 0);
+		sofia_emit_auth_challenge(nua, nh, realm, nonce, 0, NULL);
 
 		if (sofia_debug) {
 			int want_md5, want_sha256;
@@ -10071,7 +10085,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		char chal_nonce[96];
 		/* Fresh stateless nonce (no peer nonce state to clobber). */
 		sofia_make_auth_nonce(peer->name, realm, method, chal_nonce, sizeof(chal_nonce));
-		sofia_emit_auth_challenge(nua, nh, realm, chal_nonce, 1);
+		sofia_emit_auth_challenge(nua, nh, realm, chal_nonce, 1, NULL);
 		ast_verbose("Sofia: %s auth realm mismatch for '%s' - expected '%s' got '%s'\n",
 			method, peer->name, realm, auth_realm ? auth_realm : "(none)");
 		return SOFIA_AUTH_CHALLENGE;
@@ -10131,7 +10145,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		if (nv != 0) {
 			char fresh[96];
 			sofia_make_auth_nonce(peer->name, realm, method, fresh, sizeof(fresh));
-			sofia_emit_auth_challenge(nua, nh, realm, fresh, 1);
+			sofia_emit_auth_challenge(nua, nh, realm, fresh, 1, NULL);
 			if (sofia_debug) {
 				ast_verbose("Sofia: %s auth for '%s' - %s nonce; re-challenged\n",
 					method, peer->name, nv < 0 ? "invalid" : "expired");
@@ -10244,7 +10258,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		if (sofia_nonce_replay_check(auth_nonce, new_nc, nonce_issue_ts)) {
 			char fresh_nonce[96];
 			sofia_make_auth_nonce(peer->name, realm, method, fresh_nonce, sizeof(fresh_nonce));
-			sofia_emit_auth_challenge(nua, nh, realm, fresh_nonce, 1);
+			sofia_emit_auth_challenge(nua, nh, realm, fresh_nonce, 1, NULL);
 			if (sofia_debug) {
 				ast_verbose("Sofia: %s auth for '%s' - valid but nc replay on this nonce; re-challenged\n",
 					method, peer->name);
@@ -10461,12 +10475,20 @@ static void sofia_delay_reject_emit_authfailure(const struct sofia_delay_reject_
  * the nua_handle ref — the caller owns that bookkeeping. */
 static void sofia_delay_reject_emit_now(const struct sofia_delay_reject_ctx *ctx)
 {
+	/* Bind to the SAVED request for a deferred (timer) emit: in a su_timer callback
+	 * nua_current_request() is NULL, so NUTAG_WITH_THIS would leave nutag_with=NULL and
+	 * nua_respond would drop the 401/403 as a "Non-Existing Request" (never transmitted).
+	 * The immediate/synchronous emit paths (overload fuse, alloc/ref/timer failures) run
+	 * inside the live nua_i_* handler with no saved event, so they fall back to the current
+	 * request (identical to the old NUTAG_WITH_THIS behavior). */
+	msg_t *req = ctx->saved[0] ? nua_saved_event_request(ctx->saved) : nua_current_request(ctx->nua);
+
 	if (ctx->kind == SOFIA_DELAY_REJECT_401_CHALLENGE) {
-		sofia_emit_auth_challenge(ctx->nua, ctx->nh, ctx->realm, ctx->nonce, 0);
+		sofia_emit_auth_challenge(ctx->nua, ctx->nh, ctx->realm, ctx->nonce, 0, req);
 		sofia_delay_reject_emit_authfailure(ctx);
 	} else {
 		nua_respond(ctx->nh, SIP_403_FORBIDDEN,
-			NUTAG_WITH_THIS(ctx->nua), TAG_END());
+			NUTAG_WITH(req), TAG_END());
 	}
 }
 
@@ -10491,6 +10513,9 @@ static void sofia_delay_reject_deferred_cleanup(struct sofia_delay_reject_ctx *c
 	if (ctx->reap_handle_on_fire) {
 		ctx->reap_handle_on_fire = 0;
 		sofia_subscribe_reject_reap(ctx->nh);
+	}
+	if (ctx->saved[0]) {
+		nua_destroy_event(ctx->saved);   /* free the saved request msg (balances nua_save_event) */
 	}
 }
 
@@ -10635,6 +10660,22 @@ static void sofia_delay_reject_schedule(enum sofia_delay_reject_kind kind,
 	ctx->timer = su_timer_create(su_root_task(sofia_root), delay_ms);
 	if (!ctx->timer) {
 		ast_log(LOG_WARNING, "Sofia: delayed-reject su_timer_create failed — emitting immediately\n");
+		sofia_delay_reject_emit_now(ctx);
+		sofia_delay_reject_deferred_cleanup(ctx);
+		nua_handle_unref(nh);
+		ast_free(ctx);
+		return;
+	}
+
+	/* Save the current nua request event so the deferred emit can bind the 401/403 to it: in the
+	 * su_timer callback nua_current_request() is NULL, so without a saved request nua_respond would
+	 * drop the response as a "Non-Existing Request". MUST run HERE — synchronously inside the live
+	 * nua_i_* handler where nua->nua_current is set. If the save fails there is nothing to bind a
+	 * deferred response to, so emit immediately (still synchronous → nua_current valid) instead of
+	 * arming a timer whose response could never transmit. */
+	if (!nua_save_event(nua, ctx->saved)) {
+		ast_log(LOG_WARNING, "Sofia: delayed-reject nua_save_event failed — emitting immediately\n");
+		su_timer_destroy(ctx->timer);
 		sofia_delay_reject_emit_now(ctx);
 		sofia_delay_reject_deferred_cleanup(ctx);
 		nua_handle_unref(nh);
@@ -11246,7 +11287,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 	if (!user) {
 		/* Malformed REGISTER (no From user): bogus challenge then reject. Honors
 		 * auth_algorithms so a sha256-only deployment never advertises MD5. */
-		sofia_emit_auth_challenge(nua, nh, realm, "empty", 0);
+		sofia_emit_auth_challenge(nua, nh, realm, "empty", 0, NULL);
 		sofia_blacklist_add_sip(sip, "REGISTER missing user");
 		return;
 	}
