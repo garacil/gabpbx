@@ -1,3 +1,21 @@
+## 1.5.13 — blacklist-drop SIP handle leak (chan_sofia)
+
+A follow-up to the 1.5.12 memory-safety audit. Under an active SIP brute-force — the exact
+condition the built-in IP blacklist exists to defend against — every out-of-dialog request the
+blacklist dropped (`REGISTER`, `SUBSCRIBE`, `MESSAGE`, `NOTIFY`, `REFER`, `INFO`, `PUBLISH`)
+leaked the fresh protocol handle the stack had created for it, along with its memory pool — and,
+for `SUBSCRIBE`, a dialog leg that is never reclaimed. Only `OPTIONS` was reaped on the drop
+path. Sustained flooding of a blacklisted source therefore grew memory without bound precisely
+while the box was under attack — the anti-brute-force defense amplifying a memory-exhaustion
+denial of service.
+
+The blacklist drop path now reaps the unbound handle for every out-of-dialog method (the same
+`magic`-guarded reap already used for `OPTIONS`), so a dropped request frees its handle instead
+of leaking it; a bound, in-dialog handle is never touched. Verified on a live box by driving a
+source into the blacklist and flooding it: before the fix the resident set grew ~5 KB per
+dropped request and could not be reclaimed (`malloc_trim`), after the fix it returns to baseline.
+No configuration or behavior change for a correctly-configured deployment.
+
 ## 1.5.12 — security hardening (chan_sofia audit)
 
 A focused security-hardening release from a full audit of `chan_sofia` (correctness, memory

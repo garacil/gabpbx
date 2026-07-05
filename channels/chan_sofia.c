@@ -8197,21 +8197,30 @@ static void sofia_process_cancel(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	}
 }
 
-/* Reap the fresh UNBOUND nua handle sofia-sip creates for an out-of-dialog OPTIONS.
+/* Reap the fresh UNBOUND nua handle sofia-sip creates for an out-of-dialog request the application
+ * is discarding. Two callers:
  *
- * OPTIONS is deliberately NOT in our NUTAG_APPL_METHOD set, so the sofia-sip stack AUTO-ANSWERS it
- * 200 — carrying our global NUTAG_ALLOW list + application/sdp (nua_session.c:4780-4802) — BEFORE
- * this nua_i_options event is reported to us (nua_server.c auto-respond ~:276, report ~:279). The
- * stack does NOT destroy the handle: sip_response_terminates_dialog() returns 0 for a 2xx
- * (sip_util.c:912), so nua_base_server_report() returns early without nh_destroy (nua_server.c:743),
- * and sofia-sip's own docs (nua_session.c:4739-4743) state the application must destroy an unbound
- * OPTIONS handle. Left unreaped, every out-of-dialog OPTIONS (SIP registrar / proxy keepalive ping,
- * typically ~30s per contact) leaks a nua_handle_t + su_home -> unbounded, remote, UNAUTHENTICATED
- * memory growth.
+ *   1) out-of-dialog OPTIONS (sofia_process_options): OPTIONS is deliberately NOT in our
+ *      NUTAG_APPL_METHOD set, so the stack AUTO-ANSWERS it 200 — carrying our global NUTAG_ALLOW
+ *      list + application/sdp (nua_session.c:4780-4802) — BEFORE this nua_i_options event is
+ *      reported (nua_server.c auto-respond ~:276, report ~:279). The stack does NOT destroy the
+ *      handle: sip_response_terminates_dialog() returns 0 for a 2xx (sip_util.c:912), so
+ *      nua_base_server_report() returns early without nh_destroy (nua_server.c:743), and sofia-sip's
+ *      own docs (nua_session.c:4739-4743) state the application must destroy an unbound OPTIONS
+ *      handle. Because the request was already answered 200, the destroy here is SILENT.
  *
- * Guard on magic==NULL so a BOUND, in-dialog OPTIONS handle owned by a live pvt is NEVER destroyed
+ *   2) any out-of-dialog request DROPPED by the IP blacklist gate: the stack likewise created a
+ *      fresh unbound handle before the app event, and left unreaped on the drop it leaks a
+ *      nua_handle_t + su_home (+ a ds_leg for create_dialog methods like SUBSCRIBE -> PERMANENT).
+ *      For a request the stack has NOT yet given a final response (a pending APPL_METHOD such as
+ *      REGISTER/SUBSCRIBE/MESSAGE), nua_handle_destroy -> nta_incoming_destroy auto-sends a 500
+ *      (nta.c:5673) as it frees the handle. That terse 500 to an already-blacklisted source is
+ *      acceptable; the alternative is unbounded, remote, per-request memory growth exactly while
+ *      the box is under a brute-force flood (the blacklist only engages under attack).
+ *
+ * Guard on magic==NULL so a BOUND, in-dialog handle owned by a live pvt is NEVER destroyed
  * (identical reap-guard idiom to sofia_subscribe_reject_reap() and the MESSAGE reject reap). */
-static void sofia_reap_unbound_options(nua_handle_t *nh)
+static void sofia_reap_unbound_handle(nua_handle_t *nh)
 {
 	if (!nh || nua_handle_magic(nh) != NULL) {
 		return;
@@ -8227,7 +8236,7 @@ static void sofia_process_options(nua_t *nua, nua_handle_t *nh, struct sofia_pvt
 	 * server request and fires a spurious internal nua_i_error 500 "Responding to a Non-Existing
 	 * Request" (the same trap the nua_i_cancel handler documents above). We only reap the unbound
 	 * handle the stack left behind. */
-	sofia_reap_unbound_options(nh);
+	sofia_reap_unbound_handle(nh);
 }
 
 /* Append to pvt->initreq_headers, preserving wire order so SIP_HEADER(name, N)
@@ -15121,14 +15130,15 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			if (indialog) {
 				ao2_ref(indialog, -1);	/* exempt: in-dialog request on a live call */
 			} else if (sofia_blacklist_check_sip(sip)) {
-				/* OPTIONS was already auto-answered 200 by the stack before this event, so a
-				 * blacklist drop must STILL reap its fresh unbound handle or it leaks exactly as
-				 * the normal path would (see sofia_reap_unbound_options). Other gated methods are
-				 * APPL_METHOD'd / not stack-auto-answered, so their handle lifetime differs and is
-				 * not reaped here. */
-				if (event == nua_i_options) {
-					sofia_reap_unbound_options(nh);
-				}
+				/* The stack creates a fresh unbound handle for EVERY out-of-dialog request
+				 * (OPTIONS auto-answered 200; the rest pending APPL_METHOD) BEFORE this event.
+				 * Dropping the request here must STILL reap that handle or it leaks a
+				 * nua_handle_t + su_home per dropped packet — unbounded, remote, and triggered
+				 * exactly when the blacklist engages (i.e. under a brute-force flood: SUBSCRIBE
+				 * even holds a ds_leg, so its leak is permanent). The magic==NULL guard inside
+				 * the helper protects any bound in-dialog handle; a pending request is freed with
+				 * a stack-generated terse 500 (see sofia_reap_unbound_handle). */
+				sofia_reap_unbound_handle(nh);
 				return;
 			}
 		}
