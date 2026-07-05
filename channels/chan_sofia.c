@@ -14360,14 +14360,25 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 		return;
 	}
 
+	/* Reject BEFORE accepting. A 2xx to a REFER creates an implicit refer subscription (RFC 3515
+	 * §2.4.4) the sender then waits on for progress NOTIFYs — which we never send on this path, so a
+	 * premature 202 orphans that subscription until the sender's own timeout. An out-of-dialog /
+	 * torn-down REFER (no op/owner) is 481; a REFER with no Refer-To is 400. (The bad-extension case
+	 * further below correctly keeps the 202 + a NOTIFY 404 — that IS valid RFC 3515 progress.) */
+	if (!refer_to || !op || !op->owner) {
+		if (!refer_to) {
+			nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
+			ast_log(LOG_WARNING, "Sofia: REFER missing Refer-To — 400 Bad Request\n");
+		} else {
+			nua_respond(nh, SIP_481_NO_TRANSACTION, NUTAG_WITH_THIS(nua), TAG_END());
+			ast_log(LOG_WARNING, "Sofia: REFER with no active call — 481 Call/Transaction Does Not Exist\n");
+		}
+		return;
+	}
+
 	nua_respond(nh, SIP_202_ACCEPTED,
 		NUTAG_WITH_THIS(nua),
 		TAG_END());
-
-	if (!refer_to || !op || !op->owner) {
-		ast_log(LOG_WARNING, "Sofia: REFER missing Refer-To or no active call\n");
-		return;
-	}
 
 	/* Snapshot+ref op->owner under op->lock for the whole transfer body — the handler
 	 * derefs it across blocking ops (ast_queue_hangup, bridged-finder, ast_async_goto)
