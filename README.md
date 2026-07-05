@@ -214,7 +214,7 @@ GABPBX uses the standard Asterisk source workflow (`./configure && make menusele
 
 | Dependency | Needed for | Debian/Ubuntu |
 | --- | --- | --- |
-| **Sofia-SIP 2.0.1**, built from source into `/usr/local` | `chan_sofia`'s SIP stack — **not a distro package** | tag `v2.0.1` from [garacil/sofia-sip](https://github.com/garacil/sofia-sip) (a fork of [freeswitch/sofia-sip](https://github.com/freeswitch/sofia-sip)) — a **warning-clean build on GCC 14 / OpenSSL 3** (soname unchanged, `0.6.0`) |
+| **Sofia-SIP 2.0.3**, built from source into `/usr/local` | `chan_sofia`'s SIP stack — **not a distro package** | tag `v2.0.3` from [garacil/sofia-sip](https://github.com/garacil/sofia-sip) (a fork of [freeswitch/sofia-sip](https://github.com/freeswitch/sofia-sip)) — a **warning-clean build on GCC 14 / OpenSSL 3** (soname unchanged, `0.6.0`) |
 | OpenSSL | TLS, DTLS-SRTP, WebRTC, SHA-256 auth | `libssl-dev` |
 | libsrtp2 | SRTP / DTLS-SRTP media | `libsrtp2-dev` |
 | usrsctp *(optional)* | WebRTC DataChannel (SCTP-over-DTLS) | `libusrsctp-dev` |
@@ -227,7 +227,7 @@ GABPBX uses the standard Asterisk source workflow (`./configure && make menusele
 ```sh
 # 1) Sofia-SIP into /usr/local (do this first)
 git clone https://github.com/garacil/sofia-sip.git && cd sofia-sip
-git checkout v2.0.1  # the release chan_sofia is built + tested against (warning-clean on GCC 14 / OpenSSL 3)
+git checkout v2.0.3  # the release chan_sofia is built + tested against (warning-clean on GCC 14 / OpenSSL 3)
 ./autogen.sh                   # generate ./configure on a fresh clone (./bootstrap.sh also works)
 ./configure --prefix=/usr/local && make && sudo make install && sudo ldconfig
 
