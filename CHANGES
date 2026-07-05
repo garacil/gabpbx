@@ -1,7 +1,7 @@
-## Build — Sofia-SIP dependency pinned to `v1.13.17-gabpbx1` (warning-clean)
+## Build — Sofia-SIP dependency pinned to `v2.0.1` (warning-clean)
 
 `chan_sofia` builds against our Sofia-SIP fork, now pinned to the tag
-`v1.13.17-gabpbx1` — a warning-clean build of Sofia-SIP 1.13.17 that compiles
+`v2.0.1` — a warning-clean build of Sofia-SIP 1.13.17 that compiles
 absolutely clean (zero warnings, zero errors) on GCC 14 and OpenSSL 3, with no
 behavior or ABI change (soname unchanged, `0.6.0`). This is a dependency/build
 update only — no GABPBX source change. Rebuild Sofia-SIP from the new tag before
