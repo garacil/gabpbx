@@ -9810,12 +9810,19 @@ static int sofia_validate_auth_nonce(const char *nonce, const char *scope, const
 		const char *method, time_t *issue_ts)
 {
 	char ts_hex[24], rand_hex[40], hmac_hex[40], msg[640], want_hex[33];
+	char nonce_extra;	/* end-anchor sentinel: sscanf assigns it (==4 fields) iff trailing junk */
 	unsigned long long ts;
 	int ttl;
 	time_t now;
 
 	if (!nonce) return -1;
-	if (sscanf(nonce, "s1.%23[0-9a-fA-F].%39[0-9a-fA-F].%39[0-9a-fA-F]", ts_hex, rand_hex, hmac_hex) != 3) {
+	/* Trailing %c sentinel end-anchors the parse: a canonical nonce has NO character after the
+	 * 32-hex HMAC, so a valid token yields exactly 3 assigned fields; any trailing byte (e.g. a
+	 * non-hex suffix that the third %[...] stops at) makes sscanf assign 4 -> reject. Without this,
+	 * a non-canonical "…<32hex>Z" would validate (HMAC checks only the parsed prefix) yet key the
+	 * replay cache + digest on the FULL raw string, so validation and replay-keying diverge. */
+	if (sscanf(nonce, "s1.%23[0-9a-fA-F].%39[0-9a-fA-F].%39[0-9a-fA-F]%c",
+			ts_hex, rand_hex, hmac_hex, &nonce_extra) != 3) {
 		return -1;
 	}
 	if (strlen(hmac_hex) != 32) {
