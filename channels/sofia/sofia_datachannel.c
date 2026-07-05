@@ -98,6 +98,9 @@
  * the relay caps each forwarded message to min(262144, the FAR peer's advertised max). RFC 8841 §6:
  * an absent max-message-size defaults to 65536; an explicit 0 means unbounded (then 262144 binds). */
 #define SOFIA_DC_HARD_MAX_MSG       262144u	/* our advertised cap, the absolute relay ceiling */
+#define SOFIA_DC_RX_INFLIGHT_MAX    512		/* per-dc cap on RX events queued (not yet drained) on the
+						 * shared dc_lane; bounds the inbound backlog + heap copies so a
+						 * peer cannot grow the lane without limit (memory-exhaustion DoS) */
 #define SOFIA_DC_DEFAULT_PEER_MAX   65536u	/* RFC 8841 §6 default when the peer OMITS the attribute */
 
 /* RFC 8841 §6 distinguishes THREE cases for a=max-message-size that we must not conflate.
@@ -166,6 +169,11 @@ struct sofia_datachannel {
 	struct sofia_dc_stream *streams;	/* growable table (worker-lane-owned; see above) */
 	unsigned int n_streams;		/* live entries in use */
 	unsigned int cap_streams;	/* allocated capacity of `streams` */
+	int rx_inflight;		/* ATOMIC (ast_atomic_fetchadd_int only): RX events queued on the shared
+					 * dc_lane for THIS dc but not yet drained. Producer (sofia_dc_engine_rx,
+					 * under the RTP instance lock) and consumer (sofia_dc_rx_task, no lock)
+					 * touch it from different threads, so it must be atomic. Bounds the per-dc
+					 * inbound backlog at SOFIA_DC_RX_INFLIGHT_MAX. */
 };
 
 /* RX hand-off event: the bytes copied off the instance lock, carried to the worker lane. */
@@ -783,12 +791,26 @@ static void sofia_dc_engine_rx(struct ast_rtp_instance *instance, const uint8_t 
 		return;
 	}
 
+	/* Per-dc inbound backlog cap. ast_taskprocessor_push() has NO depth gate (it only fails on
+	 * task-struct OOM), so without this a peer blasting DTLS-SCTP appdata faster than
+	 * usrsctp_conninput drains would grow the shared dc_lane queue + the per-packet heap copies
+	 * without limit — a memory-exhaustion DoS that also head-of-line-blocks every other datachannel
+	 * on the shared lane. Bound how many un-drained RX events THIS dc may have queued; over the cap,
+	 * drop (SCTP retransmits, so a drop under pressure is loss-safe). fetchadd returns the
+	 * PRE-increment value; every early-return below releases the slot we took. */
+	if (ast_atomic_fetchadd_int(&dc->rx_inflight, 1) >= SOFIA_DC_RX_INFLIGHT_MAX) {
+		ast_atomic_fetchadd_int(&dc->rx_inflight, -1);
+		return;
+	}
+
 	ev = ast_malloc(sizeof(*ev));
 	if (!ev) {
+		ast_atomic_fetchadd_int(&dc->rx_inflight, -1);
 		return;
 	}
 	ev->buf = ast_malloc(len);
 	if (!ev->buf) {
+		ast_atomic_fetchadd_int(&dc->rx_inflight, -1);
 		ast_free(ev);
 		return;
 	}
@@ -800,7 +822,9 @@ static void sofia_dc_engine_rx(struct ast_rtp_instance *instance, const uint8_t 
 	ev->dc = dc;
 
 	if (ast_taskprocessor_push(dc_lane, sofia_dc_rx_task, ev) < 0) {
-		/* Lane gone/overflowed — drop the packet (SCTP retransmits). Release what we took. */
+		/* task-struct OOM (NOT a depth overflow — the lane has no depth gate) — drop the packet
+		 * (SCTP retransmits) and release everything we took, including the inflight slot. */
+		ast_atomic_fetchadd_int(&dc->rx_inflight, -1);
 		ao2_ref(dc, -1);
 		ast_free(ev->buf);
 		ast_free(ev);
@@ -822,6 +846,8 @@ static int sofia_dc_rx_task(void *data)
 	 * was closed by a concurrent detach, conninput against a closed/deregistered token is benign. */
 	usrsctp_conninput(ev->dc, ev->buf, ev->len, 0);
 
+	/* Release this event's per-dc backlog slot (balances the increment in sofia_dc_engine_rx). */
+	ast_atomic_fetchadd_int(&ev->dc->rx_inflight, -1);
 	ast_free(ev->buf);
 	ao2_ref(ev->dc, -1);
 	ast_free(ev);
