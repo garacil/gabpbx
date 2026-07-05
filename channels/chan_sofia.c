@@ -3232,6 +3232,16 @@ static struct sofia_peer *sofia_peer_alloc(const char *name)
 	return peer;
 }
 
+/* Static, never-linked "bogus" peer with an impossible cleartext secret (mirrors chan_sip's
+ * bogus_peer, chan_sip.c:1153-1155). An unknown-peer + alwaysauthreject request is run through the
+ * SAME sofia_verify_digest_auth() against this peer so its 400/401-stale/403 classification is
+ * byte- and timing-identical to a real peer with a bad password — closing the account-enumeration
+ * oracle. Created at load, destroyed at unload. See sofia_verify_digest_auth (is_bogus). NO
+ * md5secret: a plain unmatchable secret keeps it off the md5secret->SHA-256 re-challenge path so a
+ * bogus retry is always forced through the final 403, never re-challenged. */
+static struct sofia_peer *sofia_bogus_peer;
+#define SOFIA_BOGUS_PEER_SECRET "\x01-sofia-bogus-peer-impossible-secret-no-client-can-ever-know-\x01"
+
 /* Auto-add (onoff=1) / remove (onoff=0) regcontext dialplan extensions on a peer's
  * register/qualify transition. Multi-ext via "&", per-ext @context, name fallback,
  * idempotent. (chan_sip's cleanup_stale_contexts sweep is not mirrored.) */
@@ -7883,18 +7893,19 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			}
 		}
 	} else if (sofia_cfg.alwaysauthreject) {
-		/* Unknown peer: challenge (fresh nonce + timing-equalized) so the response
-		 * is indistinguishable from known-peer-bad-password (RFC 3261 §22.4).
-		 *
-		 * RESIDUAL-RACE FENCE: nh is bound to this fresh pvt, so our ao2_ref(pvt,-1)
-		 * below would run the destructor -> nua_handle_destroy -> nta_incoming_destroy
-		 * auto-500, racing ahead of the deferred 401 timer. Pass `pvt` as pvt_ref so the
-		 * scheduler takes an ADDITIONAL ao2 ref pinning the pvt (and its bound handle +
-		 * NTA server request) until the 401 is queued; dropped at fire/immediate/failure/
-		 * unload. No reap flag — the handle is BOUND, the pvt owns its destruction. */
+		/* Unknown peer: run the SAME digest verifier against the static bogus peer so a no-auth
+		 * request is challenged (401) and a credentialed retry gets the IDENTICAL 400/401-stale/403
+		 * classification — and timing — a known peer with a bad password would, closing the
+		 * account-enumeration oracle (chan_sip bogus_peer parity, chan_sip.c:15405-15452). The
+		 * verifier emits SYNCHRONOUSLY inside this handler, so no deferred-reject / residual-race
+		 * fence is needed: the response is already queued before we drop the pvt ref (identical to
+		 * the matched-peer path above). */
 		char realm_buf[MAXHOSTNAMELEN];
 		const char *realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
-		sofia_send_auth_challenge(nua, nh, sip, realm, "INVITE", "UnknownPeer", pvt, 0);
+		sip_authorization_t const *au = sip->sip_authorization
+			? sip->sip_authorization
+			: (sip_authorization_t const *)sip->sip_proxy_authorization;
+		sofia_verify_digest_auth(sofia_bogus_peer, nua, nh, sip, au, "INVITE", realm);
 		ao2_ref(pvt, -1);
 		return;
 	} else if (!sofia_cfg.allowguest) {
@@ -9961,6 +9972,12 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	const char *auth_algorithm;
 	const char *auth_username;
 	int using_qop;
+	/* The static bogus peer (unknown-peer + alwaysauthreject path): run through this verifier so the
+	 * response is indistinguishable from a known peer. When is_bogus we SKIP the username-mismatch
+	 * early-return and FORCE the final response compare to fail, so a credentialed retry always lands
+	 * on the same full-hash 403 as a real bad password (no status OR timing oracle); every other
+	 * precheck (missing-field 400, stale-nonce 401, no-auth 401) runs unchanged. */
+	int is_bogus = (peer == sofia_bogus_peer);
 	unsigned int new_nc = 0;
 	time_t nonce_issue_ts = 0;	/* issue time parsed from the validated stateless nonce; fed to the per-nonce replay cache */
 	int algorithm = SOFIA_DIGEST_MD5;  /* RFC 2617 backward-compat default */
@@ -10164,7 +10181,10 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	 * is not a secret -> plain compare; a missing username is a malformed digest (400). */
 	{
 		const char *expected_user = !ast_strlen_zero(peer->defaultuser) ? peer->defaultuser : peer->name;
-		if (!auth_username || strcmp(auth_username, expected_user) != 0) {
+		/* is_bogus: an unknown user never matches the bogus peer's name; skip the mismatch 403 so we
+		 * fall through to the full-hash forced-fail 403 (timing parity). A MISSING username is still a
+		 * malformed digest -> 400 for both, exactly as a known peer classifies it. */
+		if (!auth_username || (strcmp(auth_username, expected_user) != 0 && !is_bogus)) {
 			char snap_name[80], snap_exp[128];
 			int missing = !auth_username;
 			ast_copy_string(snap_name, peer->name, sizeof(snap_name));
@@ -10237,7 +10257,10 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	}
 
 	/* Constant-time compare over hash_len_hex (32 MD5 / 64 SHA-256). */
-	if (!auth_response || sofia_ct_memcmp(auth_response, expected_hash, hash_len_hex) != 0) {
+	/* is_bogus: the full HA1/HA2/response hash above already ran (timing parity with a real bad
+	 * password); force the 403 here so an unknown user can never authenticate even if its response
+	 * somehow collided with the impossible-secret hash. */
+	if (is_bogus || !auth_response || sofia_ct_memcmp(auth_response, expected_hash, hash_len_hex) != 0) {
 		ast_mutex_unlock(&peer->lock);
 		nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
 		ast_verbose("Sofia: %s auth failed for '%s' - bad response\n",
@@ -10377,7 +10400,18 @@ struct sofia_peer *sofia_message_authenticate_sender(nua_t *nua, nua_handle_t *n
 	if (sofia_cfg.alwaysauthreject) {
 		char realm_buf[MAXHOSTNAMELEN];
 		const char *realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
-		sofia_send_auth_challenge(nua, nh, sip, realm, "MESSAGE", "UnknownPeer", NULL, 1);
+		sip_authorization_t const *au = sip->sip_authorization
+			? sip->sip_authorization
+			: (sip_authorization_t const *)sip->sip_proxy_authorization;
+		/* SAME verifier vs the static bogus peer (synchronous) -> no-auth 401 / credentialed retry
+		 * 403, identical to a known peer with a bad password (enumeration-oracle close). Then reap the
+		 * fresh UNBOUND MESSAGE handle the stack made for this out-of-dialog request — the old
+		 * sofia_send_auth_challenge did this via reap_handle_on_fire; the synchronous verify does not,
+		 * so reap here (same magic==NULL guard as the other MESSAGE reap paths). */
+		sofia_verify_digest_auth(sofia_bogus_peer, nua, nh, sip, au, "MESSAGE", realm);
+		if (nua_handle_magic(nh) == NULL) {
+			nua_handle_destroy(nh);
+		}
 		if (challenged) {
 			*challenged = 1;
 		}
@@ -11302,9 +11336,14 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 	peer = sofia_find_peer(user);
 	if (!peer) {
 		if (sofia_cfg.alwaysauthreject) {
-			/* REGISTER: no pvt pin / no reap — unaffected by the residual-race fence. */
-			sofia_send_auth_challenge(nua, nh, sip, realm, "REGISTER", "UnknownPeer", NULL, 0);
-			ast_verbose("Sofia: REGISTER from unknown peer '%s' — 401 challenge (alwaysauthreject)\n", user);
+			/* Unknown peer: SAME verifier vs the static bogus peer (synchronous) — a no-auth REGISTER
+			 * is challenged 401 and a credentialed retry gets the IDENTICAL 400/401-stale/403 (and
+			 * timing) a known peer with a bad password would, closing the enumeration oracle. */
+			sip_authorization_t const *au = sip->sip_authorization
+				? sip->sip_authorization
+				: (sip_authorization_t const *)sip->sip_proxy_authorization;
+			sofia_verify_digest_auth(sofia_bogus_peer, nua, nh, sip, au, "REGISTER", realm);
+			ast_verbose("Sofia: REGISTER from unknown peer '%s' — bogus-peer verify (alwaysauthreject)\n", user);
 		} else {
 			nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
 			ast_verbose("Sofia: Registration rejected for unknown peer '%s'\n", user);
@@ -19632,6 +19671,18 @@ static int load_module(void)
 	sofia_nonce_secret_init();
 	sofia_nonce_cache = ao2_container_alloc(SOFIA_NONCE_CACHE_BUCKETS, sofia_nonce_cache_hash, sofia_nonce_cache_cmp);
 
+	/* Static bogus peer for the alwaysauthreject anti-enumeration path (sofia_verify_digest_auth
+	 * is_bogus): unknown-peer requests are run through the SAME verifier against it, with an
+	 * unmatchable secret, so a credentialed retry always lands on the same 403 as a known bad
+	 * password. Built here, BEFORE sofia_thread accepts SIP, so the callsites never see NULL. */
+	sofia_bogus_peer = sofia_peer_alloc("");
+	if (!sofia_bogus_peer) {
+		ast_log(LOG_ERROR, "Unable to allocate the Sofia bogus auth peer\n");
+		rc = AST_MODULE_LOAD_FAILURE;
+		goto err_cleanup;
+	}
+	ast_string_field_set(sofia_bogus_peer, secret, SOFIA_BOGUS_PEER_SECRET);
+
 	/* Container allocation — checked individually; the err_cleanup ladder unwinds in reverse. */
 	peers = ao2_container_alloc(MAX_PEER_BUCKETS, peer_hash_fn, peer_cmp_fn);
 	if (!peers) {
@@ -19840,6 +19891,10 @@ err_cleanup:
 	}
 
 	/* Containers — destructors release any peers/dialogs/blacklist the parse populated. */
+	if (sofia_bogus_peer) {
+		ao2_ref(sofia_bogus_peer, -1);
+		sofia_bogus_peer = NULL;
+	}
 	sofia_blacklist_destroy();
 	sofia_presence_destroy();
 	sofia_publications_destroy();
@@ -19970,6 +20025,10 @@ static int unload_module(void)
 	if (dialogs) {
 		ao2_ref(dialogs, -1);
 		dialogs = NULL;
+	}
+	if (sofia_bogus_peer) {
+		ao2_ref(sofia_bogus_peer, -1);
+		sofia_bogus_peer = NULL;
 	}
 	sofia_blacklist_destroy();
 	sofia_presence_destroy();
