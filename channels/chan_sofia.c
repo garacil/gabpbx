@@ -13483,12 +13483,29 @@ struct ast_channel *sofia_find_bridged_channel(struct sofia_pvt *op)
 		while ((p = ao2_iterator_next(&it))) {
 			if (p != op) {
 				struct ast_channel *po;
+				/* Ref the sibling owner under its pvt lock (guards p->owner NULLing in
+				 * sofia_hangup), then DROP p->lock before locking the sibling CHANNEL to read
+				 * its linkedid. linkedid is an AST_STRING_FIELD whose pool a concurrent
+				 * masquerade/rename frees under the sibling's CHANNEL lock (not p->lock), so the
+				 * strcmp must run under po's channel lock. channel->pvt is the canonical order —
+				 * po must not be locked while p->lock is still held. */
 				ast_mutex_lock(&p->lock);
 				po = p->owner;
-				if (po && po->linkedid && !strcmp(po->linkedid, linkedid_copy)) {
-					bridged = ast_channel_ref(po);
+				if (po) {
+					ast_channel_ref(po);
 				}
 				ast_mutex_unlock(&p->lock);
+				if (po) {
+					int match;
+					ast_channel_lock(po);
+					match = (po->linkedid && !strcmp(po->linkedid, linkedid_copy));
+					ast_channel_unlock(po);
+					if (match) {
+						bridged = po;	/* keep the ref taken above */
+					} else {
+						ast_channel_unref(po);
+					}
+				}
 			}
 			ao2_ref(p, -1);
 			if (bridged) {
@@ -13549,13 +13566,32 @@ static struct ast_channel *sofia_find_inbound_sibling_by_linkedid(struct sofia_p
 	while ((p = ao2_iterator_next(&it))) {
 		if (p != answered) {
 			struct ast_channel *po;
+			int inbound;
+			/* Ref the sibling owner + read the pvt-owned p->outgoing under the pvt lock; then DROP
+			 * p->lock and lock the sibling CHANNEL to read po->tech + po->linkedid, which a
+			 * concurrent masquerade/rename mutates/frees under the channel lock (not p->lock).
+			 * channel->pvt is canonical, so po is locked only after p->lock is released. */
 			ast_mutex_lock(&p->lock);
+			inbound = !p->outgoing;
 			po = p->owner;
-			if (!p->outgoing && po && po->tech == &sofia_tech
-					&& po->linkedid && !strcmp(po->linkedid, linkedid_copy)) {
-				found = ast_channel_ref(po);
+			if (inbound && po) {
+				ast_channel_ref(po);
+			} else {
+				po = NULL;
 			}
 			ast_mutex_unlock(&p->lock);
+			if (po) {
+				int match;
+				ast_channel_lock(po);
+				match = (po->tech == &sofia_tech
+						&& po->linkedid && !strcmp(po->linkedid, linkedid_copy));
+				ast_channel_unlock(po);
+				if (match) {
+					found = po;	/* keep the ref taken above */
+				} else {
+					ast_channel_unref(po);
+				}
+			}
 		}
 		ao2_ref(p, -1);
 		if (found) {
@@ -13754,12 +13790,27 @@ void *sofia_dc_pair_bridged(struct sofia_pvt *self_pvt, void *self_dc)
 		while ((p = ao2_iterator_next(&it))) {
 			if (p != self_pvt) {
 				struct ast_channel *po;
+				/* Ref the sibling owner under its pvt lock, then DROP p->lock before locking the
+				 * sibling CHANNEL to read its linkedid: linkedid is an AST_STRING_FIELD whose pool
+				 * a concurrent masquerade/rename frees under the channel lock (not p->lock).
+				 * channel->pvt is canonical, so po is locked only after p->lock is released. */
 				ast_mutex_lock(&p->lock);
 				po = p->owner;
-				if (po && po->linkedid && !strcmp(po->linkedid, linkedid_copy)) {
-					far_chan = ast_channel_ref(po);
+				if (po) {
+					ast_channel_ref(po);
 				}
 				ast_mutex_unlock(&p->lock);
+				if (po) {
+					int match;
+					ast_channel_lock(po);
+					match = (po->linkedid && !strcmp(po->linkedid, linkedid_copy));
+					ast_channel_unlock(po);
+					if (match) {
+						far_chan = po;	/* keep the ref taken above */
+					} else {
+						ast_channel_unref(po);
+					}
+				}
 			}
 			ao2_ref(p, -1);
 			if (far_chan) {
