@@ -12,9 +12,10 @@ Signaling / media:
   re-INVITE's 2xx/reject handling stays isolated — a hold re-INVITE never disturbs directmedia redirip or
   T.38 state, and vice versa.
 
-  Shipped **experimental and off by default**: the disabled path is unchanged from prior releases, and the
-  enabled positive path (the emitted `a=sendonly` re-INVITE) was not yet confirmed end to end in the test
-  environment. Validate in your environment before enabling.
+  Shipped **experimental and off by default**: the disabled path is unchanged from prior releases. The
+  enabled positive path (the emitted `a=sendonly` re-INVITE) is **validated end to end** in a controlled
+  test environment; it stays off by default pending production soak, so validate in your own environment
+  before enabling.
 
 
 ## 1.5.10 — forked-call early media (experimental, opt-in)
