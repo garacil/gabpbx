@@ -10,6 +10,28 @@ unchanged, so any consumer built against 2.0.x needs no rebuild. This is a
 dependency/build update only — no GABPBX source change. Rebuild Sofia-SIP from
 the new tag before building GABPBX. See https://github.com/garacil/sofia-sip.
 
+## 1.5.14 — `sip show version` CLI (chan_sofia)
+
+New CLI command that reports which Sofia-SIP library `chan_sofia` is using:
+
+```
+*CLI> sip show version
+
+Sofia-SIP:
+----------
+  Built against:   2.0.3 (sofia-sip-2.0.3)
+  Runtime version: sofia-sip-2.0.3
+  Loaded library:  /usr/local/lib/libsofia-sip-ua.so.0
+```
+
+- **Built against** — the compile-time version from the Sofia-SIP headers
+  (`SOFIA_SIP_VERSION`), i.e. the release `chan_sofia` was built with.
+- **Runtime version** — a symbol exported by the shared object actually loaded
+  (`sofia_sip_name_version`), so a value that differs from *Built against* flags
+  a library newer or older than the headers `chan_sofia` was compiled with.
+- **Loaded library** — the resolved path of that shared object (the ABI-stable
+  soname link), confirming which file backs the running stack.
+
 ## 1.5.13 — blacklist-drop SIP handle leak (chan_sofia)
 
 A follow-up to the 1.5.12 memory-safety audit. Under an active SIP brute-force — the exact

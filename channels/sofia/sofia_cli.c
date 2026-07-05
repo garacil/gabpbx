@@ -13,6 +13,7 @@
 
 #include "gabpbx.h"
 #include <regex.h>
+#include <dlfcn.h>	/* dladdr: resolve the path of the loaded libsofia-sip-ua */
 #include "gabpbx/astobj2.h"
 #include "gabpbx/cli.h"
 #include "gabpbx/lock.h"
@@ -33,6 +34,7 @@
 #include <sofia-sip/tport.h>
 #include <sofia-sip/tport_tag.h>
 #include <sofia-sip/nta_tag.h>
+#include <sofia-sip/sofia_features.h>	/* SOFIA_SIP_VERSION / SOFIA_SIP_NAME_VERSION */
 
 #include "include/chan_sofia_internal.h"
 #include "include/sofia_publish.h"
@@ -912,6 +914,43 @@ char *sofia_cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 			ast_strlen_zero(sofia_cfg.publish_password) ? "(none)" : "<set>");
 	}
 	ast_cli(a->fd, "\n");
+
+	return CLI_SUCCESS;
+}
+
+char *sofia_cli_show_version(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	Dl_info dli;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "sip show version";
+		e->usage =
+			"Usage: sip show version\n"
+			"       Show the Sofia-SIP library version chan_sofia was built against\n"
+			"       and the path of the shared library actually loaded at runtime.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	ast_cli(a->fd, "\nSofia-SIP:\n");
+	ast_cli(a->fd, "----------\n");
+	/* Compile-time version from <sofia-sip/sofia_features.h>, generated from the
+	 * library's configure PACKAGE_VERSION: the release chan_sofia was built against. */
+	ast_cli(a->fd, "  Built against:   %s (%s)\n", SOFIA_SIP_VERSION, SOFIA_SIP_NAME_VERSION);
+	/* Runtime version: a data symbol exported by the loaded library itself, so this is
+	 * the version compiled into the shared object actually mapped into this process. If
+	 * it differs from "Built against", the running .so is newer/older than the headers
+	 * chan_sofia was compiled with (rebuild chan_sofia to match). */
+	ast_cli(a->fd, "  Runtime version: %s\n", sofia_sip_name_version);
+	/* Confirm which file backs the running stack: resolve a library symbol to its
+	 * shared object. The soname is ABI-stable, so the path stays at the .so.0 link. */
+	if (dladdr((void *)nua_create, &dli) && dli.dli_fname) {
+		ast_cli(a->fd, "  Loaded library:  %s\n", dli.dli_fname);
+	} else {
+		ast_cli(a->fd, "  Loaded library:  (unknown)\n");
+	}
 
 	return CLI_SUCCESS;
 }

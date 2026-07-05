@@ -16840,6 +16840,7 @@ static struct ast_cli_entry cli_sofia[] = {
 	AST_CLI_DEFINE(sofia_cli_show_peer, "Show detailed Sofia-SIP peer info"),
 	AST_CLI_DEFINE(sofia_cli_show_inuse, "Show SIP peer call usage counters"),
 	AST_CLI_DEFINE(sofia_cli_show_settings, "Show Sofia-SIP global settings"),
+	AST_CLI_DEFINE(sofia_cli_show_version, "Show Sofia-SIP library version"),
 	AST_CLI_DEFINE(sofia_cli_prune_realtime, "Prune cached Realtime users/peers"),
 	AST_CLI_DEFINE(sofia_set_debug, "Enable Sofia debug logging"),
 	AST_CLI_DEFINE(sofia_cli_reload, "Reload sofia.conf (chan_sip-parity alias for `module reload chan_sofia.so`)"),

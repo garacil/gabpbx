@@ -17,6 +17,7 @@ char *sofia_cli_show_peers(struct ast_cli_entry *e, int cmd, struct ast_cli_args
 char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 char *sofia_cli_show_inuse(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 char *sofia_cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+char *sofia_cli_show_version(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 char *sofia_set_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 char *sofia_cli_reload(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 char *sofia_cli_prune_realtime(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
