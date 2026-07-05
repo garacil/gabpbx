@@ -14245,6 +14245,47 @@ cleanup:
 /* RFC 3515 NOTIFY message/sipfrag transfer-progress to the transferer (chan_sip
  * parity). terminate=0 -> in-progress (substate active); terminate=1 -> terminal
  * (substate terminated;reason=noresource). Also emits AMI ReferProgress. */
+/* Snapshot the owner channel's name (+ optional uniqueid) for an off-thread AMI/log emit. The
+ * channel `name` is a mutable AST_STRING_FIELD whose backing pool a concurrent masquerade/rename
+ * frees under the OWNER's CHANNEL lock — never under op->lock — so reading op->owner->name under only
+ * op->lock (which just guards op->owner NULLing in sofia_hangup) is a torn-read/UAF race. Ref the
+ * owner under op->lock, DROP op->lock, then read under the channel lock (channel->pvt canonical
+ * order; caller must NOT hold op->lock). uniqueid is immutable post-alloc but copied here for
+ * convenience when requested. Both buffers are set to "" when there is no owner. */
+static void sofia_snapshot_owner_id(struct sofia_pvt *op, char *name, size_t name_sz,
+		char *uid, size_t uid_sz)
+{
+	struct ast_channel *owner;
+
+	if (name && name_sz) {
+		name[0] = '\0';
+	}
+	if (uid && uid_sz) {
+		uid[0] = '\0';
+	}
+	if (!op) {
+		return;
+	}
+	ast_mutex_lock(&op->lock);
+	owner = op->owner;
+	if (owner) {
+		ast_channel_ref(owner);
+	}
+	ast_mutex_unlock(&op->lock);
+	if (!owner) {
+		return;
+	}
+	ast_channel_lock(owner);
+	if (name && name_sz) {
+		ast_copy_string(name, owner->name, name_sz);
+	}
+	if (uid && uid_sz) {
+		ast_copy_string(uid, owner->uniqueid, uid_sz);
+	}
+	ast_channel_unlock(owner);
+	ast_channel_unref(owner);
+}
+
 static void sofia_send_refer_notify(struct sofia_pvt *op, const char *sipfrag_status, int terminate)
 {
 	char payload[64];
@@ -14272,11 +14313,7 @@ static void sofia_send_refer_notify(struct sofia_pvt *op, const char *sipfrag_st
 		/* Snapshot owner name under op->lock (sofia_hangup nulls op->owner under it)
 		 * before the AMI emit. */
 		char ev_name[128] = "";
-		ast_mutex_lock(&op->lock);
-		if (op->owner) {
-			ast_copy_string(ev_name, op->owner->name, sizeof(ev_name));
-		}
-		ast_mutex_unlock(&op->lock);
+		sofia_snapshot_owner_id(op, ev_name, sizeof(ev_name), NULL, 0);
 		manager_event(EVENT_FLAG_SYSTEM, "ReferProgress",
 			"Channel: %s\r\n"
 			"Peer: SIP/%s\r\n"
@@ -14338,12 +14375,7 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 			 * op->owner under it) before the AMI emit. */
 			char ev_name[128] = "";
 			char ev_uniqueid[150] = "";
-			ast_mutex_lock(&op->lock);
-			if (op->owner) {
-				ast_copy_string(ev_name, op->owner->name, sizeof(ev_name));
-				ast_copy_string(ev_uniqueid, op->owner->uniqueid, sizeof(ev_uniqueid));
-			}
-			ast_mutex_unlock(&op->lock);
+			sofia_snapshot_owner_id(op, ev_name, sizeof(ev_name), ev_uniqueid, sizeof(ev_uniqueid));
 			manager_event(EVENT_FLAG_CALL, "TransferRejected",
 				"Channel: %s\r\n"
 				"Uniqueid: %s\r\n"
@@ -14669,6 +14701,13 @@ static void sofia_process_info(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *o
 		}
 		ast_mutex_unlock(&op->lock);
 		if (owner) {
+			/* owner->name is a mutable AST_STRING_FIELD (a masquerade/rename frees the pool under
+			 * the CHANNEL lock, not op->lock); snapshot it here under the channel lock and use the
+			 * copy in the logs below (same owner ref that receives the queued frame). */
+			char owner_name[128];
+			ast_channel_lock(owner);
+			ast_copy_string(owner_name, owner->name, sizeof(owner_name));
+			ast_channel_unlock(owner);
 			if (is_flash) {
 				struct ast_frame f = {
 					.frametype = AST_FRAME_CONTROL,
@@ -14677,7 +14716,7 @@ static void sofia_process_info(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *o
 				};
 				ast_queue_frame(owner, &f);
 				if (sofia_dtmflog)
-					ast_log(LOG_NOTICE, "Sofia: DTMF FLASH received via SIP INFO on %s\n", owner->name);
+					ast_log(LOG_NOTICE, "Sofia: DTMF FLASH received via SIP INFO on %s\n", owner_name);
 				else if (sofia_debug)
 					ast_verbose("Sofia: Received DTMF FLASH via SIP INFO\n");
 			} else {
@@ -14693,7 +14732,7 @@ static void sofia_process_info(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *o
 				/* "sip set debug dtmf on" → operator-visible NOTICE (CLI + messages); else the legacy
 				 * sofia_debug verbose. Same log family as the RFC2833/inband path in sofia_read. */
 				if (sofia_dtmflog)
-					ast_log(LOG_NOTICE, "Sofia: DTMF '%c' received via SIP INFO on %s\n", out_digit, owner->name);
+					ast_log(LOG_NOTICE, "Sofia: DTMF '%c' received via SIP INFO on %s\n", out_digit, owner_name);
 				else if (sofia_debug)
 					ast_verbose("Sofia: Received DTMF '%c' via SIP INFO (duration=%u)\n", out_digit, duration);
 			}
@@ -15432,11 +15471,10 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			already_up = (pvt->state == SOFIA_DIALOG_STATE_UP);
 			pvt->session_negotiated_expires = sip->sip_session_expires->x_delta;
 			pvt->session_last_refresh_at = time(NULL);
-			if (pvt->owner) {
-				ast_copy_string(own_name, pvt->owner->name, sizeof(own_name));
-				ast_copy_string(own_uniqueid, pvt->owner->uniqueid, sizeof(own_uniqueid));
-			}
 			ast_mutex_unlock(&pvt->lock);
+			/* owner name/uniqueid: snapshot under the CHANNEL lock (name is a mutable stringfield),
+			 * NOT pvt->lock — same owner-identity race as the REFER AMI emits (folded into id98). */
+			sofia_snapshot_owner_id(pvt, own_name, sizeof(own_name), own_uniqueid, sizeof(own_uniqueid));
 			if (already_up) {
 				manager_event(EVENT_FLAG_CALL, "SessionTimerRefresh",
 					"Channel: %s\r\n"
