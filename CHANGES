@@ -1,11 +1,14 @@
-## Build — Sofia-SIP dependency pinned to `v2.0.1` (warning-clean)
+## Build — Sofia-SIP dependency pinned to `v2.0.3` (warning-clean)
 
 `chan_sofia` builds against our Sofia-SIP fork, now pinned to the tag
-`v2.0.1` — a warning-clean build of Sofia-SIP 1.13.17 that compiles
-absolutely clean (zero warnings, zero errors) on GCC 14 and OpenSSL 3, with no
-behavior or ABI change (soname unchanged, `0.6.0`). This is a dependency/build
-update only — no GABPBX source change. Rebuild Sofia-SIP from the new tag before
-building GABPBX. See https://github.com/garacil/sofia-sip.
+`v2.0.3` — a warning-clean build (zero warnings, zero errors on GCC 14 and
+OpenSSL 3) of our Sofia-SIP line. As of this tag the library reports its own
+fork version: `pkg-config --modversion sofia-sip-ua` returns `2.0.3` (earlier
+tags still reported the upstream base `1.13.17`). No behavior or ABI change —
+the API series header directory (`sofia-sip-1.13`) and the soname (`0.6.0`) are
+unchanged, so any consumer built against 2.0.x needs no rebuild. This is a
+dependency/build update only — no GABPBX source change. Rebuild Sofia-SIP from
+the new tag before building GABPBX. See https://github.com/garacil/sofia-sip.
 
 ## 1.5.13 — blacklist-drop SIP handle leak (chan_sofia)
 
