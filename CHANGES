@@ -1,3 +1,48 @@
+## 1.5.12 — security hardening (chan_sofia audit)
+
+A focused security-hardening release from a full audit of `chan_sofia` (correctness, memory
+safety, and exploit-class review). Eight fixes; no configuration or behavior change for a
+correctly-configured deployment.
+
+Denial of service / resource exhaustion:
+- **Out-of-dialog OPTIONS no longer leak a SIP handle.** An out-of-dialog `OPTIONS` — the common
+  registrar/proxy keep-alive — is auto-answered `200` by the stack, but the fresh handle it creates
+  was never destroyed: every keep-alive leaked a handle and its memory pool, unbounded, remote, and
+  unauthenticated. The handler now reaps the unbound handle, and no longer issues a redundant manual
+  response (which had emitted a spurious internal "Non-Existing Request" 500 per OPTIONS).
+- **The inbound DataChannel receive queue is now bounded.** A peer with an established WebRTC
+  DataChannel that flooded SCTP application data faster than it drained grew the shared worker-lane
+  queue and its per-packet heap copies without limit (a memory-exhaustion vector that also stalled
+  every other DataChannel). A per-DataChannel in-flight cap now drops under pressure — SCTP
+  retransmits, so a drop is loss-safe.
+
+Authentication:
+- **`alwaysauthreject` no longer distinguishes existing from non-existent accounts.** An unknown user
+  was answered with a fresh `401` challenge while a known user with a bad password was answered `403`,
+  so a credentialed retry revealed which accounts exist. Unknown-user authentication now runs through
+  the same digest verifier against an internal bogus account (matching `chan_sip`), so the
+  `400`/`401`/`403` outcome — and its timing — is identical for existing and non-existent users.
+- **Delayed authentication rejections are now actually transmitted.** The anti-enumeration delayed
+  `401`/`403` was bound to the request currently being processed, which does not exist inside the timer
+  callback that fires it, so the stack silently dropped every delayed reject (an unknown peer received
+  no response at all). The reject is now bound to the saved request and reaches the wire.
+- **Stateless authentication nonces are parsed strictly.** A nonce carrying trailing bytes after its
+  canonical form was accepted by the validator while the digest and the replay cache keyed on the full
+  raw string; the parser now rejects any non-canonical suffix.
+
+Concurrency (crash safety):
+- **Channel identity is read under the channel lock.** Several dialog-walk finders and off-thread AMI /
+  log emits read a peer channel's name or linked-call id while holding only the SIP private lock; a
+  concurrent masquerade or rename frees that string under the *channel* lock, so the read could touch
+  freed memory (a torn read / use-after-free). All such reads now take the channel lock.
+
+Protocol correctness:
+- **A malformed or out-of-dialog REFER is rejected before it is accepted.** A `REFER` with no
+  `Refer-To`, or targeting no active call, was answered `202 Accepted` first — creating an implicit
+  transfer subscription the sender then waits on for progress that never comes — and only afterwards
+  dropped. It is now rejected `400 Bad Request` / `481 Call/Transaction Does Not Exist` before the 202.
+
+
 ## 1.5.11 — local-hold offer direction (experimental, opt-in)
 
 Signaling / media:
