@@ -3631,8 +3631,9 @@ static void sofia_create_peer_hint(struct sofia_peer *peer, const char *source)
 	char hintsip[AST_MAX_EXTENSION + 5];
 	const char *registrar;
 
-	if (!peer || ast_strlen_zero(peer->subscribecontext) || ast_strlen_zero(peer->regexten)) {
-		return; /* both fields required */
+	if (!peer || ast_strlen_zero(peer->regexten)
+			|| (ast_strlen_zero(peer->subscribecontext) && ast_strlen_zero(peer->context))) {
+		return; /* need a regexten and a context to place the hint (subscribecontext, else context) */
 	}
 	snprintf(hintsip, sizeof(hintsip), "SIP/%s", peer->name);
 	registrar = (source && !strcmp(source, "realtime")) ? "realtime_peer" : "sofia_config_peer";
@@ -3640,8 +3641,8 @@ static void sofia_create_peer_hint(struct sofia_peer *peer, const char *source)
 	ast_copy_string(multi, peer->regexten, sizeof(multi));
 	stringp = multi;
 	while ((ext = strsep(&stringp, "&"))) {
-		const char *ctxname = peer->subscribecontext;
-		struct ast_context *hintcontext;
+		/* Hint context: subscribecontext first, else the peer context (a per-token @ctx overrides). */
+		const char *ctxname = S_OR(peer->subscribecontext, peer->context);
 
 		if (ast_strlen_zero(ext)) {
 			continue;
@@ -3655,14 +3656,26 @@ static void sofia_create_peer_hint(struct sofia_peer *peer, const char *source)
 			}
 			ctxname = ctx;
 		}
-		hintcontext = ast_context_find_or_create(NULL, NULL, ctxname, "chan_sofia");
-		if (!hintcontext) {
-			ast_log(LOG_WARNING, "Sofia: failed to find_or_create hint context '%s' for peer '%s'\n",
-				ctxname, peer->name);
+		/* Idempotent: skip if the hint already exists in the authoritative context (cheap; the add
+		 * below is safe on a duplicate too, this just avoids a benign "already in use" log on a
+		 * register/SUBSCRIBE race). */
+		if (ast_get_hint(NULL, 0, NULL, 0, NULL, ctxname, ext)) {
 			continue;
 		}
-		ast_add_extension2(hintcontext, 0, ext, PRIORITY_HINT, NULL, NULL,
-			hintsip, NULL, NULL, registrar);
+		/* Add the hint BY NAME into the EXISTING dialplan context. ast_add_extension() resolves the
+		 * authoritative contexts_table object under conlock and adds atomically; it NEVER creates a
+		 * context (returns non-zero if ctxname is not a loaded dialplan context). This replaces
+		 * ast_context_find_or_create(), whose check-then-act (rdlock lookup, unlock, wrlock insert)
+		 * lost same-name races and left the hint on a list-only ORPHAN context that the presence
+		 * lookup (contexts_table only) could never resolve — the hint was "created" yet the SUBSCRIBE
+		 * still 404'd, and orphans accumulated as duplicates. The subscribecontext must therefore name
+		 * a context that already exists in the dialplan (chan_sip custom BLF-hint parity). */
+		if (ast_add_extension(ctxname, 0, ext, PRIORITY_HINT, NULL, NULL,
+				hintsip, NULL, NULL, registrar)) {
+			ast_debug(2, "Sofia: hint %s@%s not added for peer '%s' (context not loaded in the dialplan)\n",
+				ext, ctxname, peer->name);
+			continue;
+		}
 		manager_event(EVENT_FLAG_SYSTEM, "HintCreated",
 			"Peer: SIP/%s\r\n"
 			"Extension: %s\r\n"
@@ -13199,17 +13212,36 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	ao2_ref(peer, -1);
 	peer = NULL;
 
-	/* The watched extension must have a dialplan hint, else nothing to watch. A watcher subscribing to an
-	 * exten with no hint is a NORMAL/expected condition (not an error), so this is debug-only — at NOTICE it
-	 * floods the log on every such SUBSCRIBE. Visible with `sip set debug on`. */
+	/* The watched extension needs a dialplan hint, else nothing to watch. If none exists yet, the target
+	 * may be a configured (realtime) peer whose hint has not been created — it never registered/was
+	 * looked-up, or a mass-reboot SUBSCRIBE raced ahead of the peer build. Materialize it ON DEMAND so a
+	 * SUBSCRIBE to ANY configured target is accepted instead of 404 (phones do NOT retry a 404):
+	 * sofia_find_peer() resolves/builds the peer and sofia_create_peer_hint() adds its hint BY NAME into
+	 * the existing dialplan context (ast_add_extension — no ast_context_find_or_create phantom-context
+	 * race), then re-check. Runs synchronously here on the single sofia_thread, so no cross-thread create
+	 * race. Only a genuinely unknown/unwatchable exten still 404s (a NORMAL condition, kept debug-only —
+	 * at NOTICE it floods the log; visible with `sip set debug on`). */
 	if (!ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, l_context, to_user)) {
-		if (sofia_debug) {
-			ast_verbose("Sofia presence: no hint for %s@%s (watcher SIP/%s) — 404\n",
-				to_user, l_context, l_peername);
+		/* Local-domain guard: only turn the To-user into a realtime lookup for our own domain(s)
+		 * (empty domain_list = no configured local-domain truth -> permissive, as the INVITE path). */
+		if (AST_LIST_EMPTY(&domain_list) || ast_strlen_zero(to_host)
+				|| sofia_check_sip_domain(to_host)) {
+			struct sofia_peer *target = sofia_find_peer(to_user);
+
+			if (target) {
+				sofia_create_peer_hint(target, "realtime");
+				ao2_ref(target, -1);
+			}
 		}
-		nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
-		sofia_subscribe_reject_reap(nh);	/* reap the challenge handle */
-		return;
+		if (!ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, l_context, to_user)) {
+			if (sofia_debug) {
+				ast_verbose("Sofia presence: no hint for %s@%s (watcher SIP/%s) — 404\n",
+					to_user, l_context, l_peername);
+			}
+			nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
+			sofia_subscribe_reject_reap(nh);	/* reap the challenge handle */
+			return;
+		}
 	}
 
 	/* Logical key: at most ONE sub per (watcher, watched-exten, context). Correlates a
