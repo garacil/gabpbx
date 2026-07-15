@@ -1,3 +1,44 @@
+## 1.5.16 — automatic BLF hints with reliable watchers (chan_sofia)
+
+Makes `chan_sofia` BLF work end to end: a watcher subscribing to any configured
+extension now gets a live lamp, including extensions that have not registered yet,
+without the duplicate/stranded hints seen before. No configuration change.
+
+### Root cause — hints were created on an unreachable "orphan" context
+
+`sofia_create_peer_hint()` placed the hint with `ast_context_find_or_create()`, a
+check-then-act (read-lock lookup, unlock, write-lock insert). Under a same-name race
+the loser was prepended to the context **list** but rejected from the context
+**hashtab** (duplicate name), becoming a list-only *orphan* context. Hint resolution
+(`ast_get_hint` → `pbx_find_extension` → `find_context`) reads the **hashtab only**, so
+a hint added to an orphan was unreachable: the `SUBSCRIBE` still answered `404` and the
+orphans piled up as duplicates (`dialplan show` and `core show hints` showed many
+same-named hints, all with `Watchers 0`, while the lookup resolved none of them).
+
+### Fix — add the hint by name into the authoritative context
+
+The hint is now added with **`ast_add_extension()` by context name**: it resolves the
+hashtab-authoritative context under the contexts lock and adds atomically, so the hint
+always lands exactly where the presence lookup resolves it (and survives a dialplan
+reload via the normal context merge). A peer's `subscribecontext` is often a BLF-only
+namespace the dialplan does not define, so the context is created **once** only when
+`ast_context_find()` shows it genuinely absent — an already-defined context (e.g.
+`default`) is never re-created and so can never be raced into a duplicate; and because
+the add is by name, even a concurrent create that left an empty orphan cannot strand
+the hint.
+
+### Automatic hints — materialize on register and on demand
+
+Hints are created eagerly at peer build (config load and realtime lookup/register) and,
+for a configured peer whose hint does not exist yet (never registered/looked-up), **on
+demand when a watcher subscribes**: the presence `SUBSCRIBE` resolves/builds the target
+(`sofia_find_peer`) and creates its hint synchronously on the SIP thread, then re-checks
+— so a BLF `SUBSCRIBE` to any configured target is accepted (`202`) instead of `404`
+(phones do not retry a `404`). The hint context resolves `subscribecontext` first, else
+the peer `context`; hint creation, removal (reload/prune) and the lookup all use the
+same resolution, and the peer string fields are snapshotted under the peer lock before
+the dialplan operations.
+
 ## Build — Sofia-SIP dependency pinned to `v2.0.4` (warning-clean)
 
 `chan_sofia` builds against our Sofia-SIP fork, now pinned to the tag
