@@ -3626,23 +3626,40 @@ static int sofia_parse_callingpres(const char *value)
  * symmetric sofia_remove_peer_hints() (called from reload/sweep/realtime-prune). */
 static void sofia_create_peer_hint(struct sofia_peer *peer, const char *source)
 {
+	char s_name[256];
+	char s_regexten[256];
+	char s_subctx[AST_MAX_CONTEXT];
+	char s_context[AST_MAX_CONTEXT];
 	char multi[256];
 	char *stringp, *ext, *ctx;
-	char hintsip[AST_MAX_EXTENSION + 5];
-	const char *registrar;
+	char hintsip[sizeof("SIP/") + 256];
+	const char *registrar, *defctx;
 
-	if (!peer || ast_strlen_zero(peer->regexten)
-			|| (ast_strlen_zero(peer->subscribecontext) && ast_strlen_zero(peer->context))) {
+	if (!peer) {
+		return;
+	}
+	/* Snapshot the reload-mutable stringfields under peer->lock (leaf) and release it BEFORE the PBX ops:
+	 * ast_add_extension takes conlock, and the SUBSCRIBE rescue now calls this on an existing (cache-hit)
+	 * peer that a concurrent reload could be mutating. Callers must NOT hold peer->lock (config releases it
+	 * before the call; the realtime lookup and the SUBSCRIBE materialize path hold no peer lock). */
+	ast_mutex_lock(&peer->lock);
+	ast_copy_string(s_name, peer->name, sizeof(s_name));
+	ast_copy_string(s_regexten, peer->regexten, sizeof(s_regexten));
+	ast_copy_string(s_subctx, peer->subscribecontext, sizeof(s_subctx));
+	ast_copy_string(s_context, peer->context, sizeof(s_context));
+	ast_mutex_unlock(&peer->lock);
+
+	if (ast_strlen_zero(s_regexten) || (ast_strlen_zero(s_subctx) && ast_strlen_zero(s_context))) {
 		return; /* need a regexten and a context to place the hint (subscribecontext, else context) */
 	}
-	snprintf(hintsip, sizeof(hintsip), "SIP/%s", peer->name);
+	snprintf(hintsip, sizeof(hintsip), "SIP/%s", s_name);
 	registrar = (source && !strcmp(source, "realtime")) ? "realtime_peer" : "sofia_config_peer";
+	defctx = S_OR(s_subctx, s_context);	/* hint context: subscribecontext first, else the peer context */
 
-	ast_copy_string(multi, peer->regexten, sizeof(multi));
+	ast_copy_string(multi, s_regexten, sizeof(multi));
 	stringp = multi;
 	while ((ext = strsep(&stringp, "&"))) {
-		/* Hint context: subscribecontext first, else the peer context (a per-token @ctx overrides). */
-		const char *ctxname = S_OR(peer->subscribecontext, peer->context);
+		const char *ctxname = defctx;	/* a per-token @ctx overrides below */
 
 		if (ast_strlen_zero(ext)) {
 			continue;
@@ -3651,7 +3668,7 @@ static void sofia_create_peer_hint(struct sofia_peer *peer, const char *source)
 			*ctx++ = '\0';
 			if (ast_strlen_zero(ext) || ast_strlen_zero(ctx)) {
 				ast_log(LOG_WARNING, "Sofia: peer '%s' regexten token has an empty exten/context — skipped\n",
-					peer->name);
+					s_name);
 				continue;
 			}
 			ctxname = ctx;
@@ -3673,7 +3690,7 @@ static void sofia_create_peer_hint(struct sofia_peer *peer, const char *source)
 		if (ast_add_extension(ctxname, 0, ext, PRIORITY_HINT, NULL, NULL,
 				hintsip, NULL, NULL, registrar)) {
 			ast_debug(2, "Sofia: hint %s@%s not added for peer '%s' (context not loaded in the dialplan)\n",
-				ext, ctxname, peer->name);
+				ext, ctxname, s_name);
 			continue;
 		}
 		manager_event(EVENT_FLAG_SYSTEM, "HintCreated",
@@ -3682,7 +3699,7 @@ static void sofia_create_peer_hint(struct sofia_peer *peer, const char *source)
 			"Context: %s\r\n"
 			"HintDevice: %s\r\n"
 			"Source: %s\r\n",
-			peer->name, ext, ctxname, hintsip,
+			s_name, ext, ctxname, hintsip,
 			source ? source : "unknown");
 	}
 }
@@ -17877,7 +17894,7 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		if (!ast_strlen_zero(peer->subscribecontext) && !ast_strlen_zero(peer->regexten)) {
 			char old_subctx[AST_MAX_CONTEXT];
 			char old_regexten[256];	/* a multi-token regexten SPEC, not one exten — match the 256 the splitter uses */
-			ast_copy_string(old_subctx, peer->subscribecontext, sizeof(old_subctx));
+			ast_copy_string(old_subctx, S_OR(peer->subscribecontext, peer->context), sizeof(old_subctx));
 			ast_copy_string(old_regexten, peer->regexten, sizeof(old_regexten));
 			sofia_remove_peer_hints(old_regexten, old_subctx, "sofia_config_peer");
 		}
@@ -19480,11 +19497,12 @@ static int sofia_peer_sweep_cb(void *obj, void *arg, int flags)
 	 * sofia_remove_peer_hints takes conlock (peers->conlock inverts the dialplan-merge conlock->peers
 	 * leg). Snapshot the hint spec into the caller's list; the caller removes it after the container
 	 * lock is dropped. (registrar matches sofia_create_peer_hint = "sofia_config_peer".) */
-	if (hints && !ast_strlen_zero(peer->subscribecontext) && !ast_strlen_zero(peer->regexten)) {
+	if (hints && !ast_strlen_zero(peer->regexten)
+			&& (!ast_strlen_zero(peer->subscribecontext) || !ast_strlen_zero(peer->context))) {
 		struct sofia_swept_hint *h = ast_calloc(1, sizeof(*h));
 		if (h) {
 			ast_copy_string(h->regexten, peer->regexten, sizeof(h->regexten));
-			ast_copy_string(h->subscribecontext, peer->subscribecontext, sizeof(h->subscribecontext));
+			ast_copy_string(h->subscribecontext, S_OR(peer->subscribecontext, peer->context), sizeof(h->subscribecontext));
 			AST_LIST_INSERT_HEAD(hints, h, list);
 		} else {
 			/* OOM: do NOT remove the hint here - that takes conlock UNDER the peers lock, the exact
