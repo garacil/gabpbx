@@ -2541,13 +2541,13 @@ static void sofia_pvt_destructor(void *obj)
 
 	/* Catchall call-counter DEC for orphaned pvts (flag-gated idempotency). Must run
 	 * BEFORE the peer ao2_ref drop — the counter helper needs pvt->peer.
-	 * hold_state is included so a pvt hung up WHILE ON HOLD whose inUse was already DEC'd
-	 * elsewhere (call_inc_done cleared) still reaches DEC_CALL_LIMIT to release its onHold. */
-	if (pvt->peer && (pvt->call_inc_done || pvt->ring_inc_done || pvt->hold_state)) {
+	 * hold_inc_done/hold_state are included so a pvt hung up WHILE ON HOLD whose inUse was already
+	 * DEC'd elsewhere (call_inc_done cleared) still reaches DEC_CALL_LIMIT to release its onHold. */
+	if (pvt->peer && (pvt->call_inc_done || pvt->ring_inc_done || pvt->hold_inc_done || pvt->hold_state)) {
 		if (pvt->ring_inc_done) {
 			sofia_update_call_counter(pvt, SOFIA_DEC_CALL_RINGING);
 		}
-		if (pvt->call_inc_done || pvt->hold_state) {
+		if (pvt->call_inc_done || pvt->hold_inc_done || pvt->hold_state) {
 			sofia_update_call_counter(pvt, SOFIA_DEC_CALL_LIMIT);
 		}
 	}
@@ -7274,6 +7274,7 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	pvt->hold_state = new_hold;
 	if (trans && pvt->peer && sofia_cfg.notifyhold) {
 		ast_atomic_fetchadd_int(&pvt->peer->onHold, new_hold ? +1 : -1);
+		pvt->hold_inc_done = new_hold ? 1 : 0;   /* mark/clear the outstanding +1 for teardown */
 	}
 	if (trans && owner) {
 		if (new_hold) {
@@ -7478,6 +7479,7 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 		pvt->hold_state = new_hold;
 		if (trans && pvt->peer && sofia_cfg.notifyhold) {
 			ast_atomic_fetchadd_int(&pvt->peer->onHold, new_hold ? +1 : -1);
+			pvt->hold_inc_done = new_hold ? 1 : 0;   /* mark/clear the outstanding +1 for teardown */
 		}
 		if (trans && owner) {
 			if (new_hold) {
@@ -12593,15 +12595,18 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		 * sends the resume, so without this the +1 leaks and sofia_devicestate stays ONHOLD forever
 		 * (peer->onHold has priority over inUse at :13046 -> BLF watchers see the peer busy with 0
 		 * live channels). Idempotent by hold_state (cleared here), independent of call_inc_done;
-		 * gated on notifyhold exactly like the INC (:7274/:7478). ATOMIC fetchadd (not a plain '--')
-		 * because those INC sites modify onHold atomically WITHOUT ao2_lock, so a bounded read-modify-
-		 * write here would race a concurrent hold on another pvt of this peer; the underflow undo
-		 * keeps it >=0 defensively (e.g. a prior underflow, or notifyhold toggled mid-call). */
-		if (pvt->hold_state && sofia_cfg.notifyhold) {
+		 * Keyed on hold_inc_done (the OUTSTANDING +1, set at the INC), NOT the current notifyhold:
+		 * a notifyhold=false reload between hold and teardown must still release the count.
+		 * Idempotent (flag cleared, mirrors call_inc_done), independent of call_inc_done. ATOMIC
+		 * fetchadd (not a plain '--') because the INC sites modify onHold atomically WITHOUT ao2_lock,
+		 * so a bounded read-modify-write here would race a concurrent hold on another pvt of this
+		 * peer; the underflow undo keeps it >=0 defensively. */
+		if (pvt->hold_inc_done) {
 			if (ast_atomic_fetchadd_int(&peer->onHold, -1) <= 0) {
 				ast_atomic_fetchadd_int(&peer->onHold, +1);   /* was already 0 -> undo, no underflow */
 				ast_log(LOG_WARNING, "Sofia: peer '%s' onHold underflow avoided on teardown\n", peer->name);
 			}
+			pvt->hold_inc_done = 0;
 			pvt->hold_state = 0;
 		}
 		ao2_unlock(peer);

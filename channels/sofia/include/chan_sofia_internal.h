@@ -554,6 +554,9 @@ struct sofia_pvt {
 	int history_retained;		/* idempotency net: history already snapshotted into the retained ring */
 	int call_inc_done; /* this pvt incremented peer->inUse — idempotency guard for DEC sites */
 	int ring_inc_done; /* this pvt incremented peer->inRinging — idempotency guard */
+	int hold_inc_done; /* this pvt has an OUTSTANDING peer->onHold +1 (set at the hold INC, cleared on
+			    * resume/teardown). Tracks the +1 independent of the CURRENT notifyhold so a
+			    * hangup-in-hold after a notifyhold=false reload still DECs -> no onHold leak. */
 	struct ast_dsp *dsp; /* set by sofia_enable_dsp_detect for inband/auto DTMF or fax-CNG; freed in destructor */
 
 	/* T.38 fax UDPTL state. udptl: per-dialog session, lazily allocated on first
