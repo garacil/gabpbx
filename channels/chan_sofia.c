@@ -2540,12 +2540,14 @@ static void sofia_pvt_destructor(void *obj)
 	sofia_pvt_clear_active_contact(pvt);
 
 	/* Catchall call-counter DEC for orphaned pvts (flag-gated idempotency). Must run
-	 * BEFORE the peer ao2_ref drop — the counter helper needs pvt->peer. */
-	if (pvt->peer && (pvt->call_inc_done || pvt->ring_inc_done)) {
+	 * BEFORE the peer ao2_ref drop — the counter helper needs pvt->peer.
+	 * hold_state is included so a pvt hung up WHILE ON HOLD whose inUse was already DEC'd
+	 * elsewhere (call_inc_done cleared) still reaches DEC_CALL_LIMIT to release its onHold. */
+	if (pvt->peer && (pvt->call_inc_done || pvt->ring_inc_done || pvt->hold_state)) {
 		if (pvt->ring_inc_done) {
 			sofia_update_call_counter(pvt, SOFIA_DEC_CALL_RINGING);
 		}
-		if (pvt->call_inc_done) {
+		if (pvt->call_inc_done || pvt->hold_state) {
 			sofia_update_call_counter(pvt, SOFIA_DEC_CALL_LIMIT);
 		}
 	}
@@ -12586,6 +12588,21 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		if (pvt->call_inc_done && peer->inUse > 0) {
 			peer->inUse--;
 			pvt->call_inc_done = 0;
+		}
+		/* On-hold counter DEC (chan_sip INC/DEC parity): a hangup/transfer WHILE ON HOLD never
+		 * sends the resume, so without this the +1 leaks and sofia_devicestate stays ONHOLD forever
+		 * (peer->onHold has priority over inUse at :13046 -> BLF watchers see the peer busy with 0
+		 * live channels). Idempotent by hold_state (cleared here), independent of call_inc_done;
+		 * gated on notifyhold exactly like the INC (:7274/:7478). ATOMIC fetchadd (not a plain '--')
+		 * because those INC sites modify onHold atomically WITHOUT ao2_lock, so a bounded read-modify-
+		 * write here would race a concurrent hold on another pvt of this peer; the underflow undo
+		 * keeps it >=0 defensively (e.g. a prior underflow, or notifyhold toggled mid-call). */
+		if (pvt->hold_state && sofia_cfg.notifyhold) {
+			if (ast_atomic_fetchadd_int(&peer->onHold, -1) <= 0) {
+				ast_atomic_fetchadd_int(&peer->onHold, +1);   /* was already 0 -> undo, no underflow */
+				ast_log(LOG_WARNING, "Sofia: peer '%s' onHold underflow avoided on teardown\n", peer->name);
+			}
+			pvt->hold_state = 0;
 		}
 		ao2_unlock(peer);
 		ast_mutex_unlock(&pvt->lock);
