@@ -13263,9 +13263,12 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 			const char *norm = (!strcasecmp(event, "dialog") || !strcasecmp(event, "dialog-info"))
 				? "dialog" : "presence";
 			int nh_is_old = (old && old->nh == nh);
+			/* routable Contact user = watched exten (see the initial-accept note below). */
 			nua_respond(nh, SIP_200_OK, NUTAG_WITH_THIS(nua),
+				NUTAG_M_USERNAME(l_exten),
 				SIPTAG_EXPIRES_STR("0"), TAG_END());
 			nua_notify(nh,
+				NUTAG_M_USERNAME(l_exten),
 				SIPTAG_EVENT_STR(norm),
 				NUTAG_SUBSTATE(nua_substate_terminated),
 				SIPTAG_SUBSCRIPTION_STATE_STR("terminated;reason=timeout"),
@@ -13297,7 +13300,9 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 				old->expires_at = time(NULL) + expires;
 				ast_copy_string(old->nat_proxy, l_proxy, sizeof(old->nat_proxy));	/* source may have moved */
 				snprintf(eb, sizeof(eb), "%d", expires);
+				/* routable Contact user = watched exten (see the initial-accept note below). */
 				nua_respond(nh, SIP_202_ACCEPTED, NUTAG_WITH_THIS(nua),
+					NUTAG_M_USERNAME(old->exten),
 					SIPTAG_EXPIRES_STR(eb), TAG_END());
 				st = ast_extension_state(NULL, old->context, old->exten);
 				sofia_presence_emit_notify(old, st, 0);
@@ -13392,7 +13397,13 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	{
 		char expires_buf[16];
 		snprintf(expires_buf, sizeof(expires_buf), "%d", expires);
+		/* NUTAG_M_USERNAME(l_exten): the generated SUBSCRIBE-dialog Contact user MUST be the watched
+		 * resource, not the stack default NUTAG_M_USERNAME("*") (:16373) -> a non-routable
+		 * Contact:<sip:*@ourip> makes the watcher refresh in-dialog to SUBSCRIBE sip:* -> 404/481 ->
+		 * the sub dies at its first refresh (BLF watchers decay). The stack applies these tags before
+		 * Contact generation (nua_server.c:455/584); keep the correct host:port it fills. */
 		nua_respond(nh, SIP_202_ACCEPTED, NUTAG_WITH_THIS(nua),
+			NUTAG_M_USERNAME(l_exten),
 			SIPTAG_EXPIRES_STR(expires_buf), TAG_END());
 	}
 

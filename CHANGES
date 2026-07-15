@@ -13,6 +13,66 @@ the soname (`0.6.0`) are unchanged, so any consumer built against 2.0.x needs no
 rebuild. Rebuild Sofia-SIP from the new tag before building GABPBX. See
 https://github.com/garacil/sofia-sip.
 
+## 1.5.15 — presence/BLF fixes (chan_sofia)
+
+Two `chan_sofia` presence bugs that made watched-extension (BLF) lamps go stale and
+never settle into a full mesh. No configuration change; no behaviour change for
+anything other than the broken presence paths.
+
+### BLF subscriptions died at their first in-dialog refresh (non-routable `Contact`)
+
+**Symptom.** With BLF (`Event: dialog`) subscriptions, watcher counts on `core show
+hints` were uneven and decaying (some extensions 0, others a few) with **zero active
+calls**, and watched extensions showed the wrong busy/idle state on other phones —
+especially after a restart, which reset every subscription and then let it decay again.
+
+**Root cause.** The stack-wide default `Contact` user-part is a wildcard (`*`). Almost
+every `chan_sofia` response supplies an explicit, routable `Contact`, so the default
+never shows — but the **presence-subscribe accept did not**. The `200`/`202` to a
+`SUBSCRIBE` and the `NOTIFY`s were sent without an explicit `Contact`, so the stack
+generated one from the default: `Contact: <sip:*@<our-ip>:<port>>`. That user-part is
+not routable. The subscriber adopts the `Contact` as the dialog remote target and
+refreshes **in-dialog** to it — `SUBSCRIBE sip:*@<our-ip>` — which `chan_sofia` cannot
+resolve to a hint, so it answers `404 Not Found` and tears the subscription down with
+`NOTIFY … Subscription-State: terminated;reason=timeout`. Every `Event: dialog`
+subscription therefore established, then **collapsed on its first renewal**; the watcher
+counts were only whatever survived between the initial subscribe and the first refresh,
+so they were uneven, unstable, and never a full mesh. Chronic (not restart-specific);
+a restart only resynchronises the decay. MWI (`Event: message-summary`) was unaffected.
+
+**Fix.** The presence `200`/`202` responses and the presence `NOTIFY`s now emit a
+routable `Contact` whose user-part is the **watched extension** (the `To`/Request-URI
+resource being subscribed), overriding the wildcard default on those messages only. The
+stack still fills in the correct host and port. Refreshes then target
+`SUBSCRIBE sip:<exten>@<our-ip>`, `chan_sofia` finds the hint, and the subscription
+persists across renewals. Applied at every successful presence exit — initial accept,
+in-dialog refresh, unsubscribe and its final `NOTIFY`, and the state-change and
+teardown `NOTIFY`s — so both new dialogs and pre-existing dialogs recover on their next
+refresh. The stack-wide default is left untouched (other paths rely on it).
+
+### On-hold device state stuck busy (per-peer on-hold counter leak)
+
+**Symptom.** A peer's device state (and therefore its BLF lamp on every watcher) stayed
+`ONHOLD` — the extension read as permanently busy — even with **zero live channels**.
+
+**Root cause.** The per-peer on-hold counter is incremented when a call is placed on
+hold (a hold re-`INVITE`/`UPDATE`) and decremented on resume. But a call **hung up or
+transferred while still on hold** never sends the resume, and no teardown path released
+the count, so the `+1` leaked permanently. The device-state calculation gives the
+on-hold count priority over the in-use count, so a single leaked count pins the peer
+`ONHOLD` with no active calls — and BLF watchers see it busy. A classic increment/
+decrement imbalance (inherited from the `chan_sip` model).
+
+**Fix.** The on-hold count is now released on the single idempotent teardown aggregator
+that every hangup path already routes through (channel hangup, the `BYE` handlers, and
+the private-dialog destructor catch-all), so a hang-up or transfer while on hold always
+decrements it. The release is keyed on a per-call "on-hold increment outstanding" flag —
+independent of the current `notifyhold` setting — so it stays correct even if
+`notifyhold` is reloaded mid-call, and is bounded so a previously-corrupted counter
+cannot underflow. Prevents new leaks; counts already leaked before this build clear on
+reload/restart. On-hold accounting only runs when `notifyhold` is enabled, so there is
+no change when it is off.
+
 ## 1.5.14 — `sip show version` CLI (chan_sofia)
 
 New CLI command that reports which Sofia-SIP library `chan_sofia` is using:

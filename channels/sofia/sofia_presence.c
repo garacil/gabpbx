@@ -279,6 +279,10 @@ void sofia_presence_emit_notify(struct sofia_presence_sub *sub, int state, int t
 			snprintf(ss, sizeof(ss), "active;expires=%d", remaining);
 		}
 		nua_notify(sub->nh,
+			/* routable Contact user = watched exten, NOT the stack default "*" (chan_sofia.c:16373):
+			 * a self-contained NOTIFY Contact keeps the subscriber's in-dialog target routable even
+			 * if this handle never got the hparam (BLF sip:* refresh -> 404/481 -> sub dies otherwise). */
+			NUTAG_M_USERNAME(sub->exten),
 			SIPTAG_EVENT_STR(sub->event),
 			NUTAG_SUBSTATE(terminate ? nua_substate_terminated : nua_substate_active),
 			SIPTAG_SUBSCRIPTION_STATE_STR(ss),
@@ -330,6 +334,7 @@ void sofia_presence_teardown(struct sofia_presence_sub *sub, int send_terminated
 			sub->version++;
 			sofia_presence_build_body(&body, sub, AST_EXTENSION_NOT_INUSE);
 			nua_notify(sub->nh,
+				NUTAG_M_USERNAME(sub->exten),	/* routable Contact user (see emit_notify note) */
 				SIPTAG_EVENT_STR(sub->event),
 				NUTAG_SUBSTATE(nua_substate_terminated),
 				SIPTAG_SUBSCRIPTION_STATE_STR("terminated;reason=timeout"),
