@@ -3679,18 +3679,23 @@ static void sofia_create_peer_hint(struct sofia_peer *peer, const char *source)
 		if (ast_get_hint(NULL, 0, NULL, 0, NULL, ctxname, ext)) {
 			continue;
 		}
-		/* Add the hint BY NAME into the EXISTING dialplan context. ast_add_extension() resolves the
-		 * authoritative contexts_table object under conlock and adds atomically; it NEVER creates a
-		 * context (returns non-zero if ctxname is not a loaded dialplan context). This replaces
-		 * ast_context_find_or_create(), whose check-then-act (rdlock lookup, unlock, wrlock insert)
-		 * lost same-name races and left the hint on a list-only ORPHAN context that the presence
-		 * lookup (contexts_table only) could never resolve — the hint was "created" yet the SUBSCRIBE
-		 * still 404'd, and orphans accumulated as duplicates. The subscribecontext must therefore name
-		 * a context that already exists in the dialplan (chan_sip custom BLF-hint parity). */
+		/* Ensure the hint context exists, then add the hint BY NAME. The subscribecontext is often a
+		 * BLF-only namespace the dialplan does not define (e.g. "tucall"), so create it once when it is
+		 * genuinely absent — ast_context_find() is a pure hashtab lookup, so an already-defined context
+		 * (e.g. "default") is NEVER passed to find_or_create and can never be raced into a duplicate.
+		 * The add uses ast_add_extension() BY NAME: it resolves the hashtab-authoritative context under
+		 * conlock and adds atomically, so the hint always lands exactly where the presence lookup
+		 * (ast_get_hint -> pbx_find_extension -> find_context, which reads contexts_table only) resolves
+		 * it — even if a concurrent find_or_create left an empty orphan context, the by-name add still
+		 * targets the reachable winner. This fixes the old bug where find_or_create's check-then-act
+		 * (rdlock lookup, unlock, wrlock insert) stranded the hint on an unreachable list-only orphan
+		 * context, so the SUBSCRIBE still 404'd and the orphans piled up as duplicates. */
+		if (!ast_context_find(ctxname)) {
+			ast_context_find_or_create(NULL, NULL, ctxname, "chan_sofia");
+		}
 		if (ast_add_extension(ctxname, 0, ext, PRIORITY_HINT, NULL, NULL,
 				hintsip, NULL, NULL, registrar)) {
-			ast_debug(2, "Sofia: hint %s@%s not added for peer '%s' (context not loaded in the dialplan)\n",
-				ext, ctxname, s_name);
+			ast_debug(2, "Sofia: hint %s@%s not added for peer '%s'\n", ext, ctxname, s_name);
 			continue;
 		}
 		manager_event(EVENT_FLAG_SYSTEM, "HintCreated",
