@@ -1,3 +1,34 @@
+## 1.5.17 — faithful ${HANGUPCAUSE} across the call bridge (carrier-failover fix)
+
+Fixes a double-dial / double-billing bug. After a normally-answered call that the
+**called party** hangs up, the caller's `${HANGUPCAUSE}` was left `0` instead of the
+real cause, so a carrier-failover dialplan that stops the retry loop on
+`$[${HANGUPCAUSE}=16]` mistook the completed, billable call for a failure and re-dialed
+the next carrier — a second call for every answered one. No configuration change.
+
+### Root cause — the hung-up party's cause never reached the survivor
+
+When two channels are bridged and the **callee** ends an answered call, only the leaving
+channel carries its own hangup cause; the surviving caller keeps whatever it had, often
+`0`. `apps/app_dial.c` copies the dialed party's cause to the caller only inside the
+`if (!ast_check_hangup(peer))` guard — i.e. only when the caller is the one that hangs
+up — so on a callee hangup that copy is skipped and `${HANGUPCAUSE}` (which reads the
+channel's own cause) stays `0`.
+
+### Fix — propagate the cause at the bridge, like modern Asterisk
+
+`ast_bridge_call()` (`main/features.c`) now propagates the hung-up party's hangup cause
+to the surviving bridged channel when the bridge ends, mirroring the bridging-framework
+semantics of current Asterisk (`bridge_dissolve` → `channel_set_cause`): an existing
+positive cause is **preserved**, a zero/unknown real hangup is **normalized** to
+`AST_CAUSE_NORMAL_CLEARING` (16), and a feature/time-limit return with no hung side is a
+**no-op**. This restores the `chan_sip` behavior `chan_sofia` was missing — `chan_sip`
+already set the caller's cause on answer, `chan_sofia` did not — so `${HANGUPCAUSE}` is
+now `16` after a normally-answered call regardless of which side hangs up, while
+busy / no-answer / congestion / reject (which never reach the bridge) are unchanged and
+still fail over. Validated live across `chan_sofia`, `chan_sip` and `Local` channels. A
+`core set debug 1` trace in `ast_bridge_call()` logs the before/after cause propagation.
+
 ## 1.5.16 — automatic BLF hints with reliable watchers (chan_sofia)
 
 Makes `chan_sofia` BLF work end to end: a watcher subscribing to any configured

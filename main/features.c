@@ -3964,6 +3964,113 @@ void ast_bridge_end_dtmf(struct ast_channel *chan, char digit, struct timeval st
  * \retval res on success.
  * \retval -1 on failure to bridge.
  */
+
+/*!
+ * \internal
+ * \brief Backport of the modern (12+) bridging-framework cause handling to the old
+ * ast_channel_bridge path.
+ *
+ * A current Asterisk propagates the hung-up party's Q.850 cause to the surviving channel when a
+ * bridge dissolves (main/bridge_channel.c channel_set_cause + main/bridge.c bridge_dissolve), so
+ * ${HANGUPCAUSE}, the h-extension, CEL and AMI Hangup Cause on the survivor reflect the real
+ * termination cause (e.g. 16 for a clean callee BYE). The old ast_channel_bridge path does not do
+ * this, which leaves the caller's cause at 0. These two helpers reproduce only that cause
+ * semantic, without importing the whole bridging framework.
+ *
+ * bridge_channel_set_cause() mirrors channel_set_cause(): keep chan's cause if already set (>0),
+ * otherwise use the supplied cause if >0, else AST_CAUSE_NORMAL_CLEARING. Never overwrites a
+ * non-zero cause. Returns the effective cause on chan.
+ */
+static int bridge_channel_set_cause(struct ast_channel *chan, int cause)
+{
+	int current;
+
+	ast_channel_lock(chan);
+	current = chan->hangupcause;
+	if (current > 0) {
+		ast_channel_unlock(chan);
+		return current;
+	}
+	if (cause <= 0) {
+		cause = AST_CAUSE_NORMAL_CLEARING;
+	}
+	chan->hangupcause = cause;
+	ast_channel_unlock(chan);
+	return cause;
+}
+
+/*!
+ * \internal
+ * \brief Propagate a hung-up party's cause to the surviving bridged channel after
+ * ast_channel_bridge() returns (mirror of bridge_dissolve()).
+ *
+ * The dissolve cause is the leaving party's effective cause, applied to the peer with
+ * channel_set_cause() preservation. Acts ONLY on a real hangup: a channel that is actually hung,
+ * or a HANGUP/BUSY/CONGESTION control frame. A bare f==NULL returned by a feature or time-limit
+ * timeout is NOT a hangup and must not be treated as one. 'who' is trusted only when it is one of
+ * the two bridged channels and is actually hung; otherwise the source is inferred from the hangup
+ * flags. An existing non-zero cause on either channel is preserved.
+ */
+static void bridge_propagate_hangupcause(struct ast_channel *chan, struct ast_channel *peer,
+	struct ast_frame *f, struct ast_channel *who)
+{
+	struct ast_channel *source = NULL, *other;
+	int frame_cause = 0;
+	int chan_hung = ast_check_hangup(chan);
+	int peer_hung = ast_check_hangup(peer);
+
+	/* A control frame can itself carry the cause. */
+	if (f && f->frametype == AST_FRAME_CONTROL) {
+		switch (f->subclass.integer) {
+		case AST_CONTROL_HANGUP:
+			frame_cause = (int) f->data.uint32;   /* Q.850 cause on the HANGUP frame, or 0 */
+			break;
+		case AST_CONTROL_BUSY:
+			frame_cause = AST_CAUSE_BUSY;
+			break;
+		case AST_CONTROL_CONGESTION:
+			frame_cause = AST_CAUSE_CONGESTION;
+			break;
+		}
+	}
+
+	/* Identify the party that left. Trust 'who' only when it is chan/peer AND actually hung;
+	 * otherwise infer from the hangup flags. Do NOT invent a hangup from a feature/timeout. */
+	if ((who == chan || who == peer) && ast_check_hangup(who)) {
+		source = who;
+	} else if (chan_hung && !peer_hung) {
+		source = chan;
+	} else if (peer_hung && !chan_hung) {
+		source = peer;
+	} else if (chan_hung && peer_hung) {
+		/* Both gone: normalize each if still zero, but do not synthesize a survivor cause. */
+		bridge_channel_set_cause(chan, frame_cause);
+		bridge_channel_set_cause(peer, frame_cause);
+		return;
+	} else if (frame_cause > 0 && (who == chan || who == peer)) {
+		/* A control-frame cause with a known winner but no hangup flag yet. */
+		source = who;
+	}
+
+	if (!source) {
+		return;   /* no real hangup to propagate (e.g. feature/time-limit timeout) */
+	}
+
+	/* Dissolve cause = the leaving party's effective cause; push it to the survivor. */
+	other = (source == chan) ? peer : chan;
+	{
+		int src_before = source->hangupcause;
+		int other_before = other->hangupcause;
+		int eff = bridge_channel_set_cause(source, frame_cause);
+		bridge_channel_set_cause(other, eff);
+		/* Debug trace of the cause propagation (visible with 'core set debug 1'). Shows the
+		 * leaving party (source) cause, any control-frame cause, the effective dissolve cause,
+		 * and whether the survivor (other) already had a cause that was preserved. */
+		ast_debug(1, "bridge cause propagate: src=%s src_cause=%d frame_cause=%d eff=%d other=%s other_before=%d other_after=%d\n",
+			source->name, src_before, frame_cause, eff, other->name, other_before, other->hangupcause);
+	}
+}
+
 int ast_bridge_call(struct ast_channel *chan, struct ast_channel *peer, struct ast_bridge_config *config)
 {
 	/* Copy voice back and forth between the two channels.  Give the peer
@@ -4155,7 +4262,16 @@ int ast_bridge_call(struct ast_channel *chan, struct ast_channel *peer, struct a
 	for (;;) {
 		struct ast_channel *other;	/* used later */
 	
+		/* ast_channel_bridge() initializes *fo (f) to NULL up front but does NOT always write
+		 * *rc (who) -- native/time-limit return paths can leave it untouched. bridge_propagate_
+		 * hangupcause() reads 'who', so seed it each pass to avoid an uninitialized read. */
+		who = NULL;
 		res = ast_channel_bridge(chan, peer, config, &f, &who);
+
+		/* Modern-Asterisk parity: if this bridge return is a real hangup, propagate the
+		 * leaving party's cause to the survivor BEFORE the h-extension / post-bridge code runs
+		 * (mirror of bridge_dissolve/channel_set_cause). No-op on DTMF/feature/timeout returns. */
+		bridge_propagate_hangupcause(chan, peer, f, who);
 
 		if (ast_test_flag(chan, AST_FLAG_ZOMBIE)
 			|| ast_test_flag(peer, AST_FLAG_ZOMBIE)) {
