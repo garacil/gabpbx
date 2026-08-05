@@ -129,6 +129,10 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#if defined(__linux__)
+#include <linux/netlink.h>     /* EXPERIMENTAL rebind_on_newaddr: RTM_NEWADDR watcher to heal */
+#include <linux/rtnetlink.h>   /* a SIP listener for a local address that appears after startup */
+#endif
 #include <pthread.h>
 #include <sys/time.h>
 #include <time.h>
@@ -16196,6 +16200,182 @@ static void sofia_capture_apply_deferred(su_root_magic_t *magic, su_timer_t *t, 
 		sofia_capture_apply_timer = NULL;
 }
 
+/* ===================== EXPERIMENTAL: rebind_on_newaddr (default OFF) =====================
+ * ROOT CAUSE: chan_sofia hands the wildcard bind (sip:0.0.0.0:PORT) to sofia-sip, whose tport
+ * layer resolves the wildcard by enumerating the host interfaces ONCE at nua_create
+ * (su_getlocalinfo) and binding one socket PER address — never a single INADDR_ANY socket
+ * (tport.c:1710-1736,1937). A local address that appears LATER (e.g. a VPN wg0 created after
+ * gabpbx boots) gets no listener, so inbound INVITEs to it are silently dropped until a manual
+ * restart.
+ *
+ * FIX (add-only): a netlink RTM_NEWADDR watcher on its OWN thread. On a new global IPv4 address
+ * it marshals the address to sofia_thread (sofia_dispatch_to_root_thread) and binds a concrete
+ * UDP tport there via nta_agent_add_tport(). The tport and nta APIs are touched ONLY on
+ * sofia_thread (THREAD MODEL comment near the top of this file); the watcher thread NEVER calls
+ * them directly. RTM_DELADDR teardown is not attempted (tport_zap_primary is static in sofia-sip);
+ * a removed address just leaves a stale primary that fails to send — acceptable for the heal goal.
+ * ========================================================================================= */
+#if defined(__linux__)
+static pthread_t sofia_netlink_tid;
+static volatile int sofia_netlink_running;   /* 1 while the watcher thread should run */
+static int sofia_netlink_started;            /* 1 if the thread was launched (needs join) */
+
+/* Addresses this watcher already bound. Touched ONLY on sofia_thread (sofia_netlink_addtport_root),
+ * so no lock is needed; reset at start. Add-only, so we never re-bind an address we already added. */
+#define SOFIA_NL_MAX_ADDED 64
+static char sofia_nl_added[SOFIA_NL_MAX_ADDED][INET_ADDRSTRLEN];
+static int sofia_nl_added_n;
+
+/* Runs ON sofia_thread via sofia_dispatch_to_root_thread(): bind a UDP tport for `data` (an
+ * ast_strdup'd dotted-quad) unless already bound. Frees data. */
+static void sofia_netlink_addtport_root(void *data)
+{
+	char *addr = data;
+	nta_agent_t *agent;
+	int port, i;
+	char url[128];
+
+	if (!addr) {
+		return;
+	}
+	/* Root stopping or nua gone: do nothing (the address change is moot). */
+	if (!sofia_nua || sofia_regflow_shutdown) {
+		ast_free(addr);
+		return;
+	}
+	for (i = 0; i < sofia_nl_added_n; i++) {   /* idempotent: skip an address we already bound */
+		if (!strcmp(sofia_nl_added[i], addr)) {
+			ast_free(addr);
+			return;
+		}
+	}
+	if (!(agent = nua_get_agent(sofia_nua))) {
+		ast_free(addr);
+		return;
+	}
+	port = sofia_cfg.bindport ? sofia_cfg.bindport : 5060;
+	snprintf(url, sizeof(url), "sip:%s:%d", addr, port);
+	if (nta_agent_add_tport(agent, (url_string_t *)url, TAG_END()) < 0) {
+		ast_log(LOG_WARNING, "Sofia: rebind_on_newaddr: failed to bind UDP listener on %s\n", url);
+	} else {
+		ast_log(LOG_NOTICE, "Sofia: rebind_on_newaddr: bound UDP listener on %s (late-appearing local address)\n", url);
+		if (sofia_nl_added_n < SOFIA_NL_MAX_ADDED) {
+			ast_copy_string(sofia_nl_added[sofia_nl_added_n++], addr, INET_ADDRSTRLEN);
+		}
+	}
+	ast_free(addr);
+}
+
+/* Netlink watcher thread: subscribe to IPv4 address changes; marshal each NEW global address to
+ * sofia_thread. Bounded recv (SO_RCVTIMEO 1s) so it notices sofia_netlink_running clearing. */
+static void *sofia_netlink_watcher(void *ignore)
+{
+	int fd;
+	struct sockaddr_nl sa;
+	struct timeval tv = { 1, 0 };
+	char buf[8192];
+
+	if ((fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)) < 0) {
+		ast_log(LOG_WARNING, "Sofia: rebind_on_newaddr: netlink socket failed (%s); watcher disabled\n", strerror(errno));
+		return NULL;
+	}
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+	sa.nl_groups = RTMGRP_IPV4_IFADDR;
+	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		ast_log(LOG_WARNING, "Sofia: rebind_on_newaddr: netlink bind failed (%s); watcher disabled\n", strerror(errno));
+		close(fd);
+		return NULL;
+	}
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	ast_verb(2, "Sofia: rebind_on_newaddr watcher started\n");
+
+	while (sofia_netlink_running) {
+		int len = (int)recv(fd, buf, sizeof(buf), 0);
+		struct nlmsghdr *nh;
+		if (len < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+				continue;
+			}
+			break;
+		}
+		for (nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, len); nh = NLMSG_NEXT(nh, len)) {
+			struct ifaddrmsg *ifa;
+			struct rtattr *rta;
+			int rtl;
+
+			if (nh->nlmsg_type == NLMSG_DONE) {
+				break;
+			}
+			if (nh->nlmsg_type != RTM_NEWADDR) {   /* add-only: ignore RTM_DELADDR + others */
+				continue;
+			}
+			ifa = (struct ifaddrmsg *)NLMSG_DATA(nh);
+			if (ifa->ifa_family != AF_INET
+					|| ifa->ifa_scope == RT_SCOPE_HOST      /* loopback */
+					|| ifa->ifa_scope == RT_SCOPE_LINK) {   /* link-local */
+				continue;
+			}
+			for (rta = IFA_RTA(ifa), rtl = IFA_PAYLOAD(nh); RTA_OK(rta, rtl); rta = RTA_NEXT(rta, rtl)) {
+				struct in_addr in;
+				char astr[INET_ADDRSTRLEN];
+				char *dup;
+
+				if (rta->rta_type != IFA_LOCAL && rta->rta_type != IFA_ADDRESS) {
+					continue;
+				}
+				memcpy(&in, RTA_DATA(rta), sizeof(in));
+				if (!inet_ntop(AF_INET, &in, astr, sizeof(astr))
+						|| !strncmp(astr, "127.", 4) || !strcmp(astr, "0.0.0.0")) {
+					continue;
+				}
+				if (!sofia_netlink_running) {
+					break;
+				}
+				if ((dup = ast_strdup(astr))
+						&& sofia_dispatch_to_root_thread(sofia_netlink_addtport_root, dup) < 0) {
+					ast_free(dup);   /* dispatch failed; a later address change re-triggers */
+				}
+				break;   /* one address per ifaddrmsg */
+			}
+		}
+	}
+	close(fd);
+	ast_verb(2, "Sofia: rebind_on_newaddr watcher stopped\n");
+	return NULL;
+}
+
+/* Start the watcher (called on sofia_thread just before su_root_run). No-op unless enabled. */
+static void sofia_netlink_rebind_start(void)
+{
+	if (!sofia_cfg.rebind_on_newaddr || sofia_netlink_started) {
+		return;
+	}
+	sofia_nl_added_n = 0;
+	sofia_netlink_running = 1;   /* set BEFORE create so the thread never sees a stale 0 and exits */
+	if (ast_pthread_create(&sofia_netlink_tid, NULL, sofia_netlink_watcher, NULL)) {
+		ast_log(LOG_WARNING, "Sofia: rebind_on_newaddr: failed to start watcher thread\n");
+		sofia_netlink_running = 0;
+		return;
+	}
+	sofia_netlink_started = 1;
+}
+
+/* Stop + join the watcher (called on sofia_thread after su_root_run, before nua_destroy). */
+static void sofia_netlink_rebind_stop(void)
+{
+	if (!sofia_netlink_started) {
+		return;
+	}
+	sofia_netlink_running = 0;
+	pthread_join(sofia_netlink_tid, NULL);   /* wakes within 1s via SO_RCVTIMEO */
+	sofia_netlink_started = 0;
+}
+#else /* !__linux__ : no netlink, feature is a no-op */
+static void sofia_netlink_rebind_start(void) { }
+static void sofia_netlink_rebind_stop(void) { }
+#endif /* __linux__ */
+
 static void *sofia_thread_func(void *data)
 {
 	if (su_init() != 0) {
@@ -16543,6 +16723,10 @@ static void *sofia_thread_func(void *data)
 	sofia_subscribe_start();
 	sofia_eventsub_start();
 
+	/* EXPERIMENTAL: start the netlink watcher that binds a UDP listener on a local address that
+	 * appears after startup (no-op unless rebind_on_newaddr=yes). Runs on sofia_thread. */
+	sofia_netlink_rebind_start();
+
 	sofia_regflow_shutdown = 0;	/* RFC 5626 flow-close: the root is live for the duration of su_root_run */
 	su_root_run(sofia_root);
 
@@ -16567,6 +16751,9 @@ static void *sofia_thread_func(void *data)
 	/* Outbound MWI SUBSCRIBE watcher teardown (sofia_thread, before nua_destroy). */
 	sofia_subscribe_stop();
 	sofia_eventsub_stop();
+
+	/* EXPERIMENTAL: stop + join the netlink rebind watcher before nua_destroy. */
+	sofia_netlink_rebind_stop();
 
 	/* Ownership-correct teardown — su_root_destroy MUST run on the creating thread
 	 * (sofia-sip asserts; cross-thread aborts). unload_module signals us via
@@ -17650,6 +17837,10 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "rtsavesysname")) {
 			/* Implemented at the sofia_process_register ast_update_realtime callsites. */
 			sofia_cfg.rtsave_sysname = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "rebind_on_newaddr") || !strcasecmp(v->name, "rebindonnewaddr")) {
+			/* EXPERIMENTAL (default off): netlink RTM_NEWADDR watcher that binds a UDP listener on
+			 * a local address appearing after startup (sofia_netlink_* above). */
+			sofia_cfg.rebind_on_newaddr = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "rtupdate")) {
 			/* Gates the realtime peer updates in sofia_process_register. */
 			sofia_cfg.peer_rtupdate = ast_true(v->value);
@@ -18821,6 +19012,8 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.subscribe_network_change_event = 1;
 	/* Implemented at the sofia_process_register ast_update_realtime callsites. */
 	sofia_cfg.rtsave_sysname = 0;
+	/* EXPERIMENTAL netlink re-bind on a late-appearing local address: default OFF. */
+	sofia_cfg.rebind_on_newaddr = 0;
 	/* Gates the realtime peer updates in sofia_process_register. */
 	sofia_cfg.peer_rtupdate = 1;
 	/* Register pool: default OFF + auto lane count. */

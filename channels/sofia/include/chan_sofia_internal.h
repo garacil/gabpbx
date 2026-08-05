@@ -1088,6 +1088,7 @@ struct sofia_config {
 	int default_progressinband; /* tri-state early-media in-band audio (SOFIA_PROG_INBAND_*) inherited by peers; default NEVER. NO degrades to NEVER (no SIP_PROGRESS_SENT tracking). */
 	int subscribe_network_change_event; /* parse-compatibility only (sofia-sip sres_resolver + dnsmgr absorb network-change rebinding); default 1 (chan_sip) */
 	int rtsave_sysname;        /* 1 = include regserver=AST_SYSTEM_NAME in realtime writes (multi-server deployments). Restores canonical Asterisk behavior (active chan_sip fork dropped it). Default 0. */
+	int rebind_on_newaddr;     /* EXPERIMENTAL, default 0 (OFF). 1 = watch netlink RTM_NEWADDR and bind a UDP listener on a local address that appears AFTER startup (e.g. a post-boot VPN wg0), which sofia-sip's one-shot wildcard enumeration otherwise never binds. */
 	int peer_rtupdate;         /* 1 = propagate registration changes to realtime DB (ast_update_realtime); default 1. rtupdate=no skips ALL realtime writes (cached-realtime, avoids churn). */
 	/* Bounded REGISTER realtime-DB-write offload pool (kill-switch, default OFF). */
 	int register_pool;          /* offload the realtime REGISTER DB writes to a bounded pool */
