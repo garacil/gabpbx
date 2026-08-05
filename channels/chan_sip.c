@@ -6651,6 +6651,7 @@ void __sip_destroy(struct sip_pvt *p, int lockowner, int lockdialoglist)
 static int update_call_counter(struct sip_pvt *fup, int event)
 {
 	char name[256];
+	char sha256buf[65];	/* presence token: emit SHA256Name on every PeerStatus */
 	int *inuse = NULL, *call_limit = NULL, *inringing = NULL;
 	int outgoing = fup->outgoing_call;
 	struct sip_peer *p = NULL;
@@ -6736,6 +6737,7 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 			"ActiveCalls: %d\r\n"
 			"RingingCalls: %d\r\n"
 			"CallLimit: %d\r\n"
+			"SHA256Name: %s\r\n"
 			"Event: DEC_CALL_LIMIT\r\n",
 			p->name,
 			ast_sockaddr_stringify(&p->addr),
@@ -6743,7 +6745,8 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 			p->accountcode,
 			*inuse,
 			*inringing,
-			*call_limit);
+			*call_limit,
+			sip_peer_effective_sha256name(p, sha256buf, sizeof(sha256buf)));
 
 		if (sipdebug)
 			ast_debug(2, "Call %s %s '%s' removed from call limit %d\n", outgoing ? "to" : "from", "peer", name, *call_limit);
@@ -6767,6 +6770,7 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 					"ActiveCalls: %d\r\n"
 					"RingingCalls: %d\r\n"
 					"CallLimit: %d\r\n"
+					"SHA256Name: %s\r\n"
 					"Event: CALL_REJECTED\r\n",
 					p->name,
 					ast_sockaddr_stringify(&p->addr),
@@ -6774,7 +6778,8 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 					p->accountcode,
 					*inuse,
 					*inringing,
-					*call_limit);
+					*call_limit,
+					sip_peer_effective_sha256name(p, sha256buf, sizeof(sha256buf)));
 
 				unref_peer(p, "update_call_counter: unref peer p, call limit exceeded");
 				return -1;
@@ -6812,6 +6817,7 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 			"ActiveCalls: %d\r\n"
 			"RingingCalls: %d\r\n"
 			"CallLimit: %d\r\n"
+			"SHA256Name: %s\r\n"
 			"Event: %s\r\n",
 			p->name,
 			ast_sockaddr_stringify(&p->addr),
@@ -6820,6 +6826,7 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 			*inuse,
 			*inringing,
 			*call_limit,
+			sip_peer_effective_sha256name(p, sha256buf, sizeof(sha256buf)),
 			event == INC_CALL_RINGING ? "INC_CALL_RINGING" : "INC_CALL_LIMIT");
 
 		if (sipdebug) {
@@ -6851,6 +6858,7 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 				"ActiveCalls: %d\r\n"
 				"RingingCalls: %d\r\n"
 				"CallLimit: %d\r\n"
+				"SHA256Name: %s\r\n"
 				"Event: DEC_CALL_RINGING\r\n",
 				p->name,
 				ast_sockaddr_stringify(&p->addr),
@@ -6858,7 +6866,8 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 				p->accountcode,
 				*inuse,
 				*inringing,
-				*call_limit);
+				*call_limit,
+				sip_peer_effective_sha256name(p, sha256buf, sizeof(sha256buf)));
 		}
 		break;
 
@@ -15793,6 +15802,7 @@ static enum check_auth_result register_verify(struct sip_pvt *p, struct ast_sock
 	enum check_auth_result res = AUTH_NOT_FOUND;
 	struct sip_peer *peer;
 	char tmp[256];
+	char sha256buf[65];	/* presence token for the Registered emit */
 	char *c, *name, *unused_password, *domain;
 	char *uri2 = ast_strdupa(uri);
 	int send_mwi = 0;
@@ -15977,8 +15987,8 @@ static enum check_auth_result register_verify(struct sip_pvt *p, struct ast_sock
 /*				manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Registered\r\nAddress: %s\r\nContext: %s\r\nAccountcode: %s\r\n",
 								peer->name,  ast_sockaddr_stringify(&peer->addr), peer->context, peer->accountcode);
 */
-				manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Registered\r\nExpire: %ld\r\nAddress: %s\r\nRegContact: %s\r\nUserAgent: %s\r\nContext: %s\r\nAccountcode: %s\r\n",
-						                peer->name,  ast_sched_when(sched, peer->expire), ast_sockaddr_stringify(&peer->addr), peer->fullcontact, peer->useragent, peer->context, peer->accountcode);
+				manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Registered\r\nExpire: %ld\r\nAddress: %s\r\nRegContact: %s\r\nUserAgent: %s\r\nContext: %s\r\nAccountcode: %s\r\nSHA256Name: %s\r\n",
+						                peer->name,  ast_sched_when(sched, peer->expire), ast_sockaddr_stringify(&peer->addr), peer->fullcontact, peer->useragent, peer->context, peer->accountcode, sip_peer_effective_sha256name(peer, sha256buf, sizeof(sha256buf)));
 
 				send_mwi = 1;
 				res = 0;

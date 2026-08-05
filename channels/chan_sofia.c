@@ -12607,6 +12607,7 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		char l_context[AST_MAX_CONTEXT];
 		char l_accountcode[256];	/* UNBOUNDED stringfield -> >=256 (SNAPSHOT IDIOM); emit value verbatim, no truncation */
 		char l_address[64] = "";
+		char l_sha256[65] = "";	/* presence token snapshot: emit SHA256Name on every PeerStatus */
 		int l_call_limit;
 		int l_busy_level;
 		int inUse_snap, inRinging_snap;
@@ -12621,6 +12622,7 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		}
 		l_call_limit = peer->call_limit;
 		l_busy_level = peer->busy_level;
+		sofia_peer_effective_sha256name(peer, l_sha256, sizeof(l_sha256));	/* token snapshot for the unlocked emit(s) */
 		ast_mutex_unlock(&peer->lock);
 
 		/* Decision + increment under ONE critical section: read inUse and (if allowed) bump it
@@ -12656,11 +12658,12 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 				"Address: %s\r\n"
 				"Context: %s\r\n"
 				"Accountcode: %s\r\n"
+				"SHA256Name: %s\r\n"
 				"ActiveCalls: %d\r\n"
 				"RingingCalls: %d\r\n"
 				"CallLimit: %d\r\n"
 				"Event: CALL_REJECTED\r\n",
-				l_name, l_address, l_context, l_accountcode,
+				l_name, l_address, l_context, l_accountcode, l_sha256,
 				inUse_snap, inRinging_snap, l_call_limit);
 			return -1;
 		}
@@ -12677,11 +12680,12 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 				"Address: %s\r\n"
 				"Context: %s\r\n"
 				"Accountcode: %s\r\n"
+				"SHA256Name: %s\r\n"
 				"ActiveCalls: %d\r\n"
 				"RingingCalls: %d\r\n"
 				"CallLimit: %d\r\n"
 				"Event: %s\r\n",
-				l_name, l_address, l_context, l_accountcode,
+				l_name, l_address, l_context, l_accountcode, l_sha256,
 				inUse_snap, inRinging_snap, l_call_limit,
 				event == SOFIA_INC_CALL_RINGING ? "INC_CALL_RINGING" : "INC_CALL_LIMIT");
 		}
@@ -12689,7 +12693,7 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 	}
 
 	case SOFIA_DEC_CALL_LIMIT: {
-		char l_name[80], l_context[AST_MAX_CONTEXT], l_accountcode[256], l_address[64] = "";
+		char l_name[80], l_context[AST_MAX_CONTEXT], l_accountcode[256], l_address[64] = "", l_sha256[65] = "";
 		int l_call_limit, l_busy_level, inUse_snap, inRinging_snap;
 		/* SNAPSHOT IDIOM (as the INC path): freeable fields under peer->lock, so the AMI DEC emit
 		 * below can run unlocked without UAF of peer->context/accountcode during a concurrent reload. */
@@ -12702,6 +12706,7 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		}
 		l_call_limit = peer->call_limit;
 		l_busy_level = peer->busy_level;
+		sofia_peer_effective_sha256name(peer, l_sha256, sizeof(l_sha256));	/* token snapshot for the unlocked emit */
 		ast_mutex_unlock(&peer->lock);
 		ast_mutex_lock(&pvt->lock);
 		ao2_lock(peer);
@@ -12737,14 +12742,15 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 			manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
 				"ChannelType: SIP\r\n" "Peer: SIP/%s\r\n" "PeerStatus: CallCountUpdated\r\n"
 				"Address: %s\r\n" "Context: %s\r\n" "Accountcode: %s\r\n"
+				"SHA256Name: %s\r\n"
 				"ActiveCalls: %d\r\n" "RingingCalls: %d\r\n" "CallLimit: %d\r\n" "Event: DEC_CALL_LIMIT\r\n",
-				l_name, l_address, l_context, l_accountcode, inUse_snap, inRinging_snap, l_call_limit);
+				l_name, l_address, l_context, l_accountcode, l_sha256, inUse_snap, inRinging_snap, l_call_limit);
 		}
 		break;
 	}
 
 	case SOFIA_DEC_CALL_RINGING: {
-		char l_name[80], l_context[AST_MAX_CONTEXT], l_accountcode[256], l_address[64] = "";
+		char l_name[80], l_context[AST_MAX_CONTEXT], l_accountcode[256], l_address[64] = "", l_sha256[65] = "";
 		int l_call_limit, l_busy_level, inUse_snap, inRinging_snap;
 		ast_mutex_lock(&peer->lock);
 		ast_copy_string(l_name, peer->name, sizeof(l_name));
@@ -12755,6 +12761,7 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		}
 		l_call_limit = peer->call_limit;
 		l_busy_level = peer->busy_level;
+		sofia_peer_effective_sha256name(peer, l_sha256, sizeof(l_sha256));	/* token snapshot for the unlocked emit */
 		ast_mutex_unlock(&peer->lock);
 		ast_mutex_lock(&pvt->lock);
 		ao2_lock(peer);
@@ -12770,8 +12777,9 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 			manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
 				"ChannelType: SIP\r\n" "Peer: SIP/%s\r\n" "PeerStatus: CallCountUpdated\r\n"
 				"Address: %s\r\n" "Context: %s\r\n" "Accountcode: %s\r\n"
+				"SHA256Name: %s\r\n"
 				"ActiveCalls: %d\r\n" "RingingCalls: %d\r\n" "CallLimit: %d\r\n" "Event: DEC_CALL_RINGING\r\n",
-				l_name, l_address, l_context, l_accountcode, inUse_snap, inRinging_snap, l_call_limit);
+				l_name, l_address, l_context, l_accountcode, l_sha256, inUse_snap, inRinging_snap, l_call_limit);
 		}
 		break;
 	}
