@@ -31,7 +31,7 @@
  *   - Channel tech name:     "SIP"      (not "Sofia")
  *     Dialplan: Dial(SIP/peer) routes to chan_sofia.
  *   - Realtime family:       "sippeers" (chan_sip default)
- *     extconfig.conf: sippeers => pgsql,general,voip_sip_conf
+ *     extconfig.conf: sippeers => pgsql,general,the sippeers realtime table
  *   - Dialplan functions:    SIPPEER / SIPCHANINFO / SIP_HEADER /
  *                            CHECKSIPDOMAIN  (chan_sip-parity
  *                            names, drop-in for existing dialplans).
@@ -517,6 +517,8 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
  * dialogs and the canonical lock order are in scope there). SDP-only: never mutates capability/nativeformats. */
 static struct ast_channel *sofia_find_inbound_sibling_by_linkedid(struct sofia_pvt *answered);
 static void sofia_set_caller_video_mask_from_answered(struct sofia_pvt *answered);
+/* SHA-256 -> 64 hex (defined later); forward-declared for the realtime fill_sha256name path. */
+static void sofia_sha256_hash(char *out_buf, const char *input);
 
 static int fork_branch_hash_fn(const void *obj, int flags)
 {
@@ -3107,6 +3109,7 @@ static void sofia_dnsmgr_setup_peer(struct sofia_peer *peer)
 static void sofia_peer_set_defaults(struct sofia_peer *peer)
 {
 	ast_string_field_set(peer, context, sofia_cfg.context);
+	peer->sha256name[0] = '\0';   /* cleared on (re)load; re-captured from config/DB or recomputed */
 	peer->type = 0;
 	peer->port = DEFAULT_SIP_PORT;
 	peer->transport = SOFIA_TRANSPORT_UDP;
@@ -3779,6 +3782,11 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 		} else if (!strcasecmp(v->name, "subscribe_event")) {
 			/* Generic outbound SUBSCRIBE (RFC 6665): <event>[;<accept-mime>][;<expires>]. */
 			ast_string_field_set(peer, subscribe_event, v->value);
+		} else if (!strcasecmp(v->name, "sha256name")) {
+			/* Presence identity token cache (the sippeers realtime sha256name column); captured so the
+			 * fill_sha256name path can detect an empty or stale value and refresh it.
+			 * (Empty column values never reach here — the loop skips ast_strlen_zero values.) */
+			ast_copy_string(peer->sha256name, v->value, sizeof(peer->sha256name));
 		} else if (!strcasecmp(v->name, "callerid")) {
 			/* Keep the raw string (CLI/AMI display + the realtime callerid helper) AND split it into
 			 * cid_num/cid_name (chan_sip.c:28779-28784 parity) — those are the functional fields read
@@ -4257,6 +4265,28 @@ static struct sofia_peer *sofia_find_peer_realtime_build(const char *name, struc
 		if (regvar) {
 			sofia_apply_peer_variables(peer, regvar, 1);
 			ast_variables_destroy(regvar);
+		}
+	}
+
+	/* fill_sha256name (optional, default OFF): persist SHA256(systemname + '.' + name) into
+	 * the sippeers realtime sha256name column (the presence identity token) ONLY WHEN the column is EMPTY. A value
+	 * already set — a manually FORCED token or a prior fill — is authoritative and never overwritten.
+	 * Realtime peers only (this is the realtime build path; static-file peers have no DB row and are
+	 * filled in-memory in sofia_parse_peer_config). Writes to the "sippeers" realtime family.
+	 * Runs OUTSIDE the peers lock (this builder's invariant), so the write never stalls lookups. */
+	if (sofia_cfg.fill_sha256name && !ast_strlen_zero(peer->name)
+			&& ast_strlen_zero(peer->sha256name)) {
+		const char *sysname = ast_config_AST_SYSTEM_NAME;
+		if (!ast_strlen_zero(sysname)) {
+			char *input = NULL;
+			if (ast_asprintf(&input, "%s.%s", sysname, peer->name) >= 0 && input) {
+				char computed[65];
+				sofia_sha256_hash(computed, input);
+				ast_update_realtime("sippeers", "name", peer->name,
+					"sha256name", computed, SENTINEL);
+				ast_copy_string(peer->sha256name, computed, sizeof(peer->sha256name));
+			}
+			ast_free(input);   /* ast_free(NULL) is a no-op on the asprintf-failure path */
 		}
 	}
 
@@ -9418,6 +9448,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 		update->now_registered = peer->registered;
 		update->contacts_after = ao2_container_count(peer->contacts);
 		ast_sockaddr_copy(&update->new_src, &peer->src_addr);
+		update->new_expires = expires;	/* negotiated TTL (s); emitted in PeerStatus Registered so presence can TTL-expire */
 	}
 
 	return 0;
@@ -9613,6 +9644,34 @@ static void sofia_sha256_hash(char *out_buf, const char *input)
 	for (size_t i = 0; i < SHA256_DIGEST_LENGTH; i++) {
 		snprintf(out_buf + (i * 2), 3, "%02x", digest[i]);
 	}
+}
+
+/* Effective presence identity token for AMI emission: the peer's forced/stored sha256name if set,
+ * else SHA256(systemname + '.' + name) computed on the fly when fill_sha256name is enabled. Empty
+ * string when the flag is off and none is set. Writes into buf (>= 65) and returns it. Read-only on
+ * the peer, so it is safe to call unlocked (no peer mutation). */
+static const char *sofia_peer_effective_sha256name(struct sofia_peer *peer, char *buf, size_t buflen)
+{
+	buf[0] = '\0';
+	if (!peer) {
+		return buf;
+	}
+	if (!ast_strlen_zero(peer->sha256name)) {
+		ast_copy_string(buf, peer->sha256name, buflen);
+		return buf;
+	}
+	if (sofia_cfg.fill_sha256name && !ast_strlen_zero(peer->name)) {
+		const char *sysname = ast_config_AST_SYSTEM_NAME;
+		char *input = NULL;
+		if (!ast_strlen_zero(sysname)
+				&& ast_asprintf(&input, "%s.%s", sysname, peer->name) >= 0 && input) {
+			char computed[65];
+			sofia_sha256_hash(computed, input);
+			ast_copy_string(buf, computed, buflen);
+		}
+		ast_free(input);
+	}
+	return buf;
 }
 
 /* HA1 = hash(user:realm:secret), or md5secret used directly when set (chan_sip
@@ -11304,6 +11363,8 @@ static void sofia_respond_register_query(nua_t *nua, nua_handle_t *nh, struct so
 void sofia_emit_register_side_effects(struct sofia_peer *peer, sip_t const *sip,
 		const struct sofia_register_update *update)
 {
+	char tokbuf[65];
+
 	if (!peer || !update) {
 		return;
 	}
@@ -11313,8 +11374,10 @@ void sofia_emit_register_side_effects(struct sofia_peer *peer, sip_t const *sip,
 			"ChannelType: SIP\r\n"
 			"Peer: SIP/%s\r\n"
 			"PeerStatus: Unregistered\r\n"
-			"Cause: %s\r\n",
-			peer->name, update->unregister_cause ? update->unregister_cause : "Unregister");
+			"Cause: %s\r\n"
+			"SHA256Name: %s\r\n",
+			peer->name, update->unregister_cause ? update->unregister_cause : "Unregister",
+			sofia_peer_effective_sha256name(peer, tokbuf, sizeof(tokbuf)));
 		ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
 		return;	/* mutually exclusive with the registered tail */
 	}
@@ -11328,17 +11391,23 @@ void sofia_emit_register_side_effects(struct sofia_peer *peer, sip_t const *sip,
 		"ChannelType: SIP\r\n"
 		"Peer: SIP/%s\r\n"
 		"PeerStatus: Registered\r\n"
+		"Expire: %ld\r\n"
 		"Address: %s\r\n"
 		"RegContact: %s\r\n"
 		"UserAgent: %s\r\n"
-		"Context: %s\r\n",
+		"Context: %s\r\n"
+		"Accountcode: %s\r\n"
+		"SHA256Name: %s\r\n",
 		peer->name,
+		(long)update->new_expires,	/* negotiated TTL (s) so the connector/presence can TTL-expire this reg */
 		ast_sockaddr_stringify(&update->new_src),	/* use the snapshot, not a post-unlock peer->src_addr read */
 		(sip && sip->sip_contact && sip->sip_contact->m_url->url_host) ?
 			sip->sip_contact->m_url->url_host : "",
 		(sip && sip->sip_user_agent && sip->sip_user_agent->g_string) ?
 			sip->sip_user_agent->g_string : "",
-		peer->context);
+		peer->context,
+		peer->accountcode,	/* chan_sip parity: without this the connector's force-renewal wipes accountcode to "" every REGISTER */
+		sofia_peer_effective_sha256name(peer, tokbuf, sizeof(tokbuf)));
 }
 
 static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
@@ -12619,7 +12688,21 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		break;
 	}
 
-	case SOFIA_DEC_CALL_LIMIT:
+	case SOFIA_DEC_CALL_LIMIT: {
+		char l_name[80], l_context[AST_MAX_CONTEXT], l_accountcode[256], l_address[64] = "";
+		int l_call_limit, l_busy_level, inUse_snap, inRinging_snap;
+		/* SNAPSHOT IDIOM (as the INC path): freeable fields under peer->lock, so the AMI DEC emit
+		 * below can run unlocked without UAF of peer->context/accountcode during a concurrent reload. */
+		ast_mutex_lock(&peer->lock);
+		ast_copy_string(l_name, peer->name, sizeof(l_name));
+		ast_copy_string(l_context, peer->context, sizeof(l_context));
+		ast_copy_string(l_accountcode, S_OR(peer->accountcode, ""), sizeof(l_accountcode));
+		if (!ast_sockaddr_isnull(&peer->src_addr)) {
+			ast_copy_string(l_address, ast_sockaddr_stringify(&peer->src_addr), sizeof(l_address));
+		}
+		l_call_limit = peer->call_limit;
+		l_busy_level = peer->busy_level;
+		ast_mutex_unlock(&peer->lock);
 		ast_mutex_lock(&pvt->lock);
 		ao2_lock(peer);
 		if (pvt->call_inc_done && peer->inUse > 0) {
@@ -12644,20 +12727,54 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 			pvt->hold_inc_done = 0;
 			pvt->hold_state = 0;
 		}
+		inUse_snap = peer->inUse;
+		inRinging_snap = peer->inRinging;
 		ao2_unlock(peer);
 		ast_mutex_unlock(&pvt->lock);
+		/* chan_sip parity: emit the MATCHING DEC so the connector sees ActiveCalls fall back to 0.
+		 * Without it a call-limited peer's presence lamp sticks InUse after every call. Gated like the INC. */
+		if (l_call_limit || l_busy_level) {
+			manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
+				"ChannelType: SIP\r\n" "Peer: SIP/%s\r\n" "PeerStatus: CallCountUpdated\r\n"
+				"Address: %s\r\n" "Context: %s\r\n" "Accountcode: %s\r\n"
+				"ActiveCalls: %d\r\n" "RingingCalls: %d\r\n" "CallLimit: %d\r\n" "Event: DEC_CALL_LIMIT\r\n",
+				l_name, l_address, l_context, l_accountcode, inUse_snap, inRinging_snap, l_call_limit);
+		}
 		break;
+	}
 
-	case SOFIA_DEC_CALL_RINGING:
+	case SOFIA_DEC_CALL_RINGING: {
+		char l_name[80], l_context[AST_MAX_CONTEXT], l_accountcode[256], l_address[64] = "";
+		int l_call_limit, l_busy_level, inUse_snap, inRinging_snap;
+		ast_mutex_lock(&peer->lock);
+		ast_copy_string(l_name, peer->name, sizeof(l_name));
+		ast_copy_string(l_context, peer->context, sizeof(l_context));
+		ast_copy_string(l_accountcode, S_OR(peer->accountcode, ""), sizeof(l_accountcode));
+		if (!ast_sockaddr_isnull(&peer->src_addr)) {
+			ast_copy_string(l_address, ast_sockaddr_stringify(&peer->src_addr), sizeof(l_address));
+		}
+		l_call_limit = peer->call_limit;
+		l_busy_level = peer->busy_level;
+		ast_mutex_unlock(&peer->lock);
 		ast_mutex_lock(&pvt->lock);
 		ao2_lock(peer);
 		if (pvt->ring_inc_done && peer->inRinging > 0) {
 			peer->inRinging--;
 			pvt->ring_inc_done = 0;
 		}
+		inUse_snap = peer->inUse;
+		inRinging_snap = peer->inRinging;
 		ao2_unlock(peer);
 		ast_mutex_unlock(&pvt->lock);
+		if (l_call_limit || l_busy_level) {
+			manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
+				"ChannelType: SIP\r\n" "Peer: SIP/%s\r\n" "PeerStatus: CallCountUpdated\r\n"
+				"Address: %s\r\n" "Context: %s\r\n" "Accountcode: %s\r\n"
+				"ActiveCalls: %d\r\n" "RingingCalls: %d\r\n" "CallLimit: %d\r\n" "Event: DEC_CALL_RINGING\r\n",
+				l_name, l_address, l_context, l_accountcode, inUse_snap, inRinging_snap, l_call_limit);
+		}
 		break;
+	}
 	}
 
 	/* BLF/presence (chan_sip parity): fire a devstate change so the SIP/<peer> hint
@@ -15485,7 +15602,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					"ChannelType: SIP\r\n"
 					"Username: %s\r\n"
 					"Domain: %s\r\n"
-					"Status: Failed\r\n"
+					"Status: Registration Failed\r\n"	/* AMI Registry consumers act on Registered/Unregistered/Registration Failed; the bare "Failed" was silently dropped -> distinct outbound-trunk lamp */
 					"Cause: %d %s\r\n",
 					peer->defaultuser, peer->host, status, phrase ? phrase : "");
 			}
@@ -16013,6 +16130,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			int transitioned = 0, do_regexten_add = 0, do_regexten_remove = 0, l_lastms = -1;
 			const char *new_name = "";
 			char l_name[256] = "";
+			char l_context[256] = "", l_accountcode[256] = "", l_address[80] = "", l_sha256[65] = "";	/* chan_sip parity: qualify PeerStatus carries the presence fields */
 			nua_handle_t *old_qnh = NULL;
 
 			if (pingtime < 1)
@@ -16039,6 +16157,10 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 						peer->peer_status == PEER_LAGGED ? "Lagged" : "Unreachable";
 					l_lastms = peer->lastms;
 					ast_copy_string(l_name, peer->name, sizeof(l_name));
+					ast_copy_string(l_context, peer->context, sizeof(l_context));
+					ast_copy_string(l_accountcode, peer->accountcode, sizeof(l_accountcode));
+					ast_copy_string(l_address, ast_sockaddr_stringify(&peer->src_addr), sizeof(l_address));
+					sofia_peer_effective_sha256name(peer, l_sha256, sizeof(l_sha256));	/* read-only helper, safe under lock; snapshot the token for the unlocked emit */
 					if (sofia_cfg.regextenonqualify) {
 						if (peer->peer_status == PEER_REACHABLE) {
 							do_regexten_add = 1;
@@ -16067,8 +16189,12 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					"ChannelType: SIP\r\n"
 					"Peer: SIP/%s\r\n"
 					"PeerStatus: %s\r\n"
-					"Time: %d\r\n",
-					l_name, new_name, l_lastms);
+					"Time: %d\r\n"
+					"Address: %s\r\n"
+					"Context: %s\r\n"
+					"Accountcode: %s\r\n"
+					"SHA256Name: %s\r\n",
+					l_name, new_name, l_lastms, l_address, l_context, l_accountcode, l_sha256);
 				/* BLF/presence: reachability changed -> re-evaluate hint. */
 				ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", l_name);
 				/* regextenonqualify: ADD on REACHABLE, REMOVE on UNREACHABLE (LAGGED neither). */
@@ -17653,6 +17779,10 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "rtupdate")) {
 			/* Gates the realtime peer updates in sofia_process_register. */
 			sofia_cfg.peer_rtupdate = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "fill_sha256name") || !strcasecmp(v->name, "fillsha256name")) {
+			/* Optional: on realtime peer build, persist SHA256(systemname.name) into
+			 * the sippeers realtime sha256name column when empty or stale (sofia_find_peer_realtime_build). */
+			sofia_cfg.fill_sha256name = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "register_pool")) {
 			/* Kill-switch: offload realtime REGISTER DB writes to a bounded pool
 			 * (default OFF). Takes effect on reload. */
@@ -18003,6 +18133,11 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "subscribe_event")) {
 			/* Generic outbound SUBSCRIBE (RFC 6665): <event>[;<accept-mime>][;<expires>]. */
 			ast_string_field_set(peer, subscribe_event, v->value);
+		} else if (!strcasecmp(v->name, "sha256name")) {
+			/* FORCED presence identity token for this file peer (overrides the computed
+			 * SHA256(systemname.name)). Emitted in PeerStatus and honored end-to-end; if absent,
+			 * fill_sha256name computes it on the fly at emit time. */
+			ast_copy_string(peer->sha256name, v->value, sizeof(peer->sha256name));
 		} else if (!strcasecmp(v->name, "type")) {
 			if (!strcasecmp(v->value, "friend")) {
 				peer->type = SOFIA_TYPE_FRIEND;
@@ -18823,6 +18958,8 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.rtsave_sysname = 0;
 	/* Gates the realtime peer updates in sofia_process_register. */
 	sofia_cfg.peer_rtupdate = 1;
+	/* Realtime sha256name fill: default ON (operator: fill by default). */
+	sofia_cfg.fill_sha256name = 1;
 	/* Register pool: default OFF + auto lane count. */
 	sofia_cfg.register_pool = 0;
 	sofia_cfg.register_pool_workers = 0;

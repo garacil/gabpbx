@@ -302,6 +302,7 @@ struct ao2_container *sofia_dialogs_container(void);	/* accessor for the live-di
 struct sofia_register_update {
 	int was_registered;
 	int now_registered;
+	int new_expires;                /*!< negotiated registration Expires (seconds); emitted as PeerStatus Registered "Expire" so the connector/presence can TTL-expire the peer (chan_sip parity) */
 	int contacts_before;
 	int contacts_after;
 	int contacts_added;
@@ -807,6 +808,7 @@ struct sofia_peer {
 	struct timeval last_qualify;
 	nua_handle_t *qualify_nh;
 	int is_realtime;
+	char sha256name[65];       /* the sippeers realtime sha256name column cache: SHA256(systemname.name) hex (64+NUL). Captured on realtime build; used by fill_sha256name to detect empty/stale and refresh. */
 		int is_register_line;
 	/* Transient flag used only by sofia_reload_worker for mark-and-sweep
 	 * (chan_sofia.c sofia_peer_mark_cb / sofia_peer_sweep_cb). Set/cleared
@@ -1089,6 +1091,7 @@ struct sofia_config {
 	int subscribe_network_change_event; /* parse-compatibility only (sofia-sip sres_resolver + dnsmgr absorb network-change rebinding); default 1 (chan_sip) */
 	int rtsave_sysname;        /* 1 = include regserver=AST_SYSTEM_NAME in realtime writes (multi-server deployments). Restores canonical Asterisk behavior (active chan_sip fork dropped it). Default 0. */
 	int peer_rtupdate;         /* 1 = propagate registration changes to realtime DB (ast_update_realtime); default 1. rtupdate=no skips ALL realtime writes (cached-realtime, avoids churn). */
+	int fill_sha256name;       /* 1 = on realtime peer build, persist SHA256(systemname.name) into the sippeers realtime sha256name column (presence identity token) when empty or stale; default 0 (OFF). Realtime peers only. */
 	/* Bounded REGISTER realtime-DB-write offload pool (kill-switch, default OFF). */
 	int register_pool;          /* offload the realtime REGISTER DB writes to a bounded pool */
 	int register_pool_workers;  /* lane count; 0 = auto = clamp(ncpu/2+1, 2, 16) */

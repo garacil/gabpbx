@@ -696,6 +696,7 @@ struct __show_chan_arg {
 */
 struct sip_settings {
 	int peer_rtupdate;          /*!< G: Update database with registration data for peer? */
+	int fill_sha256name;        /*!< G: On realtime peer build, persist SHA256(systemname.name) into the sippeers realtime sha256name column when empty (chan_sofia parity) */
 	int rtsave_sysname;         /*!< G: Save system name at registration? */
 	int ignore_regexpire;       /*!< G: Ignore expiration of peer  */
 	int rtautoclear;            /*!< Realtime ?? */
@@ -1229,6 +1230,7 @@ struct sip_peer {
 		AST_STRING_FIELD(unsolicited_mailbox);  /*!< Mailbox to store received unsolicited MWI NOTIFY messages information in */
 		AST_STRING_FIELD(realtime_id);          /*!< Unique ID from database. Realtime only */
 		AST_STRING_FIELD(sipserver);            /*!< Server where service is active TO REMOVE IN THE FUTURE */
+		AST_STRING_FIELD(sha256name);           /*!< Presence identity token cache (the sippeers realtime sha256name column = SHA256(systemname.name)); chan_sofia parity */
 		);
 	struct sip_socket socket;       /*!< Socket used for this peer */
 	enum sip_transport default_outbound_transport;   /*!< Peer Registration may change the default outbound transport.
