@@ -1,13 +1,13 @@
 <refentry>
  <refentryinfo>
-  <date>2011-02-08</date>
+  <date>2026-08-06</date>
  </refentryinfo>
  <refmeta>
   <refentrytitle>
    <application>gabpbx</application>
   </refentrytitle>
   <manvolnum>8</manvolnum>
-  <refmiscinfo>gabpbx 1.8</refmiscinfo>
+  <refmiscinfo>gabpbx 1.5.17</refmiscinfo>
  </refmeta>
  <refnamediv>
   <refname>
@@ -44,7 +44,7 @@
  </refsynopsisdiv>
  <refsect1>
   <refsect1info>
-   <date>2011-02-08</date>
+   <date>2026-08-06</date>
   </refsect1info>
   <title>DESCRIPTION</title>
   <para>
@@ -73,7 +73,7 @@
    currently loaded into the system.
   </para>
   <para>
-   GABpbx is a trademark of Digium, Inc.
+   GABpbx is free software, a fork of Asterisk. Asterisk is a registered trademark of Sangoma Technologies Corporation.
   </para>
  </refsect1>
  <refsect1>
@@ -415,29 +415,29 @@
  <refsect1>
   <title>BUGS</title>
   <para>
-  Bug reports and feature requests may be filed at https://github.com/garacil/gabpbx/issues
+  Bug reports and feature requests may be filed at https://issues.gabpbx.org
   </para>
  </refsect1>
  <refsect1>
   <title>SEE ALSO</title>
   <para>
-   https://github.com/garacil/gabpbx - The GABpbx Home Page
+   http://www.gabpbx.org - The GABpbx Home Page
   </para>
   <para>
-   https://github.com/garacil/gabpbx/wiki - The GABpbx Documentation Project
+   http://www.gabpbxdocs.org - The GABpbx Documentation Project
   </para>
   <para>
-   https://github.com/garacil/gabpbx/wiki - The GABpbx Wiki
+   http://wiki.gabpbx.org - The GABpbx Wiki
   </para>
   <para>
-   http://www.digium.com/ - derived from Asterisk (originally sponsored by Digium)
+   https://gabpbx.org/ - GABpbx, a fork of Asterisk
   </para>
  </refsect1>
  <refsect1>
   <title>AUTHOR</title>
   <para>
    <author>
-    <firstname>Mark Spencer &lt;markster@digium.com&gt;</firstname> 
+    <firstname>Germán Luis Aracil Boned and the GABpbx project &lt;https://gabpbx.org&gt;</firstname>
    </author>
   </para>
   <para>
