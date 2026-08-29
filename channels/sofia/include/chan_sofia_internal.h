@@ -445,6 +445,7 @@ enum sofia_reinvite_purpose {
 	SOFIA_REINVITE_DIRECTMEDIA,
 	SOFIA_REINVITE_T38,
 	SOFIA_REINVITE_LOCAL_HOLD,
+	SOFIA_REINVITE_CONNECTED_LINE,
 };
 
 /* The per-call/dialog object — the central media/signaling state. Shared so the SDP, T.38, register
@@ -550,6 +551,12 @@ struct sofia_pvt {
 	struct ast_sockaddr ourip; /* kernel-routed source IP for outbound From/Contact + SDP c= (sofia_resolve_ourip) */
 	int callingpres; /* AST_PRES_* mask; inherits peer->callingpres */
 	int outgoing; /* 1=outbound dial, 0=inbound INVITE; drives RPID ;party=calling/called */
+	/* A connected-line update arrived before the call was up, so it had no request of its own to ride on; the next
+	 * 180/183 we emit carries the RPID/PAI and clears this (chan_sip SIP_PAGE2_CONNECTLINEUPDATE_PEND parity).
+	 * Deliberately a plain int, not a :1 bitfield: the bitfield group above is written from both the channel thread
+	 * (progress_sent) and the stack thread (offer_had_audio), so adding a bit there would widen that read-modify-write
+	 * window. A word-sized store does not disturb its neighbours. */
+	int connectedline_pending;
 	struct sofia_history *history;	/* SIP history ring (sofia_history.c); lazily allocated, freed in destructor */
 	int do_history;			/* per-dialog snapshot of sofia_record_history at creation (chan_sip parity) */
 	int history_retained;		/* idempotency net: history already snapshotted into the retained ring */

@@ -157,6 +157,7 @@
 #include "gabpbx/udptl.h"  /* T.38 fax UDPTL + struct ast_control_t38_parameters */
 #include "gabpbx/sched.h"  /* ast_sched_thread for the sofia_t38_abort 5s reINVITE timeout */
 #include "gabpbx/causes.h"
+#include "gabpbx/aoc.h"  /* Advice of Charge decode for the AST_CONTROL_AOC indication */
 #include "gabpbx/acl.h"
 #include "gabpbx/musiconhold.h"
 #include "gabpbx/ast_version.h"  /* ast_get_version() for the User-Agent default */
@@ -2703,6 +2704,11 @@ static int sofia_get_pai(struct sofia_pvt *pvt, sip_t const *sip);
 static int sofia_get_rpid(struct sofia_pvt *pvt, sip_t const *sip);
 /* Inbound Diversion parser — walks sip->sip_unknown for "Diversion" by name. */
 static int sofia_change_redirecting_info(struct sofia_pvt *pvt, struct ast_channel *owner, sip_t const *sip);
+/* Mid-call identity updates driven by the core's AST_CONTROL_CONNECTED_LINE /
+ * AST_CONTROL_REDIRECTING indications (chan_sip update_connectedline /
+ * update_redirecting parity). Defined next to the header builders they reuse. */
+static void sofia_update_connectedline(struct sofia_pvt *pvt);
+static void sofia_update_redirecting(struct sofia_pvt *pvt);
 
 /* MWI re-NOTIFY cross-thread dispatch carrier: mwi_event_cb fires on the event-bus
  * thread, nua_notify must run on sofia_thread. The peer +1 ref is TRANSFERRED
@@ -5077,6 +5083,18 @@ static void sofia_session_timer_values(const struct sofia_peer *peer, int is_out
 	}
 }
 
+/* Human-readable tag for the shared re-INVITE builder's log line. */
+static const char *sofia_reinvite_purpose_str(int purpose)
+{
+	switch (purpose) {
+	case SOFIA_REINVITE_DIRECTMEDIA:    return "directmedia";
+	case SOFIA_REINVITE_T38:            return "T.38";
+	case SOFIA_REINVITE_LOCAL_HOLD:     return "local-hold";
+	case SOFIA_REINVITE_CONNECTED_LINE: return "connected-line";
+	default:                            return "in-dialog";
+	}
+}
+
 /* Send an in-dialog re-INVITE. LOCK: caller MUST hold pvt->lock (reads redirip,
  * writes reinvite_pending; both also touched by the sofia event-loop thread). */
 static void sofia_send_reinvite(struct sofia_pvt *pvt)
@@ -5084,6 +5102,7 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 	char sdp_buf[4096];	/* WebRTC video (multi-PT rtcp-fb + ICE candidates) can exceed 2048 → SDP dropped fail-closed; RFC 8843/6184 headroom */
 	char mf_str[8];	/* RFC 3261 §20.22 Max-Forwards */
 	char gruu_contact[1024] = "";	/* sized for an opaque GRUU (RFC 5627) */
+	char rpid_buf[512] = "";	/* connected-line re-INVITE only; empty for every other purpose */
 	int have_gruu = 0;
 	int mf = sofia_cfg.default_max_forwards;
 
@@ -5103,6 +5122,12 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 		ast_mutex_lock(&pvt->peer->lock);
 		mf = pvt->peer->maxforwards;
 		have_gruu = sofia_gruu_dialog_contact(pvt->peer, gruu_contact, sizeof(gruu_contact));
+		/* A connected-line re-INVITE exists solely to carry the new identity, so build the
+		 * RPID/PAI under the same peer->lock span as the other stringfield readers
+		 * (chan_sip add_rpid on its update_connectedline INVITE, chan_sip.c:14030). */
+		if (pvt->reinvite_purpose == SOFIA_REINVITE_CONNECTED_LINE) {
+			sofia_add_rpid(pvt, rpid_buf, sizeof(rpid_buf));
+		}
 		ast_mutex_unlock(&pvt->peer->lock);
 	}
 	snprintf(mf_str, sizeof(mf_str), "%d", mf);
@@ -5116,13 +5141,24 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 		SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 		SIPTAG_PAYLOAD_STR(sdp_buf),
 		SIPTAG_MAX_FORWARDS_STR(mf_str),
+		TAG_IF(rpid_buf[0], SIPTAG_HEADER_STR(rpid_buf)),
 		TAG_IF(!ast_strlen_zero(pvt->outbound_proxy), NUTAG_PROXY(pvt->outbound_proxy)),	/* NAT: re-INVITE to the learned public source (operation-level) */
 		TAG_IF(have_gruu, SIPTAG_CONTACT_STR(gruu_contact)),
 		TAG_END());
-	ast_verbose("Sofia: directmedia re-INVITE sent on '%s' -> %s:%d\n",
-		pvt->callid ? pvt->callid : "(no-callid)",
-		ast_sockaddr_stringify_host(&pvt->redirip),
-		ast_sockaddr_port(&pvt->redirip));
+	/* One line for every purpose that shares this builder — it used to say "directmedia"
+	 * unconditionally, which misreported the T.38, hold and connected-line re-INVITEs. The
+	 * media target is only meaningful for directmedia; the other purposes leave redirip
+	 * unset and used to print "(null):0". */
+	if (pvt->reinvite_purpose == SOFIA_REINVITE_DIRECTMEDIA) {
+		ast_verbose("Sofia: directmedia re-INVITE sent on '%s' -> %s:%d\n",
+			pvt->callid ? pvt->callid : "(no-callid)",
+			ast_sockaddr_stringify_host(&pvt->redirip),
+			ast_sockaddr_port(&pvt->redirip));
+	} else {
+		ast_verbose("Sofia: %s re-INVITE sent on '%s'\n",
+			sofia_reinvite_purpose_str(pvt->reinvite_purpose),
+			pvt->callid ? pvt->callid : "(no-callid)");
+	}
 }
 
 /* Runs a re-INVITE on sofia_thread (shared by directmedia, T.38 and local hold; dispatched with a
@@ -6496,11 +6532,19 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 		/* Contact from pvt->ourip; see sofia_answer. reload-UAF: hold peer->lock
 		 * across sofia_build_contact (reads freeable fromuser). */
 		char contact_buf[1024];	/* sized for an opaque GRUU Contact (RFC 5627), not just sip:user@host */
+		char rpid_buf[512] = "";	/* only when a pre-answer connected-line update is latched */
 		if (pvt->peer) ast_mutex_lock(&pvt->peer->lock);
 		sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
+		/* Carry a latched connected-line update out on this provisional (chan_sip
+		 * consumes SIP_PAGE2_CONNECTLINEUPDATE_PEND the same way, chan_sip.c:11431). */
+		if (pvt->connectedline_pending) {
+			sofia_add_rpid(pvt, rpid_buf, sizeof(rpid_buf));
+			pvt->connectedline_pending = 0;
+		}
 		if (pvt->peer) ast_mutex_unlock(&pvt->peer->lock);
 		nua_respond(pvt->nh, SIP_180_RINGING,
 			TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
+			TAG_IF(rpid_buf[0], SIPTAG_HEADER_STR(rpid_buf)),
 			TAG_END());
 	}
 		/* progressinband (chan_sip.c AST_CONTROL_RINGING parity, chan_sip.c:7639-7645):
@@ -6574,12 +6618,20 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 			/* Contact from pvt->ourip (see sofia_answer); reload-UAF: hold peer->lock
 			 * across sofia_build_contact (reads freeable fromuser). */
 			char contact_buf[1024];	/* sized for an opaque GRUU Contact (RFC 5627), not just sip:user@host */
+			char rpid_buf[512] = "";	/* only when a pre-answer connected-line update is latched */
 			if (pvt->peer) ast_mutex_lock(&pvt->peer->lock);
 			sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
+			/* Carry a latched connected-line update out on this provisional (chan_sip
+			 * consumes SIP_PAGE2_CONNECTLINEUPDATE_PEND the same way, chan_sip.c:11431). */
+			if (pvt->connectedline_pending) {
+				sofia_add_rpid(pvt, rpid_buf, sizeof(rpid_buf));
+				pvt->connectedline_pending = 0;
+			}
 			if (pvt->peer) ast_mutex_unlock(&pvt->peer->lock);
 			if (pvt->rtp && sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf), 1 /* answer */)) {
 				nua_respond(pvt->nh, SIP_183_SESSION_PROGRESS,
 					TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
+					TAG_IF(rpid_buf[0], SIPTAG_HEADER_STR(rpid_buf)),
 					SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 					SIPTAG_PAYLOAD_STR(sdp_buf),
 					TAG_END());
@@ -6587,6 +6639,7 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 				/* RTP not yet bound — bodyless 183 (rare; rtp_init runs earlier). */
 				nua_respond(pvt->nh, SIP_183_SESSION_PROGRESS,
 					TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
+					TAG_IF(rpid_buf[0], SIPTAG_HEADER_STR(rpid_buf)),
 					TAG_END());
 			}
 			pvt->progress_sent = 1;	/* chan_sip SIP_PROGRESS_SENT parity: a 183 went out (see RINGING) */
@@ -6732,6 +6785,54 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 			}
 		}
 		break;
+	case AST_CONTROL_CONNECTED_LINE:
+		/* chan_sip parity (chan_sip.c:7818): the connected party changed mid-call —
+		 * assert the new identity toward the peer. Without this arm the indication fell
+		 * through to the default warning, which is what call parking hits: on retrieval
+		 * parked_call_exec exchanges connected-line identity between the parked channel
+		 * and the retriever (main/features.c:5393). */
+		sofia_update_connectedline(pvt);
+		break;
+	case AST_CONTROL_REDIRECTING:
+		/* chan_sip parity (chan_sip.c:7821). */
+		sofia_update_redirecting(pvt);
+		break;
+	case AST_CONTROL_PROCEEDING:
+		/* chan_sip emits a 100 Trying here (chan_sip.c:7765). chan_sofia deliberately
+		 * does NOT: the stack's transaction layer auto-sends 100 the instant the INVITE
+		 * server transaction is created, so an explicit one only duplicated it on the
+		 * wire — see the standing note in the inbound INVITE handler. Absorb it so the
+		 * core does not log an unhandled indication for a condition we have covered. */
+		break;
+	case AST_CONTROL_AOC:
+		/* chan_sip parity (chan_sip.c:7824). Only the termination-request branch is
+		 * load-bearing: the far end already started the hangup and is only waiting for a
+		 * final AOC-E, which SIP cannot carry here, so complete the teardown instead of
+		 * waiting for a timeout. The AOC-D/E emit needs a vendor-specific INFO body and a
+		 * per-peer opt-in that chan_sofia does not have, so it is not ported. */
+		{
+			struct ast_aoc_decoded *decoded =
+				ast_aoc_decode((struct ast_aoc_encoded *) data, datalen, ast);
+
+			if (!decoded) {
+				ast_log(LOG_ERROR, "Sofia: error decoding indicated AOC data\n");
+				return -1;
+			}
+			if (ast_aoc_get_msg_type(decoded) == AST_AOC_REQUEST
+					&& ast_aoc_get_termination_request(decoded)) {
+				ast_debug(1, "Sofia: AOC-E termination request on %s is not supported; continuing with hangup\n",
+					ast->name);
+				ast_softhangup_nolock(ast, AST_SOFTHANGUP_DEV);
+			}
+			ast_aoc_destroy_decoded(decoded);
+		}
+		break;
+	case AST_CONTROL_UPDATE_RTP_PEER:
+		/* Absorb this since it is handled by the bridge (chan_sip.c:7859). */
+		break;
+	case AST_CONTROL_FLASH:
+		/* Not handled, but expected — no warning (chan_sip.c:7861). */
+		return -1;
 	default:
 		ast_log(LOG_WARNING, "Sofia: Don't know how to indicate condition %d\n", condition);
 		return -1;
@@ -12226,6 +12327,105 @@ static int sofia_add_diversion(struct sofia_pvt *pvt, char *header_buf, size_t h
 	return 1;
 }
 
+/* AST_CONTROL_REDIRECTING handler (chan_sip update_redirecting parity, chan_sip.c:13990).
+ * The core applies the new redirecting party to owner->redirecting before calling the
+ * driver, so we only have to put it on the wire. Like chan_sip this is a UAS pre-answer
+ * courtesy: once the call is up, or when we are the UAC, chan_sip silently returns and so
+ * do we. Runs on the channel thread with the channel lock held (sofia_indicate). */
+static void sofia_update_redirecting(struct sofia_pvt *pvt)
+{
+	char diversion_buf[512] = "";
+
+	if (!pvt || !pvt->owner || !pvt->nh) {
+		return;
+	}
+	if (pvt->owner->_state == AST_STATE_UP || pvt->outgoing) {
+		return;
+	}
+
+	/* reload-UAF: the builder reads freeable peer stringfields. LOCK ORDER channel -> peer. */
+	if (pvt->peer) {
+		ast_mutex_lock(&pvt->peer->lock);
+	}
+	sofia_add_diversion(pvt, diversion_buf, sizeof(diversion_buf));
+	if (pvt->peer) {
+		ast_mutex_unlock(&pvt->peer->lock);
+	}
+	if (!diversion_buf[0]) {
+		/* No redirect indication on the channel — nothing to forward. */
+		return;
+	}
+
+	nua_respond(pvt->nh, 181, "Call is being forwarded",
+		SIPTAG_HEADER_STR(diversion_buf),
+		TAG_END());
+}
+
+/* AST_CONTROL_CONNECTED_LINE handler (chan_sip update_connectedline parity,
+ * chan_sip.c:14004). The core applies the new connected party to owner->connected before
+ * calling the driver, and sofia_resolve_identity already reads owner->connected.id as its
+ * primary source, so sofia_add_rpid builds exactly the header this update needs.
+ * Runs on the channel thread with the channel lock held (sofia_indicate). */
+static void sofia_update_connectedline(struct sofia_pvt *pvt)
+{
+	int dispatch = 0;
+
+	if (!pvt || !pvt->owner || !pvt->nh) {
+		return;
+	}
+	/* chan_sip.c:14007 — the peer does not want RPID/PAI, so there is nothing to send. */
+	if (!pvt->peer || pvt->peer->sendrpid == 0) {
+		return;
+	}
+	/* chan_sip.c:14010 — no usable connected number, nothing to assert. */
+	if (!pvt->owner->connected.id.number.valid
+			|| ast_strlen_zero(pvt->owner->connected.id.number.str)) {
+		return;
+	}
+
+	if (pvt->owner->_state != AST_STATE_UP && !pvt->outgoing) {
+		/* chan_sip.c:14047 — pre-answer as UAS there is no standalone request to carry
+		 * this, so latch it and let the next 180/183 stamp the RPID (chan_sip consumes
+		 * the same latch in its provisional-response path, chan_sip.c:11431). chan_sip's
+		 * rpid_immediate, which fabricates a provisional right now, has no chan_sofia
+		 * knob and is deliberately not introduced here. */
+		ast_mutex_lock(&pvt->lock);
+		pvt->connectedline_pending = 1;
+		ast_mutex_unlock(&pvt->lock);
+		return;
+	}
+
+	/* Mid-call: re-INVITE carrying the new identity (chan_sip.c:14023 sends an
+	 * INVITE/UPDATE with add_rpid + add_sdp; sofia_send_reinvite re-offers the SDP and
+	 * stamps the RPID for this purpose). Claim the single re-INVITE slot exactly like the
+	 * T.38 and local-hold paths. If one is already in flight the update is dropped rather
+	 * than glaring — chan_sip defers via SIP_NEEDREINVITE, which has no equivalent here. */
+	ast_mutex_lock(&pvt->lock);
+	if (pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh && !pvt->alreadygone
+			&& !pvt->reinvite_pending) {
+		pvt->reinvite_pending = 1;
+		pvt->reinvite_purpose = SOFIA_REINVITE_CONNECTED_LINE;
+		ao2_ref(pvt, +1);	/* dispatch ref; sofia_reinvite_root drops it */
+		dispatch = 1;
+	}
+	ast_mutex_unlock(&pvt->lock);
+
+	if (!dispatch) {
+		ast_debug(1, "Sofia: connected-line update on '%s' skipped — a re-INVITE is already in flight\n",
+			pvt->owner->name);
+		return;
+	}
+	if (sofia_dispatch_to_root_thread(sofia_reinvite_root, pvt) < 0) {
+		ast_mutex_lock(&pvt->lock);
+		pvt->reinvite_pending = 0;
+		pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
+		ast_mutex_unlock(&pvt->lock);
+		ao2_ref(pvt, -1);
+		ast_log(LOG_WARNING, "Sofia: failed to dispatch connected-line re-INVITE on '%s'\n",
+			pvt->owner->name);
+	}
+}
+
 /* Returns 1 if a Privacy: id token is present (RFC 3323 §4.2). */
 static int sofia_check_privacy_id(sip_t const *sip)
 {
@@ -15842,6 +16042,53 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				}
 				break;
 				}
+			if (reinvite_purpose == SOFIA_REINVITE_CONNECTED_LINE) {
+				/* Connected-line re-INVITE response. This purpose carries no media or
+				 * state change of its own — the offer was a plain re-offer of the current
+				 * session whose only job was to deliver the new RPID/PAI — so there is
+				 * nothing to roll back on reject (unlike LOCAL_HOLD above, which restores
+				 * local_hold_mode_prev). Just apply the answer and release the gate. */
+				int rejected = (status >= 300);
+				int has_sdp = (!rejected && sip && sip->sip_payload && sip->sip_payload->pl_data);
+				struct ast_channel *owner = NULL;
+
+				ast_mutex_lock(&pvt->lock);
+				for (;;) {	/* re-acquire channel->pvt order for a safe sofia_parse_sdp (set_format) */
+					owner = pvt->owner;
+					if (!owner) {
+						break;
+					}
+					ast_channel_ref(owner);
+					ast_mutex_unlock(&pvt->lock);
+					ast_channel_lock(owner);
+					ast_mutex_lock(&pvt->lock);
+					if (pvt->owner == owner) {
+						break;
+					}
+					ast_channel_unlock(owner);
+					ast_channel_unref(owner);
+					owner = NULL;
+				}
+				pvt->reinvite_pending = 0;
+				pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
+				if (has_sdp) {
+					sofia_parse_sdp(pvt, sip, 0 /* answer: connected-line re-INVITE 2xx */);
+				}
+				if (owner) {
+					ast_channel_unlock(owner);
+				}
+				ast_mutex_unlock(&pvt->lock);
+				if (owner) {
+					ast_channel_unref(owner);
+				}
+				if (rejected) {
+					/* Purely informational: the peer declined an identity refresh, the
+					 * session itself is unaffected. */
+					ast_debug(1, "Sofia: connected-line re-INVITE rejected on '%s' (%d %s)\n",
+						pvt->callid ? pvt->callid : "(no-callid)", status, phrase ? phrase : "");
+				}
+				break;
+			}
 			/* Not LOCAL_HOLD → Direct-media / T.38 re-INVITE response (call already up).
 			 * reinvite_pending + redirip are shared with the bridge thread; guard with pvt->lock. */
 			int rejected = (status >= 300);
