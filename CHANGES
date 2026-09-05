@@ -1,3 +1,72 @@
+## 1.6.0 — mobile push wake-up: park, push and resume calls to sleeping softphones
+
+A mobile softphone cannot keep its SIP socket alive in the background: the OS kills the
+app (its registration binding disappears) or freezes it with the socket open but dead.
+Until now a call to such an extension failed instantly (`CHANUNAVAIL`) or waited out a
+32-second Timer-B black hole. `chan_sofia` can now **wake the phone** instead.
+
+### How it works
+
+- **Token capture.** A mobile app adds four headers to its REGISTER — `X-Device-ID`,
+  `X-Push-Token`, `X-Push-Platform` (`ios`/`android`) and `X-Push-Type` (`voip`/`fcm`) —
+  and the registrar stores one row per device in a **local SQLite store** (realtime
+  families `pushtokens`/`pushlog` through `res_config_sqlite3`), mirrored in a global
+  in-memory cache preloaded at module init, so **the dial path never reads a database**.
+  Retention follows mobile reality: an unregister that names the device (`X-Device-ID`)
+  deletes that device only; a logout without it keeps the token (the phone must remain
+  wakeable); a token purges automatically when the push service declares it dead
+  (APNs `BadDeviceToken`/`410`, FCM `404`/`400`), after 5 unanswered pushes, or past
+  `push_token_ttl` days without a REGISTER.
+- **Park instead of fail.** A call to a dynamic peer that has usable tokens but no live
+  binding is parked in a bounded registry (per-peer and global caps; one-winner state
+  transitions under a leaf lock) and **one push per device** goes out through the
+  companion sender scripts (APNs VoIP over HTTP/2, FCM v1) — executed with an argv-only
+  fork/exec (never a shell), a captured result line, a hard deadline and the token always
+  redacted in logs. The push announces a **pre-generated Call-ID** as the call's uuid.
+- **Resume.** Any successful REGISTER of the account delivers the parked call: the
+  INVITE is posted through the exact builder normal calls use, carrying the announced
+  Call-ID as an operation tag, committed under the channel lock so a racing hangup is
+  structurally excluded; a commit-then-recheck closes the REGISTER-during-park window.
+  If no device wakes within `push_wait`, the caller gets a clean `NOANSWER` (forwards
+  and voicemail behave exactly like an unanswered desk phone; trunk failover does not
+  misfire).
+- **Zero impact without tokens.** Desk phones, trunks and WebRTC browsers never send a
+  push token, so their behavior is byte-for-byte unchanged.
+
+Measured on real devices: wake REGISTER 1–2 s after the push, call answered a few
+seconds after dialing, wire Call-ID matching the announced uuid byte-for-byte; the
+park/resume/cancel machinery survives a `sip reload` hammer with a REGISTER flapper
+under `DEBUG_THREADS` with zero lock or memory errors.
+
+### Configuration
+
+```ini
+; modules.conf
+preload => res_config_sqlite3.so
+
+; res_config_sqlite3.conf
+[general]
+dbfile = /var/lib/gabpbx/push_tokens.sqlite3
+
+; extconfig.conf
+pushtokens => sqlite3,push,push_tokens
+pushlog    => sqlite3,push,push_log
+
+; sofia.conf
+[general]
+push=yes                 ; master enable (default no)
+push_scripts=/etc/gabpbx/push   ; sender scripts directory
+push_wait=24             ; seconds parked awaiting the wake REGISTER
+push_token_ttl=30        ; days a token survives without a REGISTER
+push_max_devices=10      ; devices pushed per peer per call
+push_min_interval=5      ; per-device push floor, seconds
+```
+
+`push=no` on a peer opts it out. The SQLite schema (`push_tokens`, `push_log`) is created
+once at deploy (enable WAL so operator reads never block the driver); the sender scripts
+need their APNs auth key / FCM service-account credentials next to them. `sip show push`
+lists cached tokens (redacted) and parked calls.
+
 ## 1.5.17 — faithful ${HANGUPCAUSE} across the call bridge (carrier-failover fix)
 
 Fixes a double-dial / double-billing bug. After a normally-answered call that the
