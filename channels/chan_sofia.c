@@ -5679,10 +5679,382 @@ int sofia_post_invite(struct sofia_pvt *pvt, struct ast_channel *ast, const char
 	return 0;
 }
 
+/* Build + INVITE ONE fork branch to a single (unexpired) contact: child pvt cloned
+ * from the master, per-contact RURI/NAT proxy/transport-matched media profile, linked
+ * into fork->children + dialogs and counted before its nua_invite. Shared by the
+ * initial fork loop and the push multi-ring LATE APPEND (a device whose wake REGISTER
+ * lands while the resumed call is still unanswered gets its branch added here).
+ * Channel lock held by the caller; returns 1 when the INVITE was posted, else 0. */
+static int sofia_fork_dial_one(struct sofia_pvt *pvt, struct sofia_fork *fork,
+	struct sofia_contact *c, int branch_idx)
+{
+	char sdp_buf[4096];	/* same headroom rationale as sofia_call */
+	time_t now = time(NULL);
+	int posted = 0;
+	struct sofia_pvt *child;
+	char ruri[256];
+	time_t c_exp;
+
+	/* Snapshot expires under the contact lock (refresh race). */
+	ao2_lock(c);
+	c_exp = c->expires;
+	ao2_unlock(c);
+	if (!sofia_contact_is_unexpired(c_exp, now)) {
+		return 0;
+	}
+
+	child = sofia_pvt_alloc();
+	if (!child) {
+		return 0;
+	}
+
+	child->fork = fork;
+	ao2_ref(fork, +1);
+	child->is_fork_child = 1;
+	snprintf(child->fork_branch_id, sizeof(child->fork_branch_id),
+		"b%d-%lx", branch_idx, (unsigned long)now);
+
+	/* Copy dial parameters from master. */
+	ast_string_field_set(child, exten, pvt->exten);
+	ast_string_field_set(child, peername, pvt->peername);
+	ast_string_field_set(child, context, pvt->context);
+	ast_string_field_set(child, username, pvt->username);
+	ast_string_field_set(child, peersecret, pvt->peersecret);
+	ast_string_field_set(child, fromuser, pvt->fromuser);
+	ast_string_field_set(child, fromdomain, pvt->fromdomain);
+	child->capability = pvt->capability;
+	child->prefs = pvt->prefs;
+	child->dtmfmode = pvt->dtmfmode;
+	child->dtmf_effective = pvt->dtmf_effective;	/* inherit the master's runtime mode; child rtp_init applies the property */
+	child->dtmf_detect_off = pvt->dtmf_detect_off;	/* inherit any runtime DIGIT_DETECT suspend (complete runtime-state clone) */
+	child->peer = pvt->peer;
+	ao2_ref(child->peer, +1);
+	/* children never own the ast_channel. Inherit the master's resolved
+	 * outbound identity (scalars here; a temporary owner alias across the
+	 * header builders below) so forked INVITEs carry the real caller. */
+	child->callingpres = pvt->callingpres;
+	ast_sockaddr_copy(&child->ourip, &pvt->ourip);
+	char child_path[1024] = "";	/* RFC 3327 Path of THIS contact, pre-loaded as Route on its forked INVITE */
+
+	/* Build RURI for this contact via the shared per-contact builder
+	 * (single source of truth with the single-live-contact request path):
+	 * snapshots c->transport/src_addr/host/port under ao2_lock(c), routes
+	 * ws/wss to c->src_addr (BUG 2 / WSS fork), appends the transport, and
+	 * copies this contact's RFC 3327 Path. c->host may be unbracketed IPv6 —
+	 * the helper wraps it (RFC 3261 §19.1.2). */
+	sofia_build_contact_ruri(c, pvt->exten, ruri, sizeof(ruri),
+		(child->peer && child->peer->path_support), child_path, sizeof(child_path));
+	ast_string_field_set(child, ruri, ruri);
+	/* B (chan_sip parity): keep the (private) Contact in the RURI above; route THIS
+	 * child's INVITE packet to the contact's learned PUBLIC src via NUTAG_PROXY (the fork
+	 * path previously set no proxy, so NAT'd UDP forked contacts went to the private RURI). */
+	char child_proxy_url[128] = "";
+	sofia_build_contact_proxy_url(child->peer, c, child_proxy_url, sizeof(child_proxy_url));
+	/* NAT: apply the next-hop proxy at the child nua_invite OPERATION level (below), not at
+	 * nua_handle (ineffective for the initial INVITE in this sofia-sip fork). Stash on the child;
+	 * sofia_fork_pick_winner copies it onto master so later master re-INVITEs keep routing here. */
+	ast_string_field_set(child, outbound_proxy, child_proxy_url);
+
+	/* Create handle auto-bound to child. */
+	if (sofia_nua) {
+		child->nh = nua_handle(sofia_nua, child,
+			NUTAG_URL(ruri),
+			SIPTAG_TO_STR(ruri),
+			TAG_IF(child_path[0], NUTAG_INITIAL_ROUTE_STR(child_path)),	/* RFC 3327 Path as Route */
+			TAG_IF(child->peer && child->peer->gruu, NUTAG_SUPPORTED("gruu")),	/* RFC 5627 §4.4 */
+			TAG_END());
+	}
+
+	/* Init RTP + (if encryption=yes) per-child SRTP, then SDP. */
+	if (child->nh && sofia_rtp_init(child) == 0) {
+		int crypto_ok = 1;
+		/* Each fork child gets its own DTLS cert + ICE creds for an
+		 * independent WebRTC offer (mirrors the per-child SDES keys below).
+		 * child->rtp exists from sofia_rtp_init(child) above. Mutually
+		 * exclusive with the per-child a=crypto block. Fail per child (skip
+		 * its INVITE); if ALL children fail, the fork-empty path → 503. */
+		/* effective WebRTC for THIS child's contact = webrtc enabled AND this contact registered over
+		 * ws/wss; a udp/tls contact -> RTP/AVP (even with webrtc=yes, global or explicit). Snapshot
+		 * c->transport under the contact lock (mirrors the c->expires snapshot above). This is what
+		 * serves one account from several phones at once: DTLS to the wss child, RTP/AVP to the udp/tls child. */
+		int want_webrtc;
+		{
+			char tgt_transport[8] = "";
+			ao2_lock(c);
+			ast_copy_string(tgt_transport, c->transport, sizeof(tgt_transport));
+			ao2_unlock(c);
+			want_webrtc = sofia_offer_effective_webrtc(pvt->peer, tgt_transport);
+			if (sofia_forkdebug) {
+				char rbuf[256];
+				SOFIA_FORKDBG("child branch=%s idx=%d nh=%p rtp=%p transport=%s want_webrtc=%d ruri=%s",
+					child->fork_branch_id, branch_idx, (void *)child->nh, (void *)child->rtp,
+					tgt_transport, want_webrtc, sofia_uri_redact(ruri, rbuf, sizeof(rbuf)));
+			}
+		}
+		if (want_webrtc) {
+			if (sofia_webrtc_provision_offer(child)) {
+				ast_log(LOG_ERROR, "Sofia: fork-child %d WebRTC offer provisioning failed (peer '%s')\n",
+					branch_idx, S_OR(pvt->peername, "unknown"));
+				crypto_ok = 0;
+			}
+		} else
+		/* Each child needs independent crypto keys (RFC 4568). Hard-fail per
+		 * child → skip its INVITE; if ALL fail, the fork-empty path → 503.
+		 * No silent downgrade. */
+		if (pvt->peer->encryption) {
+			/* Cipher list (peer or [general] fallback); NULL = legacy single line.
+			 * reload-UAF: snapshot srtpcipher under peer->lock, sdp_crypto_* calls
+			 * OUTSIDE the lock. LOCK ORDER channel -> peer. */
+			char l_srtpcipher[256];
+			const char *cipher_list;
+			l_srtpcipher[0] = '\0';
+			ast_mutex_lock(&pvt->peer->lock);
+			if (!ast_strlen_zero(pvt->peer->srtpcipher)) {
+				ast_copy_string(l_srtpcipher, pvt->peer->srtpcipher, sizeof(l_srtpcipher));
+			}
+			ast_mutex_unlock(&pvt->peer->lock);
+			cipher_list = !ast_strlen_zero(l_srtpcipher) ? l_srtpcipher
+				: (!ast_strlen_zero(sofia_cfg.default_srtpcipher) ? sofia_cfg.default_srtpcipher : NULL);
+			child->srtp = sofia_srtp_alloc();
+			if (!child->srtp || !(child->srtp->crypto = sdp_crypto_setup())
+					|| sdp_crypto_offer_list(child->srtp->crypto, cipher_list) < 0) {
+				ast_log(LOG_ERROR, "Sofia: fork-child %d crypto setup failed (peer '%s')\n",
+					branch_idx, S_OR(pvt->peername, "unknown"));
+				if (child->srtp) { sofia_srtp_destroy(child->srtp); child->srtp = NULL; }
+				crypto_ok = 0;
+			}
+			if (crypto_ok && child->vrtp) {
+				child->vsrtp = sofia_srtp_alloc();
+				if (!child->vsrtp || !(child->vsrtp->crypto = sdp_crypto_setup())
+						|| sdp_crypto_offer_list(child->vsrtp->crypto, cipher_list) < 0) {
+					ast_log(LOG_ERROR, "Sofia: fork-child %d video crypto setup failed (peer '%s')\n",
+						branch_idx, S_OR(pvt->peername, "unknown"));
+					if (child->vsrtp) { sofia_srtp_destroy(child->vsrtp); child->vsrtp = NULL; }
+					sofia_srtp_destroy(child->srtp); child->srtp = NULL;
+					crypto_ok = 0;
+				}
+			}
+		}
+		if (crypto_ok) {
+			char from_buf[256];
+			char contact_buf[1024];	/* sized for an opaque GRUU Contact (RFC 5627), not just sip:user@host */
+			char rpid_buf[512];
+			char diversion_buf[512];
+			/* reload-UAF: the identity builders read freeable peer
+			 * stringfields freed under peer->lock; all are pure formatting,
+			 * so hold child->peer->lock across the block. LOCK ORDER channel
+			 * -> peer. Alias the master's channel as the child's owner ONLY
+			 * here (reset to NULL before link/invite) so the builders read the
+			 * real caller's connected.id; ast_call holds the master lock. */
+			child->owner = pvt->owner;
+			if (child->peer) {
+				ast_mutex_lock(&child->peer->lock);
+			}
+			sofia_build_from(child, from_buf, sizeof(from_buf));
+			sofia_build_contact(child, contact_buf, sizeof(contact_buf));
+			sofia_add_rpid(child, rpid_buf, sizeof(rpid_buf));
+			/* Diversion (RFC 5806) when a redirecting chain is present. */
+			sofia_add_diversion(child, diversion_buf, sizeof(diversion_buf));
+			if (child->peer) {
+				ast_mutex_unlock(&child->peer->lock);
+			}
+			child->owner = NULL;
+			/* Per-child session timers (RFC 4028). */
+			int st_seconds, st_min_se, st_refresher;
+			sofia_session_timer_values(pvt->peer, 1 /* outbound */, &st_seconds, &st_min_se, &st_refresher);
+			/* RFC 3261 §20.22 Max-Forwards. */
+			char mf_str_child[8];
+			snprintf(mf_str_child, sizeof(mf_str_child), "%d", child->peer ? child->peer->maxforwards : sofia_cfg.default_max_forwards);
+			/* Link into fork->children + dialogs and count BEFORE nua_invite so
+			 * an immediate local error/1xx can find the child via
+			 * sofia_pvt_ref_if_linked; only invited children are counted, so
+			 * child_count stays exact. Require BOTH links (NOT-in-dialogs →
+			 * unroutable response; NOT-in-children → uncancellable loser); undo a
+			 * partial link and skip the invite on OOM. */
+			int child_linked = 0;
+			if (ao2_link(fork->children, child)) {
+				if (ao2_link(dialogs, child)) {
+					child_linked = 1;
+				} else {
+					ao2_unlink(fork->children, child);
+				}
+			}
+			if (child_linked) {
+			ast_mutex_lock(&fork->lock);
+			fork->child_count++;
+			ast_mutex_unlock(&fork->lock);
+			posted = 1;
+			if (sofia_generate_sdp(child, sdp_buf, sizeof(sdp_buf), 0 /* offer */)) {
+				nua_invite(child->nh,
+					SIPTAG_FROM_STR(from_buf),
+					/* push multi-ring resume: every branch carries the ANNOUNCED Call-ID (the
+					 * push uuid) so each woken device matches its card to its own INVITE and
+					 * shows ONE call; sofia-sip disambiguates same-Call-ID legs by tags
+					 * (nta.c:5088-5150). Empty on every normal call -> tag inert. */
+					TAG_IF(pvt->sip_callid[0], SIPTAG_CALL_ID_STR(pvt->sip_callid)),
+					SIPTAG_CONTACT_STR(contact_buf),
+					TAG_IF(rpid_buf[0], SIPTAG_HEADER_STR(rpid_buf)),
+					TAG_IF(diversion_buf[0], SIPTAG_HEADER_STR(diversion_buf)),
+					TAG_IF(st_seconds >= 0, NUTAG_SESSION_TIMER(st_seconds)),
+					TAG_IF(st_min_se > 0, NUTAG_MIN_SE(st_min_se)),
+					TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
+					SIPTAG_CONTENT_TYPE_STR("application/sdp"),
+					SIPTAG_PAYLOAD_STR(sdp_buf),
+					TAG_IF(!ast_strlen_zero(child->outbound_proxy), NUTAG_PROXY(child->outbound_proxy)),	/* NAT: steer this child INVITE to the contact public source (operation-level) */
+					SIPTAG_MAX_FORWARDS_STR(mf_str_child),
+					TAG_END());
+			} else {
+				nua_invite(child->nh,
+					SIPTAG_FROM_STR(from_buf),
+					/* push multi-ring resume: every branch carries the ANNOUNCED Call-ID (the
+					 * push uuid) so each woken device matches its card to its own INVITE and
+					 * shows ONE call; sofia-sip disambiguates same-Call-ID legs by tags
+					 * (nta.c:5088-5150). Empty on every normal call -> tag inert. */
+					TAG_IF(pvt->sip_callid[0], SIPTAG_CALL_ID_STR(pvt->sip_callid)),
+					SIPTAG_CONTACT_STR(contact_buf),
+					TAG_IF(rpid_buf[0], SIPTAG_HEADER_STR(rpid_buf)),
+					TAG_IF(diversion_buf[0], SIPTAG_HEADER_STR(diversion_buf)),
+					TAG_IF(st_seconds >= 0, NUTAG_SESSION_TIMER(st_seconds)),
+					TAG_IF(st_min_se > 0, NUTAG_MIN_SE(st_min_se)),
+					TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
+					TAG_IF(!ast_strlen_zero(child->outbound_proxy), NUTAG_PROXY(child->outbound_proxy)),	/* NAT: steer this child INVITE to the contact public source (operation-level) */
+					SIPTAG_MAX_FORWARDS_STR(mf_str_child),
+					TAG_END());
+			}
+			}
+		}
+	}
+
+	if (sofia_debug)
+		ast_verbose("Sofia: Fork child %d -> %s (branch=%s)\n",
+			branch_idx, ruri, child->fork_branch_id);
+
+	ao2_ref(child, -1);
+	return posted;
+}
+
+/* Fork one INVITE per live contact — the sofia_call live>1 engine, extracted verbatim
+ * so the push multi-ring resume can dial EVERY freshly bound device of a woken peer.
+ * Caller holds the channel lock (ast_call, or the resume commit which takes it). When
+ * pvt->sip_callid is preset (push resume) every branch INVITE carries it as Call-ID —
+ * the phones dedup their push card against that uuid; when empty (every normal call)
+ * the TAG_IF is inert and each branch keeps its stack-generated Call-ID (byte-identical
+ * pre-extraction behavior). Returns 0 with >=1 INVITE posted, -1 when none was. */
+int sofia_fork_dial(struct sofia_pvt *pvt)
+{
+	time_t now = time(NULL);
+	int posted_any = 0;	/* #1: set once any child actually reaches nua_invite */
+	struct ao2_iterator ci;
+	struct sofia_contact *c;
+
+	/* Forking mode — one child per live contact. */
+	struct sofia_fork *fork;
+	int branch_idx = 0;
+
+	fork = sofia_fork_alloc();
+	if (!fork) {
+		ast_log(LOG_ERROR, "Sofia: fork alloc failed\n");
+		return -1;
+	}
+
+	ast_mutex_lock(&fork->lock);
+	/* fork->master is derefed by child handlers on sofia_thread after the
+	 * caller may have hung up the master. Anchor its lifetime with an ao2 ref
+	 * (released + cleared in sofia_hangup's is_fork_master block). Not a cycle:
+	 * sofia_hangup drops the fork->master ref first. */
+	fork->master = pvt;
+	ao2_ref(pvt, +1);
+	fork->fork_start = now;
+	ast_mutex_unlock(&fork->lock);
+
+	pvt->fork = fork;
+	pvt->is_fork_master = 1;
+	/* Master has no nh — INVITEs go through child handles. */
+
+	ci = ao2_iterator_init(pvt->peer->contacts, 0);
+	while ((c = ao2_iterator_next(&ci))) {
+		posted_any |= sofia_fork_dial_one(pvt, fork, c, branch_idx);
+		branch_idx++;
+		ao2_ref(c, -1);
+	}
+	ao2_iterator_destroy(&ci);
+
+	/* No contact invited → no event can arrive → master would hang forever.
+	 * Fail now. posted_any (not child_count) is deliberate: children posted
+	 * then failed fast are handled by the event-driven all-failed HANGUP. */
+	if (!posted_any) {
+		ast_log(LOG_WARNING,
+			"Sofia: fork to peer '%s' emitted no INVITE (all contacts failed setup) — failing call\n",
+			pvt->peername);
+		return -1;
+	}
+
+	/* fork_early_media: the posting loop is complete, so fork->child_count is
+	 * now authoritative. A 18x that raced in before this point saw a partial count,
+	 * so the single-live-child early-media gate requires posting_done. */
+	ast_mutex_lock(&fork->lock);
+	fork->posting_done = 1;
+	ast_mutex_unlock(&fork->lock);
+
+	ast_mutex_lock(&pvt->lock);
+	/* A fast winner may already have advanced master->state during the loop.
+	 * Don't clobber UP/RINGING back to TRYING — a later hangup would then
+	 * CANCEL (invalid post-200) instead of BYE, leaving a zombie answered leg. */
+	if (pvt->state != SOFIA_DIALOG_STATE_UP
+			&& pvt->state != SOFIA_DIALOG_STATE_RINGING) {
+		pvt->state = SOFIA_DIALOG_STATE_TRYING;
+	}
+	ast_mutex_unlock(&pvt->lock);
+	if (sofia_debug)
+		ast_verbose("Sofia: Forking %d INVITEs to peer '%s' (%s)\n",
+			branch_idx, pvt->peername, fork->fork_id);
+
+	/* Enable inband-DTMF/fax-CNG DSP on the master too (fork parity with the
+	 * single-contact path below): forked media is masqueraded into the master pvt
+	 * and sofia_read runs ast_dsp_process on it, so without this a forked call to an
+	 * INBAND/AUTO or faxdetect=cng peer would have no detection. Idempotent +
+	 * self-gating, so non-inband/non-fax forking peers pay zero cost. */
+	sofia_enable_dsp_detect(pvt);
+
+	return 0;
+}
+
+/* Push multi-ring LATE APPEND: a device whose wake REGISTER lands while the fork-resumed
+ * call is STILL UNANSWERED gets its own branch (same announced Call-ID via the master's
+ * sip_callid, so the phone binds it to the push card it is already showing). Caller holds
+ * the channel lock. Refuses once a winner was picked or the master is UP; returns 0 when
+ * the branch INVITE was posted. */
+int sofia_fork_append_contact(struct sofia_pvt *pvt, struct sofia_contact *c)
+{
+	struct sofia_fork *fork;
+	int idx, picked, posted;
+
+	ast_mutex_lock(&pvt->lock);
+	if (!pvt->is_fork_master || !pvt->fork || pvt->state == SOFIA_DIALOG_STATE_UP) {
+		ast_mutex_unlock(&pvt->lock);
+		return -1;
+	}
+	fork = pvt->fork;
+	ao2_ref(fork, +1);
+	ast_mutex_unlock(&pvt->lock);
+
+	ast_mutex_lock(&fork->lock);
+	picked = fork->winner_picked;
+	idx = fork->child_count;
+	ast_mutex_unlock(&fork->lock);
+	if (picked) {
+		ao2_ref(fork, -1);
+		return -1;
+	}
+
+	posted = sofia_fork_dial_one(pvt, fork, c, idx);
+	ao2_ref(fork, -1);
+	return posted ? 0 : -1;
+}
+
 static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 {
 	struct sofia_pvt *pvt = ast->tech_pvt;
-	char sdp_buf[4096];	/* WebRTC video (multi-PT rtcp-fb + ICE candidates) can exceed 2048 → SDP dropped fail-closed; RFC 8843/6184 headroom */
 
 	if (!pvt) {
 		ast_log(LOG_ERROR, "Sofia call: no pvt\n");
@@ -5751,7 +6123,6 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		time_t now = time(NULL);
 		struct ao2_iterator ci;
 		struct sofia_contact *c;
-		int posted_any = 0;   /* #1: set once any child actually reaches nua_invite */
 		int peer_is_dynamic = 0;
 
 		ci = ao2_iterator_init(pvt->peer->contacts, 0);
@@ -5785,306 +6156,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		}
 
 		if (live > 1) {
-			/* Forking mode — one child per live contact. */
-			struct sofia_fork *fork;
-			int branch_idx = 0;
-
-			fork = sofia_fork_alloc();
-			if (!fork) {
-				ast_log(LOG_ERROR, "Sofia: fork alloc failed\n");
-				return -1;
-			}
-
-			ast_mutex_lock(&fork->lock);
-			/* fork->master is derefed by child handlers on sofia_thread after the
-			 * caller may have hung up the master. Anchor its lifetime with an ao2 ref
-			 * (released + cleared in sofia_hangup's is_fork_master block). Not a cycle:
-			 * sofia_hangup drops the fork->master ref first. */
-			fork->master = pvt;
-			ao2_ref(pvt, +1);
-			fork->fork_start = now;
-			ast_mutex_unlock(&fork->lock);
-
-			pvt->fork = fork;
-			pvt->is_fork_master = 1;
-			/* Master has no nh — INVITEs go through child handles. */
-
-			ci = ao2_iterator_init(pvt->peer->contacts, 0);
-			while ((c = ao2_iterator_next(&ci))) {
-				struct sofia_pvt *child;
-				char ruri[256];
-				time_t c_exp;
-
-				/* Snapshot expires under the contact lock (refresh race). */
-				ao2_lock(c);
-				c_exp = c->expires;
-				ao2_unlock(c);
-				if (!sofia_contact_is_unexpired(c_exp, now)) {
-					ao2_ref(c, -1);
-					continue;
-				}
-
-				child = sofia_pvt_alloc();
-				if (!child) {
-					ao2_ref(c, -1);
-					continue;
-				}
-
-				child->fork = fork;
-				ao2_ref(fork, +1);
-				child->is_fork_child = 1;
-				snprintf(child->fork_branch_id, sizeof(child->fork_branch_id),
-					"b%d-%lx", branch_idx, (unsigned long)now);
-
-				/* Copy dial parameters from master. */
-				ast_string_field_set(child, exten, pvt->exten);
-				ast_string_field_set(child, peername, pvt->peername);
-				ast_string_field_set(child, context, pvt->context);
-				ast_string_field_set(child, username, pvt->username);
-				ast_string_field_set(child, peersecret, pvt->peersecret);
-				ast_string_field_set(child, fromuser, pvt->fromuser);
-				ast_string_field_set(child, fromdomain, pvt->fromdomain);
-				child->capability = pvt->capability;
-				child->prefs = pvt->prefs;
-				child->dtmfmode = pvt->dtmfmode;
-				child->dtmf_effective = pvt->dtmf_effective;	/* inherit the master's runtime mode; child rtp_init applies the property */
-				child->dtmf_detect_off = pvt->dtmf_detect_off;	/* inherit any runtime DIGIT_DETECT suspend (complete runtime-state clone) */
-				child->peer = pvt->peer;
-				ao2_ref(child->peer, +1);
-				/* children never own the ast_channel. Inherit the master's resolved
-				 * outbound identity (scalars here; a temporary owner alias across the
-				 * header builders below) so forked INVITEs carry the real caller. */
-				child->callingpres = pvt->callingpres;
-				ast_sockaddr_copy(&child->ourip, &pvt->ourip);
-				char child_path[1024] = "";	/* RFC 3327 Path of THIS contact, pre-loaded as Route on its forked INVITE */
-
-				/* Build RURI for this contact via the shared per-contact builder
-				 * (single source of truth with the single-live-contact request path):
-				 * snapshots c->transport/src_addr/host/port under ao2_lock(c), routes
-				 * ws/wss to c->src_addr (BUG 2 / WSS fork), appends the transport, and
-				 * copies this contact's RFC 3327 Path. c->host may be unbracketed IPv6 —
-				 * the helper wraps it (RFC 3261 §19.1.2). */
-				sofia_build_contact_ruri(c, pvt->exten, ruri, sizeof(ruri),
-					(child->peer && child->peer->path_support), child_path, sizeof(child_path));
-				ast_string_field_set(child, ruri, ruri);
-				/* B (chan_sip parity): keep the (private) Contact in the RURI above; route THIS
-				 * child's INVITE packet to the contact's learned PUBLIC src via NUTAG_PROXY (the fork
-				 * path previously set no proxy, so NAT'd UDP forked contacts went to the private RURI). */
-				char child_proxy_url[128] = "";
-				sofia_build_contact_proxy_url(child->peer, c, child_proxy_url, sizeof(child_proxy_url));
-				/* NAT: apply the next-hop proxy at the child nua_invite OPERATION level (below), not at
-				 * nua_handle (ineffective for the initial INVITE in this sofia-sip fork). Stash on the child;
-				 * sofia_fork_pick_winner copies it onto master so later master re-INVITEs keep routing here. */
-				ast_string_field_set(child, outbound_proxy, child_proxy_url);
-
-				/* Create handle auto-bound to child. */
-				if (sofia_nua) {
-					child->nh = nua_handle(sofia_nua, child,
-						NUTAG_URL(ruri),
-						SIPTAG_TO_STR(ruri),
-						TAG_IF(child_path[0], NUTAG_INITIAL_ROUTE_STR(child_path)),	/* RFC 3327 Path as Route */
-						TAG_IF(child->peer && child->peer->gruu, NUTAG_SUPPORTED("gruu")),	/* RFC 5627 §4.4 */
-						TAG_END());
-				}
-
-				/* Init RTP + (if encryption=yes) per-child SRTP, then SDP. */
-				if (child->nh && sofia_rtp_init(child) == 0) {
-					int crypto_ok = 1;
-					/* Each fork child gets its own DTLS cert + ICE creds for an
-					 * independent WebRTC offer (mirrors the per-child SDES keys below).
-					 * child->rtp exists from sofia_rtp_init(child) above. Mutually
-					 * exclusive with the per-child a=crypto block. Fail per child (skip
-					 * its INVITE); if ALL children fail, the fork-empty path → 503. */
-					/* effective WebRTC for THIS child's contact = webrtc enabled AND this contact registered over
-					 * ws/wss; a udp/tls contact -> RTP/AVP (even with webrtc=yes, global or explicit). Snapshot
-					 * c->transport under the contact lock (mirrors the c->expires snapshot above). This is what
-					 * serves one account from several phones at once: DTLS to the wss child, RTP/AVP to the udp/tls child. */
-					int want_webrtc;
-					{
-						char tgt_transport[8] = "";
-						ao2_lock(c);
-						ast_copy_string(tgt_transport, c->transport, sizeof(tgt_transport));
-						ao2_unlock(c);
-						want_webrtc = sofia_offer_effective_webrtc(pvt->peer, tgt_transport);
-						if (sofia_forkdebug) {
-							char rbuf[256];
-							SOFIA_FORKDBG("child branch=%s idx=%d nh=%p rtp=%p transport=%s want_webrtc=%d ruri=%s",
-								child->fork_branch_id, branch_idx, (void *)child->nh, (void *)child->rtp,
-								tgt_transport, want_webrtc, sofia_uri_redact(ruri, rbuf, sizeof(rbuf)));
-						}
-					}
-					if (want_webrtc) {
-						if (sofia_webrtc_provision_offer(child)) {
-							ast_log(LOG_ERROR, "Sofia: fork-child %d WebRTC offer provisioning failed (peer '%s')\n",
-								branch_idx, S_OR(pvt->peername, "unknown"));
-							crypto_ok = 0;
-						}
-					} else
-					/* Each child needs independent crypto keys (RFC 4568). Hard-fail per
-					 * child → skip its INVITE; if ALL fail, the fork-empty path → 503.
-					 * No silent downgrade. */
-					if (pvt->peer->encryption) {
-						/* Cipher list (peer or [general] fallback); NULL = legacy single line.
-						 * reload-UAF: snapshot srtpcipher under peer->lock, sdp_crypto_* calls
-						 * OUTSIDE the lock. LOCK ORDER channel -> peer. */
-						char l_srtpcipher[256];
-						const char *cipher_list;
-						l_srtpcipher[0] = '\0';
-						ast_mutex_lock(&pvt->peer->lock);
-						if (!ast_strlen_zero(pvt->peer->srtpcipher)) {
-							ast_copy_string(l_srtpcipher, pvt->peer->srtpcipher, sizeof(l_srtpcipher));
-						}
-						ast_mutex_unlock(&pvt->peer->lock);
-						cipher_list = !ast_strlen_zero(l_srtpcipher) ? l_srtpcipher
-							: (!ast_strlen_zero(sofia_cfg.default_srtpcipher) ? sofia_cfg.default_srtpcipher : NULL);
-						child->srtp = sofia_srtp_alloc();
-						if (!child->srtp || !(child->srtp->crypto = sdp_crypto_setup())
-								|| sdp_crypto_offer_list(child->srtp->crypto, cipher_list) < 0) {
-							ast_log(LOG_ERROR, "Sofia: fork-child %d crypto setup failed (peer '%s')\n",
-								branch_idx, S_OR(pvt->peername, "unknown"));
-							if (child->srtp) { sofia_srtp_destroy(child->srtp); child->srtp = NULL; }
-							crypto_ok = 0;
-						}
-						if (crypto_ok && child->vrtp) {
-							child->vsrtp = sofia_srtp_alloc();
-							if (!child->vsrtp || !(child->vsrtp->crypto = sdp_crypto_setup())
-									|| sdp_crypto_offer_list(child->vsrtp->crypto, cipher_list) < 0) {
-								ast_log(LOG_ERROR, "Sofia: fork-child %d video crypto setup failed (peer '%s')\n",
-									branch_idx, S_OR(pvt->peername, "unknown"));
-								if (child->vsrtp) { sofia_srtp_destroy(child->vsrtp); child->vsrtp = NULL; }
-								sofia_srtp_destroy(child->srtp); child->srtp = NULL;
-								crypto_ok = 0;
-							}
-						}
-					}
-					if (crypto_ok) {
-						char from_buf[256];
-						char contact_buf[1024];	/* sized for an opaque GRUU Contact (RFC 5627), not just sip:user@host */
-						char rpid_buf[512];
-						char diversion_buf[512];
-						/* reload-UAF: the identity builders read freeable peer
-						 * stringfields freed under peer->lock; all are pure formatting,
-						 * so hold child->peer->lock across the block. LOCK ORDER channel
-						 * -> peer. Alias the master's channel as the child's owner ONLY
-						 * here (reset to NULL before link/invite) so the builders read the
-						 * real caller's connected.id; ast_call holds the master lock. */
-						child->owner = pvt->owner;
-						if (child->peer) {
-							ast_mutex_lock(&child->peer->lock);
-						}
-						sofia_build_from(child, from_buf, sizeof(from_buf));
-						sofia_build_contact(child, contact_buf, sizeof(contact_buf));
-						sofia_add_rpid(child, rpid_buf, sizeof(rpid_buf));
-						/* Diversion (RFC 5806) when a redirecting chain is present. */
-						sofia_add_diversion(child, diversion_buf, sizeof(diversion_buf));
-						if (child->peer) {
-							ast_mutex_unlock(&child->peer->lock);
-						}
-						child->owner = NULL;
-						/* Per-child session timers (RFC 4028). */
-						int st_seconds, st_min_se, st_refresher;
-						sofia_session_timer_values(pvt->peer, 1 /* outbound */, &st_seconds, &st_min_se, &st_refresher);
-						/* RFC 3261 §20.22 Max-Forwards. */
-						char mf_str_child[8];
-						snprintf(mf_str_child, sizeof(mf_str_child), "%d", child->peer ? child->peer->maxforwards : sofia_cfg.default_max_forwards);
-						/* Link into fork->children + dialogs and count BEFORE nua_invite so
-						 * an immediate local error/1xx can find the child via
-						 * sofia_pvt_ref_if_linked; only invited children are counted, so
-						 * child_count stays exact. Require BOTH links (NOT-in-dialogs →
-						 * unroutable response; NOT-in-children → uncancellable loser); undo a
-						 * partial link and skip the invite on OOM. */
-						int child_linked = 0;
-						if (ao2_link(fork->children, child)) {
-							if (ao2_link(dialogs, child)) {
-								child_linked = 1;
-							} else {
-								ao2_unlink(fork->children, child);
-							}
-						}
-						if (child_linked) {
-						ast_mutex_lock(&fork->lock);
-						fork->child_count++;
-						ast_mutex_unlock(&fork->lock);
-						posted_any = 1;
-						if (sofia_generate_sdp(child, sdp_buf, sizeof(sdp_buf), 0 /* offer */)) {
-							nua_invite(child->nh,
-								SIPTAG_FROM_STR(from_buf),
-								SIPTAG_CONTACT_STR(contact_buf),
-								TAG_IF(rpid_buf[0], SIPTAG_HEADER_STR(rpid_buf)),
-								TAG_IF(diversion_buf[0], SIPTAG_HEADER_STR(diversion_buf)),
-								TAG_IF(st_seconds >= 0, NUTAG_SESSION_TIMER(st_seconds)),
-								TAG_IF(st_min_se > 0, NUTAG_MIN_SE(st_min_se)),
-								TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
-								SIPTAG_CONTENT_TYPE_STR("application/sdp"),
-								SIPTAG_PAYLOAD_STR(sdp_buf),
-								TAG_IF(!ast_strlen_zero(child->outbound_proxy), NUTAG_PROXY(child->outbound_proxy)),	/* NAT: steer this child INVITE to the contact public source (operation-level) */
-								SIPTAG_MAX_FORWARDS_STR(mf_str_child),
-								TAG_END());
-						} else {
-							nua_invite(child->nh,
-								SIPTAG_FROM_STR(from_buf),
-								SIPTAG_CONTACT_STR(contact_buf),
-								TAG_IF(rpid_buf[0], SIPTAG_HEADER_STR(rpid_buf)),
-								TAG_IF(diversion_buf[0], SIPTAG_HEADER_STR(diversion_buf)),
-								TAG_IF(st_seconds >= 0, NUTAG_SESSION_TIMER(st_seconds)),
-								TAG_IF(st_min_se > 0, NUTAG_MIN_SE(st_min_se)),
-								TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
-								TAG_IF(!ast_strlen_zero(child->outbound_proxy), NUTAG_PROXY(child->outbound_proxy)),	/* NAT: steer this child INVITE to the contact public source (operation-level) */
-								SIPTAG_MAX_FORWARDS_STR(mf_str_child),
-								TAG_END());
-						}
-						}
-					}
-				}
-
-				if (sofia_debug)
-					ast_verbose("Sofia: Fork child %d -> %s (branch=%s)\n",
-						branch_idx, ruri, child->fork_branch_id);
-
-				ao2_ref(child, -1);
-				branch_idx++;
-				ao2_ref(c, -1);
-			}
-			ao2_iterator_destroy(&ci);
-
-			/* No contact invited → no event can arrive → master would hang forever.
-			 * Fail now. posted_any (not child_count) is deliberate: children posted
-			 * then failed fast are handled by the event-driven all-failed HANGUP. */
-			if (!posted_any) {
-				ast_log(LOG_WARNING,
-					"Sofia: fork to peer '%s' emitted no INVITE (all contacts failed setup) — failing call\n",
-					pvt->peername);
-				return -1;
-			}
-
-			/* fork_early_media: the posting loop is complete, so fork->child_count is
-			 * now authoritative. A 18x that raced in before this point saw a partial count,
-			 * so the single-live-child early-media gate requires posting_done. */
-			ast_mutex_lock(&fork->lock);
-			fork->posting_done = 1;
-			ast_mutex_unlock(&fork->lock);
-
-			ast_mutex_lock(&pvt->lock);
-			/* A fast winner may already have advanced master->state during the loop.
-			 * Don't clobber UP/RINGING back to TRYING — a later hangup would then
-			 * CANCEL (invalid post-200) instead of BYE, leaving a zombie answered leg. */
-			if (pvt->state != SOFIA_DIALOG_STATE_UP
-					&& pvt->state != SOFIA_DIALOG_STATE_RINGING) {
-				pvt->state = SOFIA_DIALOG_STATE_TRYING;
-			}
-			ast_mutex_unlock(&pvt->lock);
-			if (sofia_debug)
-				ast_verbose("Sofia: Forking %d INVITEs to peer '%s' (%s)\n",
-					branch_idx, pvt->peername, fork->fork_id);
-
-			/* Enable inband-DTMF/fax-CNG DSP on the master too (fork parity with the
-			 * single-contact path below): forked media is masqueraded into the master pvt
-			 * and sofia_read runs ast_dsp_process on it, so without this a forked call to an
-			 * INBAND/AUTO or faxdetect=cng peer would have no detection. Idempotent +
-			 * self-gating, so non-inband/non-fax forking peers pay zero cost. */
-			sofia_enable_dsp_detect(pvt);
-
-			return 0;
+			return sofia_fork_dial(pvt);	/* forking engine (extracted): one child per live contact */
 		}
 	}
 
@@ -6352,15 +6424,18 @@ static int sofia_hangup(struct ast_channel *ast)
 	pvt->state = SOFIA_DIALOG_STATE_DOWN;
 	{
 		int was_parked = pvt->push_parked;
+		int was_appending = pvt->push_appending;
 		pvt->push_parked = 0;
+		pvt->push_appending = 0;
 
 		ast_mutex_unlock(&pvt->lock);
 
 		/* Parked call reaped by the caller (or Dial's own timeout): terminal-CAS the
 		 * registry entry + cancel push_wait. AFTER pvt->lock (the entry lock is a leaf;
 		 * the hangup path must never nest it under pvt->lock), BEFORE the final unref
-		 * (we still hold this pvt ref; the entry holds its own). */
-		if (was_parked) {
+		 * (we still hold this pvt ref; the entry holds its own). appending = a multi-ring
+		 * fork resume left the entry live for late appends; reap it the same way. */
+		if (was_parked || was_appending) {
 			sofia_push_on_pvt_hangup(pvt);
 		}
 	}
@@ -18187,6 +18262,15 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 				g = g < 2 ? 2 : 10;
 			}
 			sofia_cfg.push_noresponse = g;
+		} else if (!strcasecmp(v->name, "push_resume_window")) {
+			/* multi-ring: how long the resume waits after the FIRST wake REGISTER so
+			 * every pushed device can bind; then one fork INVITE per live binding. */
+			int g = atoi(v->value);
+			if (g < 0 || g > 5) {
+				ast_log(LOG_WARNING, "Sofia PUSH: push_resume_window=%d out of range (0..5) - clamping\n", g);
+				g = g < 0 ? 0 : 5;
+			}
+			sofia_cfg.push_resume_window = g;
 		} else if (!strcasecmp(v->name, "register_pool")) {
 			/* Kill-switch: offload realtime REGISTER DB writes to a bounded pool
 			 * (default OFF). Takes effect on reload. */
@@ -19374,6 +19458,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.push_max_devices = 10;
 	sofia_cfg.push_min_interval = 5;
 	sofia_cfg.push_noresponse = 4;	/* P2 guard; 0 disables */
+	sofia_cfg.push_resume_window = 2;	/* multi-ring collect window; 0 = first-registrant-wins */
 	/* Register pool: default OFF + auto lane count. */
 	sofia_cfg.register_pool = 0;
 	sofia_cfg.register_pool_workers = 0;

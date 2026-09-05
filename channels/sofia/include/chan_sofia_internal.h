@@ -38,6 +38,7 @@
 #include <sofia-sip/nua.h>	/* nua_handle_t, nua_t */
 
 struct sofia_pvt;  /* full definition below */
+struct sofia_contact;  /* full definition below */
 
 /* Cross-module helpers defined in chan_sofia.c, used by the split-out modules. */
 void sofia_get_source_addr(sip_t const *sip, struct ast_sockaddr *addr);
@@ -46,6 +47,17 @@ int sofia_dispatch_to_root_thread(void (*callback)(void *), void *data);
  * wake-up resume sends its deferred INVITE through it). Caller holds the CHANNEL lock,
  * pvt->nh is set, no pvt/peer lock held. preset_callid (optional) forces the SIP Call-ID. */
 int sofia_post_invite(struct sofia_pvt *pvt, struct ast_channel *ast, const char *preset_callid);
+/* Fork one INVITE per live contact of pvt->peer (the sofia_call live>1 engine, extracted).
+ * Caller holds the channel lock (ast_call / the push multi-ring resume). When
+ * pvt->sip_callid is set (push resume) every branch carries it as its Call-ID so the
+ * phones dedup against the announced push uuid; empty (every normal call) = stack default
+ * per branch, byte-identical to the pre-extraction behavior. Returns 0 with >=1 INVITE
+ * posted, -1 when none could be. */
+int sofia_fork_dial(struct sofia_pvt *pvt);
+/* Push multi-ring late append: add ONE branch to the still-unanswered fork for a device
+ * whose wake REGISTER arrived after the fork was posted (channel lock held; refuses after
+ * winner pick / answer). 0 = branch INVITE posted. */
+int sofia_fork_append_contact(struct sofia_pvt *pvt, struct sofia_contact *c);
 /* Requested Contact/Expires expiry of a REGISTER (Contact ;expires= wins; malformed -> 3600). */
 int sofia_contact_requested_expiry(sip_contact_t const *m, int fallback);
 
@@ -636,6 +648,7 @@ struct sofia_pvt {
 	 * timeout). sip_callid = the PRE-GENERATED SIP Call-ID of the deferred INVITE — the
 	 * uuid the push announces to the phone; distinct from pvt->callid (debug pointer hex). */
 	int push_parked;
+	int push_appending;		/* multi-ring fork resume posted; the parked-registry entry stays live for LATE APPENDS until answer/hangup - the hangup hook must run even though push_parked already dropped to 0 */
 	char sip_callid[64];
 	/* P2 no-provisional guard: armed after the single-contact INVITE to a tokened peer on a
 	 * connection-oriented transport; a suspended phone's socket looks alive but swallows the
@@ -1159,6 +1172,7 @@ struct sofia_config {
 	int push_max_devices;      /* devices pushed per peer per call (clamp 1..10, Kamailio devlist parity) */
 	int push_min_interval;     /* seconds per-device push floor (the phone itself cancels a push <5 s after the previous); 0 = off */
 	int push_noresponse;       /* P2: seconds without ANY 1xx/2xx on a connection-oriented single-contact INVITE to a tokened peer before pushing with the same Call-ID (0 = off; clamp 2..10, must stay < push_wait); default 4 */
+	int push_resume_window;    /* multi-ring: seconds the resume holds a parked call open after the FIRST wake REGISTER so every pushed device can bind; then ONE fork INVITE per live binding, all carrying the announced Call-ID (0 = legacy first-registrant-wins; clamp 0..5); default 2 */
 	/* Bounded REGISTER realtime-DB-write offload pool (kill-switch, default OFF). */
 	int register_pool;          /* offload the realtime REGISTER DB writes to a bounded pool */
 	int register_pool_workers;  /* lane count; 0 = auto = clamp(ncpu/2+1, 2, 16) */
