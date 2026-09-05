@@ -14886,9 +14886,15 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 			ast_log(LOG_WARNING, "Sofia: Blind REFER to non-existent extension %s@%s — refusing transfer\n",
 				refer_to, op->context);
 			/* RFC 3515: terminal failure NOTIFY (404) so the transferer's UA learns the
-			 * transfer was rejected; tear the transferer leg down (failure path). */
+			 * transfer was rejected.
+			 *
+			 * The transferer's own call MUST SURVIVE the failed transfer (chan_sip parity):
+			 * handle_request_refer answers "202 Accepted" + a 404 sipfrag NOTIFY, sets res = 0
+			 * and jumps to handle_refer_cleanup, which only ast_channel_unref()s the two
+			 * channels — it never hangs anybody up (chan_sip.c:24738+). So the user who
+			 * mistyped the transfer target keeps the call and can retry. Queueing a hangup
+			 * here dropped that call instead. */
 			sofia_send_refer_notify(op, "404 Not Found", 1);
-			ast_queue_hangup(owner);
 			ast_channel_unref(owner);
 			return;
 		}
@@ -14953,9 +14959,10 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 			/* RFC 3515: terminal failure NOTIFY when bridged-finder NULL (paren-tail
 			 * kept for operator-script grep compat). */
 			sofia_send_refer_notify(op, "503 Service Unavailable (cant handle one-legged xfers)", 1);
-			/* No bridged peer — tear the transferer leg down now (failure path does
-			 * not defer the BYE). */
-			ast_queue_hangup(owner);
+			/* No bridged peer, so nothing was transferred — but the transferer's call MUST
+			 * SURVIVE (chan_sip parity): chan_sip marks REFER_FAILED, emits this same 503
+			 * sipfrag, sets res = -1 and falls into handle_refer_cleanup, which only unrefs
+			 * the channels (chan_sip.c:25044-25055). No hangup on the failure path. */
 		}
 		if (bridged) {
 			ast_channel_unref(bridged);	/* helper returns a +1 ref */
