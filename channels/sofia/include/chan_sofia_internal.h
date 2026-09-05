@@ -42,6 +42,29 @@ struct sofia_pvt;  /* full definition below */
 /* Cross-module helpers defined in chan_sofia.c, used by the split-out modules. */
 void sofia_get_source_addr(sip_t const *sip, struct ast_sockaddr *addr);
 int sofia_dispatch_to_root_thread(void (*callback)(void *), void *data);
+/* Post the outbound INVITE for a single-contact call (extracted from sofia_call; the push
+ * wake-up resume sends its deferred INVITE through it). Caller holds the CHANNEL lock,
+ * pvt->nh is set, no pvt/peer lock held. preset_callid (optional) forces the SIP Call-ID. */
+int sofia_post_invite(struct sofia_pvt *pvt, struct ast_channel *ast, const char *preset_callid);
+/* Requested Contact/Expires expiry of a REGISTER (Contact ;expires= wins; malformed -> 3600). */
+int sofia_contact_requested_expiry(sip_contact_t const *m, int fallback);
+
+/* Mobile push wake-up (sofia_push.c). */
+struct sofia_peer;		/* full definition below */
+struct sofia_register_update;	/* full definition below */
+int sofia_push_init(void);
+void sofia_push_on_register(struct sofia_peer *peer, sip_t const *sip, const struct sofia_register_update *update);
+int sofia_push_peer_enabled(const struct sofia_peer *peer);
+int sofia_push_peer_pushable(struct sofia_peer *peer);
+/* Park a push_parked pvt (called from sofia_call under the CHANNEL lock): registry entry +
+ * push_wait timer (+ sender jobs in a later stage). 0 = call parked (in progress); -1 =
+ * fail-closed to today's failure (never park without an armed timer). */
+int sofia_push_park_and_notify(struct sofia_pvt *pvt, struct ast_channel *ast);
+/* Hangup notification for a pvt whose push_parked flag was set (called from sofia_hangup
+ * AFTER pvt->lock is released, before the final unref): terminal-CAS + timer cancel. */
+void sofia_push_on_pvt_hangup(struct sofia_pvt *pvt);
+const char *sofia_push_redact(const char *token, char *buf, size_t buflen);
+void sofia_push_log_event(const char *peer, const char *device_id, const char *callid, const char *event, const char *detail);
 int sofia_format_auth_creds(msg_auth_t const *challenge, const char *user, const char *secret, char *buf, size_t len);
 void sofia_split_hostport_from_uri(const char *hostport, char *host, size_t hostlen, int *port);
 void sofia_presence_state_map(int state, const char **statestring, const char **pidfstate, const char **pidfnote, int *local_state);
@@ -244,6 +267,11 @@ int sofia_build_contact_proxy_url(const struct sofia_peer *peer, struct sofia_co
 /* Normalize peer/[general] outboundproxy into a "sip:HOST[:PORT];lr" Route; buf empty if none.
  * Caller MUST hold peer->lock. Shared by REGISTER + the outbound MWI SUBSCRIBE (sofia_subscribe.c). */
 void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len);
+/* Exported for the push wake-up resume (sofia_push.c). */
+void sofia_pvt_set_active_contact(struct sofia_pvt *pvt, struct sofia_contact *contact);
+struct sofia_contact *sofia_peer_select_single_live_contact(struct sofia_peer *peer, int *n_unexpired, int *n_total);
+struct sofia_contact *sofia_peer_find_contact_by_addr(struct sofia_peer *peer, const struct ast_sockaddr *src);
+void sofia_resolve_ourip(struct sofia_pvt *pvt, const struct ast_sockaddr *target);
 /* Remove the per-token PRIORITY_HINT extensions for a regexten spec (ext1[@ctx]&ext2...). Splits like
  * the hint creator so multi-token hints are fully reclaimed; registrar matches the creator. */
 void sofia_remove_peer_hints(const char *regexten, const char *subscribecontext, const char *registrar);
@@ -594,6 +622,12 @@ struct sofia_pvt {
 	 * SOFIA_DEFER_BYE_TIMEOUT_MS for UAs that don't auto-BYE. Incoming BYE cancels it. */
 	int defer_bye;
 	int defer_bye_sched_id;
+	/* Mobile push wake-up (sofia_push.c): push_parked is set pre-channel on the dialing
+	 * thread (sofia_request_call) and cleared under pvt->lock (resume commit / hangup /
+	 * timeout). sip_callid = the PRE-GENERATED SIP Call-ID of the deferred INVITE — the
+	 * uuid the push announces to the phone; distinct from pvt->callid (debug pointer hex). */
+	int push_parked;
+	char sip_callid[64];
 	/* This leg negotiated WebRTC (DTLS-SRTP + ICE-lite + rtcp-mux). Set
 	 * by sofia_parse_sdp ONLY after the DTLS/ICE commit fully succeeds; read by
 	 * sofia_generate_sdp to emit the UDP/TLS/RTP/SAVPF profile + the a= block. */
@@ -742,6 +776,7 @@ struct sofia_peer {
 	int max_contacts;
 	int encryption;                 /* SDES-SRTP per-peer toggle (0/1); default off; encryption=yes enables */
 	int webrtc;                     /* WebRTC per-peer toggle (0/1): the ENABLE/permission for DTLS-SRTP + ICE-lite + rtcp-mux; default off; webrtc=yes enables. The actual media profile is decided by the target's physical transport (sofia_offer_effective_webrtc), so webrtc=yes never forces DTLS onto a non-ws/wss target. */
+	int push;                       /* mobile push wake-up per-peer override: -1 = inherit [general] push, 0 = never push/capture this peer, 1 = allowed (still requires stored tokens to act) */
 	int datachannel;                /* WebRTC DataChannel per-peer toggle (0/1): accept the offered m=application (RFC 8841 SCTP) on the BUNDLE'd audio DTLS; default off; requires webrtc=yes + a usrsctp build. With it off the m=application is port-0 reflected exactly as today. */
 	int webrtc_video_bundle;        /* WebRTC video BUNDLE per-peer toggle (0/1): ride video on the audio ICE/DTLS transport (RFC 8843 max-bundle) instead of a separate vrtp; default off; requires webrtc=yes. Off = today's separate-transport video. Consumed during BUNDLE video staging. */
 	int flowclose_emit_unregister;  /* RFC 5626 flow-close policy (0/1; default 0): a connection-oriented binding is ALWAYS removed when its flow closes. 0 = remove silently (no external unregister side-effects: no AMI PeerStatus, BLF/devstate, regexten) — avoids a BLF flap on browser F5. 1 = also emit the full unregister side-effects. Per-peer overrides [general]. */
@@ -1099,6 +1134,13 @@ struct sofia_config {
 	int rtsave_sysname;        /* 1 = include regserver=AST_SYSTEM_NAME in realtime writes (multi-server deployments). Restores canonical Asterisk behavior (active chan_sip fork dropped it). Default 0. */
 	int peer_rtupdate;         /* 1 = propagate registration changes to realtime DB (ast_update_realtime); default 1. rtupdate=no skips ALL realtime writes (cached-realtime, avoids churn). */
 	int fill_sha256name;       /* 1 = on realtime peer build, persist SHA256(systemname.name) into the sippeers realtime sha256name column (presence identity token) when empty or stale; default 0 (OFF). Realtime peers only. */
+	/* --- Mobile push wake-up ([general] push*; sofia_push.c). All sip-reload-safe. --- */
+	int push_enabled;          /* push=yes master enable; default 0 = feature fully off (no capture, no park) */
+	char push_scripts[256];    /* sender scripts dir (send_push.py / send_push_voip.py), default /etc/gabpbx/push */
+	int push_wait;             /* seconds a parked call waits for the wake REGISTER (clamp 5..28; must stay under the 30 s common Dial ringtimer) */
+	int push_token_ttl_days;   /* days a token survives without a REGISTER (stale devices are skipped + lazily purged); default 30 */
+	int push_max_devices;      /* devices pushed per peer per call (clamp 1..10, Kamailio devlist parity) */
+	int push_min_interval;     /* seconds per-device push floor (the phone itself cancels a push <5 s after the previous); 0 = off */
 	/* Bounded REGISTER realtime-DB-write offload pool (kill-switch, default OFF). */
 	int register_pool;          /* offload the realtime REGISTER DB writes to a bounded pool */
 	int register_pool_workers;  /* lane count; 0 = auto = clamp(ncpu/2+1, 2, 16) */
