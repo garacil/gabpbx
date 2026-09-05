@@ -49,6 +49,26 @@ push_noresponse=4        ; seconds without any 1xx before the guard fires
 
 `sip show push` now also reports the guard window.
 
+### Multi-ring: every woken device rings, the first to answer wins
+
+With several devices on one account, the original resume delivered the parked call to
+whichever device re-registered first — rarely the one the user picks up, leaving the
+other device's push card with no call behind it. Now the first wake REGISTER opens a
+short **collect window** (`push_resume_window`, default 2 s; 0 restores the old
+behavior), and when it closes the resume sends **one fork INVITE per live binding** —
+every branch carrying the announced Call-ID — so all woken devices ring, the first
+`200` wins and the losers get a real CANCEL. And because a phone may only send its wake
+REGISTER after the user accepts the card (10-30 s after the push), the entry stays open
+while the call rings: a **late** wake REGISTER gets its own branch appended and can
+still win the call.
+
+```ini
+; sofia.conf
+[general]
+push_resume_window=2     ; seconds the resume collects wake REGISTERs before forking
+                         ; 0 = first-registrant-wins (legacy); clamped 0..5
+```
+
 ## 1.6.0 — mobile push wake-up: park, push and resume calls to sleeping softphones
 
 A mobile softphone cannot keep its SIP socket alive in the background: the OS kills the
