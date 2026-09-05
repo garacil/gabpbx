@@ -182,6 +182,7 @@
 #include <sofia-sip/nua.h>
 #include <sofia-sip/su.h>
 #include <sofia-sip/su_string.h>
+#include <sofia-sip/su_uniqueid.h>	/* su_guid_* — P2 pre-generated Call-ID for tokened peers */
 #include <sofia-sip/sip.h>
 #include <sofia-sip/sip_header.h>
 #include <sofia-sip/sip_status.h>
@@ -2614,6 +2615,14 @@ static void sofia_pvt_destructor(void *obj)
 		}
 		pvt->t38id = -1;
 	}
+	/* P2 guard safety net (same del-or-fire; normally unreachable while armed — the
+	 * scheduler entry holds a pvt ref — but cheap insurance against future motion). */
+	if (pvt->push_guard_sched_id != -1 && sofia_sched) {
+		if (ast_sched_thread_del(sofia_sched, pvt->push_guard_sched_id) == 0) {
+			ao2_ref(pvt, -1);
+		}
+		pvt->push_guard_sched_id = -1;
+	}
 	if (pvt->udptl) {
 		ast_udptl_destroy(pvt->udptl);
 		pvt->udptl = NULL;
@@ -2663,6 +2672,7 @@ static struct sofia_pvt *sofia_pvt_alloc(void)
 	pvt->t38_state = SOFIA_T38_DISABLED;
 	pvt->t38id = -1;
 	pvt->defer_bye_sched_id = -1;
+	pvt->push_guard_sched_id = -1;	/* P2 no-provisional guard: same sentinel discipline */
 
 	/* RFC 3264 answer-direction: -1 sentinel = "no offer staged" (sdp_inactive==0 would
 	 * otherwise mean an unset field emits a=inactive). Staged in sofia_parse_sdp. */
@@ -2778,6 +2788,19 @@ static void sofia_nh_destroy_cleanup(void *arg)
 		return;
 	}
 	nua_handle_destroy(nh);
+}
+
+/* Exported for the P2 leg swap (sofia_push.c): destroy a handle on sofia_thread. The
+ * caller MUST have nua_handle_bind(nh, NULL)'d it first — from that instant late events
+ * on the old leg carry a NULL magic and can never validate against a live pvt. */
+void sofia_nh_destroy_async(nua_handle_t *nh)
+{
+	if (!nh) {
+		return;
+	}
+	if (sofia_dispatch_to_root_thread(sofia_nh_destroy_cleanup, nh) < 0) {
+		nua_handle_destroy(nh);	/* dispatch failed (shutdown): nua enqueues internally */
+	}
 }
 
 /* AST_EVENT_MWI callback (event-bus thread): dispatch a re-NOTIFY to sofia_thread.
@@ -6071,7 +6094,21 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		return -1;
 	}
 
-	return sofia_post_invite(pvt, ast, NULL);
+	/* P2: pre-generate the SIP Call-ID for a tokened peer's INVITE so a later
+	 * no-provisional push can announce the uuid ALREADY on the wire (a frozen phone
+	 * sends nothing to capture it from). Non-tokened peers: empty -> stack default. */
+	if (!pvt->sip_callid[0] && pvt->peer && sofia_push_peer_pushable(pvt->peer)) {
+		su_guid_t g[1];
+		su_guid_generate(g);
+		su_guid_sprintf(pvt->sip_callid, sizeof(pvt->sip_callid), g);
+	}
+	{
+		int rc = sofia_post_invite(pvt, ast, pvt->sip_callid[0] ? pvt->sip_callid : NULL);
+		if (!rc) {
+			sofia_push_guard_arm(pvt);	/* no-op unless tokened + connection-oriented + knob on */
+		}
+		return rc;
+	}
 }
 
 /* Outbound text-message sender (SendText). In-dialog MESSAGE (RFC 3428); NULL text
@@ -6215,6 +6252,8 @@ static int sofia_hangup(struct ast_channel *ast)
 	 * teardown (queues AST_CONTROL_TRANSFER=FAILED if pending). Off-thread-safe (it
 	 * marshals the su_timer ops onto sofia_thread). No-op if no transfer is pending. */
 	sofia_transfer_cleanup(pvt);
+	/* P2: disarm the no-provisional guard (del-or-fire; no-op when not armed). */
+	sofia_push_guard_cancel(pvt);
 
 	/* Channel-hangup counter DEC. Decrements peer->inUse if this pvt incremented it
 	 * (call_inc_done flag-gated for multi-site safety with the BYE handlers +
@@ -16246,6 +16285,10 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		}
 		if (pvt) {
 			struct ast_channel *owner = NULL;
+			/* P2: ANY response >=100 on the in-flight INVITE proves the leg alive —
+			 * disarm the no-provisional guard and unpark a pending inflight entry
+			 * (the old leg lives; no swap will happen). sofia_thread, no locks held. */
+			sofia_push_guard_progress(pvt, status);
 			if (status == 180) {
 				ast_mutex_lock(&pvt->lock);
 				pvt->state = SOFIA_DIALOG_STATE_RINGING;
@@ -18137,6 +18180,13 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "push_min_interval")) {
 			int s = atoi(v->value);
 			sofia_cfg.push_min_interval = (s < 0 || s > 60) ? 5 : s;
+		} else if (!strcasecmp(v->name, "push_noresponse")) {
+			int g = atoi(v->value);
+			if (g != 0 && (g < 2 || g > 10)) {
+				ast_log(LOG_WARNING, "Sofia PUSH: push_noresponse=%d out of range (0=off, 2..10) - clamping\n", g);
+				g = g < 2 ? 2 : 10;
+			}
+			sofia_cfg.push_noresponse = g;
 		} else if (!strcasecmp(v->name, "register_pool")) {
 			/* Kill-switch: offload realtime REGISTER DB writes to a bounded pool
 			 * (default OFF). Takes effect on reload. */
@@ -19323,6 +19373,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.push_token_ttl_days = 30;
 	sofia_cfg.push_max_devices = 10;
 	sofia_cfg.push_min_interval = 5;
+	sofia_cfg.push_noresponse = 4;	/* P2 guard; 0 disables */
 	/* Register pool: default OFF + auto lane count. */
 	sofia_cfg.register_pool = 0;
 	sofia_cfg.register_pool_workers = 0;

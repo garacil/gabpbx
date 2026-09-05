@@ -468,9 +468,10 @@ int sofia_push_peer_pushable(struct sofia_peer *peer)
 	}
 	e = sofia_push_entry_get(peer->name, !sofia_push_cache_complete /* create only in lazy mode */);
 	if (!e) {
-		/* complete cache: miss == no tokens, answered from memory. Field-support line:
-		 * "why was my phone not pushed" starts here. */
-		ast_verb(3, "Sofia PUSH: peer '%s' not pushable - no cached tokens (cache %s)\n",
+		/* complete cache: miss == no tokens, answered from memory. debug-level only —
+		 * this gate now runs on EVERY single-contact call (P2 Call-ID pre-gen), and
+		 * "no tokens" is the normal state of trunks and desk phones. */
+		ast_debug(2, "Sofia PUSH: peer '%s' not pushable - no cached tokens (cache %s)\n",
 			peer->name, sofia_push_cache_complete ? "complete" : "lazy");
 		return 0;
 	}
@@ -720,6 +721,7 @@ struct sofia_push_park {
 	char cid_name[80];
 	int sched_id;			/* push_wait; -1 = none */
 	enum sofia_push_park_state state;
+	int inflight;			/* P2: an INVITE is ALREADY on the wire (no-provisional guard fired); resume swaps the leg instead of creating the first one */
 	time_t parked_at;
 	int npushed;			/* devices actually notified */
 	char pushed_dev[SOFIA_PUSH_MAX_DEVICES][SOFIA_PUSH_DEVID_MAX];
@@ -920,6 +922,235 @@ static void sofia_push_park_cancel_timer(struct sofia_push_park *e)
 	}
 }
 
+/* Core entry creation shared by the P1 park and the P2 inflight guard: alloc + link +
+ * sender jobs + push_wait timer, fail-closed at every step (an entry either ends up
+ * fully armed and announced, or does not exist). Returns the entry +1 (caller drops)
+ * or NULL. Any thread that holds NO pvt/peer/entry locks. */
+static struct sofia_push_park *sofia_push_park_create(struct sofia_pvt *pvt, const char *callid,
+	const char *cid_num, const char *cid_name, int inflight)
+{
+	struct sofia_push_park *e;
+
+	if (!sofia_push_parked || !sofia_sched || !callid || !callid[0]) {
+		return NULL;
+	}
+	if (!(e = ao2_alloc(sizeof(*e), sofia_push_park_destructor))) {
+		return NULL;
+	}
+	ast_copy_string(e->peername, pvt->peername, sizeof(e->peername));
+	ast_copy_string(e->callid, callid, sizeof(e->callid));
+	ast_copy_string(e->cid_num, S_OR(cid_num, "unknown"), sizeof(e->cid_num));
+	ast_copy_string(e->cid_name, S_OR(cid_name, e->cid_num), sizeof(e->cid_name));
+	e->pvt = pvt;
+	ao2_ref(pvt, +1);
+	e->sched_id = -1;
+	e->state = SOFIA_PUSH_PARKED;
+	e->inflight = inflight;
+	e->parked_at = time(NULL);
+
+	if (!ao2_link(sofia_push_parked, e)) {
+		ao2_ref(e, -1);
+		return NULL;
+	}
+
+	/* Notify: one sender job per eligible device. A park nobody was told about is a
+	 * silent hole — fail it (unwind) UNLESS the only reason no job went out is the
+	 * per-device rate limit (a push from moments ago is already waking the phone). */
+	{
+		int rate_limited = 0;
+		int queued = sofia_push_notify_devices(e, &rate_limited);
+		if (!queued && !rate_limited) {
+			ao2_unlink(sofia_push_parked, e);
+			ao2_ref(e, -1);
+			ast_log(LOG_WARNING, "Sofia PUSH: no sender job could be queued for peer '%s' - failing the park\n",
+				pvt->peername);
+			return NULL;
+		}
+	}
+
+	/* Arm push_wait UNDER the entry lock (defer-BYE idiom): the callback's first act is
+	 * taking this lock, so the id store below happens-before it can observe the entry. */
+	ao2_lock(e);
+	ao2_ref(e, +1);		/* the timer's ref */
+	e->sched_id = ast_sched_thread_add(sofia_sched, sofia_cfg.push_wait * 1000, sofia_push_wait_cb, e);
+	if (e->sched_id < 0) {
+		e->sched_id = -1;
+		ao2_unlock(e);
+		ao2_ref(e, -1);	/* timer ref rollback */
+		ao2_unlink(sofia_push_parked, e);
+		ao2_ref(e, -1);	/* alloc ref */
+		ast_log(LOG_WARNING, "Sofia PUSH: could not arm push_wait for peer '%s' - failing the park (never park untimed)\n",
+			pvt->peername);
+		return NULL;
+	}
+	ao2_unlock(e);
+	return e;
+}
+
+/* ---------- P2: the no-provisional guard ----------
+ *
+ * A suspended phone keeps its connection-oriented socket open but never processes the
+ * INVITE: the flow watch sees nothing, the INVITE black-holes until Timer B (32 s). The
+ * guard arms after the single-contact INVITE to a tokened peer; with no >=100 response in
+ * push_noresponse seconds it pushes with the SAME Call-ID already on the wire and parks
+ * the pvt in INFLIGHT mode. Progress on the old leg cancels the park itself (the leg
+ * lives, nothing is swapped); the wake REGISTER swaps the leg: unbind the old handle
+ * FIRST (synchronous — from that instant its late events carry a NULL magic and can
+ * never validate against this pvt), async-destroy it, and post a fresh INVITE with the
+ * same Call-ID to the new binding (new from-tag; the phone dedups by uuid). */
+
+static int sofia_push_transport_is_co(const char *t)	/* tcp/tls/ws/wss (mirror of the driver's helper) */
+{
+	return t && (!strcasecmp(t, "tcp") || !strcasecmp(t, "tls")
+		|| !strcasecmp(t, "ws") || !strcasecmp(t, "wss"));
+}
+
+/* Guard fired (sched thread; sched lock released, defer-BYE contract). */
+static int sofia_push_guard_cb(const void *data)
+{
+	struct sofia_pvt *pvt = (struct sofia_pvt *) data;
+	struct ast_channel *owner = NULL;
+	struct sofia_push_park *e;
+	char callid[64] = "", cid_num[80] = "unknown", cid_name[80] = "";
+	int fire = 0;
+
+	ast_mutex_lock(&pvt->lock);
+	pvt->push_guard_sched_id = -1;
+	if (!pvt->got_provisional && !pvt->push_parked && pvt->nh
+		&& pvt->state == SOFIA_DIALOG_STATE_TRYING && pvt->owner && pvt->sip_callid[0]) {
+		fire = 1;
+		ast_copy_string(callid, pvt->sip_callid, sizeof(callid));
+		owner = pvt->owner;
+		ast_channel_ref(owner);
+	}
+	ast_mutex_unlock(&pvt->lock);
+
+	if (fire) {
+		/* caller identity for the push payload: channel lock, nothing else held */
+		ast_channel_lock(owner);
+		ast_copy_string(cid_num, S_OR(owner->caller.id.number.str, "unknown"), sizeof(cid_num));
+		ast_copy_string(cid_name, S_OR(owner->caller.id.name.str, cid_num), sizeof(cid_name));
+		ast_channel_unlock(owner);
+		ast_channel_unref(owner);
+
+		e = sofia_push_park_create(pvt, callid, cid_num, cid_name, 1 /* inflight */);
+		if (e) {
+			ast_log(LOG_NOTICE, "Sofia PUSH: guard fired %s peer='%s' - no 1xx in %ds on a connection-oriented leg, pushed with the in-flight Call-ID\n",
+				e->callid, e->peername, sofia_cfg.push_noresponse);
+			sofia_push_log_event(e->peername, "", e->callid, "sent", "noresponse");
+			ao2_ref(e, -1);
+		}
+	} else if (owner) {
+		ast_channel_unref(owner);
+	}
+	ao2_ref(pvt, -1);	/* the arm-time ref */
+	return 0;
+}
+
+/* Arm after the single-contact INVITE (PBX thread, channel lock held, no pvt/peer lock).
+ * No-op unless: knob on, sched up, the peer has usable tokens, the target contact's
+ * transport is connection-oriented, and the Call-ID was pre-generated. */
+void sofia_push_guard_arm(struct sofia_pvt *pvt)
+{
+	char transport[8] = "";
+
+	if (!pvt || sofia_cfg.push_noresponse <= 0 || !sofia_sched || !sofia_push_parked) {
+		return;
+	}
+	if (!pvt->sip_callid[0] || !pvt->peer || !sofia_push_peer_pushable(pvt->peer)) {
+		return;
+	}
+	if (pvt->active_contact) {
+		ao2_lock(pvt->active_contact);
+		ast_copy_string(transport, pvt->active_contact->transport, sizeof(transport));
+		ao2_unlock(pvt->active_contact);
+	}
+	if (!sofia_push_transport_is_co(transport)) {
+		return;		/* UDP: a dead peer does not black-hole silently the same way; out of P2 v1 scope */
+	}
+	ast_mutex_lock(&pvt->lock);
+	if (pvt->push_guard_sched_id == -1 && !pvt->got_provisional) {
+		ao2_ref(pvt, +1);
+		pvt->push_guard_sched_id = ast_sched_thread_add(sofia_sched,
+			sofia_cfg.push_noresponse * 1000, sofia_push_guard_cb, pvt);
+		if (pvt->push_guard_sched_id < 0) {
+			pvt->push_guard_sched_id = -1;
+			ao2_ref(pvt, -1);	/* arm failed: guard silently off, the call keeps today's Timer-B bound */
+		}
+	}
+	ast_mutex_unlock(&pvt->lock);
+}
+
+/* Any >=100 response on the in-flight INVITE (sofia_thread, no locks held): the leg is
+ * alive. Disarm the guard and UNPARK a pending inflight entry — the old leg wins, no
+ * swap will happen (rule agreed with the phone team). Also the 486-after-swap field
+ * counter: a fast failure on a freshly swapped leg is the P2.1 tripwire. */
+void sofia_push_guard_progress(struct sofia_pvt *pvt, int status)
+{
+	int sid;
+	time_t swapped;
+
+	if (!pvt || status < 100) {
+		return;
+	}
+	ast_mutex_lock(&pvt->lock);
+	pvt->got_provisional = 1;
+	sid = pvt->push_guard_sched_id;
+	pvt->push_guard_sched_id = -1;
+	swapped = pvt->push_swapped_at;
+	ast_mutex_unlock(&pvt->lock);
+	if (sid > -1 && sofia_sched && ast_sched_thread_del(sofia_sched, sid) == 0) {
+		ao2_ref(pvt, -1);	/* timer never ran */
+	}
+	if (status >= 300 && swapped && time(NULL) - swapped <= 10) {
+		ast_log(LOG_NOTICE, "Sofia PUSH: new leg answered %d within 10s of an inflight swap - P2.1 field counter (old socket answered the phone?)\n",
+			status);
+		sofia_push_log_event(pvt->peername, "", pvt->sip_callid, "swap_fail", "");
+	}
+	if (sofia_push_parked) {
+		struct ao2_iterator it = ao2_iterator_init(sofia_push_parked, 0);
+		struct sofia_push_park *e;
+		while ((e = ao2_iterator_next(&it))) {
+			int won = 0;
+			if (e->pvt == pvt && e->inflight) {
+				ao2_lock(e);
+				if (e->state == SOFIA_PUSH_PARKED) {
+					e->state = SOFIA_PUSH_DONE;
+					won = 1;
+				}
+				ao2_unlock(e);
+				if (won) {
+					sofia_push_park_cancel_timer(e);
+					ast_verb(2, "Sofia PUSH: unparked %s peer='%s' - the in-flight leg progressed (%d), old leg wins\n",
+						e->callid, e->peername, status);
+					sofia_push_log_event(e->peername, "", e->callid, "unparked", "");
+					ao2_unlink(sofia_push_parked, e);
+				}
+			}
+			ao2_ref(e, -1);
+		}
+		ao2_iterator_destroy(&it);
+	}
+}
+
+/* Disarm only (hangup entry / teardown): the registry entries themselves are cleaned by
+ * sofia_push_on_pvt_hangup (which matches inflight entries too). Any thread, no locks. */
+void sofia_push_guard_cancel(struct sofia_pvt *pvt)
+{
+	int sid;
+
+	if (!pvt) {
+		return;
+	}
+	ast_mutex_lock(&pvt->lock);
+	sid = pvt->push_guard_sched_id;
+	pvt->push_guard_sched_id = -1;
+	ast_mutex_unlock(&pvt->lock);
+	if (sid > -1 && sofia_sched && ast_sched_thread_del(sofia_sched, sid) == 0) {
+		ao2_ref(pvt, -1);
+	}
+}
+
 /* Park the call: registry entry + sender jobs + push_wait timer. PBX dialing
  * thread, CHANNEL lock held by ast_call (the serializer the resume path also takes).
  * Fail-closed: any piece missing -> -1 and the call fails exactly as today. */
@@ -959,63 +1190,22 @@ int sofia_push_park_and_notify(struct sofia_pvt *pvt, struct ast_channel *ast)
 		}
 	}
 
-	if (!(e = ao2_alloc(sizeof(*e), sofia_push_park_destructor))) {
-		return -1;
-	}
-	ast_copy_string(e->peername, pvt->peername, sizeof(e->peername));
-	su_guid_generate(guid);
-	su_guid_sprintf(e->callid, sizeof(e->callid), guid);
-	/* caller identity snapshot - the channel lock ast_call holds makes these reads safe */
-	ast_copy_string(e->cid_num, S_OR(ast->caller.id.number.str, "unknown"), sizeof(e->cid_num));
-	ast_copy_string(e->cid_name, S_OR(ast->caller.id.name.str, e->cid_num), sizeof(e->cid_name));
-	e->pvt = pvt;
-	ao2_ref(pvt, +1);
-	e->sched_id = -1;
-	e->state = SOFIA_PUSH_PARKED;
-	e->parked_at = time(NULL);
-
-	/* Publish the pre-generated Call-ID on the pvt (resume + CLI + P2 read it there). */
+	/* Publish the pre-generated Call-ID on the pvt first (resume + CLI + P2 read it
+	 * there); sofia_call may have pre-generated it already for the P2 guard. */
 	ast_mutex_lock(&pvt->lock);
-	ast_copy_string(pvt->sip_callid, e->callid, sizeof(pvt->sip_callid));
+	if (!pvt->sip_callid[0]) {
+		su_guid_generate(guid);
+		su_guid_sprintf(pvt->sip_callid, sizeof(pvt->sip_callid), guid);
+	}
 	ast_mutex_unlock(&pvt->lock);
 
-	if (!ao2_link(sofia_push_parked, e)) {
-		ao2_ref(e, -1);
+	e = sofia_push_park_create(pvt, pvt->sip_callid,
+		S_OR(ast->caller.id.number.str, "unknown"),	/* channel lock held by ast_call */
+		S_OR(ast->caller.id.name.str, S_OR(ast->caller.id.number.str, "unknown")),
+		0 /* not inflight: no INVITE exists yet */);
+	if (!e) {
 		return -1;
 	}
-
-	/* Notify: one sender job per eligible device. A park nobody was told about is a
-	 * silent 24 s hole — fail it (unwind to today's failure) UNLESS the only reason no
-	 * job went out is the per-device rate limit (a push from moments ago is already
-	 * waking the phone; the wake REGISTER will resume THIS park too). */
-	{
-		int rate_limited = 0;
-		int queued = sofia_push_notify_devices(e, &rate_limited);
-		if (!queued && !rate_limited) {
-			ao2_unlink(sofia_push_parked, e);
-			ao2_ref(e, -1);
-			ast_log(LOG_WARNING, "Sofia PUSH: no sender job could be queued for peer '%s' - failing the park\n",
-				pvt->peername);
-			return -1;
-		}
-	}
-
-	/* Arm push_wait UNDER the entry lock (defer-BYE idiom): the callback's first act is
-	 * taking this lock, so the id store below happens-before it can observe the entry. */
-	ao2_lock(e);
-	ao2_ref(e, +1);		/* the timer's ref */
-	e->sched_id = ast_sched_thread_add(sofia_sched, sofia_cfg.push_wait * 1000, sofia_push_wait_cb, e);
-	if (e->sched_id < 0) {
-		e->sched_id = -1;
-		ao2_unlock(e);
-		ao2_ref(e, -1);	/* timer ref rollback */
-		ao2_unlink(sofia_push_parked, e);
-		ao2_ref(e, -1);	/* alloc ref */
-		ast_log(LOG_WARNING, "Sofia PUSH: could not arm push_wait for peer '%s' - failing the park (never park untimed)\n",
-			pvt->peername);
-		return -1;
-	}
-	ao2_unlock(e);
 
 	ast_verb(2, "Sofia PUSH: parked call %s peer='%s' from %s wait %ds\n",
 		e->callid, e->peername, e->cid_num, sofia_cfg.push_wait);
@@ -1131,14 +1321,40 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 	}
 	ast_channel_lock(owner);
 	ast_mutex_lock(&pvt->lock);
-	if (pvt->owner != owner || pvt->nh || !pvt->push_parked) {
+	if (e->inflight) {
+		/* P2 swap: an INVITE is ALREADY on the wire. Swap ONLY if the old leg showed no
+		 * progress (rule agreed with the phone team: any >=100 means the old leg wins —
+		 * normally guard_progress already unparked us; this is the race-safe recheck). */
+		nua_handle_t *old_nh;
+		if (pvt->owner != owner || !pvt->nh || pvt->got_provisional) {
+			ast_mutex_unlock(&pvt->lock);
+			ast_channel_unlock(owner);
+			ast_channel_unref(owner);
+			owner = NULL;
+			goto orphan;
+		}
+		old_nh = pvt->nh;
+		pvt->nh = NULL;
+		pvt->push_swapped_at = time(NULL);
+		ast_mutex_unlock(&pvt->lock);
+		/* Unbind FIRST, synchronously: from this instant a late 408/487/200 on the old
+		 * leg carries a NULL magic and can never validate against this live pvt (the
+		 * dispatch gate skips it); then destroy on sofia_thread — nua completes the old
+		 * client transaction internally, nothing goes on the wire (a CANCEL with no 1xx
+		 * would be deferred and never leave the box anyway, RFC 3261 §9.1). */
+		nua_handle_bind(old_nh, NULL);
+		sofia_nh_destroy_async(old_nh);
+		ast_verb(2, "Sofia PUSH: inflight swap %s peer='%s' - old leg unbound+destroyed, re-posting to the fresh binding\n",
+			e->callid, e->peername);
+	} else if (pvt->owner != owner || pvt->nh || !pvt->push_parked) {
 		ast_mutex_unlock(&pvt->lock);
 		ast_channel_unlock(owner);
 		ast_channel_unref(owner);
 		owner = NULL;
 		goto orphan;	/* hangup/masquerade won between snapshot and lock */
+	} else {
+		ast_mutex_unlock(&pvt->lock);
 	}
-	ast_mutex_unlock(&pvt->lock);
 
 	/* Builders: routes/gruu under peer->lock; RURI+Path from the contact (contact lock
 	 * only, sofia_build_contact_ruri takes it); NAT proxy helper takes peer+contact
@@ -1441,9 +1657,10 @@ static char *sofia_push_cli_show(struct ast_cli_entry *e, int cmd, struct ast_cl
 	if (a->argc == 4) {
 		filter = a->argv[3];
 	}
-	ast_cli(a->fd, "Push wake-up: %s  scripts=%s  wait=%ds  ttl=%dd  max_devices=%d  min_interval=%ds  cache=%s  queue=%d\n",
+	ast_cli(a->fd, "Push wake-up: %s  scripts=%s  wait=%ds  noresponse=%ds  ttl=%dd  max_devices=%d  min_interval=%ds  cache=%s  queue=%d\n",
 		sofia_cfg.push_enabled ? "ENABLED" : "disabled",
-		sofia_cfg.push_scripts, sofia_cfg.push_wait, sofia_cfg.push_token_ttl_days,
+		sofia_cfg.push_scripts, sofia_cfg.push_wait, sofia_cfg.push_noresponse,
+		sofia_cfg.push_token_ttl_days,
 		sofia_cfg.push_max_devices, sofia_cfg.push_min_interval,
 		sofia_push_cache_complete ? "complete" : "lazy", sofia_pushdb_depth);
 	if (!sofia_push_cache) {

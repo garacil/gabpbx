@@ -63,6 +63,15 @@ int sofia_push_park_and_notify(struct sofia_pvt *pvt, struct ast_channel *ast);
 /* Hangup notification for a pvt whose push_parked flag was set (called from sofia_hangup
  * AFTER pvt->lock is released, before the final unref): terminal-CAS + timer cancel. */
 void sofia_push_on_pvt_hangup(struct sofia_pvt *pvt);
+/* P2 no-provisional guard (sofia_push.c). Arm after the single-contact nua_invite (PBX
+ * thread, channel lock held, no pvt/peer lock); progress on ANY >=100 response (sofia_thread)
+ * disarms it and unparks a pending inflight entry; cancel from hangup/destructor. */
+void sofia_push_guard_arm(struct sofia_pvt *pvt);
+void sofia_push_guard_progress(struct sofia_pvt *pvt, int status);
+void sofia_push_guard_cancel(struct sofia_pvt *pvt);
+/* Async nua handle destroy on sofia_thread (the pvt-destructor idiom, exported for the
+ * P2 leg swap: unbind FIRST - synchronous - then hand the handle here). */
+void sofia_nh_destroy_async(nua_handle_t *nh);
 const char *sofia_push_redact(const char *token, char *buf, size_t buflen);
 void sofia_push_log_event(const char *peer, const char *device_id, const char *callid, const char *event, const char *detail);
 int sofia_format_auth_creds(msg_auth_t const *challenge, const char *user, const char *secret, char *buf, size_t len);
@@ -628,6 +637,14 @@ struct sofia_pvt {
 	 * uuid the push announces to the phone; distinct from pvt->callid (debug pointer hex). */
 	int push_parked;
 	char sip_callid[64];
+	/* P2 no-provisional guard: armed after the single-contact INVITE to a tokened peer on a
+	 * connection-oriented transport; a suspended phone's socket looks alive but swallows the
+	 * INVITE, so with no 1xx in push_noresponse seconds the driver pushes with the SAME
+	 * Call-ID and, on the wake REGISTER, swaps the leg (unbind old handle FIRST, then async
+	 * destroy - a late response on the old leg must never validate against this pvt). */
+	int push_guard_sched_id;	/* -1 = none; defer-BYE del-or-fire idiom */
+	int got_provisional;		/* any >=100 on the in-flight INVITE (under pvt->lock) */
+	time_t push_swapped_at;		/* when the inflight swap posted the new leg (486-after-swap field counter) */
 	/* This leg negotiated WebRTC (DTLS-SRTP + ICE-lite + rtcp-mux). Set
 	 * by sofia_parse_sdp ONLY after the DTLS/ICE commit fully succeeds; read by
 	 * sofia_generate_sdp to emit the UDP/TLS/RTP/SAVPF profile + the a= block. */
@@ -1141,6 +1158,7 @@ struct sofia_config {
 	int push_token_ttl_days;   /* days a token survives without a REGISTER (stale devices are skipped + lazily purged); default 30 */
 	int push_max_devices;      /* devices pushed per peer per call (clamp 1..10, Kamailio devlist parity) */
 	int push_min_interval;     /* seconds per-device push floor (the phone itself cancels a push <5 s after the previous); 0 = off */
+	int push_noresponse;       /* P2: seconds without ANY 1xx/2xx on a connection-oriented single-contact INVITE to a tokened peer before pushing with the same Call-ID (0 = off; clamp 2..10, must stay < push_wait); default 4 */
 	/* Bounded REGISTER realtime-DB-write offload pool (kill-switch, default OFF). */
 	int register_pool;          /* offload the realtime REGISTER DB writes to a bounded pool */
 	int register_pool_workers;  /* lane count; 0 = auto = clamp(ncpu/2+1, 2, 16) */
