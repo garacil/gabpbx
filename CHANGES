@@ -1,3 +1,54 @@
+## 1.7.0 — push wake-up phase 2: the 4-second no-answer guard for suspended apps
+
+Phase 1 (1.6.0) wakes a phone whose registration is already gone. The nastier case is
+the app that is **suspended with its binding still live**: the OS froze it, the TCP/TLS/
+WebSocket socket looks open, the INVITE is sent — and nothing ever comes back until the
+32-second Timer-B failure. `chan_sofia` now detects that black hole in 4 seconds and
+converts it into a push wake-up mid-call.
+
+### How it works
+
+- **Pre-generated Call-ID.** Every non-forked outbound INVITE to a peer with cached push
+  tokens carries a driver-generated Call-ID (same format the stack would use), injected
+  as an operation tag on the INVITE. A suspended app emits no event to react to, so the
+  driver must know the call's uuid *before* anything goes wrong. Peers without tokens
+  are untouched.
+- **The guard.** After posting such an INVITE on a **connection-oriented** transport
+  (tcp/tls/ws/wss — where a dead socket stays silent; UDP retransmits already probe the
+  path) to a peer's single live contact, a `push_noresponse` timer (default 4 s) arms.
+  Any provisional ≥ 100 disarms it; hangup and channel teardown cancel it. Forked
+  (multi-contact) calls never arm the guard.
+- **Fire = park in flight + push.** If nothing arrived, the call parks in a special
+  in-flight state and the push goes out announcing **the Call-ID already on the wire**.
+  The phone's incoming-call UI dedupes by uuid, so the user sees one call whether the
+  original INVITE eventually thawed or the wake-up path delivers it.
+- **The wake REGISTER swaps the leg.** The old SIP leg is detached first (unbound
+  synchronously, then destroyed off-thread) and a fresh INVITE with the **same Call-ID**
+  goes to the just-registered binding. No CANCEL hits the wire — with no provisional
+  response received, RFC 3261 §9.1 defers a CANCEL anyway — and a late 408/487 from the
+  dying leg can no longer touch the live call.
+- **The old leg can still win.** If a provisional arrives *after* the guard fired (a
+  slow phone rather than a dead one), the in-flight entry is quietly unparked and the
+  call continues on the original leg; the duplicate push is deduped by uuid on the
+  phone. An immediate failure right after a swap is logged (`swap_fail`) for diagnosis.
+
+Verified with wire captures: silent callee → guard at 4 s → swap on the wake REGISTER →
+answered, with the abandoned leg seeing exactly one INVITE and zero CANCEL; a fast
+provisional produces zero guard activity; a provisional at 6 s unparks and the original
+leg answers. The machinery survives a call flood crossed with a `sip reload` hammer and
+a REGISTER flapper under `DEBUG_THREADS` with zero lock or memory errors.
+
+### Configuration
+
+```ini
+; sofia.conf
+[general]
+push_noresponse=4        ; seconds without any 1xx before the guard fires
+                         ; 0 disables; clamped to 2..10 and always < push_wait
+```
+
+`sip show push` now also reports the guard window.
+
 ## 1.6.0 — mobile push wake-up: park, push and resume calls to sleeping softphones
 
 A mobile softphone cannot keep its SIP socket alive in the background: the OS kills the
