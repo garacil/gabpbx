@@ -726,6 +726,9 @@ struct sofia_push_park {
 	int collected;			/* a collect window already ran: stragglers resume immediately */
 	struct ast_sockaddr dialed[SOFIA_PUSH_MAX_DEVICES];	/* REGISTER source addrs already given a branch (late-append dedup; entry lock) */
 	int ndialed;
+	char exclude_instance[128];	/* self-call: the CALLING device's +sip.instance - its push is skipped (never wake the phone that is placing the call) */
+	struct ast_sockaddr exclude_src;	/* self-call: the CALLING device's transport source - its own re-REGISTER is NOT a wake (must not resume this park) and its binding is never a resume target */
+	int exclude_valid;
 	enum sofia_push_park_state state;
 	int inflight;			/* P2: an INVITE is ALREADY on the wire (no-provisional guard fired); resume swaps the leg instead of creating the first one */
 	time_t parked_at;
@@ -790,6 +793,12 @@ static int sofia_push_notify_devices(struct sofia_push_park *entry, int *rate_li
 	ao2_lock(e);
 	for (i = 0; i < e->ndev && nsnap < cap; i++) {
 		if (sofia_push_device_stale(&e->dev[i], now)) {
+			continue;
+		}
+		/* Self-call: never push the device that is PLACING this call (matched by the
+		 * normalized +sip.instance both sides store via sofia_contact_parse_instance). */
+		if (entry->exclude_instance[0] && e->dev[i].instance[0]
+				&& !strcasecmp(e->dev[i].instance, entry->exclude_instance)) {
 			continue;
 		}
 		if (sofia_cfg.push_min_interval > 0
@@ -961,6 +970,11 @@ static struct sofia_push_park *sofia_push_park_create(struct sofia_pvt *pvt, con
 		return NULL;
 	}
 	ast_copy_string(e->peername, pvt->peername, sizeof(e->peername));
+	ast_copy_string(e->exclude_instance, pvt->push_exclude_instance, sizeof(e->exclude_instance));
+	if (pvt->fork_exclude_valid) {
+		ast_sockaddr_copy(&e->exclude_src, &pvt->fork_exclude_src);
+		e->exclude_valid = 1;
+	}
 	ast_copy_string(e->callid, callid, sizeof(e->callid));
 	ast_copy_string(e->cid_num, S_OR(cid_num, "unknown"), sizeof(e->cid_num));
 	ast_copy_string(e->cid_name, S_OR(cid_name, e->cid_num), sizeof(e->cid_name));
@@ -1242,7 +1256,7 @@ int sofia_push_park_and_notify(struct sofia_pvt *pvt, struct ast_channel *ast)
 	 * channel lock ast_call holds is recursive, so resume_one's own channel_lock nests. */
 	if (pvt->peer) {
 		int nu = 0, nt = 0;
-		struct sofia_contact *lc = sofia_peer_select_single_live_contact(pvt->peer, &nu, &nt);
+		struct sofia_contact *lc = sofia_peer_select_single_live_contact(pvt->peer, &nu, &nt, NULL, NULL);
 		if (lc) {
 			ao2_ref(lc, -1);
 			sofia_push_resume_one(e, pvt->peer, NULL);
@@ -1319,13 +1333,33 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 	 * single-live selector). No contact yet -> leave the entry PARKED: the push_wait
 	 * timer stays armed as the safety net and a later REGISTER retries. */
 	int c_from_update = 0;
-	if (update && !ast_sockaddr_isnull(&update->new_src)) {
+	if (update && !ast_sockaddr_isnull(&update->new_src)
+			&& !(e->exclude_valid && !ast_sockaddr_cmp(&update->new_src, &e->exclude_src))) {
 		c = sofia_peer_find_contact_by_addr(peer, &update->new_src);
+		if (c && (e->exclude_valid || e->exclude_instance[0])) {
+			/* The caller's device may have re-registered from a NEW source (mid-call
+			 * socket rebuild): recognize it by instance and refuse it as a wake. */
+			char c_inst[128];
+			struct ast_sockaddr c_src;
+			ao2_lock(c);
+			ast_copy_string(c_inst, c->instance_id, sizeof(c_inst));
+			ast_sockaddr_copy(&c_src, &c->src_addr);
+			ao2_unlock(c);
+			if (sofia_selfcall_contact_excluded(&c_src, c_inst,
+					e->exclude_valid ? &e->exclude_src : NULL,
+					e->exclude_instance[0] ? e->exclude_instance : NULL)) {
+				ao2_ref(c, -1);
+				c = NULL;
+			}
+		}
 		c_from_update = (c != NULL);
 	}
 	if (!c) {
 		int nu = 0, nt = 0;
-		c = sofia_peer_select_single_live_contact(peer, &nu, &nt);
+		/* Self-call park: the caller's own binding is never a resume target. */
+		c = sofia_peer_select_single_live_contact(peer, &nu, &nt,
+			e->exclude_valid ? &e->exclude_src : NULL,
+			e->exclude_instance[0] ? e->exclude_instance : NULL);
 	}
 	if (!c || !pvt || !sofia_nua) {
 		if (c) {
@@ -1608,9 +1642,24 @@ static int sofia_push_collect_cb(const void *data)
 		struct sofia_contact *ct;
 		while ((ct = ao2_iterator_next(&ci))) {
 			time_t c_exp;
+			struct ast_sockaddr c_src;
 			ao2_lock(ct);
 			c_exp = ct->expires;
+			ast_sockaddr_copy(&c_src, &ct->src_addr);
 			ao2_unlock(ct);
+			/* Self-call park: the caller's own binding never counts as a wake target. */
+			{
+				char ct_inst[128];
+				ao2_lock(ct);
+				ast_copy_string(ct_inst, ct->instance_id, sizeof(ct_inst));
+				ao2_unlock(ct);
+				if (sofia_selfcall_contact_excluded(&c_src, ct_inst,
+						e->exclude_valid ? &e->exclude_src : NULL,
+						e->exclude_instance[0] ? e->exclude_instance : NULL)) {
+					ao2_ref(ct, -1);
+					continue;
+				}
+			}
 			if (c_exp > now) {	/* sofia_contact_is_unexpired: RFC 3261 soft state */
 				live++;
 			}
@@ -1619,6 +1668,8 @@ static int sofia_push_collect_cb(const void *data)
 		ao2_iterator_destroy(&ci);
 	}
 
+	ast_verb(3, "Sofia PUSH: %s peer='%s' - collect window closed: %d wakeable binding(s)%s\n",
+		e->callid, e->peername, live, e->exclude_valid ? " (caller's own excluded)" : "");
 	if (live == 0 || !peer) {
 		/* Every binding lapsed inside the window (pathological): back under push_wait. */
 		ao2_lock(e);
@@ -1779,6 +1830,31 @@ static void sofia_push_try_resume(struct sofia_peer *peer, const struct sofia_re
 	it = ao2_iterator_init(sofia_push_parked, 0);
 	while ((pe = ao2_iterator_next(&it))) {
 		if (!strcasecmp(pe->peername, peer->name)) {
+			/* Self-call park: the CALLING device's own re-REGISTER (refresh, or a NAT
+			 * rebinding from a NEW source - recognized by instance) must not resume
+			 * the park it created - the wake we wait for is one of the OTHER devices. */
+			if ((pe->exclude_valid || pe->exclude_instance[0])
+					&& update && !ast_sockaddr_isnull(&update->new_src)) {
+				int own = pe->exclude_valid
+					&& !ast_sockaddr_cmp(&update->new_src, &pe->exclude_src);
+				if (!own && pe->exclude_instance[0]) {
+					struct sofia_contact *rc = sofia_peer_find_contact_by_addr(peer, &update->new_src);
+					if (rc) {
+						char rinst[128];
+						ao2_lock(rc);
+						ast_copy_string(rinst, rc->instance_id, sizeof(rinst));
+						ao2_unlock(rc);
+						ao2_ref(rc, -1);
+						own = rinst[0] && !strcasecmp(rinst, pe->exclude_instance);
+					}
+				}
+				if (own) {
+					ast_debug(1, "Sofia PUSH: %s peer='%s' - caller's own REGISTER, not a wake\n",
+						pe->callid, pe->peername);
+					ao2_ref(pe, -1);
+					continue;
+				}
+			}
 			if (!logged++) {
 				sofia_push_log_event(peer->name, "", "", "registered", "wake");
 			}

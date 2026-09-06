@@ -1048,7 +1048,8 @@ static int sofia_contact_is_unexpired(time_t expires, time_t now)
 }
 
 struct sofia_contact *sofia_peer_select_single_live_contact(struct sofia_peer *peer,
-	int *unexpired_out, int *total_out)
+	int *unexpired_out, int *total_out, const struct ast_sockaddr *exclude_src,
+	const char *exclude_instance)
 {
 	struct ao2_iterator ci;
 	struct sofia_contact *c, *winner = NULL;
@@ -1065,10 +1066,20 @@ struct sofia_contact *sofia_peer_select_single_live_contact(struct sofia_peer *p
 	ci = ao2_iterator_init(peer->contacts, 0);
 	while ((c = ao2_iterator_next(&ci))) {
 		time_t c_exp;
+		struct ast_sockaddr c_src;
+		char c_inst[128];
 		ao2_lock(c);
 		c_exp = c->expires;
+		ast_sockaddr_copy(&c_src, &c->src_addr);
+		ast_copy_string(c_inst, c->instance_id, sizeof(c_inst));
 		ao2_unlock(c);
 		total++;
+		/* Self-call exclusion: the calling device's own binding is invisible to the
+		 * selection (counted in total, never in unexpired, never the winner). */
+		if (sofia_selfcall_contact_excluded(&c_src, c_inst, exclude_src, exclude_instance)) {
+			ao2_ref(c, -1);
+			continue;
+		}
 		if (sofia_contact_is_unexpired(c_exp, now)) {	/* RFC 3261 soft state: expiry alone, any transport */
 			unexpired++;
 			if (unexpired == 1) {
@@ -4984,12 +4995,19 @@ static enum ast_rtp_glue_result sofia_get_rtp_peer(struct ast_channel *chan,
 	ao2_ref(pvt->rtp, +1);
 	*instance = pvt->rtp;
 
-	/* SRTP / DTLS-SRTP active → force LOCAL relay. directmedia would bridge this leg's encrypted media to a
-	 * possibly non-DTLS peer or disclose the SRTP key via re-INVITE. DTLS-SRTP (WebRTC) keys live in the
-	 * engine instance, NOT pvt->srtp/vsrtp, so is_webrtc must be checked explicitly (review fix). */
+	/* SRTP / DTLS-SRTP active → FORBID any native bridge (chan_sip parity: sip_get_rtp_peer ends with
+	 * `if (p->srtp) res = FORBID`). NOT "LOCAL": LOCAL still permits the P2P local RTP bridge
+	 * (ast_rtp_instance_bridge → local_bridge_loop → bridge_p2p_rtp_write), which relays each RTP packet
+	 * carrying the SOURCE leg's SSRC/sequence re-encrypted under the DESTINATION leg's SRTP context — the
+	 * receiver then rejects it on SRTP auth/replay and the call is DEAF BOTH WAYS (field-proven on a
+	 * self-call 200→200 where both legs are the same WebRTC peer). FORBID makes the core fall back to the
+	 * GENERIC bridge (ast_generic_bridge), which reads a decrypted audio FRAME via sofia_read and
+	 * REGENERATES a fresh RTP packet under the far leg's own SSRC/seq via sofia_write — the only correct
+	 * path for SRTP↔SRTP. Also strictly safer than LOCAL against a directmedia re-INVITE key disclosure.
+	 * DTLS-SRTP (WebRTC) keys live in the engine instance, not pvt->srtp/vsrtp, so is_webrtc is checked. */
 	if (pvt->srtp || pvt->vsrtp || pvt->is_webrtc) {
-		ast_debug(2, "Sofia: get_rtp_peer LOCAL (SRTP/DTLS active, direct media inhibited)\n");
-		return AST_RTP_GLUE_RESULT_LOCAL;
+		ast_debug(2, "Sofia: get_rtp_peer FORBID (SRTP/DTLS active → generic bridge, no P2P/directmedia)\n");
+		return AST_RTP_GLUE_RESULT_FORBID;
 	}
 	if (!pvt->peer || !pvt->peer->directmedia) {
 		return AST_RTP_GLUE_RESULT_LOCAL;
@@ -5973,6 +5991,20 @@ int sofia_fork_dial(struct sofia_pvt *pvt)
 
 	ci = ao2_iterator_init(pvt->peer->contacts, 0);
 	while ((c = ao2_iterator_next(&ci))) {
+		/* Self-call: never post a branch back to the device that is placing the call. */
+		if (pvt->fork_exclude_valid) {
+			struct ast_sockaddr c_src;
+			char c_inst[128];
+			ao2_lock(c);
+			ast_sockaddr_copy(&c_src, &c->src_addr);
+			ast_copy_string(c_inst, c->instance_id, sizeof(c_inst));
+			ao2_unlock(c);
+			if (sofia_selfcall_contact_excluded(&c_src, c_inst,
+					&pvt->fork_exclude_src, pvt->push_exclude_instance)) {
+				ao2_ref(c, -1);
+				continue;
+			}
+		}
 		posted_any |= sofia_fork_dial_one(pvt, fork, c, branch_idx);
 		branch_idx++;
 		ao2_ref(c, -1);
@@ -6083,14 +6115,24 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		ast->caller.id.name.presentation = pvt->callingpres;
 	}
 
-	/* Busy-on-active: reject if any contact has an active call */
+	/* Busy-on-active: reject if any contact has an active call. On a SELF-CALL (a device
+	 * dialing its own extension) the caller's own binding is inherently "active" (it is
+	 * placing this very call) — excluding it (by src / +sip.instance, same signal as the
+	 * ring exclusion) so autollamada never returns BUSY on account of the caller itself;
+	 * a DIFFERENT device in a call still trips busy_on_active as intended. */
 	if (pvt->peer && pvt->peer->busy_on_active && pvt->peer->contacts) {
 		int any_busy = 0;
 		struct ao2_iterator ci = ao2_iterator_init(pvt->peer->contacts, 0);
 		struct sofia_contact *c;
 		while ((c = ao2_iterator_next(&ci))) {
+			char c_inst[128];
+			struct ast_sockaddr c_src;
 			ao2_lock(c);
-			if (c->active_calls > 0) {
+			ast_sockaddr_copy(&c_src, &c->src_addr);
+			ast_copy_string(c_inst, c->instance_id, sizeof(c_inst));
+			if (c->active_calls > 0
+					&& !(pvt->fork_exclude_valid && sofia_selfcall_contact_excluded(&c_src, c_inst,
+						&pvt->fork_exclude_src, pvt->push_exclude_instance))) {
 				any_busy = 1;
 				ao2_unlock(c);
 				ao2_ref(c, -1);
@@ -6128,12 +6170,22 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		ci = ao2_iterator_init(pvt->peer->contacts, 0);
 		while ((c = ao2_iterator_next(&ci))) {
 			time_t c_exp;
+			struct ast_sockaddr c_src;
+			char c_inst[128];
 			/* Snapshot the mutable expires under the contact lock (a concurrent
 			 * REGISTER refresh rewrites it). */
 			ao2_lock(c);
 			c_exp = c->expires;
+			ast_sockaddr_copy(&c_src, &c->src_addr);
+			ast_copy_string(c_inst, c->instance_id, sizeof(c_inst));
 			ao2_unlock(c);
 			total++;
+			/* Self-call: the calling device's binding is invisible to the fork gate. */
+			if (pvt->fork_exclude_valid && sofia_selfcall_contact_excluded(&c_src, c_inst,
+					&pvt->fork_exclude_src, pvt->push_exclude_instance)) {
+				ao2_ref(c, -1);
+				continue;
+			}
 			if (sofia_contact_is_unexpired(c_exp, now))
 				live++;
 			ao2_ref(c, -1);
@@ -6510,6 +6562,88 @@ static int sofia_answer(struct ast_channel *ast)
 	return 0;
 }
 
+/* RTP-inactivity sweep — chan_sip check_rtp_timeout() port (chan_sip.c:27187-27245).
+ * The values are ALREADY applied per-call to the RTP instances (rtptimeout /
+ * rtpholdtimeout / rtpkeepalive at sofia_apply_rtp_timers); until now nothing ever
+ * POLLED them, so a phone that vanished mid-call (crash, reinstall, dead battery -
+ * it can send no BYE) left the channel up forever. Every SOFIA_RTP_SWEEP_MS the
+ * sofia_sched thread walks the dialogs container: keepalive CNG when the TX side
+ * idles, and a NOTICE + soft hangup when no inbound RTP arrived within rtptimeout
+ * (rtpholdtimeout while the peer holds us). lastrtprx==0 (media never started)
+ * stays unarmed, chan_sip parity. Owner discipline: snapshot+ref under pvt->lock,
+ * TRYlock the channel (busy -> next sweep retries), revalidate, softhangup. */
+#define SOFIA_RTP_SWEEP_MS 2000
+static int sofia_rtp_sweep_id = -1;
+
+static int sofia_rtp_timeout_sweep(const void *data)
+{
+	struct ao2_iterator it;
+	struct sofia_pvt *pvt;
+	time_t t = time(NULL);
+
+	if (!dialogs) {
+		return SOFIA_RTP_SWEEP_MS;
+	}
+	it = ao2_iterator_init(dialogs, 0);
+	while ((pvt = ao2_iterator_next(&it))) {
+		struct ast_channel *owner;
+		time_t rx, tx;
+		int hold, t38;
+
+		ast_mutex_lock(&pvt->lock);
+		owner = pvt->owner ? ast_channel_ref(pvt->owner) : NULL;
+		rx = pvt->lastrtprx;
+		tx = pvt->lastrtptx;
+		hold = pvt->hold_state;
+		t38 = pvt->t38_state;
+		ast_mutex_unlock(&pvt->lock);
+
+		if (!owner || !pvt->rtp || owner->_state != AST_STATE_UP || t38 == SOFIA_T38_ENABLED) {
+			if (owner) {
+				ast_channel_unref(owner);
+			}
+			ao2_ref(pvt, -1);
+			continue;
+		}
+
+		/* Keepalive: an idle TX side sends a comfort-noise packet (chan_sip parity). */
+		if (tx && ast_rtp_instance_get_keepalive(pvt->rtp)
+				&& t > tx + ast_rtp_instance_get_keepalive(pvt->rtp)) {
+			pvt->lastrtptx = time(NULL);
+			ast_rtp_instance_sendcng(pvt->rtp, 0);
+		}
+
+		if (rx && (ast_rtp_instance_get_timeout(pvt->rtp) || ast_rtp_instance_get_hold_timeout(pvt->rtp))
+				&& t > rx + ast_rtp_instance_get_timeout(pvt->rtp)) {
+			if (!hold || (ast_rtp_instance_get_hold_timeout(pvt->rtp)
+					&& t > rx + ast_rtp_instance_get_hold_timeout(pvt->rtp))) {
+				if (ast_rtp_instance_get_timeout(pvt->rtp)) {
+					if (!ast_channel_trylock(owner)) {
+						if (pvt->owner == owner) {	/* revalidate under the channel lock */
+							ast_log(LOG_NOTICE, "Disconnecting call '%s' for lack of RTP activity in %ld seconds\n",
+								owner->name, (long) (t - rx));
+							ast_softhangup_nolock(owner, AST_SOFTHANGUP_DEV);
+						}
+						ast_channel_unlock(owner);
+						/* Forget the timers: the hangup is requested once (chan_sip parity). */
+						ast_rtp_instance_set_timeout(pvt->rtp, 0);
+						ast_rtp_instance_set_hold_timeout(pvt->rtp, 0);
+						if (pvt->vrtp) {
+							ast_rtp_instance_set_timeout(pvt->vrtp, 0);
+							ast_rtp_instance_set_hold_timeout(pvt->vrtp, 0);
+						}
+					}
+					/* trylock busy: the next sweep retries */
+				}
+			}
+		}
+		ast_channel_unref(owner);
+		ao2_ref(pvt, -1);
+	}
+	ao2_iterator_destroy(&it);
+	return SOFIA_RTP_SWEEP_MS;	/* reschedule */
+}
+
 static struct ast_frame *sofia_read(struct ast_channel *ast)
 {
 	struct sofia_pvt *pvt = ast->tech_pvt;
@@ -6605,6 +6739,7 @@ static struct ast_frame *sofia_read(struct ast_channel *ast)
 				pvt->dtmf_effective == SOFIA_DTMF_INBAND ? "inband" : "RFC2833",
 				ast->name);
 		}
+		pvt->lastrtprx = time(NULL);	/* RTP-inactivity reference (chan_sip sip_read parity; monotonic word store) */
 		return f;
 	}
 	case 1:
@@ -6633,6 +6768,7 @@ static int sofia_write(struct ast_channel *ast, struct ast_frame *frame)
 	if (!pvt) {
 		return -1;
 	}
+	pvt->lastrtptx = time(NULL);	/* rtpkeepalive reference (chan_sip parity) */
 
 	if (pvt->is_fork_master && pvt->fork) {
 		int picked;
@@ -7286,6 +7422,9 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 	int rq_h264_valid = 0;
 	int rq_h264_pmode = 0;
 	char rq_h264_fmtp[160] = "";
+	struct ast_sockaddr rq_self_src;
+	int rq_self_call = 0;	/* requestor is a sofia leg of the SAME peer (a device dialing its own extension) */
+	ast_sockaddr_setnull(&rq_self_src);
 	if (requestor) {
 		/* Canonical channel→pvt order: lock the requestor channel, then its pvt, to read the caller's
 		 * negotiated H264 config. No peer lock is held here, so this is order-clean. */
@@ -7299,9 +7438,23 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 				rq_h264_pmode = rq->h264_pmode;
 				ast_copy_string(rq_h264_fmtp, rq->h264_fmtp, sizeof(rq_h264_fmtp));
 			}
+			/* Self-call detection: the caller is a sofia leg of the SAME peer this
+			 * request dials (a device calling its own extension). Snapshot its INVITE
+			 * transport source; the matching registered binding is excluded from the
+			 * ring below - "ring my OTHER devices". rq->peer's name is immutable for
+			 * the object's lifetime and the pointer is guarded by rq->lock. */
+			if (rq->peer && peername && !strcasecmp(rq->peer->name, peername)
+					&& !ast_sockaddr_isnull(&rq->last_src_addr)) {
+				ast_sockaddr_copy(&rq_self_src, &rq->last_src_addr);
+				rq_self_call = 1;
+			}
 			ast_mutex_unlock(&rq->lock);
 		}
 		ast_channel_unlock(rq_chan);
+	}
+	if (rq_self_call) {
+		ast_sockaddr_copy(&pvt->fork_exclude_src, &rq_self_src);
+		pvt->fork_exclude_valid = 1;	/* pre-channel: pvt not shared yet */
 	}
 
 	if (peer) {
@@ -7410,7 +7563,25 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 			 * peer->lock release (the selector locks the contacts container + per-contact ao2). */
 			{
 				int n_unexpired = 0, n_total = 0;
-				struct sofia_contact *single = sofia_peer_select_single_live_contact(peer, &n_unexpired, &n_total);
+				struct sofia_contact *single;
+				if (pvt->fork_exclude_valid) {
+					/* Self-call: resolve the caller's own binding once - log it and
+					 * remember its +sip.instance so a resulting wake push skips the
+					 * very device that is placing the call. */
+					struct sofia_contact *xc = sofia_peer_find_contact_by_addr(peer, &pvt->fork_exclude_src);
+					if (xc) {
+						ao2_lock(xc);
+						ast_copy_string(pvt->push_exclude_instance, xc->instance_id,
+							sizeof(pvt->push_exclude_instance));
+						ao2_unlock(xc);
+						ao2_ref(xc, -1);
+						ast_verb(3, "Sofia: self-call to '%s' - excluding the calling device %s from the ring\n",
+							peername, ast_sockaddr_stringify(&pvt->fork_exclude_src));
+					}
+				}
+				single = sofia_peer_select_single_live_contact(peer, &n_unexpired, &n_total,
+					pvt->fork_exclude_valid ? &pvt->fork_exclude_src : NULL,
+					pvt->fork_exclude_valid ? pvt->push_exclude_instance : NULL);
 				if (single) {
 					sofia_build_contact_ruri(single, exten, url, sizeof(url),
 						peer->path_support, path_buf, sizeof(path_buf));
@@ -14773,24 +14944,71 @@ static int sofia_local_attended_transfer(struct sofia_pvt *transferer, const str
 	transferee_chan = sofia_ref_bridged_channel(transferer_chan);
 	target_peer_chan = sofia_ref_bridged_channel(target_chan);
 
-	if (!transferee_chan || !target_peer_chan) {
+	/* chan_sip attempt_transfer parity (chan_sip.c:22979-23009): the guard needs THREE
+	 * channels, not four. peerd (the target dialog's bridged peer) is OPTIONAL - an
+	 * attended transfer whose consult leg sits in an application (IVR, echo, voicemail,
+	 * queue prompt) completes by masquerading the transferee INTO the consult channel,
+	 * and the app keeps running against the transferee's media. The mirror branch
+	 * ("three channels to handle"): the TRANSFEROR's original leg is the app (no
+	 * transferee) and the consult leg is bridged - the target's peer masquerades into
+	 * the transferor's original channel. Only when BOTH sides lack a live counterpart
+	 * (nothing to hand to anybody) is the transfer refused. */
+	if (!transferee_chan && !target_peer_chan) {
 		ast_log(LOG_WARNING, "Sofia: attended transfer Replaces call '%s' missing bridge "
-			"(transferee=%s targetpeer=%s)\n",
-			replaces->callid,
-			transferee_chan ? transferee_chan->name : "(none)",
-			target_peer_chan ? target_peer_chan->name : "(none)");
+			"(transferee=(none) targetpeer=(none))\n", replaces->callid);
+		goto cleanup;
+	}
+
+	sofia_quiet_chan(transferer_chan);
+	sofia_quiet_chan(target_chan);
+	if (transferee_chan) {
+		sofia_quiet_chan(transferee_chan);
+	}
+	if (target_peer_chan) {
+		sofia_quiet_chan(target_peer_chan);
+	}
+
+	if (!transferee_chan) {
+		/* Mirror/IVR branch: masquerade the target's peer into the transferor's
+		 * original channel (chan_sip masquerade(peerb=transferer->chan1,
+		 * peerc=target->chan2)). The surviving object is transferer_chan carrying the
+		 * target-peer's body; the transferor's original SIP dialog moves to the zombie,
+		 * whose hangup emits its BYE. The caller must NOT queue a hangup on owner. */
+		if (sofia_debug) {
+			ast_verbose("Sofia: attended transfer (IVR branch) %s takes over %s using Replaces %s\n",
+				target_peer_chan->name, transferer_chan->name, replaces->callid);
+		}
+		res = ast_channel_masquerade(transferer_chan, target_peer_chan);
+		if (res) {
+			ast_log(LOG_WARNING, "Sofia: attended transfer masquerade failed (%s into %s)\n",
+				target_peer_chan->name, transferer_chan->name);
+			goto cleanup;
+		}
+		chans[0] = transferer_chan;
+		chans[1] = target_peer_chan;
+		ast_manager_event_multichan(EVENT_FLAG_CALL, "Transfer", 2, chans,
+			"TransferMethod: SIP\r\n"
+			"TransferType: Attended\r\n"
+			"Channel: %s\r\n"
+			"Uniqueid: %s\r\n"
+			"SIP-Callid: %s\r\n"
+			"TargetChannel: %s\r\n"
+			"TargetUniqueid: %s\r\n",
+			transferer_chan->name, transferer_chan->uniqueid,
+			transferer->callid,
+			target_peer_chan->name, target_peer_chan->uniqueid);
+		ast_do_masquerade(transferer_chan);
+		ast_indicate(transferer_chan, AST_CONTROL_SRCCHANGE);
+		ast_indicate(transferer_chan, AST_CONTROL_UNHOLD);
+		res = 2;	/* success; owner survives as the transferred call - no hangup */
 		goto cleanup;
 	}
 
 	if (sofia_debug) {
 		ast_verbose("Sofia: attended transfer local bridge %s <-> %s using Replaces %s\n",
-			transferee_chan->name, target_peer_chan->name, replaces->callid);
+			transferee_chan->name,
+			target_peer_chan ? target_peer_chan->name : "(app leg)", replaces->callid);
 	}
-
-	sofia_quiet_chan(transferer_chan);
-	sofia_quiet_chan(target_chan);
-	sofia_quiet_chan(transferee_chan);
-	sofia_quiet_chan(target_peer_chan);
 
 	res = ast_channel_masquerade(target_chan, transferee_chan);
 	if (res) {
@@ -14816,14 +15034,16 @@ static int sofia_local_attended_transfer(struct sofia_pvt *transferer, const str
 		target_chan->uniqueid);
 
 	ast_do_masquerade(target_chan);
-	if (ast_channel_make_compatible(target_chan, target_peer_chan)) {
-		ast_log(LOG_WARNING, "Sofia: attended transfer could not make %s and %s codec-compatible\n",
-			target_chan->name, target_peer_chan->name);
+	if (target_peer_chan) {
+		if (ast_channel_make_compatible(target_chan, target_peer_chan)) {
+			ast_log(LOG_WARNING, "Sofia: attended transfer could not make %s and %s codec-compatible\n",
+				target_chan->name, target_peer_chan->name);
+		}
+		ast_indicate(target_peer_chan, AST_CONTROL_SRCCHANGE);
+		ast_indicate(target_peer_chan, AST_CONTROL_UNHOLD);
 	}
 	ast_indicate(target_chan, AST_CONTROL_SRCCHANGE);
-	ast_indicate(target_peer_chan, AST_CONTROL_SRCCHANGE);
 	ast_indicate(target_chan, AST_CONTROL_UNHOLD);
-	ast_indicate(target_peer_chan, AST_CONTROL_UNHOLD);
 	res = 0;
 
 cleanup:
@@ -15042,6 +15262,13 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 		if (attended_res == 0) {
 			sofia_send_refer_notify(op, "200 OK", 1);
 			ast_queue_hangup(owner);
+			ast_channel_unref(owner);
+			return;
+		} else if (attended_res == 2) {
+			/* IVR-branch success: owner is the SURVIVING channel (it now carries the
+			 * target's peer); the transferor's old dialog dies with the masquerade
+			 * zombie. Hanging owner up here would kill the transferred call. */
+			sofia_send_refer_notify(op, "200 OK", 1);
 			ast_channel_unref(owner);
 			return;
 		} else if (attended_res < 0) {
@@ -20587,6 +20814,13 @@ static int load_module(void)
 	sofia_sched = ast_sched_thread_create();
 	if (!sofia_sched) {
 		ast_log(LOG_WARNING, "Sofia: ast_sched_thread_create failed — T.38 5s reINVITE timeout disabled\n");
+	} else {
+		/* RTP-inactivity/keepalive sweep (chan_sip check_rtp_timeout parity). */
+		sofia_rtp_sweep_id = ast_sched_thread_add(sofia_sched, SOFIA_RTP_SWEEP_MS,
+			sofia_rtp_timeout_sweep, NULL);
+		if (sofia_rtp_sweep_id < 0) {
+			ast_log(LOG_WARNING, "Sofia: could not arm the RTP-inactivity sweep — rtptimeout/rtpkeepalive disabled\n");
+		}
 	}
 
 	ast_register_application_xml(app_dtmfmode, sofia_app_dtmfmode);
@@ -20757,6 +20991,10 @@ static int unload_module(void)
 	/* Defensive (unload returns -1 below before any teardown runs at runtime). */
 	ast_udptl_proto_unregister(&sofia_udptl);
 	if (sofia_sched) {
+		if (sofia_rtp_sweep_id > -1) {
+			ast_sched_thread_del(sofia_sched, sofia_rtp_sweep_id);
+			sofia_rtp_sweep_id = -1;
+		}
 		sofia_sched = ast_sched_thread_destroy(sofia_sched);
 	}
 	ast_unregister_application(app_dtmfmode);

@@ -290,7 +290,22 @@ int sofia_build_contact_proxy_url(const struct sofia_peer *peer, struct sofia_co
 void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len);
 /* Exported for the push wake-up resume (sofia_push.c). */
 void sofia_pvt_set_active_contact(struct sofia_pvt *pvt, struct sofia_contact *contact);
-struct sofia_contact *sofia_peer_select_single_live_contact(struct sofia_peer *peer, int *n_unexpired, int *n_total);
+struct sofia_contact *sofia_peer_select_single_live_contact(struct sofia_peer *peer, int *n_unexpired, int *n_total, const struct ast_sockaddr *exclude_src, const char *exclude_instance);
+/* Self-call exclusion match: a binding belongs to the CALLING device when its REGISTER
+ * source equals the caller's INVITE source (same socket / NAT mapping) OR its normalized
+ * +sip.instance equals the caller's (survives a mid-call socket rebuild: the phone
+ * re-registers from a new source but keeps its instance). Either signal suffices. */
+static inline int sofia_selfcall_contact_excluded(const struct ast_sockaddr *c_src, const char *c_inst,
+	const struct ast_sockaddr *ex_src, const char *ex_inst)
+{
+	if (ex_src && c_src && !ast_sockaddr_isnull(ex_src) && !ast_sockaddr_cmp(c_src, ex_src)) {
+		return 1;
+	}
+	if (ex_inst && ex_inst[0] && c_inst && c_inst[0] && !strcasecmp(c_inst, ex_inst)) {
+		return 1;
+	}
+	return 0;
+}
 struct sofia_contact *sofia_peer_find_contact_by_addr(struct sofia_peer *peer, const struct ast_sockaddr *src);
 void sofia_resolve_ourip(struct sofia_pvt *pvt, const struct ast_sockaddr *target);
 /* Remove the per-token PRIORITY_HINT extensions for a regexten spec (ext1[@ctx]&ext2...). Splits like
@@ -579,6 +594,16 @@ struct sofia_pvt {
 	unsigned long sess_id;           /* SDP o= session-id, set ONCE per dialog (RFC 4566 §5.2 / RFC 3264 §8: constant across offers/answers) */
 	unsigned long sess_version;      /* SDP o= session-version, bumped per generated SDP */
 	int hold_state;                  /* 1 = peer holding us (a=sendonly/inactive) */
+	/* Self-call device exclusion: when a device dials its OWN extension, the calling
+	 * binding is excluded from ring/fork/park (its INVITE transport source, captured
+	 * from the requestor pvt's last_src_addr, matched against contact src_addr by full
+	 * addr+port - two devices behind one NAT differ by port) and its push device
+	 * (matched by normalized +sip.instance) is excluded from the wake push. */
+	struct ast_sockaddr fork_exclude_src;
+	int fork_exclude_valid;
+	char push_exclude_instance[128];
+	time_t lastrtprx;                /* last inbound audio RTP read (sofia_read fdno 0). 0 = nothing received yet -> the RTP-inactivity teardown stays UNARMED (chan_sip parity: a call whose media never started is not killed by rtptimeout). */
+	time_t lastrtptx;                /* last outbound write (sofia_write) - rtpkeepalive CNG reference (chan_sip parity) */
 	int local_hold_mode;             /* WE are holding the peer (hold_reinvite): 0 = not held (offers a=sendrecv); 1 = sendonly; 2 = inactive. Drives the OFFER direction in sofia_generate_sdp; guarded by pvt->lock. */
 	/* RFC 3264 §6.1 answer-direction mirror: the LAST accepted inbound SDP's per-media mode
 	 * (sofia sdp_mode_t: sdp_inactive/sendonly/recvonly/sendrecv). sofia_parse_sdp stages this
