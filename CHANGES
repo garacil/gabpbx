@@ -1,3 +1,72 @@
+## 1.8.0 — self-call ringing, SRTP bridge audio, RTP-inactivity teardown, attended-transfer parity, DTLS keying race
+
+A release of call-control and media-path fixes on top of the 1.6/1.7 mobile push work.
+
+### Self-call: dial your own extension and your OTHER devices ring
+
+When several devices register to one account and that account dials its own extension,
+`chan_sofia` now rings **every other registered binding and never the device that placed
+the call** — any technology (desk phone, softphone, WebRTC browser). The calling binding
+is identified by its INVITE source **or** its `+sip.instance` (the instance match still
+recognises the caller after a mid-call NAT rebinding from a new source) and is removed
+from the single-live selector, the fork gate and the fork loop. When the other devices
+are only reachable through push, the wake push and the parked-call resume both skip the
+caller's own device, and the caller's own re-REGISTER never resumes the very call it just
+placed. `busy_on_active` also ignores the caller's own binding, so an autocall is not
+answered `486 Busy` on account of itself — while a *different* device already in a call
+still trips it.
+
+### SRTP↔SRTP bridge is no longer deaf
+
+A bridge between two SRTP/DTLS/WebRTC legs of the driver (first hit on a self-call
+between two WebRTC devices of the same account) carried **no audio in either direction**.
+`sofia_get_rtp_peer` returned `LOCAL`, which still permits the P2P local RTP bridge; that
+path relays each RTP packet carrying the *source* leg's SSRC/sequence re-encrypted under
+the *destination* leg's SRTP context, so the receiver rejects every packet on SRTP
+auth/replay. It now returns `FORBID` for any SRTP leg (matching `chan_sip`, whose
+`sip_get_rtp_peer` ends with `if (p->srtp) res = FORBID`), so the core uses the **generic
+bridge**, which reads a decrypted frame and regenerates a fresh RTP packet under the far
+leg's own SSRC/sequence — the only correct path for SRTP, and safer than `LOCAL` against
+a direct-media key disclosure.
+
+### RTP-inactivity teardown (`rtptimeout` is now enforced)
+
+`rtptimeout` / `rtpholdtimeout` / `rtpkeepalive` were applied to every call's RTP
+instance but nothing ever polled them, so a peer that vanished mid-call (crash, reinstall,
+dead battery — it can send no BYE) left the channel up forever. A 2-second sweep over the
+active dialogs now sends a keepalive comfort-noise packet when the TX side idles, and a
+`NOTICE` + soft hangup when no inbound RTP arrives within `rtptimeout` (or `rtpholdtimeout`
+while the call is on hold). A call whose media never started is left alone and a T.38
+session is skipped — a faithful port of `chan_sip`'s `check_rtp_timeout`.
+
+### Attended transfer completes into an application consult leg
+
+An attended transfer (`REFER` with `Replaces`) whose consult leg sits in an application —
+an IVR, echo test, voicemail or queue prompt — was answered `486 Busy` by the driver's
+own handler, which demanded four live channels. `chan_sip`'s `attempt_transfer` needs
+three: the target dialog's bridged peer is optional. The handler now masquerades the
+transferee into the consult channel in that case (plus the mirror case where the
+*transferer's* leg is the application), and refuses the transfer only when neither side
+has a counterpart to hand over.
+
+### DTLS-SRTP keying race (~10 s of dead audio at answer)
+
+On an outbound call the callee fires its DTLS `ClientHello` the instant it answers,
+racing our parse of the same `200 OK` that carries its `a=fingerprint`. When the
+handshake completed before the fingerprint was stored, the session was failed ('refusing
+to key an unverified peer') and only the peer's eventual re-handshake recovered it —
+measured as ~10 seconds of dead audio, or the whole call when it never re-handshook. The
+completed-but-unkeyed session is now kept with a pending flag and keyed the instant the
+fingerprint arrives (under the same instance lock), fail-closed intact: nothing is keyed
+until the fingerprint matches and a mismatch still tears the call down.
+
+```ini
+; sofia.conf [general] — RTP-inactivity teardown (chan_sip semantics; 0 = off)
+rtptimeout=30            ; seconds without inbound RTP before an answered call is dropped
+rtpholdtimeout=300       ; same, while the call is on hold
+rtpkeepalive=0           ; seconds between keepalive comfort-noise packets
+```
+
 ## 1.7.0 — push wake-up phase 2: the 4-second no-answer guard for suspended apps
 
 Phase 1 (1.6.0) wakes a phone whose registration is already gone. The nastier case is
