@@ -267,6 +267,7 @@ struct ast_rtp {
 	enum ast_srtp_suite suite;         /*!< negotiated SRTP suite (set from the DTLS-selected profile) */
 	struct ast_rtp_dtls_cfg dtls_cfg;  /*!< copy of cfg from set_configuration */
 	unsigned int dtls_failure:1;       /*!< handshake/fingerprint failed -> tear the call down */
+	unsigned int dtls_verify_pending:1; /*!< handshake completed BEFORE the SDP a=fingerprint arrived (the peer's ClientHello races our parse of its 200 OK on outbound calls); keying is deferred - set_fingerprint() finishes verification the moment the anchor lands. Fail-closed intact: nothing is keyed until the check passes. */
 	int rekeyid;                       /*!< rekey sched id (-1 = none) */
 	/* WebRTC A3: ICE-lite state (RFC 8445 §2.5) — we are permanently the controlled, lite agent.
 	 * Touched on the channel/sofia thread (set_authentication/get_* during SDP) AND the RTP read path
@@ -820,6 +821,7 @@ static int gabpbx_dtls_set_configuration(struct ast_rtp_instance *instance, cons
 	/* (Re)build the per-instance DTLS context. Tear down any prior association first (call-once from
 	 * the SDP glue in practice, but be safe on reconfiguration — free the SSL before its ssl_ctx). */
 	rtp->dtls_failure = 0;	/* a fresh handshake starts clean (HIGH2/LOW7) */
+	rtp->dtls_verify_pending = 0;
 	if (rtp->dtls.timeout_timer > -1) {
 		/* MED4: cancel the old retransmit timer so the new handshake arms fresh and the stale sched id
 		 * is released. set_configuration runs LOCKED (A1 wrapper); the stop precondition is
@@ -955,6 +957,7 @@ static void gabpbx_dtls_reset(struct ast_rtp_instance *instance)
 		return;
 	}
 	rtp->dtls_failure = 0;
+	rtp->dtls_verify_pending = 0;
 	SSL_clear(rtp->dtls.ssl);
 	if (rtp->dtls.dtls_setup == AST_RTP_DTLS_SETUP_PASSIVE) {
 		SSL_set_accept_state(rtp->dtls.ssl);
@@ -1011,6 +1014,8 @@ static void gabpbx_dtls_set_setup(struct ast_rtp_instance *instance, enum ast_rt
 	}
 }
 
+static void dtls_srtp_finish_negotiation(struct ast_rtp_instance *instance, struct ast_rtp *rtp);
+
 static void gabpbx_dtls_set_fingerprint(struct ast_rtp_instance *instance, enum ast_rtp_dtls_hash hash, const char *fingerprint)
 {
 	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
@@ -1038,6 +1043,16 @@ static void gabpbx_dtls_set_fingerprint(struct ast_rtp_instance *instance, enum 
 		p += 2;
 	}
 	rtp->remote_fingerprint_len = n;
+
+	/* Deferred verify (ClientHello-vs-200 race): the handshake already completed while no
+	 * fingerprint was stored. We run under the instance lock (rtp_engine A1 wrapper), which
+	 * is dtls_srtp_finish_negotiation()'s precondition - finish it now: verify + key. */
+	if (n && rtp->dtls_verify_pending && rtp->dtls.ssl && SSL_is_init_finished(rtp->dtls.ssl)) {
+		dtls_srtp_finish_negotiation(instance, rtp);
+		if (!rtp->dtls_failure) {
+			ast_verb(3, "DTLS-SRTP deferred verify completed on fingerprint arrival for RTP instance '%p' - media keyed\n", instance);
+		}
+	}
 }
 
 static enum ast_rtp_dtls_hash gabpbx_dtls_get_fingerprint_hash(struct ast_rtp_instance *instance)
@@ -1187,6 +1202,8 @@ static void dtls_srtp_finish_negotiation(struct ast_rtp_instance *instance, stru
 		ao2_lock(instance);
 	}
 
+	rtp->dtls_verify_pending = 0;	/* this run settles it: verified+keyed, deferred again, or failed */
+
 	/* C2/C3: the SDP a=fingerprint is the trust anchor — fail closed. */
 	if (!(cert = SSL_get_peer_certificate(dtls->ssl))) {
 		ast_log(LOG_WARNING, "DTLS peer presented no certificate for RTP instance '%p'\n", instance);
@@ -1206,9 +1223,17 @@ static void dtls_srtp_finish_negotiation(struct ast_rtp_instance *instance, stru
 		const EVP_MD *md = (rtp->remote_hash == AST_RTP_DTLS_HASH_SHA1) ? EVP_sha1() : EVP_sha256();
 
 		if (!rtp->remote_fingerprint_len) {
-			ast_log(LOG_WARNING, "DTLS-SRTP refused: no remote a=fingerprint stored for RTP instance '%p' — refusing to key an unverified peer\n", instance);
+			/* The handshake finished BEFORE the SDP a=fingerprint got here: on an outbound
+			 * call the callee fires its ClientHello the instant it answers, racing our parse
+			 * of the very 200 OK that carries the fingerprint (field-measured: the losing
+			 * order cost ~10 s of dead audio waiting for the peer to re-handshake, or the
+			 * whole call when it never did). Do NOT fail: keep the completed, still-unkeyed
+			 * session and let set_fingerprint() run this verification the moment the anchor
+			 * arrives. Fail-closed is preserved - nothing is keyed until the check passes,
+			 * and a mismatch then still tears the call down. */
+			ast_verb(3, "DTLS-SRTP verify deferred: handshake completed before the SDP fingerprint for RTP instance '%p' - keying waits for it\n", instance);
 			X509_free(cert);
-			rtp->dtls_failure = 1;
+			rtp->dtls_verify_pending = 1;
 			return;
 		}
 		if (!X509_digest(cert, md, fp, &n) || n != rtp->remote_fingerprint_len
