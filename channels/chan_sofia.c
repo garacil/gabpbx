@@ -1415,24 +1415,48 @@ static int sofia_fork_cancel_loser_cb(void *obj, void *arg, int flags)
 	SOFIA_FORKDBG("cancel-loser branch=%s child_nh=%p child_rtp=%p is_webrtc=%d",
 		child->fork_branch_id, (void *)child->nh, (void *)child->rtp, child->is_webrtc);
 	if (child->nh) {
-		nua_cancel(child->nh, TAG_END());
+		char q850[128];
+		/* The winner has just answered, so this branch is "answered elsewhere" by
+		 * definition — the exact case RFC 3326 section 3.1 describes. A fork child owns
+		 * no ast_channel and no hangup cause of its own, so the value is a constant.
+		 * The Reason header class is msg_kind_append, so two SIPTAG_REASON_STR tags
+		 * become two Reason headers in tag order; one comma-joined value is avoided
+		 * because a single malformed sub-value would silently drop the whole tag list. */
+		int have_q850 = sofia_cfg.use_q850_reason
+			&& sofia_reason_build(AST_CAUSE_ANSWERED_ELSEWHERE, q850, sizeof(q850));
+		nua_cancel(child->nh,
+			SIPTAG_REASON_STR(SOFIA_REASON_ANSWERED_ELSEWHERE),
+			TAG_IF(have_q850, SIPTAG_REASON_STR(q850)),
+			TAG_END());
 	}
 	ao2_unlink(dialogs, child);
 	return CMP_MATCH;
 }
+
+/* Reason values carried on a fork CANCEL fan-out; either member may be NULL. */
+struct sofia_fork_cancel_reason {
+	const char *answered_elsewhere;	/* SIP;cause=200 (RFC 3326 section 3.1) */
+	const char *q850;		/* Q.850;cause=N built from the master's hangup cause */
+};
 
 /* ao2_callback: cancel + unlink every fork child unconditionally.
  * Used by sofia_hangup when the master is torn down before any winner was picked. */
 static int sofia_fork_cancel_all_cb(void *obj, void *arg, int flags)
 {
 	struct sofia_pvt *child = obj;
-	const char *reason = arg;	/* Q.850 Reason from the master hangup (RFC 3326), or NULL */
-	SOFIA_FORKDBG("cancel-all branch=%s child_nh=%p child_rtp=%p is_webrtc=%d reason=%s",
+	/* Reason values from the master hangup (RFC 3326), or NULL. The master is itself a
+	 * losing branch when an outer Dial reached several extensions and another one answered,
+	 * so its children must be told "answered elsewhere" too. */
+	const struct sofia_fork_cancel_reason *r = arg;
+	const char *ae = r ? r->answered_elsewhere : NULL;
+	const char *q850 = r ? r->q850 : NULL;
+	SOFIA_FORKDBG("cancel-all branch=%s child_nh=%p child_rtp=%p is_webrtc=%d reason=%s/%s",
 		child->fork_branch_id, (void *)child->nh, (void *)child->rtp, child->is_webrtc,
-		S_OR(reason, "(none)"));
+		S_OR(ae, "(none)"), S_OR(q850, "(none)"));
 	if (child->nh) {
 		nua_cancel(child->nh,
-			TAG_IF(!ast_strlen_zero(reason), SIPTAG_REASON_STR(reason)),
+			TAG_IF(!ast_strlen_zero(ae), SIPTAG_REASON_STR(ae)),
+			TAG_IF(!ast_strlen_zero(q850), SIPTAG_REASON_STR(q850)),
 			TAG_END());
 	}
 	ao2_unlink(dialogs, child);
@@ -6402,12 +6426,22 @@ static int sofia_hangup(struct ast_channel *ast)
 	/* Q.850 Reason header (RFC 3326) for the BYE/CANCEL we send — built once from the channel's
 	 * final hangup cause (set by the core before sofia_hangup). Gated by [general] use_q850_reason. */
 	int have_reason;
+	/* RFC 3326 "answered elsewhere" Reason value, or NULL. Not gated by use_q850_reason: this is
+	 * the header a phone reads to keep a cancelled branch out of its missed-call list. */
+	const char *ae_reason = NULL;
 
 	if (!pvt) {
 		return -1;
 	}
 	have_reason = (sofia_cfg.use_q850_reason
 		&& sofia_reason_build(ast->hangupcause, reason_buf, sizeof(reason_buf)));
+	/* A multi-destination Dial stamps BOTH the flag and cause 26 on every losing branch
+	 * (app_dial.c hanguptree), while call pickup stamps only the flag (features.c). Test both,
+	 * the way chan_sip does. The channel is locked by the core across tech->hangup. */
+	if (ast->hangupcause == AST_CAUSE_ANSWERED_ELSEWHERE
+		|| ast_test_flag(ast, AST_FLAG_ANSWERED_ELSEWHERE)) {
+		ae_reason = SOFIA_REASON_ANSWERED_ELSEWHERE;
+	}
 
 	sofia_append_history(pvt, "Hangup", "cause %d %s", ast->hangupcause,
 		ast_cause2str(ast->hangupcause));
@@ -6452,8 +6486,12 @@ static int sofia_hangup(struct ast_channel *ast)
 		}
 
 		if (!picked) {
+			struct sofia_fork_cancel_reason fr = {
+				ae_reason,
+				have_reason ? reason_buf : NULL,
+			};
 			ao2_callback(fork->children, OBJ_UNLINK | OBJ_MULTIPLE | OBJ_NODATA,
-				sofia_fork_cancel_all_cb, have_reason ? reason_buf : NULL);
+				sofia_fork_cancel_all_cb, &fr);
 			ast_verbose("Sofia: Fork master hangup — cancelled all children (%s)\n",
 				fork->fork_id);
 		}
@@ -6481,8 +6519,12 @@ static int sofia_hangup(struct ast_channel *ast)
 		if (pvt->state == SOFIA_DIALOG_STATE_UP || pvt->state == SOFIA_DIALOG_STATE_RINGING) {
 			char target_url[256];
 			int use_target = sofia_pvt_build_nat_target_url(pvt, target_url, sizeof(target_url));
+			/* State RINGING here means an outbound INVITE that got a 18x: nua_stack_bye
+			 * routes that to the CANCEL client methods with these same tags, so this is
+			 * the branch a losing Dial destination actually leaves through. */
 			nua_bye(pvt->nh,
 				TAG_IF(use_target, NUTAG_PROXY(target_url)),
+				TAG_IF(ae_reason, SIPTAG_REASON_STR(ae_reason)),	/* RFC 3326 SIP;cause=200 */
 				TAG_IF(have_reason, SIPTAG_REASON_STR(reason_buf)),	/* RFC 3326 Q.850 */
 				TAG_END());
 		} else if (!pvt->outgoing) {
@@ -6500,12 +6542,14 @@ static int sofia_hangup(struct ast_channel *ast)
 					st = 603;	/* Decline — chan_sip default for an unmapped cause */
 				}
 				nua_respond(pvt->nh, st, NULL,
+					TAG_IF(ae_reason, SIPTAG_REASON_STR(ae_reason)),	/* RFC 3326 SIP;cause=200 */
 					TAG_IF(have_reason, SIPTAG_REASON_STR(reason_buf)),	/* RFC 3326 Q.850 */
 					TAG_END());
 				pvt->uas_final_sent = 1;
 			}
 		} else {
 			nua_cancel(pvt->nh,
+				TAG_IF(ae_reason, SIPTAG_REASON_STR(ae_reason)),	/* RFC 3326 SIP;cause=200 */
 				TAG_IF(have_reason, SIPTAG_REASON_STR(reason_buf)),	/* RFC 3326 Q.850 */
 				TAG_END());
 		}

@@ -360,6 +360,12 @@ int sofia_reason_build(int hangupcause, char *buf, size_t len);	/* Q.850 Reason 
 int sofia_reason_status2cause(int status);	/* SIP reject status -> Q.850 cause (chan_sip parity) */
 int sofia_reason_build_for_status(int status, char *buf, size_t len);	/* Reason value for a reject status */
 int sofia_reason_parse_cause(sip_reason_t const *reason);
+/* RFC 3326 section 3.1 Reason value for a branch torn down because the call was answered on
+ * another branch or device (multi-destination Dial, or a multi-binding fork). Phones read this
+ * to suppress the missed-call entry, so it is emitted unconditionally, independently of
+ * [general] use_q850_reason (chan_sip parity: chan_sip has no knob for it either). The Q.850
+ * value is a separate header and stays behind that option. */
+#define SOFIA_REASON_ANSWERED_ELSEWHERE "SIP;cause=200;text=\"Call completed elsewhere\""
 int sofia_gruu_dialog_contact(const struct sofia_peer *peer, char *buf, size_t len);	/* GRUU as the dialog Contact */
 void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
 		char *out_url, size_t out_len);
