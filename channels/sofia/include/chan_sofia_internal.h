@@ -906,11 +906,7 @@ struct sofia_peer {
 	 * an AMI LockUserAgentReject event fires (anti UA-spoofing). chan_sip parity
 	 * (extended to config-file too). Default 0 (FALSE). */
 	int lockuseragent;
-	/* lockuseragent anchor: User-Agent captured at first successful REGISTER while
-	 * lockuseragent=1 (display UA lives separately on sofia_contact). Empty = no
-	 * lock captured yet (first registration populates it). */
-	char locked_user_agent[64];
-	int usereqphone;                /* add RFC 3966 ;user=phone to outbound URIs when the username is digit-only (chan_sip parity); inherits default_usereqphone; used in Request-URI + From-URI builders. */
+		int usereqphone;                /* add RFC 3966 ;user=phone to outbound URIs when the username is digit-only (chan_sip parity); inherits default_usereqphone; used in Request-URI + From-URI builders. */
 	int maxforwards;                /* RFC 3261 §20.22 Max-Forwards initial value (1-255; chan_sip parity); inherits default_max_forwards; emitted via SIPTAG_MAX_FORWARDS_STR at outbound nua_* sites. */
 	ast_group_t callgroup;          /* call group bitmask (groups 0-63) */
 	ast_group_t pickupgroup;        /* pickup group bitmask — call groups this peer can pick up */

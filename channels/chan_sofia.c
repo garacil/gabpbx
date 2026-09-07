@@ -3265,7 +3265,6 @@ static struct sofia_peer *sofia_peer_alloc(const char *name)
 	ast_mutex_init(&peer->lock);
 	sofia_peer_set_defaults(peer);
 	/* Runtime/structural anchors NOT defaulted by the helper. */
-	peer->locked_user_agent[0] = '\0';
 	peer->is_realtime = 0;
 		peer->is_register_line = 0;
 	peer->_reload_marked = 0;
@@ -4183,9 +4182,15 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			peer->buggymwi = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "lockuseragent")) {
 			peer->lockuseragent = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "useragent")) {
+			/* PER-PEER User-Agent allowlist (voip_sip_conf.useragent, chan_sip's own
+			 * column). EMPTY = no restriction at all (chan_sip parity, chan_sip.c:15935:
+			 * `ast_strlen_zero(peer->useragent) || ...` short-circuits to accept). When set,
+			 * it is a comma-separated PREFIX list, so a firmware/build bump keeps matching.
+			 * NB: distinct from [general] useragent, which is the UA we EMIT. */
+			ast_string_field_set(peer, lockuseragent_prefixes, v->value);
 		} else if (!strcasecmp(v->name, "lockuseragent_prefixes")) {
-			/* User-Agent prefix allowlist for sofia_check_lockuseragent; stored
-			 * verbatim, tokenized/matched at REGISTER-time. */
+			/* Explicit alias, sofia.conf-only (the realtime column is `useragent`). */
 			ast_string_field_set(peer, lockuseragent_prefixes, v->value);
 		} else if (!strcasecmp(v->name, "usereqphone")) {
 			/* RFC 3966 ;user=phone for E.164 via PSTN gateways. */
@@ -11493,9 +11498,18 @@ static int sofia_check_lockuseragent(nua_t *nua, nua_handle_t *nh,
 	const char *realm;
 	struct ast_sockaddr src;
 	char addr_buf[80];
-	int prefix_mode = 0;	/* 1 when lockuseragent_prefixes is non-empty — suppresses capture/anchor logic, tags rejection AMI MatchPolicy: prefix-list */
 
 	if (!peer->lockuseragent) {
+		return 0;
+	}
+
+	/* EMPTY ALLOWLIST = NO RESTRICTION (chan_sip parity).
+	 * chan_sip.c:15935 short-circuits on `ast_strlen_zero(peer->useragent)`, so with the
+	 * voip_sip_conf.useragent column blank every User-Agent is accepted no matter what
+	 * lockuseragent says — and that column defaults to blank while lockuseragent defaults
+	 * to 1. Enforcing anything here would lock out every peer the operator never configured.
+	 * The allowlist is the operator's to set; the driver must never invent one. */
+	if (ast_strlen_zero(peer->lockuseragent_prefixes)) {
 		return 0;
 	}
 
@@ -11511,8 +11525,7 @@ static int sofia_check_lockuseragent(nua_t *nua, nua_handle_t *nh,
 	 * (rare) lets a reload / realtime UPDATE take effect on the next REGISTER
 	 * with no restart. An empty list preserves the strict capture-on-first-
 	 * REGISTER behaviour (else-branch). */
-	if (!ast_strlen_zero(peer->lockuseragent_prefixes)) {
-		prefix_mode = 1;
+	{
 		if (current_ua && current_ua[0]) {
 			char *list_dup = ast_strdupa(peer->lockuseragent_prefixes);
 			char *tok, *next = list_dup;
@@ -11529,27 +11542,14 @@ static int sofia_check_lockuseragent(nua_t *nua, nua_handle_t *nh,
 			}
 		}
 		/* No prefix matched — fall through to rejection block. */
-	} else {
-		/* Strict-anchor mode (chan_sip parity, behaviour preserved verbatim). */
-		/* First-registration capture: empty lock-anchor + non-empty current UA.
-		 * Lock under peer->lock for write race-safety vs concurrent REGISTERs. */
-		if (peer->locked_user_agent[0] == '\0') {
-			if (current_ua && current_ua[0]) {
-				ast_mutex_lock(&peer->lock);
-				ast_copy_string(peer->locked_user_agent, current_ua,
-					sizeof(peer->locked_user_agent));
-				ast_mutex_unlock(&peer->lock);
-				ast_verbose("Sofia: lockuseragent captured \"%s\" for peer '%s'\n",
-					current_ua, peer->name);
-			}
-			return 0;
-		}
-
-		/* Lock-anchor set: compare current UA. Match → pass; mismatch → reject. */
-		if (current_ua && !strcasecmp(current_ua, peer->locked_user_agent)) {
-			return 0;
-		}
 	}
+	/* NO capture-on-first-REGISTER anchor any more. It used to latch the whole
+	 * User-Agent of whichever client registered first and then demand an exact
+	 * full-string match, which (a) chan_sip never did, (b) broke on any firmware or
+	 * build bump, and (c) truncated at 64 bytes, so a browser UA (117 chars here)
+	 * could never match its own anchor — every REGISTER rejected, and each rejection
+	 * feeds the IP blacklist, so the peer banned itself. The allowlist is now
+	 * operator-declared only. */
 
 	/* Mismatch — silent 401 challenge (chan_sip AUTH_SECRET_FAILED-equivalent;
 	 * attacker cannot distinguish UA-mismatch from bad-secret) + AMI
@@ -11581,26 +11581,18 @@ static int sofia_check_lockuseragent(nua_t *nua, nua_handle_t *nh,
 		"RemoteAddr: %s\r\n"
 		"ChannelType: SIP\r\n",
 		peer->name,
-		prefix_mode ? "prefix-list" : "strict-anchor",
-		peer->locked_user_agent,
-		prefix_mode ? peer->lockuseragent_prefixes : "",
+		"prefix-list",
+		"",
+		peer->lockuseragent_prefixes,
 		ua_buf,
 		addr_buf);
 
-	if (prefix_mode) {
-		ast_log(LOG_NOTICE,
-			"Sofia: REGISTER from peer '%s' rejected — User-Agent \"%s\" "
-			"does not match any prefix in lockuseragent_prefixes=\"%s\"\n",
-			peer->name,
-			current_ua ? current_ua : "(none)",
-			peer->lockuseragent_prefixes);
-	} else {
-		ast_log(LOG_NOTICE,
-			"Sofia: REGISTER from peer '%s' rejected — lockuseragent mismatch "
-			"(locked=\"%s\", attempted=\"%s\")\n",
-			peer->name, peer->locked_user_agent,
-			current_ua ? current_ua : "(none)");
-	}
+	ast_log(LOG_NOTICE,
+		"Sofia: REGISTER from peer '%s' rejected — User-Agent \"%s\" matches no entry "
+		"in the peer's useragent allowlist \"%s\"\n",
+		peer->name,
+		current_ua ? current_ua : "(none)",
+		peer->lockuseragent_prefixes);
 
 	return -1;
 }
@@ -19245,6 +19237,9 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			peer->buggymwi = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "lockuseragent")) {
 			peer->lockuseragent = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "useragent")) {
+			/* PER-PEER allowlist — see the twin in the other loader. Empty = no restriction. */
+			ast_string_field_set(peer, lockuseragent_prefixes, v->value);
 		} else if (!strcasecmp(v->name, "lockuseragent_prefixes")) {
 			ast_string_field_set(peer, lockuseragent_prefixes, v->value);
 		} else if (!strcasecmp(v->name, "usereqphone")) {
@@ -19311,13 +19306,9 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 	/* Fields repopulated + defaulted; release the mutation lock. Everything below
 	 * (hint/dnsmgr/ao2_link) runs unlocked.
 	 *
-	 * sofia_peer_set_defaults reset the lockuseragent CONFIG flag but left the captured
-	 * locked_user_agent anchor (runtime state). Clear the anchor only if lockuseragent ended up
-	 * disabled, else a reload would let a different UA re-capture it on the next REGISTER. */
+	 * (There is no captured User-Agent anchor to clear any more: the allowlist is
+	 * operator-declared in the peer's `useragent` and repopulated by the loaders above.) */
 	if (locked) {
-		if (!peer->lockuseragent) {
-			peer->locked_user_agent[0] = '\0';
-		}
 		/* RFC 5626/5627: a reload that toggled gruu/sip_outbound left the surviving peer->nh advertising
 		 * the OLD set (NUTAG_SUPPORTED only merges on a handle) — mark it for rebuild on the next refresh.
 		 * And drop runtime advertisement state when the knob ended up off (line removed or set no). */

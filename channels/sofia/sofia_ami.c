@@ -295,9 +295,11 @@ int manager_sofia_show_peer(struct mansession *s, const struct message *m)
 	ast_str_append(&buf, 0, "AllowSubscribe: %s\r\n", peer->allowsubscribe ? "yes" : "no");
 	/* chan_sip parity. */
 	ast_str_append(&buf, 0, "BuggyMWI: %s\r\n", peer->buggymwi ? "yes" : "no");
-	/* LockedUserAgent (the current locked UA string) is a chan_sofia addition for UA-spoofing audit. */
+	/* LockUserAgentPrefixes is the operator-declared allowlist (the peer's `useragent`):
+	 * empty means NO restriction, whatever Lockuseragent says. LockedUserAgent is kept as an
+	 * always-empty field so existing AMI consumers do not break; there is no captured anchor. */
 	ast_str_append(&buf, 0, "Lockuseragent: %s\r\n", peer->lockuseragent ? "yes" : "no");
-	ast_str_append(&buf, 0, "LockedUserAgent: %s\r\n", peer->locked_user_agent);
+	ast_str_append(&buf, 0, "LockedUserAgent: \r\n");
 	ast_str_append(&buf, 0, "LockUserAgentPrefixes: %s\r\n", S_OR(peer->lockuseragent_prefixes, ""));
 	/* chan_sip parity. */
 	ast_str_append(&buf, 0, "Language: %s\r\n", peer->language);

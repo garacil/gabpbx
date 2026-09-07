@@ -427,11 +427,12 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 	sofia_cli_peer_line(&buf, "Max contacts", "%d (used: %d)", peer->max_contacts, contacts_used);
 	sofia_cli_peer_line(&buf, "Transfer mode", "%s", sofia_transfer_mode_str(peer->allowtransfer));
 	sofia_cli_peer_line(&buf, "Lock user-agent", "%s", AST_CLI_YESNO(peer->lockuseragent));
-	if (peer->lockuseragent && peer->locked_user_agent[0]) {
-		sofia_cli_peer_line(&buf, "Locked UA", "%s", peer->locked_user_agent);
-	}
-	if (peer->lockuseragent && !ast_strlen_zero(peer->lockuseragent_prefixes)) {
-		sofia_cli_peer_line(&buf, "UA prefixes", "%s", peer->lockuseragent_prefixes);
+	/* The allowlist is the peer's `useragent` (comma-separated prefixes). Say so
+	 * explicitly when it is empty: the lock is then INACTIVE, which is not obvious
+	 * from "Lock user-agent: Yes" alone (the DB column defaults to 1). */
+	if (peer->lockuseragent) {
+		sofia_cli_peer_line(&buf, "UA allowlist", "%s",
+			S_OR(peer->lockuseragent_prefixes, "(empty - no restriction)"));
 	}
 	sofia_cli_peer_line(&buf, "Language", "%s", ast_strlen_zero(peer->language) ? "(none)" : peer->language);
 	sofia_cli_peer_line(&buf, "Default IP", "%s", ast_sockaddr_stringify(&peer->defaddr));
