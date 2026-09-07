@@ -68,6 +68,14 @@ int sofia_push_init(void);
 void sofia_push_on_register(struct sofia_peer *peer, sip_t const *sip, const struct sofia_register_update *update);
 int sofia_push_peer_enabled(const struct sofia_peer *peer);
 int sofia_push_peer_pushable(struct sofia_peer *peer);
+#ifndef SOFIA_PUSH_MAX_DEVICES
+#define SOFIA_PUSH_MAX_DEVICES 10	/* hard array bound for a peer's push devices; the knob clamps to this */
+#endif
+/* Hybrid push-assist (mixed live + asleep devices): count the peer's asleep push devices
+ * (usable token, instance not the caller's nor any already-ringing live binding), and wake
+ * them alongside the fork to the live ones. */
+int sofia_push_count_asleep(struct sofia_peer *peer, const char *exclude_instance, char live_inst[][128], int n_live);
+void sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_sockaddr *live_srcs, char live_inst[][128], int n_live);
 /* Park a push_parked pvt (called from sofia_call under the CHANNEL lock): registry entry +
  * push_wait timer (+ sender jobs in a later stage). 0 = call parked (in progress); -1 =
  * fail-closed to today's failure (never park without an armed timer). */
@@ -86,6 +94,35 @@ void sofia_push_guard_cancel(struct sofia_pvt *pvt);
 void sofia_nh_destroy_async(nua_handle_t *nh);
 const char *sofia_push_redact(const char *token, char *buf, size_t buflen);
 void sofia_push_log_event(const char *peer, const char *device_id, const char *callid, const char *event, const char *detail);
+/* Native in-process push sender (sofia_push_sender.c): ONE bounded queue + ONE event-driven
+ * thread multiplexing several in-flight transfers over persistent HTTP/2 connections
+ * (curl_multi + curl_multi_wakeup) to APNs prod/sandbox and FCM, with the APNs ES256 JWT and
+ * the Google OAuth token cached in-thread. Payloads and result strings are byte-identical to
+ * the .py scripts, so the dead-token matcher / last_result / push_log consumers in
+ * sofia_push.c never notice which transport ran. Selected by [general] push_sender=native
+ * (default); per-job auto-fallback to the script lane when the native lane is unavailable. */
+enum sofia_push_purpose {
+	SOFIA_PUSH_PURPOSE_CALL = 0,	/* incoming-call wake: APNs VoIP (voip) / FCM type=call (fcm) */
+	SOFIA_PUSH_PURPOSE_REREGISTER,	/* P3 silent re-register: ALWAYS FCM-shaped, NEVER APNs VoIP (phantom CallKit); no caller today */
+};
+int sofia_push_sender_init(void);		/* create queue + thread (idempotent); 0 = native lane came up */
+void sofia_push_sender_stop(void);		/* load-failure unwind ONLY (err_cleanup ladder; module refuses runtime unload) */
+int sofia_push_sender_available(void);		/* 1 = lane usable right now (thread up, curl ready) */
+int sofia_push_sender_natq_depth(void);		/* queued + in-flight jobs, for `sip show push` */
+/* Queue one push on the native lane. purpose=REREGISTER reuses cid_num as the username and
+ * ignores cid_name. Returns 0 = queued; 1 = lane cannot serve this job right now (down, or
+ * that push type's credentials are sick) -> caller falls back to the SCRIPT sender;
+ * -1 = native queue full -> caller DROPS the device (bounded; a burst must never degrade
+ * into fork/exec). */
+int sofia_push_sender_submit(enum sofia_push_purpose purpose, const char *push_type,
+	const char *token, const char *cid_num, const char *cid_name, const char *callid,
+	const char *peername, const char *device_id);
+/* Completion contract (implemented in sofia_push.c beside its static consumers): replicates the
+ * script-sender record path verbatim — first-line truncate, redacted verb line, push_log 'sent',
+ * last_result cache+DB update, dead-token purge. sender_label is the verb-line name (e.g.
+ * "native/apns-voip"). Runs on the native sender thread (same safety class as the script lane). */
+void sofia_push_sender_complete(const char *peername, const char *device_id, const char *callid,
+	const char *sender_label, const char *token_redacted, const char *out, long ms);
 int sofia_format_auth_creds(msg_auth_t const *challenge, const char *user, const char *secret, char *buf, size_t len);
 void sofia_split_hostport_from_uri(const char *hostport, char *host, size_t hostlen, int *port);
 void sofia_presence_state_map(int state, const char **statestring, const char **pidfstate, const char **pidfnote, int *local_state);
@@ -905,7 +942,7 @@ struct sofia_peer {
 	struct timeval last_qualify;
 	nua_handle_t *qualify_nh;
 	int is_realtime;
-	char sha256name[65];       /* the sippeers realtime sha256name column cache: SHA256(systemname.name) hex (64+NUL). Captured on realtime build; used by fill_sha256name to detect empty/stale and refresh. */
+	char sha256name[65];       /* voip_sip_conf.sha256name cache: SHA256(systemname.name) hex (64+NUL). Captured on realtime build; used by fill_sha256name to detect empty/stale and refresh. */
 		int is_register_line;
 	/* Transient flag used only by sofia_reload_worker for mark-and-sweep
 	 * (chan_sofia.c sofia_peer_mark_cb / sofia_peer_sweep_cb). Set/cleared
@@ -1188,7 +1225,7 @@ struct sofia_config {
 	int subscribe_network_change_event; /* parse-compatibility only (sofia-sip sres_resolver + dnsmgr absorb network-change rebinding); default 1 (chan_sip) */
 	int rtsave_sysname;        /* 1 = include regserver=AST_SYSTEM_NAME in realtime writes (multi-server deployments). Restores canonical Asterisk behavior (active chan_sip fork dropped it). Default 0. */
 	int peer_rtupdate;         /* 1 = propagate registration changes to realtime DB (ast_update_realtime); default 1. rtupdate=no skips ALL realtime writes (cached-realtime, avoids churn). */
-	int fill_sha256name;       /* 1 = on realtime peer build, persist SHA256(systemname.name) into the sippeers realtime sha256name column (presence identity token) when empty or stale; default 0 (OFF). Realtime peers only. */
+	int fill_sha256name;       /* 1 = on realtime peer build, persist SHA256(systemname.name) into voip_sip_conf.sha256name (presence identity token) when empty or stale; default 0 (OFF). Realtime peers only. */
 	/* --- Mobile push wake-up ([general] push*; sofia_push.c). All sip-reload-safe. --- */
 	int push_enabled;          /* push=yes master enable; default 0 = feature fully off (no capture, no park) */
 	char push_scripts[256];    /* sender scripts dir (send_push.py / send_push_voip.py), default /etc/gabpbx/push */
@@ -1198,6 +1235,7 @@ struct sofia_config {
 	int push_min_interval;     /* seconds per-device push floor (the phone itself cancels a push <5 s after the previous); 0 = off */
 	int push_noresponse;       /* P2: seconds without ANY 1xx/2xx on a connection-oriented single-contact INVITE to a tokened peer before pushing with the same Call-ID (0 = off; clamp 2..10, must stay < push_wait); default 4 */
 	int push_resume_window;    /* multi-ring: seconds the resume holds a parked call open after the FIRST wake REGISTER so every pushed device can bind; then ONE fork INVITE per live binding, all carrying the announced Call-ID (0 = legacy first-registrant-wins; clamp 0..5); default 2 */
+	int push_sender_native;    /* push_sender=native|script: 1 = in-process libcurl HTTP/2 sender (sofia_push_sender.c, persistent connections + cached JWT/OAuth), 0 = fork/exec the .py scripts. Default 1 (native); auto-falls back to script per-job when the native lane is unavailable. */
 	/* Bounded REGISTER realtime-DB-write offload pool (kill-switch, default OFF). */
 	int register_pool;          /* offload the realtime REGISTER DB writes to a bounded pool */
 	int register_pool_workers;  /* lane count; 0 = auto = clamp(ncpu/2+1, 2, 16) */

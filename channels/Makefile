@@ -116,8 +116,16 @@ chan_sofia.so: LIBS+=-L/usr/local/lib -lsofia-sip-ua
 # regardless of make. Absent → USRSCTP_LIB empty → no link, no usrsctp symbols, RTP engine + plain builds untouched.
 chan_sofia.so: LIBS+=$(USRSCTP_LIB)
 chan_sofia.o: _ASTCFLAGS+=$(USRSCTP_INCLUDE)
+# Native push sender (sofia/sofia_push_sender.c): libcurl (HTTP/2 to APNs/FCM) + libcrypto (JWT
+# ES256/RS256 signing). Both come from ./configure exactly like usrsctp above: CURL_LIB/CURL_INCLUDE
+# via AST_LIBCURL_CHECK_CONFIG and CRYPTO_LIB/CRYPTO_INCLUDE via AST_EXT_LIB_CHECK — empty when not
+# detected, and the code gates on HAVE_CURL/HAVE_CRYPTO from gabpbx/autoconfig.h (stub build falls
+# back to the script sender). -lcrypto also fixes a latent fragility: chan_sofia.c already calls
+# HMAC/EVP_sha256 and only resolved those symbols transitively.
+chan_sofia.so: LIBS+=$(CURL_LIB) $(CRYPTO_LIB)
+chan_sofia.o: _ASTCFLAGS+=$(CURL_INCLUDE) $(CRYPTO_INCLUDE)
 $(if $(filter chan_sofia,$(EMBEDDED_MODS)),modules.link,chan_sofia.so): $(subst .c,.o,$(wildcard sofia/*.c))
-$(subst .c,.o,$(wildcard sofia/*.c)): _ASTCFLAGS+=$(call MOD_ASTCFLAGS,chan_sofia) -I/usr/local/include/sofia-sip-1.13 $(USRSCTP_INCLUDE)
+$(subst .c,.o,$(wildcard sofia/*.c)): _ASTCFLAGS+=$(call MOD_ASTCFLAGS,chan_sofia) -I/usr/local/include/sofia-sip-1.13 $(USRSCTP_INCLUDE) $(CURL_INCLUDE) $(CRYPTO_INCLUDE)
 
 h323/Makefile.ast:
 	$(CMD_PREFIX) $(MAKE) -C h323 Makefile.ast

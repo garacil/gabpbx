@@ -1,3 +1,51 @@
+## 1.8.1 — native in-process push sender (HTTP/2, no external scripts), one-token-one-installation
+
+A push wake-up performance and robustness release. No SIP wire behaviour changes and no
+phone-side changes: notification payloads are byte-identical to the previous sender.
+
+### The push notifications are now sent from inside `chan_sofia`
+
+Until now, waking a sleeping mobile meant `fork()`+`exec()` of a Python helper script for
+every device on every call. That cost a fresh TLS handshake to Apple **per notification**
+plus interpreter start-up, and the sends were serialised — one child at a time. Measured on
+a production box: **1341 ms per push**.
+
+`chan_sofia` now ships a native sender (`channels/sofia/sofia_push_sender.c`): **one bounded
+queue and one event-driven thread** that multiplexes several notifications at a time over
+**persistent HTTP/2 connections** to APNs (production and sandbox) and FCM, exactly as
+Apple's own guidance prescribes. The APNs ES256 JWT and the Google OAuth access token are
+signed with OpenSSL and cached in-thread (≈50 and ≈55 minutes; never re-signed more often
+than Apple's 20-minute floor). Measured on the same box: **228–332 ms cold, ~120 ms on a warm
+connection**, and several devices are now woken concurrently instead of one after another.
+
+Everything the operator already relies on is unchanged: the JSON payloads are byte-identical
+(same key order and separators), and so are the result strings (`OK:prod`, `OK:sandbox`,
+`OK`, `ERR:…`), so dead-token detection, automatic purge, `last_result` and the push log all
+behave exactly as before. Three notification shapes live in the new file — APNs VoIP,
+FCM call, and the FCM silent re-register used by the pre-expiry refresh path.
+
+Selected by **`[general] push_sender = native | script`** (default `native`), re-read on
+`sip reload`, so switching transports is a live A/B with no restart. Anything that would
+stop a notification going out falls back to the script sender **per job** — libcurl missing
+or without HTTP/2, `res_curl` unavailable, an unreadable credential — and says so once a
+minute rather than dropping the push. `sip show push` reports the active transport and the
+native queue depth. Requires libcurl (HTTP/2) and OpenSSL; built without them, the module
+compiles and uses the script sender exactly as before.
+
+### One token, one installation
+
+A device row whose push token matches another row of the same account is now recognised as
+the **same app installation re-keyed**, and the stale row is removed — cache, store and log.
+Apple and Google both define a push token as identifying one app installation, so two rows
+holding the same live token cannot be two handsets.
+
+This closes a leak nothing else could clean: a client that stops sending its device
+identifier mid-session re-keys itself under a fallback name and the account ends up with two
+live rows, so **every call sends that handset two notifications**. Neither the logout delete
+(which removes one named row) nor the dead-token purge (both rows carry the same *valid*
+token, so no error ever comes back) could resolve it. The boot-time preload runs through the
+same path, so an existing store cleans itself on the next restart.
+
 ## 1.8.0 — self-call ringing, SRTP bridge audio, RTP-inactivity teardown, attended-transfer parity, DTLS keying race
 
 A release of call-control and media-path fixes on top of the 1.6/1.7 mobile push work.

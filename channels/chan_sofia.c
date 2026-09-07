@@ -31,7 +31,7 @@
  *   - Channel tech name:     "SIP"      (not "Sofia")
  *     Dialplan: Dial(SIP/peer) routes to chan_sofia.
  *   - Realtime family:       "sippeers" (chan_sip default)
- *     extconfig.conf: sippeers => pgsql,general,the sippeers realtime table
+ *     extconfig.conf: sippeers => pgsql,general,voip_sip_conf
  *   - Dialplan functions:    SIPPEER / SIPCHANINFO / SIP_HEADER /
  *                            CHECKSIPDOMAIN  (chan_sip-parity
  *                            names, drop-in for existing dialplans).
@@ -3824,7 +3824,7 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			/* Generic outbound SUBSCRIBE (RFC 6665): <event>[;<accept-mime>][;<expires>]. */
 			ast_string_field_set(peer, subscribe_event, v->value);
 		} else if (!strcasecmp(v->name, "sha256name")) {
-			/* Presence identity token cache (the sippeers realtime sha256name column); captured so the
+			/* Presence identity token cache (voip_sip_conf.sha256name); captured so the
 			 * fill_sha256name path can detect an empty or stale value and refresh it.
 			 * (Empty column values never reach here — the loop skips ast_strlen_zero values.) */
 			ast_copy_string(peer->sha256name, v->value, sizeof(peer->sha256name));
@@ -4312,10 +4312,10 @@ static struct sofia_peer *sofia_find_peer_realtime_build(const char *name, struc
 	}
 
 	/* fill_sha256name (optional, default OFF): persist SHA256(systemname + '.' + name) into
-	 * the sippeers realtime sha256name column (the presence identity token) ONLY WHEN the column is EMPTY. A value
+	 * voip_sip_conf.sha256name (the presence identity token) ONLY WHEN the column is EMPTY. A value
 	 * already set — a manually FORCED token or a prior fill — is authoritative and never overwritten.
 	 * Realtime peers only (this is the realtime build path; static-file peers have no DB row and are
-	 * filled in-memory in sofia_parse_peer_config). Writes to the "sippeers" realtime family.
+	 * filled in-memory in sofia_parse_peer_config). Writes to the "sippeers" family = voip_sip_conf.
 	 * Runs OUTSIDE the peers lock (this builder's invariant), so the write never stalls lookups. */
 	if (sofia_cfg.fill_sha256name && !ast_strlen_zero(peer->name)
 			&& ast_strlen_zero(peer->sha256name)) {
@@ -6166,6 +6166,12 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		struct ao2_iterator ci;
 		struct sofia_contact *c;
 		int peer_is_dynamic = 0;
+		/* Hybrid push-assist: collect the LIVE bindings' sources + instances (excluding the
+		 * self-caller) so, when the peer also has ASLEEP push devices, we can ring the live
+		 * ones AND wake the sleeping ones with the same Call-ID. */
+		struct ast_sockaddr live_srcs[SOFIA_PUSH_MAX_DEVICES];
+		char live_inst[SOFIA_PUSH_MAX_DEVICES][128];
+		int n_live_ex = 0;
 
 		ci = ao2_iterator_init(pvt->peer->contacts, 0);
 		while ((c = ao2_iterator_next(&ci))) {
@@ -6186,8 +6192,14 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				ao2_ref(c, -1);
 				continue;
 			}
-			if (sofia_contact_is_unexpired(c_exp, now))
+			if (sofia_contact_is_unexpired(c_exp, now)) {
 				live++;
+				if (n_live_ex < SOFIA_PUSH_MAX_DEVICES) {
+					ast_sockaddr_copy(&live_srcs[n_live_ex], &c_src);
+					ast_copy_string(live_inst[n_live_ex], c_inst, sizeof(live_inst[n_live_ex]));
+					n_live_ex++;
+				}
+			}
 			ao2_ref(c, -1);
 		}
 		ao2_iterator_destroy(&ci);
@@ -6205,6 +6217,29 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 			ast_log(LOG_NOTICE, "Sofia: peer '%s' registration expired at call time - %d contact(s), 0 unexpired - no route\n",
 				S_OR(pvt->peername, "unknown"), total);
 			return -1;
+		}
+
+		/* Hybrid push-assist: the peer has BOTH live and asleep push devices — ring the
+		 * live ones through the fork AND wake the asleep ones by push, so "call my
+		 * extension and ALL my devices ring" holds even when some are only reachable by
+		 * push. Requires a pushable peer and >=1 live binding; forces a fork even for a
+		 * single live binding so a woken device can be late-appended as an extra branch.
+		 * A woken device rings a few seconds later and can still take the call. */
+		if (live >= 1 && pvt->peer && sofia_push_peer_pushable(pvt->peer)
+				&& sofia_push_count_asleep(pvt->peer,
+					pvt->fork_exclude_valid ? pvt->push_exclude_instance : NULL,
+					live_inst, n_live_ex) > 0) {
+			int rc;
+			if (!pvt->sip_callid[0]) {	/* shared Call-ID: fork branches + the wake push */
+				su_guid_t g[1];
+				su_guid_generate(g);
+				su_guid_sprintf(pvt->sip_callid, sizeof(pvt->sip_callid), g);
+			}
+			rc = sofia_fork_dial(pvt);	/* ring the live devices now (fork of >=1) */
+			if (!rc) {
+				sofia_push_assist_wake(pvt, live_srcs, live_inst, n_live_ex);
+			}
+			return rc;
 		}
 
 		if (live > 1) {
@@ -13159,7 +13194,7 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		char l_context[AST_MAX_CONTEXT];
 		char l_accountcode[256];	/* UNBOUNDED stringfield -> >=256 (SNAPSHOT IDIOM); emit value verbatim, no truncation */
 		char l_address[64] = "";
-		char l_sha256[65] = "";	/* presence token snapshot: emit SHA256Name on every PeerStatus */
+		char l_sha256[65] = "";	/* presence token snapshot: emit SHA256Name on every PeerStatus (operator: siempre el calculado) */
 		int l_call_limit;
 		int l_busy_level;
 		int inUse_snap, inRinging_snap;
@@ -13208,6 +13243,7 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 				"Peer: SIP/%s\r\n"
 				"PeerStatus: CallLimitExceeded\r\n"
 				"Address: %s\r\n"
+				"TuCloudPBXName: \r\n"
 				"Context: %s\r\n"
 				"Accountcode: %s\r\n"
 				"SHA256Name: %s\r\n"
@@ -13230,6 +13266,7 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 				"Peer: SIP/%s\r\n"
 				"PeerStatus: CallCountUpdated\r\n"
 				"Address: %s\r\n"
+				"TuCloudPBXName: \r\n"
 				"Context: %s\r\n"
 				"Accountcode: %s\r\n"
 				"SHA256Name: %s\r\n"
@@ -13269,13 +13306,12 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		/* On-hold counter DEC (chan_sip INC/DEC parity): a hangup/transfer WHILE ON HOLD never
 		 * sends the resume, so without this the +1 leaks and sofia_devicestate stays ONHOLD forever
 		 * (peer->onHold has priority over inUse at :13046 -> BLF watchers see the peer busy with 0
-		 * live channels). Idempotent by hold_state (cleared here), independent of call_inc_done;
-		 * Keyed on hold_inc_done (the OUTSTANDING +1, set at the INC), NOT the current notifyhold:
-		 * a notifyhold=false reload between hold and teardown must still release the count.
-		 * Idempotent (flag cleared, mirrors call_inc_done), independent of call_inc_done. ATOMIC
-		 * fetchadd (not a plain '--') because the INC sites modify onHold atomically WITHOUT ao2_lock,
-		 * so a bounded read-modify-write here would race a concurrent hold on another pvt of this
-		 * peer; the underflow undo keeps it >=0 defensively. */
+		 * live channels). Keyed on hold_inc_done (the OUTSTANDING +1, set at the INC), NOT the
+		 * current notifyhold: a notifyhold=false reload between hold and teardown must still release
+		 * the count. Idempotent (flag cleared, mirrors call_inc_done), independent of call_inc_done.
+		 * ATOMIC fetchadd (not a plain '--') because the INC sites modify onHold atomically WITHOUT
+		 * ao2_lock, so a bounded read-modify-write here would race a concurrent hold on another pvt
+		 * of this peer; the underflow undo keeps it >=0 defensively. */
 		if (pvt->hold_inc_done) {
 			if (ast_atomic_fetchadd_int(&peer->onHold, -1) <= 0) {
 				ast_atomic_fetchadd_int(&peer->onHold, +1);   /* was already 0 -> undo, no underflow */
@@ -13293,7 +13329,7 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		if (l_call_limit || l_busy_level) {
 			manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
 				"ChannelType: SIP\r\n" "Peer: SIP/%s\r\n" "PeerStatus: CallCountUpdated\r\n"
-				"Address: %s\r\n" "Context: %s\r\n" "Accountcode: %s\r\n"
+				"Address: %s\r\n" "TuCloudPBXName: \r\n" "Context: %s\r\n" "Accountcode: %s\r\n"
 				"SHA256Name: %s\r\n"
 				"ActiveCalls: %d\r\n" "RingingCalls: %d\r\n" "CallLimit: %d\r\n" "Event: DEC_CALL_LIMIT\r\n",
 				l_name, l_address, l_context, l_accountcode, l_sha256, inUse_snap, inRinging_snap, l_call_limit);
@@ -13328,7 +13364,7 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		if (l_call_limit || l_busy_level) {
 			manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
 				"ChannelType: SIP\r\n" "Peer: SIP/%s\r\n" "PeerStatus: CallCountUpdated\r\n"
-				"Address: %s\r\n" "Context: %s\r\n" "Accountcode: %s\r\n"
+				"Address: %s\r\n" "TuCloudPBXName: \r\n" "Context: %s\r\n" "Accountcode: %s\r\n"
 				"SHA256Name: %s\r\n"
 				"ActiveCalls: %d\r\n" "RingingCalls: %d\r\n" "CallLimit: %d\r\n" "Event: DEC_CALL_RINGING\r\n",
 				l_name, l_address, l_context, l_accountcode, l_sha256, inUse_snap, inRinging_snap, l_call_limit);
@@ -16225,7 +16261,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					"ChannelType: SIP\r\n"
 					"Username: %s\r\n"
 					"Domain: %s\r\n"
-					"Status: Registration Failed\r\n"	/* AMI Registry consumers act on Registered/Unregistered/Registration Failed; the bare "Failed" was silently dropped -> distinct outbound-trunk lamp */
+					"Status: Registration Failed\r\n"	/* the ami_connector's Registry rule only acts on Registered/Unregistered/Registration Failed; "Failed" was silently dropped -> distinct outbound-trunk lamp */
 					"Cause: %d %s\r\n",
 					peer->defaultuser, peer->host, status, phrase ? phrase : "");
 			}
@@ -16867,6 +16903,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					"Address: %s\r\n"
 					"Context: %s\r\n"
 					"Accountcode: %s\r\n"
+					"TuCloudPBXName: \r\n"
 					"SHA256Name: %s\r\n",
 					l_name, new_name, l_lastms, l_address, l_context, l_accountcode, l_sha256);
 				/* BLF/presence: reachability changed -> re-evaluate hint. */
@@ -18455,7 +18492,7 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			sofia_cfg.peer_rtupdate = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "fill_sha256name") || !strcasecmp(v->name, "fillsha256name")) {
 			/* Optional: on realtime peer build, persist SHA256(systemname.name) into
-			 * the sippeers realtime sha256name column when empty or stale (sofia_find_peer_realtime_build). */
+			 * voip_sip_conf.sha256name when empty or stale (sofia_find_peer_realtime_build). */
 			sofia_cfg.fill_sha256name = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "push")) {
 			sofia_cfg.push_enabled = ast_true(v->value) ? 1 : 0;	/* mobile push wake-up master enable */
@@ -18498,6 +18535,19 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 				g = g < 0 ? 0 : 5;
 			}
 			sofia_cfg.push_resume_window = g;
+		} else if (!strcasecmp(v->name, "push_sender")) {
+			/* Transport for the wake-up notifications: native = in-process libcurl HTTP/2
+			 * lane (persistent connections, cached credentials); script = fork/exec the
+			 * .py senders. Reload-safe: read per-job at dispatch time. */
+			if (!strcasecmp(v->value, "native")) {
+				sofia_cfg.push_sender_native = 1;
+			} else if (!strcasecmp(v->value, "script")) {
+				sofia_cfg.push_sender_native = 0;
+			} else {
+				ast_log(LOG_WARNING, "Sofia PUSH: push_sender='%s' unknown (native|script) - keeping native\n",
+					v->value);
+				sofia_cfg.push_sender_native = 1;
+			}
 		} else if (!strcasecmp(v->name, "register_pool")) {
 			/* Kill-switch: offload realtime REGISTER DB writes to a bounded pool
 			 * (default OFF). Takes effect on reload. */
@@ -19686,6 +19736,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.push_min_interval = 5;
 	sofia_cfg.push_noresponse = 4;	/* P2 guard; 0 disables */
 	sofia_cfg.push_resume_window = 2;	/* multi-ring collect window; 0 = first-registrant-wins */
+	sofia_cfg.push_sender_native = 1;	/* native in-process sender by default; script = fallback */
 	/* Register pool: default OFF + auto lane count. */
 	sofia_cfg.register_pool = 0;
 	sofia_cfg.register_pool_workers = 0;
@@ -20900,6 +20951,10 @@ err_cleanup:
 	/* AFTER the join (the only history user, sofia_thread, is now gone) — idempotent: drops the
 	 * retained-history ring + rwlock if init ran. */
 	sofia_history_destroy();
+
+	/* Native push sender thread (sofia_push_sender.c) — load-failure unwind only (the module
+	 * refuses runtime unload, so this ladder is the ONLY place the thread is ever joined). */
+	sofia_push_sender_stop();
 
 	/* domain_list — drain to prevent leak on retry-after-DECLINE. */
 	{

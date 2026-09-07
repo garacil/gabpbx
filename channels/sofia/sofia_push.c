@@ -64,7 +64,9 @@
 
 #include "include/chan_sofia_internal.h"
 
+#ifndef SOFIA_PUSH_MAX_DEVICES
 #define SOFIA_PUSH_MAX_DEVICES 10	/* hard array bound; the knob clamps to this */
+#endif
 #define SOFIA_PUSH_TOKEN_MAX 512	/* header hygiene: cap + printable-ASCII-no-space */
 #define SOFIA_PUSH_DEVID_MAX 64		/* expect 8 hex, accept [A-Za-z0-9._-]{1,63} (older builds) */
 #define SOFIA_PUSH_FAIL_PURGE 5		/* pushes with no wake REGISTER before the device is dropped */
@@ -339,10 +341,23 @@ static int sofia_push_device_stale(const struct sofia_push_device *d, time_t now
 	return 0;
 }
 
-/* Upsert one device into the entry (entry lock). Evicts the oldest device at the cap. */
+/* Upsert one device into the entry (entry lock). Evicts the oldest device at the cap.
+ *
+ * TOKEN COLLAPSE (operator-approved 2026-09-07): after the upsert, any OTHER row holding
+ * the IDENTICAL token is the SAME handset re-keyed and is removed. The invariant comes
+ * straight from the official Apple/Google docs: an APNs/PushKit or FCM token identifies
+ * ONE app installation - never two handsets. Without this, a client that drops
+ * X-Device-ID mid-session (phone bug 4(a), fixed in build 107) re-keys itself under the
+ * platform-name fallback and the handset ends up with TWO live rows = two pushes per
+ * call, un-cleanable by either the logout delete (keyed to one device_id) or the 410
+ * purge (both rows carry the same LIVE token, so no error ever comes back). Last write
+ * wins: the newest REGISTER is the installation's authoritative row. DB deletes + log
+ * rows are queued OUTSIDE the entry lock (leaf-lock discipline). */
 static void sofia_push_cache_upsert(struct sofia_push_tokens *e, const struct sofia_push_device *nd)
 {
 	int i, slot = -1, oldest = 0;
+	char collapsed[SOFIA_PUSH_MAX_DEVICES][SOFIA_PUSH_DEVID_MAX];
+	int ncollapsed = 0;
 
 	ao2_lock(e);
 	for (i = 0; i < e->ndev; i++) {
@@ -366,7 +381,42 @@ static void sofia_push_cache_upsert(struct sofia_push_tokens *e, const struct so
 		}
 	}
 	e->dev[slot] = *nd;
+
+	/* Collapse duplicate-token rows (same installation under another key). Tokens are
+	 * case-sensitive (FCM is base64url) -> strcmp, not strcasecmp. Swap-with-last removal;
+	 * do not advance on removal (the swapped-in row still needs checking), and track the
+	 * slot if the tail row we just wrote gets moved. */
+	if (nd->token[0]) {
+		i = 0;
+		while (i < e->ndev) {
+			if (i != slot && !strcmp(e->dev[i].token, nd->token)) {
+				if (ncollapsed < SOFIA_PUSH_MAX_DEVICES) {
+					ast_copy_string(collapsed[ncollapsed++], e->dev[i].device_id,
+						sizeof(collapsed[0]));
+				}
+				e->dev[i] = e->dev[e->ndev - 1];
+				memset(&e->dev[e->ndev - 1], 0, sizeof(e->dev[0]));
+				e->ndev--;
+				if (slot == e->ndev) {
+					slot = i;	/* the row we upserted was the tail we just moved */
+				}
+				continue;
+			}
+			i++;
+		}
+	}
 	ao2_unlock(e);
+
+	for (i = 0; i < ncollapsed; i++) {
+		struct sofia_pushdb_job dj = { .kind = PUSHDB_DELETE };
+
+		ast_copy_string(dj.peer, e->peername, sizeof(dj.peer));
+		ast_copy_string(dj.device_id, collapsed[i], sizeof(dj.device_id));
+		sofia_pushdb_queue(&dj);
+		sofia_push_log_event(e->peername, collapsed[i], "", "collapsed", nd->device_id);
+		ast_log(LOG_NOTICE, "Sofia PUSH: collapsed duplicate-token row peer='%s' dev='%s' (same installation now keyed dev='%s')\n",
+			e->peername, collapsed[i], nd->device_id);
+	}
 }
 
 static int sofia_push_cache_delete(struct sofia_push_tokens *e, const char *device_id)
@@ -589,6 +639,30 @@ static void sofia_push_record_result(const char *peername, const char *device_id
 	sofia_pushdb_queue(&fj);
 }
 
+/* Completion entry for the NATIVE sender lane (sofia_push_sender.c). Lives here, beside the
+ * static consumers, so both lanes run the IDENTICAL record path: first-line truncate, redacted
+ * verb line, push_log 'sent', last_result cache+DB, dead-token purge. Runs on the native sender
+ * thread — the same safety class as the script lane's taskprocessor thread (leaf cache-entry
+ * locks + pushdb queue only; never pvt/peer/channel). */
+void sofia_push_sender_complete(const char *peername, const char *device_id, const char *callid,
+	const char *sender_label, const char *token_redacted, const char *out_in, long ms)
+{
+	char out[SOFIA_PUSH_RESULT_MAX];
+	char *nl;
+
+	ast_copy_string(out, S_OR(out_in, ""), sizeof(out));
+	if ((nl = strchr(out, '\n'))) {
+		*nl = '\0';	/* first line only, script-lane parity */
+	}
+	ast_verb(2, "Sofia PUSH: sender %s dev=%s token=%s callid=%s result=%s (%ldms)\n",
+		sender_label, device_id, token_redacted, callid, out, ms);
+	sofia_push_log_event(peername, device_id, callid, "sent", out);
+	sofia_push_record_result(peername, device_id, out);
+	if (sofia_push_result_is_dead_token(out)) {
+		sofia_push_purge_device(peername, device_id, out);
+	}
+}
+
 /* Runs on the sofia/push taskprocessor thread (blocking up to the deadline is FINE here;
  * this is neither sofia_thread nor the PBX dialing thread). */
 static int sofia_push_send_exe(void *data)
@@ -726,6 +800,8 @@ struct sofia_push_park {
 	int collected;			/* a collect window already ran: stragglers resume immediately */
 	struct ast_sockaddr dialed[SOFIA_PUSH_MAX_DEVICES];	/* REGISTER source addrs already given a branch (late-append dedup; entry lock) */
 	int ndialed;
+	char live_inst[SOFIA_PUSH_MAX_DEVICES][128];	/* push-assist: +sip.instance of devices ALREADY ringing (a live binding) — their push is skipped, only the asleep devices are woken */
+	int n_live_inst;
 	char exclude_instance[128];	/* self-call: the CALLING device's +sip.instance - its push is skipped (never wake the phone that is placing the call) */
 	struct ast_sockaddr exclude_src;	/* self-call: the CALLING device's transport source - its own re-REGISTER is NOT a wake (must not resume this park) and its binding is never a resume target */
 	int exclude_valid;
@@ -801,6 +877,20 @@ static int sofia_push_notify_devices(struct sofia_push_park *entry, int *rate_li
 				&& !strcasecmp(e->dev[i].instance, entry->exclude_instance)) {
 			continue;
 		}
+		/* Hybrid push-assist: a device that is ALREADY ringing (a live binding was
+		 * forked to it) must not also be pushed — only the ASLEEP devices are woken. */
+		if (entry->n_live_inst && e->dev[i].instance[0]) {
+			int li, skip = 0;
+			for (li = 0; li < entry->n_live_inst; li++) {
+				if (!strcasecmp(e->dev[i].instance, entry->live_inst[li])) {
+					skip = 1;
+					break;
+				}
+			}
+			if (skip) {
+				continue;
+			}
+		}
 		if (sofia_cfg.push_min_interval > 0
 			&& e->dev[i].last_push_at > now - sofia_cfg.push_min_interval) {
 			(*rate_limited)++;
@@ -814,6 +904,37 @@ static int sofia_push_notify_devices(struct sofia_push_park *entry, int *rate_li
 
 	for (i = 0; i < nsnap; i++) {
 		struct sofia_push_send_job *j;
+		/* NATIVE lane first (push_sender=native, the default): its own bounded queue and
+		 * NO shared-budget slot held for the HTTP flight (only the completion's
+		 * log/record/purge jobs draw on sofia_pushdb_depth, exactly like the script
+		 * lane's completion). submit()==1 means "lane can't serve this job" (down, or
+		 * that push type's creds are sick) -> fall THROUGH to the script sender below
+		 * (auto-fallback); submit()==-1 means the native queue is full -> drop this
+		 * device (bounded, same semantics as the script cap; a burst must never
+		 * degrade into fork/exec). */
+		if (sofia_cfg.push_sender_native) {
+			int sr = sofia_push_sender_submit(SOFIA_PUSH_PURPOSE_CALL, snap[i].push_type,
+				snap[i].token, entry->cid_num, entry->cid_name, entry->callid,
+				entry->peername, snap[i].device_id);
+			if (sr == 0) {
+				if (entry->npushed < SOFIA_PUSH_MAX_DEVICES) {
+					ast_copy_string(entry->pushed_dev[entry->npushed++], snap[i].device_id,
+						sizeof(entry->pushed_dev[0]));
+				}
+				queued++;
+				continue;
+			}
+			if (sr < 0) {
+				continue;	/* native queue full: drop, never burst into fork/exec */
+			}
+			{	/* sr == 1: native selected but unusable -> script fallback, throttled note */
+				static time_t last_fb_warn;
+				if (time(NULL) - last_fb_warn >= 60) {
+					last_fb_warn = time(NULL);
+					ast_log(LOG_WARNING, "Sofia PUSH: push_sender=native but the native lane cannot serve this job - using the script sender\n");
+				}
+			}
+		}
 		if (ast_atomic_fetchadd_int(&sofia_pushdb_depth, +1) >= SOFIA_PUSH_DBQ_MAX) {
 			ast_atomic_fetchadd_int(&sofia_pushdb_depth, -1);
 			break;
@@ -1818,6 +1939,116 @@ done:
  * the account (with or without push headers — a desk phone binding delivers the call
  * too, Kamailio ts_append parity), and even if push= was just turned off: delivering an
  * already-parked call is strictly correct. */
+/* Hybrid push-assist: count the peer's ASLEEP push devices — those with a usable cached
+ * token whose +sip.instance is neither the caller's (self-call) nor any of the devices
+ * already ringing (a live binding was forked to them). Returns how many would be woken.
+ * Any thread; takes only the cache entry lock. */
+int sofia_push_count_asleep(struct sofia_peer *peer, const char *exclude_instance,
+	char live_inst[][128], int n_live)
+{
+	struct sofia_push_tokens *e;
+	time_t now = time(NULL);
+	int i, asleep = 0;
+
+	if (!peer || !(e = sofia_push_entry_get(peer->name, 0))) {
+		return 0;
+	}
+	ao2_lock(e);
+	for (i = 0; i < e->ndev; i++) {
+		int li, live = 0;
+		if (sofia_push_device_stale(&e->dev[i], now)) {
+			continue;
+		}
+		if (exclude_instance && exclude_instance[0] && e->dev[i].instance[0]
+				&& !strcasecmp(e->dev[i].instance, exclude_instance)) {
+			continue;	/* the caller's own device */
+		}
+		for (li = 0; li < n_live; li++) {
+			if (e->dev[i].instance[0] && !strcasecmp(e->dev[i].instance, live_inst[li])) {
+				live = 1;
+				break;
+			}
+		}
+		if (!live) {
+			asleep++;	/* has a token, no live binding -> a wake target */
+		}
+	}
+	ao2_unlock(e);
+	ao2_ref(e, -1);
+	return asleep;
+}
+
+/* Hybrid push-assist: the call is already ringing the peer's LIVE devices through the fork
+ * master `pvt` (its sip_callid seeds every branch). Wake the ASLEEP devices too by pushing
+ * them with that same Call-ID and leaving a parked-registry entry in APPENDING state, so
+ * when a woken device re-registers the existing late-append path adds it a fork branch
+ * (the phone dedups push+INVITE by the shared uuid). No push_wait/NOANSWER is armed: the
+ * live legs own the call outcome; the entry is reaped by sofia_push_on_pvt_hangup when the
+ * master tears down. Caller holds the channel lock; pvt is a live fork master with
+ * sip_callid set and (for a self-call) the exclude fields populated. */
+void sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_sockaddr *live_srcs,
+	char live_inst[][128], int n_live)
+{
+	struct sofia_push_park *e;
+	int i, queued, rate_limited = 0;
+
+	if (!sofia_push_parked || !pvt || !pvt->sip_callid[0]) {
+		return;
+	}
+	if (!(e = ao2_alloc(sizeof(*e), sofia_push_park_destructor))) {
+		return;
+	}
+	ast_copy_string(e->peername, pvt->peername, sizeof(e->peername));
+	ast_copy_string(e->exclude_instance, pvt->push_exclude_instance, sizeof(e->exclude_instance));
+	if (pvt->fork_exclude_valid) {
+		ast_sockaddr_copy(&e->exclude_src, &pvt->fork_exclude_src);
+		e->exclude_valid = 1;
+	}
+	ast_copy_string(e->callid, pvt->sip_callid, sizeof(e->callid));
+	ast_copy_string(e->cid_num, "assist", sizeof(e->cid_num));
+	ast_copy_string(e->cid_name, "assist", sizeof(e->cid_name));
+	e->pvt = pvt;
+	ao2_ref(pvt, +1);
+	e->sched_id = -1;
+	e->collect_sched_id = -1;
+	e->state = SOFIA_PUSH_APPENDING;	/* the fork already went out; only late appends from here */
+	e->collected = 1;			/* stragglers append immediately, never a fresh collect window */
+	e->parked_at = time(NULL);
+	/* Seed the dedup with the live bindings' sources (never re-dial a device already ringing)
+	 * and their instances (never push a device already ringing). Bounded by MAX_DEVICES. */
+	for (i = 0; i < n_live && i < SOFIA_PUSH_MAX_DEVICES; i++) {
+		ast_sockaddr_copy(&e->dialed[i], &live_srcs[i]);
+		ast_copy_string(e->live_inst[i], live_inst[i], sizeof(e->live_inst[i]));
+	}
+	e->ndialed = (n_live < SOFIA_PUSH_MAX_DEVICES) ? n_live : SOFIA_PUSH_MAX_DEVICES;
+	e->n_live_inst = e->ndialed;
+
+	if (!ao2_link(sofia_push_parked, e)) {
+		ao2_ref(e, -1);
+		return;
+	}
+	/* Mark the master so its hangup reaps this entry (push_appending gates the hook). */
+	ast_mutex_lock(&pvt->lock);
+	pvt->push_appending = 1;
+	ast_mutex_unlock(&pvt->lock);
+
+	queued = sofia_push_notify_devices(e, &rate_limited);
+	if (!queued && !rate_limited) {
+		/* No asleep device could be pushed (all rang, or none usable): nothing to assist.
+		 * Drop the entry; the fork to the live devices stands on its own. */
+		ast_mutex_lock(&pvt->lock);
+		pvt->push_appending = 0;
+		ast_mutex_unlock(&pvt->lock);
+		ao2_unlink(sofia_push_parked, e);
+		ao2_ref(e, -1);
+		return;
+	}
+	ast_verb(2, "Sofia PUSH: push-assist %s peer='%s' - ringing %d live device(s), woke the asleep one(s)\n",
+		e->callid, e->peername, n_live);
+	sofia_push_log_event(e->peername, "", e->callid, "sent", "assist");
+	ao2_ref(e, -1);		/* container holds the entry; hangup reaps it */
+}
+
 static void sofia_push_try_resume(struct sofia_peer *peer, const struct sofia_register_update *update)
 {
 	struct ao2_iterator it;
@@ -2036,13 +2267,16 @@ static char *sofia_push_cli_show(struct ast_cli_entry *e, int cmd, struct ast_cl
 	if (a->argc == 4) {
 		filter = a->argv[3];
 	}
-	ast_cli(a->fd, "Push wake-up: %s  scripts=%s  wait=%ds  noresponse=%ds  resume_window=%ds  ttl=%dd  max_devices=%d  min_interval=%ds  cache=%s  queue=%d\n",
+	ast_cli(a->fd, "Push wake-up: %s  sender=%s%s  scripts=%s  wait=%ds  noresponse=%ds  resume_window=%ds  ttl=%dd  max_devices=%d  min_interval=%ds  cache=%s  queue=%d  natq=%d\n",
 		sofia_cfg.push_enabled ? "ENABLED" : "disabled",
+		sofia_cfg.push_sender_native ? "native" : "script",
+		sofia_cfg.push_sender_native && !sofia_push_sender_available() ? "(lane DOWN: script fallback)" : "",
 		sofia_cfg.push_scripts, sofia_cfg.push_wait, sofia_cfg.push_noresponse,
 		sofia_cfg.push_resume_window,
 		sofia_cfg.push_token_ttl_days,
 		sofia_cfg.push_max_devices, sofia_cfg.push_min_interval,
-		sofia_push_cache_complete ? "complete" : "lazy", sofia_pushdb_depth);
+		sofia_push_cache_complete ? "complete" : "lazy", sofia_pushdb_depth,
+		sofia_push_sender_natq_depth());
 	if (!sofia_push_cache) {
 		return CLI_SUCCESS;
 	}
@@ -2128,6 +2362,10 @@ int sofia_push_init(void)
 		ast_log(LOG_WARNING, "Sofia PUSH: sender taskprocessor unavailable - pushes disabled (parks would be silent, so parking disables too)\n");
 	}
 	ast_cli_register_multiple(sofia_push_cli, ARRAY_LEN(sofia_push_cli));
+
+	/* Native sender lane (sofia_push_sender.c) — non-fatal like the taskprocessors above:
+	 * without it, push_sender=native auto-falls back to the script sender per job. */
+	sofia_push_sender_init();
 
 	/* Preload the whole table (it only holds mobile devices) so the dial path never
 	 * reads the DB: a complete-cache miss IS the answer. Engine/family missing or the
