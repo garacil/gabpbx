@@ -1,3 +1,112 @@
+## 1.8.2 — mid-call network mobility: a handset that changes network keeps the call
+
+An ICE conformance release. A WebRTC client that moves between networks mid-call —
+Wi-Fi to cellular, or between access points — now keeps its audio, and the media
+follows the new path in **18.3 milliseconds**, measured per packet on a real handover.
+Also: a phone that loses a forked call no longer logs it as missed, and the
+`lockuseragent` allowlist no longer locks accounts out of their own registration.
+
+### The media now follows a mid-call path change
+
+A client whose network disappears re-nominates its other candidate pair — this is
+ordinary ICE behaviour and needs no signalling, no re-INVITE and no ICE restart. GABPBX
+was refusing those nominations, so the media kept being transmitted to the interface the
+client had just left, for the rest of the call.
+
+Three separate defects were involved, all of them in how an **ICE-lite** agent is
+supposed to behave:
+
+- **`a=ice-lite` was emitted at media level.** RFC 8839 §5.3 is explicit: *"'ice-lite' is
+  a session-level attribute only"*. It is now emitted once in the session block.
+
+- **`a=ice-options:ice2` was never emitted.** RFC 8839 §4.2.1.5 and RFC 8445 §10 make it a
+  MUST for an agent implementing RFC 8445, and its absence tells the peer it may assume
+  RFC 5245 behaviour — so GABPBX was announcing itself as an obsolete implementation
+  while behaving as a current one. It is now advertised, and the peer's own `ice-options`
+  is parsed (a space-separated token list per §5.6, read at either level per §5.4).
+
+- **Every authenticated connectivity check moved the media destination.** RFC 8445 §12.1
+  permits sending on any valid pair *before* selected pairs exist, but once a pair is
+  nominated it becomes a MUST in the other direction: *"an agent MUST send data on those
+  pairs only"*. A consent check (RFC 7675) is not a steering command. The driver now keeps
+  a **selected pair** distinct from the last authenticated source: before nomination it
+  follows any check (this is what aims the DTLS handshake), after nomination only an
+  accepted `USE-CANDIDATE` re-selects, and the previous selected pair is retained across
+  an ICE restart (RFC 8839 §4.4.3.2).
+
+A fourth defect was introduced by the same work and is removed here, which is why the
+first three are worth stating together: nominations from a peer that does not advertise
+`ice2` were being refused when the nominating check carried a **lower PRIORITY** than the
+selected pair, on the strength of RFC 8445 §8.1.1. That reasoning does not apply to this
+driver. §8.1.1 lives under §8.1, *"Procedures for Full Implementations"*, and compares
+priorities a full agent computed; §7.3.2, the section that governs a **lite**
+implementation, says the pair built from an accepted nomination *"is assigned an
+**arbitrary priority**"*, and §8.2 concludes with no tie-break at all. A lite agent is
+told outright that the priority of its own pairs carries no meaning, so it has nothing to
+compare and no grounds to refuse. The practical consequence was severe and exactly
+backwards: a client leaving one network for another moves from a host candidate to a
+server-reflexive one, which is by construction **lower** priority — so the nomination that
+carries the handover was precisely the one being rejected.
+
+Accept-or-reject is also binary. RFC 8445 §7.3.1.5: *"If the controlled agent does not
+accept the request from the controlling agent, the controlled agent MUST reject the
+nomination request with an appropriate error code response (e.g., 400)"*. The refusal path
+was answering with a Binding **Success** while withholding the nominated flag, which tells
+the peer on the wire that its pair was selected when it was not — making the refusal
+invisible from the client's side except as media that never arrived.
+
+Two supporting changes complete the path:
+
+- **The DTLS record gate accepts any tuple that has passed MESSAGE-INTEGRITY in this
+  session**, not only the most recent one. A client with two live interfaces sends its
+  `ClientHello` from one while its checks arrive from the other, and gating on a single
+  latched source dropped it — costing seconds of silence at the start of a call even when
+  nothing was moving. RFC 8445 keeps a valid **list**, not a single pair.
+
+- **The `c=` line no longer overrides the media destination on a WebRTC leg**, where the
+  destination is the ICE pair rather than the connection line (RFC 8445 §12.1.1).
+
+Behaviour for a non-ICE peer is byte-for-byte unchanged: the RFC 4961 symmetric-RTP
+follow, which is what keeps a NAT'd phone reachable, applies exactly as before whenever
+ICE is not active.
+
+### A phone that loses a forked call no longer logs a missed call
+
+When a call rings several destinations and one answers, the losing branches were
+cancelled with a bare `CANCEL`, which a phone cannot distinguish from an unanswered call.
+`chan_sofia` now stamps the losing branch with
+
+    Reason: SIP;cause=200;text="Call completed elsewhere"
+
+which is the case RFC 3326 §3.1 describes, and which `chan_sip` has always sent. It is
+emitted on both paths that cancel a loser: a multi-destination `Dial`, where each
+destination is its own channel and `app_dial` marks the losers (call pickup sets only the
+flag, so both the flag and hangup cause 26 are tested), and the fork engine's own
+cancellation of sibling bindings of one extension. The header is **not** gated behind
+`use_q850_reason` — that option is off by default and gating it would have shipped the
+fix dead — and the two Reason values travel as two separate headers rather than one
+comma-joined value, so a malformed sub-value cannot cause the whole tag list to be
+dropped.
+
+### `lockuseragent` no longer locks an account out of its own registration
+
+`lockuseragent` latched the User-Agent of whichever client registered first and then
+demanded an exact full-string match from every later REGISTER. That is not what
+`chan_sip` does, and it failed three ways: a firmware or build bump changed the string and
+locked the peer out; the anchor was stored truncated to 64 bytes, so a browser User-Agent
+of 117 characters could never match its own anchor; and every rejection fed the IP
+blacklist, so after five attempts the peer silently banned its own address — the client
+seeing only "disconnected", with no 401/403 and nothing in the log. Because
+`lockuseragent` defaults on while the allowlist column defaults empty, that combination
+applied to **every newly created peer**.
+
+The allowlist is now the peer's own `useragent` value — the same column `chan_sip` reads —
+as a comma-separated **prefix** list, so a firmware bump keeps matching. An **empty value
+means no restriction**, matching `chan_sip`, which short-circuits before comparing. The
+capture-on-first-REGISTER anchor is gone; an allowlist is only ever operator-declared. The
+rejection remains a silent 401 challenge plus the AMI event, so an attacker still cannot
+tell a User-Agent mismatch from a bad password.
+
 ## 1.8.1 — native in-process push sender (HTTP/2, no external scripts), one-token-one-installation
 
 A push wake-up performance and robustness release. No SIP wire behaviour changes and no
