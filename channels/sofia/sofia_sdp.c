@@ -57,6 +57,26 @@ static int sofia_sdp_pt_in_use(const char *list, int pt)
 	return 0;
 }
 
+/* RFC 8839 §5.6: ice-options is a SPACE-SEPARATED LIST of tokens ("a=ice-options:ice2 rtp+ecn").
+ * Match the whole token, never a substring — "ice2x" and "noice2" must not count. */
+static int sofia_sdp_has_ice2(const char *value)
+{
+	const char *p = value;
+
+	while (p && *p) {
+		size_t len;
+		while (*p == ' ' || *p == '\t') {
+			p++;
+		}
+		len = strcspn(p, " \t");
+		if (len == 4 && !strncasecmp(p, "ice2", 4)) {
+			return 1;
+		}
+		p += len;
+	}
+	return 0;
+}
+
 static int sofia_sdp_cat(char *dst, size_t dstsize, const char *src)
 {
 	size_t dlen = strlen(dst);
@@ -186,7 +206,8 @@ static void sofia_sdp_emit_webrtc_video(struct sofia_pvt *pvt, char *buf, size_t
 			*overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), tmp_buf);
 		}
 	}
-	*overflow |= sofia_sdp_cat(vmap_buf, sizeof(vmap_buf), "a=ice-lite\r\n");
+	/* No a=ice-lite here either — session-level only (RFC 8839 §5.3); see the session block in
+	 * sofia_generate_sdp. One declaration covers every m= section of the session. */
 	if (vufrag) {
 		if (snprintf(tmp_buf, tmp_buf_size, "a=ice-ufrag:%s\r\n", vufrag) >= (int)tmp_buf_size) {
 			*overflow = 1;
@@ -775,7 +796,9 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 				overflow |= sofia_sdp_cat(rtpmap_buf, sizeof(rtpmap_buf), tmp_buf);
 			}
 		}
-		overflow |= sofia_sdp_cat(rtpmap_buf, sizeof(rtpmap_buf), "a=ice-lite\r\n");
+		/* a=ice-lite is NOT emitted here: RFC 8839 §5.3 makes it a SESSION-level attribute only,
+		 * so it is written into the session block below (search "a=ice-lite"). a=ice-ufrag and
+		 * a=ice-pwd stay at media level, which §5.4 explicitly permits. */
 		if (lufrag) {
 			if (snprintf(tmp_buf, sizeof(tmp_buf), "a=ice-ufrag:%s\r\n", lufrag) >= (int)sizeof(tmp_buf)) {
 				overflow = 1;
@@ -945,6 +968,29 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 			overflow |= sofia_sdp_cat(group_buf, sizeof(group_buf), pvt->webrtc_msid);
 			overflow |= sofia_sdp_cat(group_buf, sizeof(group_buf), "\r\n");
 		}
+	}
+	/* a=ice-lite — SESSION level, and only here. RFC 8839 §5.3: "«ice-lite» is a session-level
+	 * attribute only, and indicates that an agent is a lite implementation." It used to be emitted
+	 * inside the m=audio and m=video blocks, where a conformant parser is entitled to ignore it.
+	 * That matters beyond conformance: RFC 8445 §6.1.1 ("one agent full, one lite") makes the FULL
+	 * peer the CONTROLLING agent, and the controlling agent is the one that nominates. A peer that
+	 * never learns we are lite has no reason to switch roles, and on a leg WE offer it stays the
+	 * answerer's default — controlled — so neither end nominates and no pair is ever selected.
+	 * Appended AFTER the BUNDLE block because that block writes group_buf with snprintf at offset
+	 * 0; session-level a= lines have no required order among themselves (RFC 4566 §5). */
+	if (pvt->is_webrtc) {
+		overflow |= sofia_sdp_cat(group_buf, sizeof(group_buf), "a=ice-lite\r\n");
+		/* a=ice-options:ice2 — RFC 8445 §10: "An agent compliant to this specification MUST inform
+		 * the peer about the compliance using the 'ice2' option", encoded per RFC 8839 §5.6. Its
+		 * ABSENCE is not neutral: RFC 8839 §4.2.1.5 says a peer that sees ICE support without ice2
+		 * "can assume that the peer is compliant to [RFC5245]", i.e. we were announcing ourselves as
+		 * a 2010-era agent and licensing aggressive nomination against us.
+		 * ONE TOKEN, deliberately. The list form is legal (§5.6) but some clients
+		 * truncate a multi-token ice-options at the first token when re-serialising SDP, so a
+		 * second tag would be silently dropped there. We have nothing to add anyway: 'trickle' would
+		 * be false, since a lite agent sends its single host candidate up front with
+		 * a=end-of-candidates (RFC 8838 Appendix B). Do not add one without checking that peer. */
+		overflow |= sofia_sdp_cat(group_buf, sizeof(group_buf), "a=ice-options:ice2\r\n");
 	}
 	/* The m=audio SECTION (m= line + its a= block + a=sendrecv), built into its own buffer so the WebRTC
 	 * answer can place it at the audio's OFFER slot when the offer order is non-canonical (RFC 3264 §6 /
@@ -2011,6 +2057,12 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 							wrtc.cand[wrtc.cand_count++] = ca;
 						}
 					}
+				} else if (audio_webrtc_offered && a->a_name && a->a_value
+						&& su_casematch(a->a_name, "ice-options")) {
+					/* Sticky: once seen, remembered for the dialog (see peer_ice2). */
+					if (sofia_sdp_has_ice2(a->a_value)) {
+						pvt->peer_ice2 = 1;
+					}
 				} else if (audio_webrtc_offered && a->a_name
 						&& su_casematch(a->a_name, "ice-lite")) {
 					wrtc.remote_ice_lite = 1;
@@ -2079,7 +2131,15 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 					ast_log(LOG_WARNING, "Sofia: unparseable audio media address '%s' in SDP offer — rejecting\n", addr);
 					goto sdp_reject;
 				}
-				ast_rtp_instance_set_remote_address(pvt->rtp, &remote);
+				/* On an ICE leg the destination belongs to ICE, not to the c= line: RFC 8445 §12.1.1
+				 * says a lite agent sends to the remote candidate of the pair. Applying c= here also
+				 * wrote instance->remote_address from the SOFIA thread while the channel thread was
+				 * using it to aim DTLS flights, and it reset rxseqno / strict_rtp_state / rtcp->them
+				 * as a side effect — on every re-INVITE, hold included. The ICE responder sets the
+				 * destination from the authenticated check (phase A) or the nomination (phase B). */
+				if (!pvt->is_webrtc) {
+					ast_rtp_instance_set_remote_address(pvt->rtp, &remote);
+				}
 			}
 
 			{
@@ -2661,6 +2721,12 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 			ast_copy_string(wrtc.ice_ufrag, sa->a_value, sizeof(wrtc.ice_ufrag));
 			wrtc.have_ice_ufrag = 1;
 		}
+		/* ice-options is session-level per RFC 8839 §5.6 and JSEP RFC 8829 §5.2.1 puts it there,
+		 * but libwebrtc emits it at MEDIA level, so both places have to be read. Sticky either way. */
+		if (!pvt->peer_ice2 && (sa = sdp_attribute_find(sdp->sdp_attributes, "ice-options"))
+				&& sa->a_value && sofia_sdp_has_ice2(sa->a_value)) {
+			pvt->peer_ice2 = 1;
+		}
 		if (!wrtc.have_ice_pwd && (sa = sdp_attribute_find(sdp->sdp_attributes, "ice-pwd")) && sa->a_value) {
 			ast_copy_string(wrtc.ice_pwd, sa->a_value, sizeof(wrtc.ice_pwd));
 			wrtc.have_ice_pwd = 1;
@@ -3021,6 +3087,11 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 			ice->ice_lite(pvt->rtp);
 		}
 		ice->set_role(pvt->rtp, AST_RTP_ICE_ROLE_CONTROLLED);	/* permanent lite role */
+		if (ice->set_peer_ice2) {
+			/* Which nomination policy applies to this peer (RFC 8445 §8.1.1 vs regular). Absence of
+			 * ice2 never rejects anything — RFC 8829 §3.5.5 — it only selects the defensive path. */
+			ice->set_peer_ice2(pvt->rtp, pvt->peer_ice2);
+		}
 		ice->start(pvt->rtp);	/* remote creds are set now — safe to arm the STUN responder */
 		pvt->webrtc_answer_applied = 1;
 		/* (5) activate AFTER the remote params are applied; the ICE/DTLS state machine
@@ -3218,6 +3289,11 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 			ice->ice_lite(pvt->rtp);	/* only when the offer carried a=ice-lite */
 		}
 		ice->set_role(pvt->rtp, AST_RTP_ICE_ROLE_CONTROLLED);	/* our permanent local role */
+		if (ice->set_peer_ice2) {
+			/* Which nomination policy applies to this peer (RFC 8445 §8.1.1 vs regular). Absence of
+			 * ice2 never rejects anything — RFC 8829 §3.5.5 — it only selects the defensive path. */
+			ice->set_peer_ice2(pvt->rtp, pvt->peer_ice2);
+		}
 		ice->start(pvt->rtp);
 		/* WebRTC interop: persist the offered MID + BUNDLE intent + a stable per-pvt
 		 * tls-id onto pvt so sofia_generate_sdp can echo a=mid / a=group:BUNDLE /

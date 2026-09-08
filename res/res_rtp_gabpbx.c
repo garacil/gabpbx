@@ -283,6 +283,24 @@ struct ast_rtp {
 	unsigned int ice_lite:1;           /*!< peer advertised a=ice-lite (recorded only) */
 	unsigned int ice_active:1;         /*!< start() called — the responder is armed (hardening: gate) */
 	unsigned int ice_complete:1;       /*!< a USE-CANDIDATE check passed → selected pair (RFC 8445 §8.2) */
+	/* RFC 8445 §8.2 selected pair. Distinct from ice_peer on purpose: ice_peer is "the latest
+	 * authenticated check source" and feeds the DTLS gate, while THIS is where media may be sent
+	 * (§12.1: "once selected pairs have been produced ... an agent MUST send data on those pairs
+	 * only"). Set by an accepted USE-CANDIDATE (§7.3.2, remote candidate = that request's source),
+	 * re-set by every later one (mid-call re-nomination), and NEVER cleared while the call lives —
+	 * an ICE restart must keep sending on the previous selected pair (RFC 8839 §4.4.3.2). */
+	struct ast_sockaddr selected_pair;
+	unsigned int selected_valid:1;     /*!< a pair has been nominated; phase B rules apply */
+	unsigned int peer_ice2:1;          /*!< peer advertised ice2, so it uses RFC 8445 regular nomination */
+	unsigned int sel_prio_valid:1;     /*!< sel_priority holds the PRIORITY of the nominating check */
+	unsigned int sel_priority;         /*!< RFC 8445 §8.1.1 tie-break among concurrent nominations */
+	/* Every source that has passed MESSAGE-INTEGRITY this session (RFC 8445 keeps a valid LIST,
+	 * not a single pair). The DTLS gate accepts a record from any of them: a peer with several
+	 * live interfaces sends its ClientHello from one tuple while its checks arrive from another,
+	 * and gating on the latest single source drops it. Ring, oldest overwritten. */
+	struct ast_sockaddr auth_tuples[8];
+	unsigned int n_auth;               /*!< entries used, saturating at ARRAY_LEN(auth_tuples) */
+	unsigned int auth_next;            /*!< next slot to overwrite */
 	/* rtpicedebug ONLY (pure logging, no datapath): first-seen bits + last-* sockaddrs so the debug
 	 * logs fire once / on-change instead of per-packet. Never read outside an `if (rtpicedebug)` guard. */
 	unsigned int latch_seen:1;         /*!< rtpicedebug: first ICE latch already logged */
@@ -1515,6 +1533,12 @@ static void ast_rtp_ice_ice_lite(struct ast_rtp_instance *instance)
 	rtp->ice_lite = 1;	/* peer is also lite — irrelevant to us; record only */
 }
 
+static void ast_rtp_ice_set_peer_ice2(struct ast_rtp_instance *instance, int ice2)
+{
+	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
+	rtp->peer_ice2 = ice2 ? 1 : 0;
+}
+
 static void ast_rtp_ice_set_role(struct ast_rtp_instance *instance, enum ast_rtp_ice_role role)
 {
 	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
@@ -1546,6 +1570,7 @@ static struct ast_rtp_engine_ice gabpbx_ice = {
 	.get_local_candidates = ast_rtp_ice_get_local_candidates,
 	.ice_lite = ast_rtp_ice_ice_lite,
 	.set_role = ast_rtp_ice_set_role,
+	.set_peer_ice2 = ast_rtp_ice_set_peer_ice2,
 };
 #endif /* HAVE_OPENSSL */
 
@@ -1642,6 +1667,7 @@ static inline int rtcp_debug_test_addr(struct ast_sockaddr *addr)
 #define ICE_ATTR_USERNAME           0x0006
 #define ICE_ATTR_MESSAGE_INTEGRITY  0x0008
 #define ICE_ATTR_XOR_MAPPED_ADDRESS 0x0020
+#define ICE_ATTR_PRIORITY           0x0024
 #define ICE_ATTR_USE_CANDIDATE      0x0025
 #define ICE_ATTR_FINGERPRINT        0x8028
 #define ICE_FINGERPRINT_XOR         0x5354554eu
@@ -1739,6 +1765,39 @@ static int ice_build_xor_mapped(struct ast_sockaddr *sa, struct ice_stun_hdr *re
 	}
 }
 
+/* Record a source that has just passed MESSAGE-INTEGRITY. Ring, oldest overwritten; duplicates are
+ * not re-added so a steady two-tuple peer never evicts anything. Caller holds the demux ao2_lock. */
+static void ice_remember_tuple(struct ast_rtp *rtp, const struct ast_sockaddr *sa)
+{
+	unsigned int i;
+
+	for (i = 0; i < rtp->n_auth; i++) {
+		if (!ast_sockaddr_cmp(&rtp->auth_tuples[i], sa)) {
+			return;
+		}
+	}
+	ast_sockaddr_copy(&rtp->auth_tuples[rtp->auth_next], sa);
+	rtp->auth_next = (rtp->auth_next + 1) % ARRAY_LEN(rtp->auth_tuples);
+	if (rtp->n_auth < ARRAY_LEN(rtp->auth_tuples)) {
+		rtp->n_auth++;
+	}
+}
+
+/* Has this source ever passed an authenticated check on this instance? The DTLS gate's question:
+ * a peer with several live interfaces sends its ClientHello from one of its tuples while its
+ * checks arrive from another, so gating on the single latest source drops legitimate records. */
+static int ice_tuple_authenticated(const struct ast_rtp *rtp, const struct ast_sockaddr *sa)
+{
+	unsigned int i;
+
+	for (i = 0; i < rtp->n_auth; i++) {
+		if (!ast_sockaddr_cmp(&rtp->auth_tuples[i], sa)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
 /* The responder. Runs LOCKED (demux ao2_lock). Silent-drop on ANY failure. On a valid authenticated
  * check: learn the source as the peer + set the RTP remote address + reply success; on USE-CANDIDATE:
  * mark ice_complete + fire the active DTLS handshake (RFC 8445 §7.3.2 / §8.2). */
@@ -1747,6 +1806,9 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 {
 	struct ice_stun_hdr *h = (struct ice_stun_hdr *) buf;
 	int mlen, off, mi_off = -1, fp_off = -1, has_use_candidate = 0;
+	int moved = 0;	/* did this check actually MOVE the media destination (phase A / nomination) */
+	unsigned int priority = 0;
+	int have_priority = 0;
 	const unsigned char *username = NULL;
 	int username_len = 0;
 	uint8_t calc[20], out[512], xma[20], mi[20];
@@ -1792,6 +1854,15 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 		case ICE_ATTR_FINGERPRINT:
 			if (alen != 4) return;	/* hardening 3 */
 			fp_off = off;
+			break;
+		case ICE_ATTR_PRIORITY:
+			/* RFC 8445 §7.1.1: the controlling agent's priority for the pair being checked. Only
+			 * acted on for the §8.1.1 tie-break below, and only from BEFORE the MESSAGE-INTEGRITY
+			 * (same rule as USE-CANDIDATE: anything after it is unauthenticated). */
+			if (mi_off < 0 && alen == 4) {
+				priority = ntohl(*(uint32_t *)(buf + vstart));
+				have_priority = 1;
+			}
 			break;
 		case ICE_ATTR_USE_CANDIDATE:
 			if (mi_off < 0) {	/* HIGH2: only an authenticated USE-CANDIDATE (before MI) may nominate */
@@ -1847,15 +1918,65 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 	 *    │ a dead 5-tuple → DTLS never completes → DEAF. (b) A PRIORITY non-downgrade guard pins a non-media   │
 	 *    │ candidate for the same reason. KEEP "latest authenticated check wins" (LATCH-ALWAYS). This debug    │
 	 *    │ patch adds ONLY logging below — no datapath change. Use "rtp set debug ice on" to watch the latch.  │
-	 *    └─────────────────────────────────────────────────────────────────────────────────────────────────────┘ */
-	ast_sockaddr_copy(&rtp->ice_peer, sa);
-	ast_rtp_instance_set_remote_address(instance, sa);
+	 *    └─────────────────────────────────────────────────────────────────────────────────────────────────────┘
+	 *    THAT BOX STILL HOLDS FOR PHASE A, and only for phase A. It describes what happens BEFORE any
+	 *    pair is nominated, which is exactly the window it was written about: the DTLS handshake has to
+	 *    be aimed somewhere and RFC 8445 §12.1 permits any valid pair until selected pairs exist. What
+	 *    the box got wrong was applying that to the whole call. Once the controlling agent HAS nominated,
+	 *    §12.1 is a MUST in the other direction — "an agent MUST send data on those pairs only" — and a
+	 *    consent check (RFC 7675) is not a steering command. Field evidence: 20 non-nominating checks
+	 *    moved our transmit off a selected pair in 110 s on one call. */
+	ast_sockaddr_copy(&rtp->ice_peer, sa);	/* latest authenticated source; feeds the DTLS gate */
+	ice_remember_tuple(rtp, sa);		/* RFC 8445 valid LIST, not a single pair */
+	moved = 1;				/* cleared below when phase B declines to move the destination */
+	if (has_use_candidate) {
+		/* RFC 8445 §7.3.2: an accepted USE-CANDIDATE builds the pair with the remote candidate set
+		 * to THIS request's source and nominates it; §8.2 makes it the selected pair. No "first one
+		 * only" clause — every accepted nomination re-selects, which is what a mid-call path change
+		 * looks like on the wire.
+		 *
+		 * §8.1.1 carve-out: "A controlling agent that does not support this specification (i.e., it
+		 * is implemented according to RFC 5245) might nominate more than one candidate pair ... the
+		 * agents MUST produce the selected pairs and use the pairs with the HIGHEST PRIORITY." That
+		 * clause is scoped to a 5245 agent, and a peer that does not advertise ice2 is assumed to be
+		 * one (RFC 8839 §4.2.1.5). For such a peer a nomination that would DOWNGRADE the priority is
+		 * refused; for an ice2 peer every nomination is a deliberate re-selection and wins.
+		 * Observed: one handset nominated two different pairs inside the same second at setup.
+		 * LIMIT, stated because it will matter later: a 5245 peer legitimately moving to a
+		 * lower-priority pair must do it with an ICE restart (§9), which changes ufrag/pwd — and we
+		 * do not yet track credential generations (that is the ufrag-rotation item), so until then
+		 * such a move is refused rather than treated as a new generation. */
+		int downgrade = !rtp->peer_ice2 && rtp->selected_valid && rtp->sel_prio_valid
+			&& have_priority && priority < rtp->sel_priority;
+		if (downgrade) {
+			moved = 0;
+			if (rtpicedebug) {
+				char *p_nom = ast_strdupa(ast_sockaddr_stringify(sa));
+				ast_verbose("ICE-DBG nominate-refused inst=%p rtp=%p src=%s prio=%u < selected_prio=%u (RFC 8445 s8.1.1, peer not ice2)\n",
+					instance, rtp, p_nom, priority, rtp->sel_priority);
+			}
+		} else {
+			ast_sockaddr_copy(&rtp->selected_pair, sa);
+			rtp->selected_valid = 1;
+			if (have_priority) {
+				rtp->sel_priority = priority;
+				rtp->sel_prio_valid = 1;
+			}
+			ast_rtp_instance_set_remote_address(instance, sa);
+		}
+	} else if (!rtp->selected_valid) {
+		/* Phase A: nothing nominated yet, so follow the check (see the box above). */
+		ast_rtp_instance_set_remote_address(instance, sa);
+	} else {
+		/* Phase B: answered (§2.5 requires it) but the destination does NOT move. */
+		moved = 0;
+	}
 	if (rtpicedebug && (!rtp->latch_seen || ast_sockaddr_cmp(&rtp->last_latch, sa))) {
 		/* first latch + every latch SOURCE CHANGE (the tuple port-flap behind the intermittent/fork bugs) */
 		char *p_new = ast_strdupa(ast_sockaddr_stringify(sa));
 		char *p_old = ast_strdupa(ast_sockaddr_stringify(&rtp->last_latch));
-		ast_verbose("ICE-DBG latch inst=%p rtp=%p src=%s old=%s first=%d use_candidate=%d ice_complete=%d dtls_conn=%d dtls_setup=%d\n",
-			instance, rtp, p_new, p_old, !rtp->latch_seen, has_use_candidate, rtp->ice_complete,
+		ast_verbose("ICE-DBG latch inst=%p rtp=%p src=%s old=%s first=%d use_candidate=%d moved=%d ice_complete=%d dtls_conn=%d dtls_setup=%d\n",
+			instance, rtp, p_new, p_old, !rtp->latch_seen, has_use_candidate, moved, rtp->ice_complete,
 			(int)rtp->dtls.connection, (int)rtp->dtls.dtls_setup);
 		ast_sockaddr_copy(&rtp->last_latch, sa);
 		rtp->latch_seen = 1;
@@ -1887,14 +2008,21 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 	/* 7. USE-CANDIDATE → selected pair → ICE complete; fire the active DTLS handshake AFTER the success
 	 *    reply + remote address are set (MED2). dtls_perform_handshake re-locks ao2 (recursive — safe);
 	 *    no-op on the passive side. */
-	if (has_use_candidate && !rtp->ice_complete) {
-		rtp->ice_complete = 1;
-		if (rtpicedebug) {	/* the nominated/selected pair — the first USE-CANDIDATE that completes ICE */
+	/*    The handshake fires on the FIRST nomination only: there is one DTLS association for the life
+	 *    of the call (RFC 5763) and a path change does not re-key it. The SELECTION above is not
+	 *    gated on ice_complete — that is the difference between "ICE has ever completed" and "this
+	 *    is the pair", which the single flag used to conflate and which made re-nomination
+	 *    impossible. */
+	if (has_use_candidate) {
+		if (rtpicedebug) {	/* every nomination, so a mid-call re-selection is visible in the trace */
 			char *p = ast_strdupa(ast_sockaddr_stringify(sa));
-			ast_verbose("ICE-DBG nominate inst=%p rtp=%p selected_pair=%s dtls_conn=%d dtls_setup=%d\n",
-				instance, rtp, p, (int)rtp->dtls.connection, (int)rtp->dtls.dtls_setup);
+			ast_verbose("ICE-DBG nominate inst=%p rtp=%p selected_pair=%s first=%d dtls_conn=%d dtls_setup=%d\n",
+				instance, rtp, p, !rtp->ice_complete, (int)rtp->dtls.connection, (int)rtp->dtls.dtls_setup);
 		}
-		dtls_perform_handshake(instance, rtp);
+		if (!rtp->ice_complete) {
+			rtp->ice_complete = 1;
+			dtls_perform_handshake(instance, rtp);
+		}
 	}
 }
 #endif /* HAVE_OPENSSL */
@@ -1969,13 +2097,24 @@ read_again:
 			 * handshake) on the same authenticated source the DTLS records then come from. When
 			 * ICE is not in use (plain non-WebRTC DTLS, ice_active == 0) the gate is skipped, so
 			 * that path is byte-for-byte unchanged. */
-			int dres;
-			if (rtp->ice_active &&
-				(ast_sockaddr_isnull(&rtp->ice_peer) || ast_sockaddr_cmp(&rtp->ice_peer, sa))) {
+			int dres, authenticated;
+			/* The gate now asks "has this source EVER passed a check on this instance", not "is it
+			 * the latest one". The old single-source form was documented as sufficient for a
+			 * "single-live-tuple model"; the field falsified that premise — one handset presented
+			 * three and four simultaneous authenticated tuples, and its ClientHello arrived from one
+			 * while the latch sat on another, so we dropped it and the handshake only completed on
+			 * retransmission (~3 s of no audio, every inbound call). Every ring entry passed
+			 * MESSAGE-INTEGRITY keyed on our secret ice-pwd, so this is not weaker than before: it is
+			 * the same proof, remembered instead of overwritten. Read under the instance lock (taken
+			 * just below for the record handler) so the ring cannot be observed mid-update. */
+			ao2_lock(instance);
+			authenticated = ice_tuple_authenticated(rtp, sa);
+			ao2_unlock(instance);
+			if (rtp->ice_active && !authenticated) {
 				if (rtpicedebug && (!rtp->dtls_drop_seen || ast_sockaddr_cmp(&rtp->last_dtls_drop, sa))) {
-					/* A DTLS record (rec_first=22 => ClientHello) from a source that is NOT the ICE-latched
-					 * peer is dropped here. If the latch is on the WRONG pair this is exactly why DTLS never
-					 * completes (offerer/fork deaf class). LOG ONLY — the drop behavior is unchanged. */
+					/* A DTLS record (rec_first=22 => ClientHello) from a source that has never passed a
+					 * check is dropped here — the pre-validation DoS gate. A drop now means a genuinely
+					 * unauthenticated source, not merely a different tuple of the same peer. */
 					char *p_src = ast_strdupa(ast_sockaddr_stringify(sa));
 					char *p_peer = ast_strdupa(ast_sockaddr_stringify(&rtp->ice_peer));
 					ast_verbose("ICE-DBG dtls-drop inst=%p rtp=%p rec_first=%u rec_src=%s ice_peer=%s peer_null=%d ice_complete=%d dtls_conn=%d\n",
@@ -4427,7 +4566,18 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 	 * │ source); SRTP auth/replay already rejects forgeries. Never host+port RX filter here. Log, don't drop.│
 	 * └─────────────────────────────────────────────────────────────────────────────────────────────────────┘ */
 	/* If symmetric RTP is enabled see if the remote side is not what we expected and change where we are sending audio */
+	/* ICE outranks RFC 4961 here. Once a pair has been nominated the destination is the selected
+	 * pair (RFC 8445 §12.1) and comedia must not move it: on a peer with two live interfaces the
+	 * idle one carries checks and, occasionally, a stray packet, and following it would undo the
+	 * selection the controlling agent just made. Without ICE (ice_active == 0, the whole non-WebRTC
+	 * estate) nothing changes here — that path stays byte-for-byte as it was, which is chan_sip
+	 * parity and is correct there because nothing else supplies a destination. */
+#ifdef HAVE_OPENSSL
+	if (ast_rtp_instance_get_prop(instance, AST_RTP_PROPERTY_NAT)
+		&& !(rtp->ice_active && rtp->selected_valid)) {
+#else
 	if (ast_rtp_instance_get_prop(instance, AST_RTP_PROPERTY_NAT)) {
+#endif
 		if (ast_sockaddr_cmp(&remote_address, &addr)) {
 			ast_rtp_instance_set_remote_address(instance, &addr);
 			ast_sockaddr_copy(&remote_address, &addr);

@@ -393,6 +393,11 @@ struct ast_rtp_engine_ice {
 	void (*ice_lite)(struct ast_rtp_instance *instance);
 	/*! Change our role in negotiation (we stay CONTROLLED) */
 	void (*set_role)(struct ast_rtp_instance *instance, enum ast_rtp_ice_role role);
+	/*! Tell the engine whether the peer advertised the 'ice2' option (RFC 8445 §10). A peer that
+	 *  does not is assumed to be RFC 5245 (RFC 8839 §4.2.1.5) and may nominate more than one pair
+	 *  ("aggressive nomination"), which RFC 8445 §8.1.1 resolves by PRIORITY. Optional: NULL-check
+	 *  at the call site, like ice_lite. */
+	void (*set_peer_ice2)(struct ast_rtp_instance *instance, int ice2);
 };
 
 /*! \brief DTLS setup types (a=setup:) */

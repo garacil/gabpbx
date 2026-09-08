@@ -752,6 +752,14 @@ struct sofia_pvt {
 	/* Remote DTLS/ICE from the browser ANSWER has been applied to the live
 	 * engine (set-once; guards a re-INVITE/2nd 18x+200 from re-applying). */
 	unsigned int webrtc_answer_applied:1;
+	/* Peer advertised a=ice-options with the ice2 token (RFC 8839 §5.6 / RFC 8445 §10), so it is an
+	 * RFC 8445 agent and uses regular nomination. STICKY for the life of the dialog: a peer can lose
+	 * the attribute on a later offer — some clients truncate a multi-token
+	 * ice-options when it re-serialises SDP, and its hold re-offer therefore arrives without ice2 —
+	 * and re-reading it per body would silently downgrade a live call to the RFC 5245 rules mid-way.
+	 * Absence NEVER rejects or downgrades the media: RFC 8829 §3.5.5 requires accepting descriptions
+	 * without it. It only selects which nomination policy applies (RFC 8445 §8.1.1). */
+	unsigned int peer_ice2:1;
 	/* WebRTC answerer interop (RFC 8829 §5.3.1): values echoed into the WebRTC answer SDP.
 	 * webrtc_mid: offered audio a=mid token (default "0" if the offer omitted it),
 	 *   emitted as m=audio a=mid + the mid inside session a=group:BUNDLE.
