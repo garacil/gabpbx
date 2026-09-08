@@ -291,9 +291,12 @@ struct ast_rtp {
 	 * an ICE restart must keep sending on the previous selected pair (RFC 8839 §4.4.3.2). */
 	struct ast_sockaddr selected_pair;
 	unsigned int selected_valid:1;     /*!< a pair has been nominated; phase B rules apply */
-	unsigned int peer_ice2:1;          /*!< peer advertised ice2, so it uses RFC 8445 regular nomination */
-	unsigned int sel_prio_valid:1;     /*!< sel_priority holds the PRIORITY of the nominating check */
-	unsigned int sel_priority;         /*!< RFC 8445 §8.1.1 tie-break among concurrent nominations */
+	/* Diagnostics only. The peer's ice2 signals RFC 8445 regular nomination rather than RFC 5245
+	 * aggressive nomination, which is a statement about how the PEER nominates. It does NOT gate
+	 * anything here: §7.3.2 and §8.2 give a lite agent one unconditional rule for an accepted
+	 * nomination, with no dependency on the peer's mode. Kept because it belongs in the trace and
+	 * because credential-generation tracking will want it. */
+	unsigned int peer_ice2:1;
 	/* Every source that has passed MESSAGE-INTEGRITY this session (RFC 8445 keeps a valid LIST,
 	 * not a single pair). The DTLS gate accepts a record from any of them: a peer with several
 	 * live interfaces sends its ClientHello from one tuple while its checks arrive from another,
@@ -1925,7 +1928,12 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 	 *    the box got wrong was applying that to the whole call. Once the controlling agent HAS nominated,
 	 *    §12.1 is a MUST in the other direction — "an agent MUST send data on those pairs only" — and a
 	 *    consent check (RFC 7675) is not a steering command. Field evidence: 20 non-nominating checks
-	 *    moved our transmit off a selected pair in 110 s on one call. */
+	 *    moved our transmit off a selected pair in 110 s on one call.
+	 *    Warning (b) of that box, however, HOLDS EVERYWHERE AND WAS RIGHT. A PRIORITY guard was added
+	 *    on top of the phase machine anyway and pinned the media to a dead candidate on the first real
+	 *    handover (2026-09-08): the box predicted the failure mode in one line and the field reproduced
+	 *    it exactly. It is gone; see §7.3.2 "arbitrary priority" at the nomination below for why a lite
+	 *    agent can never have grounds for one. Do not add a third. */
 	ast_sockaddr_copy(&rtp->ice_peer, sa);	/* latest authenticated source; feeds the DTLS gate */
 	ice_remember_tuple(rtp, sa);		/* RFC 8445 valid LIST, not a single pair */
 	moved = 1;				/* cleared below when phase B declines to move the destination */
@@ -1935,35 +1943,31 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 		 * only" clause — every accepted nomination re-selects, which is what a mid-call path change
 		 * looks like on the wire.
 		 *
-		 * §8.1.1 carve-out: "A controlling agent that does not support this specification (i.e., it
-		 * is implemented according to RFC 5245) might nominate more than one candidate pair ... the
-		 * agents MUST produce the selected pairs and use the pairs with the HIGHEST PRIORITY." That
-		 * clause is scoped to a 5245 agent, and a peer that does not advertise ice2 is assumed to be
-		 * one (RFC 8839 §4.2.1.5). For such a peer a nomination that would DOWNGRADE the priority is
-		 * refused; for an ice2 peer every nomination is a deliberate re-selection and wins.
-		 * Observed: one handset nominated two different pairs inside the same second at setup.
-		 * LIMIT, stated because it will matter later: a 5245 peer legitimately moving to a
-		 * lower-priority pair must do it with an ICE restart (§9), which changes ufrag/pwd — and we
-		 * do not yet track credential generations (that is the ufrag-rotation item), so until then
-		 * such a move is refused rather than treated as a new generation. */
-		int downgrade = !rtp->peer_ice2 && rtp->selected_valid && rtp->sel_prio_valid
-			&& have_priority && priority < rtp->sel_priority;
-		if (downgrade) {
-			moved = 0;
-			if (rtpicedebug) {
-				char *p_nom = ast_strdupa(ast_sockaddr_stringify(sa));
-				ast_verbose("ICE-DBG nominate-refused inst=%p rtp=%p src=%s prio=%u < selected_prio=%u (RFC 8445 s8.1.1, peer not ice2)\n",
-					instance, rtp, p_nom, priority, rtp->sel_priority);
-			}
-		} else {
-			ast_sockaddr_copy(&rtp->selected_pair, sa);
-			rtp->selected_valid = 1;
-			if (have_priority) {
-				rtp->sel_priority = priority;
-				rtp->sel_prio_valid = 1;
-			}
-			ast_rtp_instance_set_remote_address(instance, sa);
-		}
+		 * NO PRIORITY TIE-BREAK HERE, and the reason is normative rather than a judgement call.
+		 * §7.3.2 is the section that governs US, and it says the pair built from an accepted
+		 * nomination "is assigned an ARBITRARY PRIORITY and placed into the valid list ... The agent
+		 * sets the nominated flag for that pair to true." A lite agent is told outright that the
+		 * priority of its own pairs is meaningless, so it has nothing to compare against. §8.2
+		 * concludes the same way, with no tie-break at all: "once the lite agent accepts a nomination
+		 * request for a candidate pair, the lite agent considers the pair nominated ... the pairs
+		 * become the selected pairs."
+		 *
+		 * The "use the pairs with the highest priority" MUST of §8.1.1 lives under §8.1, "Procedures
+		 * for FULL Implementations", and compares priorities a full agent actually computed. Applying
+		 * it here was a conformance bug with teeth, field-proven 2026-09-08: a handset whose Wi-Fi
+		 * interface had died re-nominated its cellular pair every 2-3 s for two minutes, every
+		 * nomination was refused because the cellular candidate's priority was lower, and we kept
+		 * transmitting 50 packets a second into the dead interface until the call ended.
+		 *
+		 * Accept-or-reject is also BINARY (§7.3.1.5: "If the controlled agent does not accept the
+		 * request from the controlling agent, the controlled agent MUST reject the nomination request
+		 * with an appropriate error code response (e.g., 400)"). There is no third state that answers
+		 * with a Binding Success while withholding the nominated flag — that tells the peer on the
+		 * wire that its pair was selected when it was not, which is exactly why the refusal was
+		 * invisible from the peer's side except as media that never arrived. */
+		ast_sockaddr_copy(&rtp->selected_pair, sa);
+		rtp->selected_valid = 1;
+		ast_rtp_instance_set_remote_address(instance, sa);
 	} else if (!rtp->selected_valid) {
 		/* Phase A: nothing nominated yet, so follow the check (see the box above). */
 		ast_rtp_instance_set_remote_address(instance, sa);
@@ -2015,9 +2019,15 @@ static void ice_handle_stun(struct ast_rtp_instance *instance, struct ast_rtp *r
 	 *    impossible. */
 	if (has_use_candidate) {
 		if (rtpicedebug) {	/* every nomination, so a mid-call re-selection is visible in the trace */
-			char *p = ast_strdupa(ast_sockaddr_stringify(sa));
-			ast_verbose("ICE-DBG nominate inst=%p rtp=%p selected_pair=%s first=%d dtls_conn=%d dtls_setup=%d\n",
-				instance, rtp, p, !rtp->ice_complete, (int)rtp->dtls.connection, (int)rtp->dtls.dtls_setup);
+			/* Print the pair we ACTUALLY selected, never the request source. Printing `sa` here read
+			 * as an acceptance even when the nomination had just been declined a few lines above, so
+			 * the trace alone said the handover had happened while the wire said the opposite. An
+			 * instrument that reports the input of a decision instead of its outcome cannot show that
+			 * decision going wrong. */
+			char *p = ast_strdupa(ast_sockaddr_stringify(&rtp->selected_pair));
+			ast_verbose("ICE-DBG nominate inst=%p rtp=%p selected_pair=%s prio=%u peer_ice2=%d first=%d dtls_conn=%d dtls_setup=%d\n",
+				instance, rtp, p, have_priority ? priority : 0, rtp->peer_ice2,
+				!rtp->ice_complete, (int)rtp->dtls.connection, (int)rtp->dtls.dtls_setup);
 		}
 		if (!rtp->ice_complete) {
 			rtp->ice_complete = 1;
