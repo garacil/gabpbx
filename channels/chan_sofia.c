@@ -11527,11 +11527,16 @@ static void sofia_emit_subscribe_rejected(sip_t const *sip, const char *peer_nam
 }
 
 /* lockuseragent security gate at REGISTER auth-success (chan_sip parity). When
- * set, locks the peer to a single User-Agent captured at the first successful
- * REGISTER; subsequent REGISTERs with a different UA reject via a 401 silent-
- * challenge (chan_sip AUTH_SECRET_FAILED-equivalent) + an AMI LockUserAgentReject
- * event for NMS UA-spoofing visibility. Called from BOTH sofia_process_register
- * paths (no-secret + auth-OK).
+ * set, only the User-Agents the operator declared may register the peer: the
+ * allowlist is peer->lockuseragent_prefixes (fed by the peer's own useragent
+ * value; realtime column `useragent`), a comma-separated PREFIX list matched
+ * case-insensitively against the inbound User-Agent. An EMPTY allowlist means NO
+ * restriction (chan_sip parity) — there is no capture-on-first-REGISTER anchor;
+ * see the note before the rejection block below for why that anchor was removed.
+ * A User-Agent that matches no prefix rejects via a 401 silent-challenge
+ * (chan_sip AUTH_SECRET_FAILED-equivalent) + an AMI LockUserAgentReject event for
+ * NMS UA-spoofing visibility. Called from BOTH sofia_process_register paths
+ * (no-secret + auth-OK).
  *
  * Returns 0 = PASS (caller continues), -1 = REJECT (401 + AMI already emitted;
  * caller MUST ao2_ref(peer,-1) and return). */
