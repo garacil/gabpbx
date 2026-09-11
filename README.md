@@ -2,6 +2,8 @@
 
 GABPBX is the Germán Aracil Boned PBX: a GPLv2 open-source PBX and telephony toolkit maintained by Germán Luis Aracil Boned <garacilb@gmail.com>.
 
+Website: **<https://gabpbx.org/>** · en español: **<https://gabpbx.org/es/>** · [Releases](https://github.com/garacil/gabpbx/releases) · [Wiki](https://github.com/garacil/gabpbx/wiki)
+
 ---
 
 ## The basics — a fork of Asterisk
