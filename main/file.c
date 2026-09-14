@@ -712,6 +712,15 @@ struct ast_filestream *ast_openvstream(struct ast_channel *chan, const char *fil
 		int fd;
 		const char *fmt;
 
+		/* The loop walks every bit from the first video bit up to the top of the video mask, and
+		 * the audio formats above bit 31 (G.719, SPEEX16, Opus) sit inside that range. Without
+		 * this guard a channel whose native audio format is one of them, playing a file that
+		 * exists in that same format, re-opened the AUDIO file here as a "video stream":
+		 * ast_filehelper(ACTION_OPEN) then closed chan->stream (the audio stream just opened by
+		 * ast_openstream) and ast_streamfile() went on to play a freed filestream (SIGSEGV). */
+		if (!(format & AST_FORMAT_VIDEO_MASK)) {
+			continue;
+		}
 		if (!(chan->nativeformats & format))
 			continue;
 		fmt = ast_getformatname(format);

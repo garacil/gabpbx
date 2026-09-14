@@ -123,7 +123,12 @@ struct ast_filestream {
 	/*! Transparently translate from another format -- just once */
 	struct ast_trans_pvt *trans;
 	struct ast_tranlator_pvt *tr;
-	int lastwriteformat;
+	/*! Format of the last frame handed to ast_writestream(). MUST be format_t: as an int the
+	 * formats above bit 31 (G.719, SPEEX16, Opus) truncated to 0, so the comparison in
+	 * ast_writestream() never matched and the translation path (and every codec state in it)
+	 * was freed and rebuilt on EVERY frame: each Opus packet was decoded as the first packet
+	 * of a stream (wrong level, distortion) in Record/MixMonitor/Monitor and 'file convert'. */
+	format_t lastwriteformat;
 	int lasttimeout;
 	struct ast_channel *owner;
 	FILE *f;
