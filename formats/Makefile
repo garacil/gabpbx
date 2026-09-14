@@ -18,3 +18,9 @@ MENUSELECT_DESCRIPTION=Format Interpreters
 all: _all
 
 include $(ASTTOPDIR)/Makefile.moddir_rules
+
+# format_ogg_opus queries the codec look-ahead (OPUS_GET_LOOKAHEAD) from libopus for the RFC 7845
+# pre-skip; libogg comes from the <depend>ogg</depend> in its MODULEINFO. Same pkg-config pattern as
+# codecs/Makefile uses for codec_opus.
+format_ogg_opus.o: _ASTCFLAGS+=$(shell pkg-config --cflags opus 2>/dev/null)
+format_ogg_opus.so: LIBS+=$(shell pkg-config --libs opus 2>/dev/null)
