@@ -1,3 +1,99 @@
+## 1.9.0 — Ogg Opus file format, and Opus recordings at the right level
+
+An Opus release. GABPBX can now **record, play and convert `.opus` files** — the standard
+Ogg Opus container defined in RFC 7845 — and a recording taken from an Opus call is finally
+**at the right level**: a core defect that had every file write from an Opus (or G.719,
+SPEEX16) source rebuild its decoder on each packet is fixed, together with a latent
+use-after-free in `ast_openvstream()` that the new format made reachable.
+
+### `.opus` files: `format_ogg_opus`
+
+A new file format module, `formats/format_ogg_opus.c`, implements the Ogg encapsulation of
+Opus (RFC 7845) under the extension the RFC recommends, `.opus` (§9). It hands the core
+**native Opus packets** (`AST_FORMAT_OPUS` frames), exactly as `format_g729` does for
+G.729, and the codec translators do the rest:
+
+- `Record()`, `MixMonitor()` and `Monitor()` on an Opus leg store the packets **verbatim** —
+  no decode, no re-encode — so the file is a faithful capture of what arrived on the wire;
+- any other source (`file convert prompt.alaw prompt.opus`, a recording taken on a G.711
+  leg) goes through `codec_opus` once;
+- `Playback()` of a `.opus` prompt to an Opus endpoint is a **passthrough** — the packets
+  leave as they are, with no transcoder on the channel — and to any other endpoint the core
+  builds `opus → slin → codec` as it would for any file format.
+
+What is written follows the RFC clause by clause: the identification header alone on the
+beginning-of-stream page and the comment header finishing the page it completes on (§3);
+one Opus packet per Ogg packet; a granule position that counts 48 kHz samples of the
+packets completed so far and is never advanced by anything else (§4, §4.1); `OpusHead`
+with version 1, one output channel, input sample rate 0 ("unspecified"), output gain 0 and
+channel mapping family 0 (§5.1); `OpusTags` carrying the vendor string plus `ENCODER` and
+`COMMENT` tags (§5.2); and an end-of-stream page **always** — the comment header is
+emitted lazily and the last audio packet is held back one step so it can carry the flag,
+so even an empty recording is a well-formed stream (RFC 3533). The **pre-skip** (§4.2, §7)
+is the codec look-ahead reported by libopus itself through `OPUS_GET_LOOKAHEAD`, queried
+when the module loads rather than hard-coded, as the libopus documentation asks (312
+samples with libopus 1.5.2). Files pass Xiph's `opusinfo` with no warnings and decode with
+`opusdec` to within 0.1 dB of the source.
+
+On reading, every header field is bounds-checked before it is used (§8). Channel mapping
+family 0, or family 1 with a single Opus stream, is accepted — a multi-stream file cannot
+be passed through as Opus frames and is rejected with a clear message — zero-octet
+packets (§3) and packets above 7,680 octets (§6) are skipped, and packet durations come
+from the TOC sequence (RFC 6716 §3.1). Seeking counts 48 kHz samples and lands on packet
+boundaries. A non-zero output gain or pre-skip found in a file is reported and left to the
+far-end decoder: opaque packets can be neither scaled nor cropped.
+
+Build and run time: the module needs **libogg** besides libopus — `libogg-dev` to build
+(`./configure` must report `OGG=1`, or the module is silently left out of the build) and
+`libogg0` at run time. With `autoload=no`, add `load => format_ogg_opus.so` to
+`modules.conf`. The module registers as `opus  ogg_opus  opus` in `core show file formats`.
+
+### A recording from an Opus call is now at the right level
+
+Recording from an Opus leg — `Record()`, `MixMonitor()`, `Monitor()`, or a `file convert`
+from a `.opus` source — produced audio at the wrong level and audibly distorted. Measured
+against one and the same −15 dB input, a recording to A-law or µ-law came out at
+**−26 dB**, to GSM at **−14 dB** and to G.729 at **−4.5 dB**, clipping. Live calls were
+fine, which is why this went unnoticed: the bridge transcodes through the channel's read
+translator, and that path was never affected.
+
+The cause is a 32-bit field. `struct ast_filestream.lastwriteformat` was an `int`, while
+formats are 64-bit masks and Opus is bit 34 (G.719 and SPEEX16 are bits 32 and 33).
+Storing the format there truncated it to 0, so the test in `ast_writestream()` that decides
+whether the translation path built for the previous frame can be reused never matched,
+and the path — the Opus decoder **and** the destination encoder — was freed and rebuilt
+for **every 20 ms packet**. Each packet was decoded by a brand-new decoder with no history,
+as the first packet of a stream, over and over; the resulting level depended on the
+destination because that encoder was reborn each frame too. The field is now `format_t`.
+
+The diagnosis was made from the source and confirmed on the running PBX: the same packets
+captured verbatim with the new format decode correctly with Xiph's `opusdec` (−15.2 dB);
+`file convert` of that very capture reproduced the defect offline, with no real-time
+component involved; and a debugger attached to the live process showed a decoder being
+created before every single `opus_decode()` call. After the fix the capture, its offline
+conversions to A-law, µ-law, G.729, GSM and slin, and live recordings all measure −15.2 dB.
+
+### `ast_openvstream()` no longer closes the audio stream it was not asked about
+
+`ast_streamfile()` opens the audio stream and then calls `ast_openvstream()` to look for a
+video file of the same name. That function walked every format bit from the first video
+bit up to the top of the video mask — and with this tree's mask that range runs through the
+audio formats above bit 31. A channel whose native audio format is Opus, playing a prompt
+that exists as `.opus`, had the **audio** file re-opened there as a "video stream";
+`ast_filehelper()` then closed `chan->stream` — the audio stream `ast_streamfile()` was
+about to play — and playback went on with a freed filestream (SIGSEGV in `fread()`). The
+loop now skips non-video bits. The defect was latent for any format above bit 31 that has a
+file format module (a G.719-native channel playing a `.g719` prompt would have crashed the
+same way); the Opus format made it reachable.
+
+### Compatibility
+
+`struct ast_filestream` changed layout (`lastwriteformat` grew to 64 bits), so **every
+module that touches a filestream must be rebuilt** with this release — a normal
+`./configure && make && make install` does that; do not mix 1.8.x format modules with a
+1.9.0 core. Behaviour for all formats below bit 32 is unchanged. Nothing changes on the
+SIP wire.
+
 ## 1.8.2 — mid-call network mobility: a handset that changes network keeps the call
 
 An ICE conformance release. A WebRTC client that moves between networks mid-call —
