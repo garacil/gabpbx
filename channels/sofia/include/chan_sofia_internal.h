@@ -952,7 +952,6 @@ struct sofia_peer {
 	struct timeval last_qualify;
 	nua_handle_t *qualify_nh;
 	int is_realtime;
-	char sha256name[65];       /* voip_sip_conf.sha256name cache: SHA256(systemname.name) hex (64+NUL). Captured on realtime build; used by fill_sha256name to detect empty/stale and refresh. */
 		int is_register_line;
 	/* Transient flag used only by sofia_reload_worker for mark-and-sweep
 	 * (chan_sofia.c sofia_peer_mark_cb / sofia_peer_sweep_cb). Set/cleared
@@ -1235,7 +1234,6 @@ struct sofia_config {
 	int subscribe_network_change_event; /* parse-compatibility only (sofia-sip sres_resolver + dnsmgr absorb network-change rebinding); default 1 (chan_sip) */
 	int rtsave_sysname;        /* 1 = include regserver=AST_SYSTEM_NAME in realtime writes (multi-server deployments). Restores canonical Asterisk behavior (active chan_sip fork dropped it). Default 0. */
 	int peer_rtupdate;         /* 1 = propagate registration changes to realtime DB (ast_update_realtime); default 1. rtupdate=no skips ALL realtime writes (cached-realtime, avoids churn). */
-	int fill_sha256name;       /* 1 = on realtime peer build, persist SHA256(systemname.name) into voip_sip_conf.sha256name (presence identity token) when empty or stale; default 0 (OFF). Realtime peers only. */
 	/* --- Mobile push wake-up ([general] push*; sofia_push.c). All sip-reload-safe. --- */
 	int push_enabled;          /* push=yes master enable; default 0 = feature fully off (no capture, no park) */
 	char push_scripts[256];    /* sender scripts dir (send_push.py / send_push_voip.py), default /etc/gabpbx/push */

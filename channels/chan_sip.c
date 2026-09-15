@@ -237,7 +237,6 @@ GABPBX_FILE_VERSION(__FILE__, "$Revision: 384162 $")
 #include <sys/signal.h>
 #include <regex.h>
 #include <inttypes.h>
-#include <openssl/sha.h>	/* SHA256() for the sha256name presence identity token (chan_sofia parity); resolved via already-loaded libcrypto, same as chan_sofia */
 
 #include "gabpbx/network.h"
 #include "gabpbx/paths.h"	/* need ast_config_AST_SYSTEM_NAME */
@@ -721,46 +720,6 @@ static unsigned int default_primary_transport;     /*!< Default primary Transpor
 static struct sip_settings sip_cfg;		/*!< SIP configuration data.
 					\note in the future we could have multiple of these (per domain, per device group etc) */
 
-/* === sha256name presence identity token (chan_sofia parity) ==================
- * SHA-256 -> 64 lowercase hex. libcrypto's SHA256(); the core SHA256* symbols are
- * resolved at load time against the already-loaded libcrypto (res_crypto), exactly
- * as chan_sofia does (no Makefile link flag needed). */
-static void sip_sha256_hash(char *out_buf, const char *input)
-{
-	unsigned char digest[SHA256_DIGEST_LENGTH];
-	SHA256((const unsigned char *)input, strlen(input), digest);
-	for (size_t i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-		snprintf(out_buf + (i * 2), 3, "%02x", digest[i]);
-	}
-}
-
-/* Effective presence identity token for AMI emission: the peer's stored/forced sha256name if set,
- * else SHA256(systemname + '.' + name) computed on the fly when fill_sha256name is enabled. Empty
- * string when the flag is off and none is set. Writes into buf (>= 65) and returns it. Read-only on
- * the peer, so it is safe to call unlocked. Mirrors chan_sofia's sofia_peer_effective_sha256name. */
-static const char *sip_peer_effective_sha256name(struct sip_peer *peer, char *buf, size_t buflen)
-{
-	buf[0] = '\0';
-	if (!peer) {
-		return buf;
-	}
-	if (!ast_strlen_zero(peer->sha256name)) {
-		ast_copy_string(buf, peer->sha256name, buflen);
-		return buf;
-	}
-	if (sip_cfg.fill_sha256name && !ast_strlen_zero(peer->name)) {
-		const char *sysname = ast_config_AST_SYSTEM_NAME;
-		char *input = NULL;
-		if (!ast_strlen_zero(sysname)
-				&& ast_asprintf(&input, "%s.%s", sysname, peer->name) >= 0 && input) {
-			char computed[65];
-			sip_sha256_hash(computed, input);
-			ast_copy_string(buf, computed, buflen);
-		}
-		ast_free(input);   /* ast_free(NULL) is a no-op on the asprintf-failure path */
-	}
-	return buf;
-}
 
 /*!< use this macro when ast_uri_decode is dependent on pedantic checking to be on. */
 #define SIP_PEDANTIC_DECODE(str)	\
@@ -5651,26 +5610,6 @@ static struct sip_peer *realtime_peer(const char *newpeername, struct ast_sockad
 		goto cleanup;
 	}
 
-	/* fill_sha256name (optional, default OFF): persist SHA256(systemname + '.' + name) into
-	 * the sippeers realtime sha256name column (the presence identity token) ONLY WHEN the column is EMPTY. A value
-	 * already set — a manually FORCED token or a prior fill — is authoritative and never overwritten.
-	 * Realtime peers only (this is the realtime build path). Mirrors chan_sofia's realtime fill. */
-	if (sip_cfg.fill_sha256name && !ast_strlen_zero(peer->name)
-			&& ast_strlen_zero(peer->sha256name)) {
-		const char *sysname = ast_config_AST_SYSTEM_NAME;
-		if (!ast_strlen_zero(sysname)) {
-			char *input = NULL;
-			if (ast_asprintf(&input, "%s.%s", sysname, peer->name) >= 0 && input) {
-				char computed[65];
-				sip_sha256_hash(computed, input);
-				ast_update_realtime("sippeers", "name", peer->name,
-					"sha256name", computed, SENTINEL);
-				ast_string_field_set(peer, sha256name, computed);
-			}
-			ast_free(input);   /* ast_free(NULL) is a no-op on the asprintf-failure path */
-		}
-	}
-
         // germanico dynamic hints
 	struct ast_context *hintcontext = NULL;
 	char hintsip[AST_MAX_EXTENSION+5] = "";
@@ -6651,7 +6590,6 @@ void __sip_destroy(struct sip_pvt *p, int lockowner, int lockdialoglist)
 static int update_call_counter(struct sip_pvt *fup, int event)
 {
 	char name[256];
-	char sha256buf[65];	/* presence token: emit SHA256Name on every PeerStatus */
 	int *inuse = NULL, *call_limit = NULL, *inringing = NULL;
 	int outgoing = fup->outgoing_call;
 	struct sip_peer *p = NULL;
@@ -6737,7 +6675,6 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 			"ActiveCalls: %d\r\n"
 			"RingingCalls: %d\r\n"
 			"CallLimit: %d\r\n"
-			"SHA256Name: %s\r\n"
 			"Event: DEC_CALL_LIMIT\r\n",
 			p->name,
 			ast_sockaddr_stringify(&p->addr),
@@ -6745,8 +6682,7 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 			p->accountcode,
 			*inuse,
 			*inringing,
-			*call_limit,
-			sip_peer_effective_sha256name(p, sha256buf, sizeof(sha256buf)));
+			*call_limit);
 
 		if (sipdebug)
 			ast_debug(2, "Call %s %s '%s' removed from call limit %d\n", outgoing ? "to" : "from", "peer", name, *call_limit);
@@ -6770,7 +6706,6 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 					"ActiveCalls: %d\r\n"
 					"RingingCalls: %d\r\n"
 					"CallLimit: %d\r\n"
-					"SHA256Name: %s\r\n"
 					"Event: CALL_REJECTED\r\n",
 					p->name,
 					ast_sockaddr_stringify(&p->addr),
@@ -6778,8 +6713,7 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 					p->accountcode,
 					*inuse,
 					*inringing,
-					*call_limit,
-					sip_peer_effective_sha256name(p, sha256buf, sizeof(sha256buf)));
+					*call_limit);
 
 				unref_peer(p, "update_call_counter: unref peer p, call limit exceeded");
 				return -1;
@@ -6817,7 +6751,6 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 			"ActiveCalls: %d\r\n"
 			"RingingCalls: %d\r\n"
 			"CallLimit: %d\r\n"
-			"SHA256Name: %s\r\n"
 			"Event: %s\r\n",
 			p->name,
 			ast_sockaddr_stringify(&p->addr),
@@ -6826,7 +6759,6 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 			*inuse,
 			*inringing,
 			*call_limit,
-			sip_peer_effective_sha256name(p, sha256buf, sizeof(sha256buf)),
 			event == INC_CALL_RINGING ? "INC_CALL_RINGING" : "INC_CALL_LIMIT");
 
 		if (sipdebug) {
@@ -6858,7 +6790,6 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 				"ActiveCalls: %d\r\n"
 				"RingingCalls: %d\r\n"
 				"CallLimit: %d\r\n"
-				"SHA256Name: %s\r\n"
 				"Event: DEC_CALL_RINGING\r\n",
 				p->name,
 				ast_sockaddr_stringify(&p->addr),
@@ -6866,8 +6797,7 @@ static int update_call_counter(struct sip_pvt *fup, int event)
 				p->accountcode,
 				*inuse,
 				*inringing,
-				*call_limit,
-				sip_peer_effective_sha256name(p, sha256buf, sizeof(sha256buf)));
+				*call_limit);
 		}
 		break;
 
@@ -14737,10 +14667,7 @@ static int expire_register(const void *data)
 		peer->socket.tcptls_session = NULL;
 	}
 
-	{
-		char sha256buf[65];
-		manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Unregistered\r\nCause: Expired\r\nSHA256Name: %s\r\n", peer->name, sip_peer_effective_sha256name(peer, sha256buf, sizeof(sha256buf)));
-	}
+	manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Unregistered\r\nCause: Expired\r\n", peer->name);
 	register_peer_exten(peer, FALSE);	/* Remove regexten */
 	ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
 
@@ -15164,11 +15091,8 @@ static enum parse_register_result parse_register_contact(struct sip_pvt *pvt, st
 	/* We might not immediately be able to reconnect via TCP, but try caching it anyhow */
 	if (!peer->rt_fromcontact || !sip_cfg.peer_rtupdate)
 		ast_db_put("SIP/Registry", peer->name, data);
-	{
-		char sha256buf[65];
-		manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Registered\r\nExpire: %ld\r\nAddress: %s\r\nRegContact: %s\r\nUserAgent: %s\r\nContext: %s\r\nAccountcode: %s\r\nSHA256Name: %s\r\n",
-			peer->name,  (long)expire, ast_sockaddr_stringify(&peer->addr), peer->fullcontact, peer->useragent, peer->context, peer->accountcode, sip_peer_effective_sha256name(peer, sha256buf, sizeof(sha256buf)));
-	}
+	manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Registered\r\nExpire: %ld\r\nAddress: %s\r\nRegContact: %s\r\nUserAgent: %s\r\nContext: %s\r\nAccountcode: %s\r\n",
+		peer->name,  (long)expire, ast_sockaddr_stringify(&peer->addr), peer->fullcontact, peer->useragent, peer->context, peer->accountcode);
 
 	/* Is this a new IP address for us? */
 	if (VERBOSITY_ATLEAST(2) && ast_sockaddr_cmp(&peer->addr, &oldsin)) {
@@ -15802,7 +15726,6 @@ static enum check_auth_result register_verify(struct sip_pvt *p, struct ast_sock
 	enum check_auth_result res = AUTH_NOT_FOUND;
 	struct sip_peer *peer;
 	char tmp[256];
-	char sha256buf[65];	/* presence token for the Registered emit */
 	char *c, *name, *unused_password, *domain;
 	char *uri2 = ast_strdupa(uri);
 	int send_mwi = 0;
@@ -15987,8 +15910,8 @@ static enum check_auth_result register_verify(struct sip_pvt *p, struct ast_sock
 /*				manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Registered\r\nAddress: %s\r\nContext: %s\r\nAccountcode: %s\r\n",
 								peer->name,  ast_sockaddr_stringify(&peer->addr), peer->context, peer->accountcode);
 */
-				manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Registered\r\nExpire: %ld\r\nAddress: %s\r\nRegContact: %s\r\nUserAgent: %s\r\nContext: %s\r\nAccountcode: %s\r\nSHA256Name: %s\r\n",
-						                peer->name,  ast_sched_when(sched, peer->expire), ast_sockaddr_stringify(&peer->addr), peer->fullcontact, peer->useragent, peer->context, peer->accountcode, sip_peer_effective_sha256name(peer, sha256buf, sizeof(sha256buf)));
+				manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Registered\r\nExpire: %ld\r\nAddress: %s\r\nRegContact: %s\r\nUserAgent: %s\r\nContext: %s\r\nAccountcode: %s\r\n",
+						                peer->name,  ast_sched_when(sched, peer->expire), ast_sockaddr_stringify(&peer->addr), peer->fullcontact, peer->useragent, peer->context, peer->accountcode);
 
 				send_mwi = 1;
 				res = 0;
@@ -22179,12 +22102,9 @@ static void handle_response_peerpoke(struct sip_pvt *p, int resp, struct sip_req
 			ast_update_realtime(ast_check_realtime("sipregs") ? "sipregs" : "sippeers", "name", peer->name, "lastms", str_lastms, SENTINEL);
 		}
 */
-		{
-			char sha256buf[65];	/* carry the presence fields so a qualify-only static-IP peer is not mis-scoped void:void / token-less */
-			manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
-				"ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: %s\r\nTime: %d\r\nAddress: %s\r\nContext: %s\r\nAccountcode: %s\r\nSHA256Name: %s\r\n",
-				peer->name, s, pingtime, ast_sockaddr_stringify(&peer->addr), peer->context, peer->accountcode, sip_peer_effective_sha256name(peer, sha256buf, sizeof(sha256buf)));
-		}
+		manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
+			"ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: %s\r\nTime: %d\r\nAddress: %s\r\nContext: %s\r\nAccountcode: %s\r\n",
+			peer->name, s, pingtime, ast_sockaddr_stringify(&peer->addr), peer->context, peer->accountcode);
 		if (is_reachable && sip_cfg.regextenonqualify)
 			register_peer_exten(peer, TRUE);
 	}
@@ -27664,10 +27584,7 @@ static int sip_poke_noanswer(const void *data)
 			ast_update_realtime(ast_check_realtime("sipregs") ? "sipregs" : "sippeers", "name", peer->name, "lastms", "-1", SENTINEL);
 		}
 */
-		{
-			char sha256buf[65];	/* carry the presence fields (see qualify Reachable emit) */
-			manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Unreachable\r\nTime: %d\r\nAddress: %s\r\nContext: %s\r\nAccountcode: %s\r\nSHA256Name: %s\r\n", peer->name, -1, ast_sockaddr_stringify(&peer->addr), peer->context, peer->accountcode, sip_peer_effective_sha256name(peer, sha256buf, sizeof(sha256buf)));
-		}
+		manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Unreachable\r\nTime: %d\r\nAddress: %s\r\nContext: %s\r\nAccountcode: %s\r\n", peer->name, -1, ast_sockaddr_stringify(&peer->addr), peer->context, peer->accountcode);
 		if (sip_cfg.regextenonqualify) {
 			register_peer_exten(peer, FALSE);
 		}
@@ -28814,11 +28731,6 @@ static struct sip_peer *build_peer(const char *name, struct ast_variable *v, str
 			} else if (realtime && !strcasecmp(v->name, "sipserver")) {
 				ast_string_field_set(peer, sipserver, v->value);
 
-			} else if (!strcasecmp(v->name, "sha256name")) {
-				/* Presence identity token cache (the sippeers realtime sha256name column). A FORCED value or a
-				 * prior fill is authoritative; captured so the realtime fill can detect empty/stale.
-				 * No realtime guard: fires for both config and realtime var lists. */
-				ast_string_field_set(peer, sha256name, v->value);
 
 			} else if (!strcasecmp(v->name, "type")) {
 				if (!strcasecmp(v->value, "peer")) {
@@ -29578,7 +29490,6 @@ static int reload_config(enum channelreloadreason reason)
 	ast_set_flag(&global_flags[1], SIP_PAGE2_ALLOWSUBSCRIBE);	/* Default for all devices: TRUE */
 	ast_set_flag(&global_flags[1], SIP_PAGE2_ALLOWOVERLAP_YES);	/* Default for all devices: Yes */
 	sip_cfg.peer_rtupdate = TRUE;
-	sip_cfg.fill_sha256name = 1;	/* Realtime sha256name fill: default ON (operator: fill by default) — chan_sofia parity */
 	global_dynamic_exclude_static = 0;	/* Exclude static peers */
 	sip_cfg.tcp_enabled = FALSE;
 
@@ -29692,10 +29603,6 @@ static int reload_config(enum channelreloadreason reason)
 			sip_cfg.rtsave_sysname = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "rtupdate")) {
 			sip_cfg.peer_rtupdate = ast_true(v->value);
-		} else if (!strcasecmp(v->name, "fill_sha256name") || !strcasecmp(v->name, "fillsha256name")) {
-			/* On realtime peer build, persist SHA256(systemname.name) into the sippeers realtime sha256name column
-			 * when empty or stale (realtime_peer). Default OFF. chan_sofia parity. */
-			sip_cfg.fill_sha256name = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "ignoreregexpire")) {
 			sip_cfg.ignore_regexpire = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "timert1")) {
