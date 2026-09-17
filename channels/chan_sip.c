@@ -14647,11 +14647,12 @@ static void set_socket_transport(struct sip_socket *socket, int transport)
 	}
 }
 
-/*! \brief Expire registration of SIP peer */
-static int expire_register(const void *data)
+/*! \brief Remove the registration of a SIP peer.
+ * \param cause goes into PeerStatus Unregistered, with the same words chan_sofia uses: "Expired" when the
+ * registration really lapsed (the scheduler), "Unregister" / "Wildcard" for an explicit un-REGISTER and "CLI"
+ * for sip unregister. They all used to say "Expired", so a real expiry could not be told apart. */
+static int expire_register_cause(struct sip_peer *peer, const char *cause)
 {
-	struct sip_peer *peer = (struct sip_peer *)data;
-
 	if (!peer) {		/* Hmmm. We have no peer. Weird. */
 		return 0;
 	}
@@ -14667,11 +14668,12 @@ static int expire_register(const void *data)
 		peer->socket.tcptls_session = NULL;
 	}
 
-	manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Unregistered\r\nCause: Expired\r\n"
+	manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Unregistered\r\nCause: %s\r\n"
 		"Address: %s\r\n"
 		"Context: %s\r\n"
 		"Accountcode: %s\r\n",
 		peer->name,
+		cause,
 		ast_sockaddr_stringify(&peer->addr),
 		peer->context,
 		peer->accountcode);
@@ -14702,6 +14704,12 @@ static int expire_register(const void *data)
 	unref_peer(peer, "removing peer ref for expire_register");
 
 	return 0;
+}
+
+/*! \brief Scheduler callback: the registration really lapsed */
+static int expire_register(const void *data)
+{
+	return expire_register_cause((struct sip_peer *) data, "Expired");
 }
 
 /*! \brief Poke peer (send qualify to check if peer is alive and well) */
@@ -14977,7 +14985,8 @@ static enum parse_register_result parse_register_contact(struct sip_pvt *pvt, st
 		AST_SCHED_DEL_UNREF(sched, peer->expire,
 				unref_peer(peer, "remove register expire ref"));
 		ast_verb(3, "Unregistered SIP '%s'\n", peer->name);
-		expire_register(ref_peer(peer,"add ref for explicit expire_register"));
+		expire_register_cause(ref_peer(peer,"add ref for explicit expire_register"),
+			!strcasecmp(curi, "*") ? "Wildcard" : "Unregister");
 		return PARSE_REGISTER_UPDATE;
 	}
 
@@ -19101,7 +19110,7 @@ static char *sip_unregister(struct ast_cli_entry *e, int cmd, struct ast_cli_arg
 		if (peer->expire > 0) {
 			AST_SCHED_DEL_UNREF(sched, peer->expire,
 				unref_peer(peer, "remove register expire ref"));
-			expire_register(ref_peer(peer, "ref for expire_register"));
+			expire_register_cause(ref_peer(peer, "ref for expire_register"), "CLI");
 			ast_cli(a->fd, "Unregistered peer \'%s\'\n\n", a->argv[2]);
 		} else {
 			ast_cli(a->fd, "Peer %s not registered\n", a->argv[2]);
