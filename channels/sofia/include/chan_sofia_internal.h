@@ -423,6 +423,7 @@ struct sofia_register_update {
 	int emit_unregister;
 	const char *unregister_cause;	/* string literal: "Wildcard" / "Expired" / "CLI" (sip unregister) */
 	char changed_uri[256];
+	char changed_instance[128];	/* +sip.instance of the contact in changed_uri, "" when the phone sent none */
 	struct ast_sockaddr old_src;
 	struct ast_sockaddr new_src;
 	struct ast_sockaddr changed_old_src;
@@ -629,6 +630,11 @@ struct sofia_pvt {
 	int is_fork_child;               /* 1 = this pvt is a fork child leg */
 	char fork_branch_id[SOFIA_FORK_ID_LEN];
 	struct sofia_contact *active_contact;  /* contact this call is on (holds ao2 ref) */
+	/* Identity of the device this call is on, copied from active_contact when it is set so the AMI emits can read
+	 * it without touching the contact: full Contact URI and RFC 5626 +sip.instance. "" = no single device (a
+	 * multi-device ring before anyone answers). Written and read under ao2_lock(pvt), used as a LEAF lock. */
+	char dev_contact[256];
+	char dev_instance[128];
 	struct ast_sockaddr redirip;     /* directmedia: peer's RTP target; zero = relay through PBX */
 	int reinvite_pending;            /* an in-dialog re-INVITE we sent is in flight; gates the response handler + glare */
 	int reinvite_purpose;            /* why reinvite_pending is set (sofia_reinvite_purpose): NONE/DIRECTMEDIA/T38/LOCAL_HOLD — the 2xx/reject handler branches on this so a hold re-INVITE does NOT run the directmedia redirip/T.38 rollback */

@@ -542,11 +542,19 @@ void sofia_pvt_set_active_contact(struct sofia_pvt *pvt, struct sofia_contact *c
 			pvt->callid ? pvt->callid : "unknown");
 		return;
 	}
+	char uri[256], inst[128];
 	pvt->active_contact = contact;
 	ao2_ref(contact, +1);
 	ao2_lock(contact);
 	contact->active_calls++;
+	ast_copy_string(uri, contact->contact_uri, sizeof(uri));
+	ast_copy_string(inst, contact->instance_id, sizeof(inst));
 	ao2_unlock(contact);
+	/* Device identity for the AMI emits. ao2_lock(pvt) is a leaf: nothing else is taken while it is held. */
+	ao2_lock(pvt);
+	ast_copy_string(pvt->dev_contact, uri, sizeof(pvt->dev_contact));
+	ast_copy_string(pvt->dev_instance, inst, sizeof(pvt->dev_instance));
+	ao2_unlock(pvt);
 }
 
 static void sofia_pvt_clear_active_contact(struct sofia_pvt *pvt)
@@ -560,6 +568,24 @@ static void sofia_pvt_clear_active_contact(struct sofia_pvt *pvt)
 	ao2_unlock(contact);
 	ao2_ref(contact, -1);
 	pvt->active_contact = NULL;
+	ao2_lock(pvt);
+	pvt->dev_contact[0] = '\0';
+	pvt->dev_instance[0] = '\0';
+	ao2_unlock(pvt);
+}
+
+/* Device this call is on, for the AMI emits: "" / "" when it has no single device. */
+static void sofia_pvt_device_snapshot(struct sofia_pvt *pvt, char *uri, size_t urilen, char *inst, size_t instlen)
+{
+	uri[0] = '\0';
+	inst[0] = '\0';
+	if (!pvt) {
+		return;
+	}
+	ao2_lock(pvt);
+	ast_copy_string(uri, pvt->dev_contact, urilen);
+	ast_copy_string(inst, pvt->dev_instance, instlen);
+	ao2_unlock(pvt);
 }
 
 const char *sofia_uri_format_host(const char *host, char *out_buf, size_t out_len);
@@ -2574,8 +2600,6 @@ static void sofia_pvt_destructor(void *obj)
 	 * hook is idempotent and a no-op when nothing is pending. */
 	sofia_transfer_cleanup(pvt);
 
-	sofia_pvt_clear_active_contact(pvt);
-
 	/* Catchall call-counter DEC for orphaned pvts (flag-gated idempotency). Must run
 	 * BEFORE the peer ao2_ref drop — the counter helper needs pvt->peer.
 	 * hold_inc_done/hold_state are included so a pvt hung up WHILE ON HOLD whose inUse was already
@@ -2588,6 +2612,10 @@ static void sofia_pvt_destructor(void *obj)
 			sofia_update_call_counter(pvt, SOFIA_DEC_CALL_LIMIT);
 		}
 	}
+
+	/* AFTER the catchall DECs above: their PeerStatus names the device the call was on, and that is read
+	 * from the active contact. Releasing it first left those last events without a device. */
+	sofia_pvt_clear_active_contact(pvt);
 
 	if (pvt->peer) {
 		ao2_ref(pvt->peer, -1);
@@ -8522,6 +8550,18 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		}
 	}
 
+	/* Set active contact by matching source addr to peer contacts. BEFORE the call counter, so its
+	 * PeerStatus already says which device is calling. A rejected call drops it in the pvt destructor. */
+	if (pvt->peer) {
+		struct ast_sockaddr src;
+		sofia_get_source_addr(sip, &src);
+		struct sofia_contact *contact = sofia_peer_find_contact_by_addr(pvt->peer, &src);
+		if (contact) {
+			sofia_pvt_set_active_contact(pvt, contact);
+			ao2_ref(contact, -1);
+		}
+	}
+
 	/* Inbound call-limit enforcement → 480. The reason text trailing space is
 	 * VERBATIM (operator scripts pattern-match it). pvt not yet in dialogs → only
 	 * the ao2_ref drop on reject (destructor DEC is a no-op, call_inc_done=0). */
@@ -8633,16 +8673,6 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 
 	nua_handle_bind(nh, pvt);
 
-	/* Set active contact by matching source addr to peer contacts. */
-	if (pvt->peer) {
-		struct ast_sockaddr src;
-		sofia_get_source_addr(sip, &src);
-		struct sofia_contact *contact = sofia_peer_find_contact_by_addr(pvt->peer, &src);
-		if (contact) {
-			sofia_pvt_set_active_contact(pvt, contact);
-			ao2_ref(contact, -1);
-		}
-	}
 
 	/* No explicit 100 Trying here: the SIP stack's transaction layer already auto-sends one the instant
 	 * the INVITE server transaction is created (immediate), so a manual nua_respond(SIP_100_TRYING) only
@@ -9601,6 +9631,11 @@ static void sofia_deregister_one_contact(struct sofia_peer *peer, sip_t const *s
 		if (update) {
 			update->contacts_removed++;
 			sofia_register_update_set_uri(update, uri);
+			if (ast_strlen_zero(update->changed_instance)) {
+				ao2_lock(c);	/* peer->lock -> contact lock */
+				ast_copy_string(update->changed_instance, c->instance_id, sizeof(update->changed_instance));
+				ao2_unlock(c);
+			}
 		}
 		ao2_unlink(peer->contacts, c);	/* by OBJECT: a rotated de-register's matched key differs from `uri` */
 		if (sofia_debug)
@@ -11846,11 +11881,15 @@ void sofia_emit_register_side_effects(struct sofia_peer *peer, sip_t const *sip,
 			"PeerStatus: Unregistered\r\n"
 			"Cause: %s\r\n"
 			"Address: %s\r\n"
+			"RegContact: %s\r\n"
+			"InstanceId: %s\r\n"
 			"Context: %s\r\n"
 			"Accountcode: %s\r\n",
 			peer->name,
 			update->unregister_cause ? update->unregister_cause : "Unregister",
 			ast_sockaddr_isnull(&update->new_src) ? "" : ast_sockaddr_stringify(&update->new_src),
+			update->changed_uri,	/* the contact that went away; "*" for a wildcard, "" when the cause is not a REGISTER */
+			update->changed_instance,
 			peer->context,
 			peer->accountcode);
 		ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
@@ -13192,6 +13231,8 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		int inUse_snap, inRinging_snap;
 		int rejected = 0;
 
+		char l_dev_contact[256], l_dev_instance[128];	/* the device this call is on; "" when there is no single one */
+		sofia_pvt_device_snapshot(pvt, l_dev_contact, sizeof(l_dev_contact), l_dev_instance, sizeof(l_dev_instance));
 		ast_mutex_lock(&peer->lock);
 		ast_copy_string(l_name, peer->name, sizeof(l_name));
 		ast_copy_string(l_context, peer->context, sizeof(l_context));
@@ -13234,13 +13275,17 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 				"Peer: SIP/%s\r\n"
 				"PeerStatus: CallLimitExceeded\r\n"
 				"Address: %s\r\n"
+				"RegContact: %s\r\n"
+				"InstanceId: %s\r\n"
 				"Context: %s\r\n"
 				"Accountcode: %s\r\n"
 				"ActiveCalls: %d\r\n"
 				"RingingCalls: %d\r\n"
 				"CallLimit: %d\r\n"
 				"Event: CALL_REJECTED\r\n",
-				l_name, l_address, l_context, l_accountcode,
+				l_name, l_address,
+				l_dev_contact, l_dev_instance,
+				l_context, l_accountcode,
 				inUse_snap, inRinging_snap, l_call_limit);
 			return -1;
 		}
@@ -13255,13 +13300,17 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 				"Peer: SIP/%s\r\n"
 				"PeerStatus: CallCountUpdated\r\n"
 				"Address: %s\r\n"
+				"RegContact: %s\r\n"
+				"InstanceId: %s\r\n"
 				"Context: %s\r\n"
 				"Accountcode: %s\r\n"
 				"ActiveCalls: %d\r\n"
 				"RingingCalls: %d\r\n"
 				"CallLimit: %d\r\n"
 				"Event: %s\r\n",
-				l_name, l_address, l_context, l_accountcode,
+				l_name, l_address,
+				l_dev_contact, l_dev_instance,
+				l_context, l_accountcode,
 				inUse_snap, inRinging_snap, l_call_limit,
 				event == SOFIA_INC_CALL_RINGING ? "INC_CALL_RINGING" : "INC_CALL_LIMIT");
 		}
@@ -13273,6 +13322,8 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		int l_call_limit, l_busy_level, inUse_snap, inRinging_snap;
 		/* SNAPSHOT IDIOM (as the INC path): freeable fields under peer->lock, so the AMI DEC emit
 		 * below can run unlocked without UAF of peer->context/accountcode during a concurrent reload. */
+		char l_dev_contact[256], l_dev_instance[128];	/* the device this call is on; "" when there is no single one */
+		sofia_pvt_device_snapshot(pvt, l_dev_contact, sizeof(l_dev_contact), l_dev_instance, sizeof(l_dev_instance));
 		ast_mutex_lock(&peer->lock);
 		ast_copy_string(l_name, peer->name, sizeof(l_name));
 		ast_copy_string(l_context, peer->context, sizeof(l_context));
@@ -13315,9 +13366,12 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		if (l_call_limit || l_busy_level) {
 			manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
 				"ChannelType: SIP\r\n" "Peer: SIP/%s\r\n" "PeerStatus: CallCountUpdated\r\n"
-				"Address: %s\r\n" "Context: %s\r\n" "Accountcode: %s\r\n"
+				"Address: %s\r\n" "RegContact: %s\r\n" "InstanceId: %s\r\n"
+				"Context: %s\r\n" "Accountcode: %s\r\n"
 				"ActiveCalls: %d\r\n" "RingingCalls: %d\r\n" "CallLimit: %d\r\n" "Event: DEC_CALL_LIMIT\r\n",
-				l_name, l_address, l_context, l_accountcode, inUse_snap, inRinging_snap, l_call_limit);
+				l_name, l_address, l_dev_contact, l_dev_instance,
+				l_context, l_accountcode,
+				inUse_snap, inRinging_snap, l_call_limit);
 		}
 		break;
 	}
@@ -13325,6 +13379,8 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 	case SOFIA_DEC_CALL_RINGING: {
 		char l_name[80], l_context[AST_MAX_CONTEXT], l_accountcode[256], l_address[64] = "";
 		int l_call_limit, l_busy_level, inUse_snap, inRinging_snap;
+		char l_dev_contact[256], l_dev_instance[128];	/* the device this call is on; "" when there is no single one */
+		sofia_pvt_device_snapshot(pvt, l_dev_contact, sizeof(l_dev_contact), l_dev_instance, sizeof(l_dev_instance));
 		ast_mutex_lock(&peer->lock);
 		ast_copy_string(l_name, peer->name, sizeof(l_name));
 		ast_copy_string(l_context, peer->context, sizeof(l_context));
@@ -13348,9 +13404,12 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		if (l_call_limit || l_busy_level) {
 			manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
 				"ChannelType: SIP\r\n" "Peer: SIP/%s\r\n" "PeerStatus: CallCountUpdated\r\n"
-				"Address: %s\r\n" "Context: %s\r\n" "Accountcode: %s\r\n"
+				"Address: %s\r\n" "RegContact: %s\r\n" "InstanceId: %s\r\n"
+				"Context: %s\r\n" "Accountcode: %s\r\n"
 				"ActiveCalls: %d\r\n" "RingingCalls: %d\r\n" "CallLimit: %d\r\n" "Event: DEC_CALL_RINGING\r\n",
-				l_name, l_address, l_context, l_accountcode, inUse_snap, inRinging_snap, l_call_limit);
+				l_name, l_address, l_dev_contact, l_dev_instance,
+				l_context, l_accountcode,
+				inUse_snap, inRinging_snap, l_call_limit);
 		}
 		break;
 	}
@@ -16824,6 +16883,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			const char *new_name = "";
 			char l_name[256] = "";
 			char l_context[256] = "", l_accountcode[256] = "", l_address[80] = "";	/* chan_sip parity: qualify PeerStatus carries the presence fields */
+			char l_dev_contact[256] = "", l_dev_instance[128] = "";	/* the device being qualified */
 			nua_handle_t *old_qnh = NULL;
 
 			if (pingtime < 1)
@@ -16853,6 +16913,16 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					ast_copy_string(l_context, peer->context, sizeof(l_context));
 					ast_copy_string(l_accountcode, peer->accountcode, sizeof(l_accountcode));
 					ast_copy_string(l_address, ast_sockaddr_stringify(&peer->src_addr), sizeof(l_address));
+					{	/* OPTIONS goes to the peer's current source, so the device is the contact registered from it */
+						struct sofia_contact *qc = sofia_peer_find_contact_by_addr(peer, &peer->src_addr);
+						if (qc) {
+							ao2_lock(qc);	/* peer->lock -> contact lock */
+							ast_copy_string(l_dev_contact, qc->contact_uri, sizeof(l_dev_contact));
+							ast_copy_string(l_dev_instance, qc->instance_id, sizeof(l_dev_instance));
+							ao2_unlock(qc);
+							ao2_ref(qc, -1);
+						}
+					}
 					if (sofia_cfg.regextenonqualify) {
 						if (peer->peer_status == PEER_REACHABLE) {
 							do_regexten_add = 1;
@@ -16883,9 +16953,11 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					"PeerStatus: %s\r\n"
 					"Time: %d\r\n"
 					"Address: %s\r\n"
+					"RegContact: %s\r\n"
+					"InstanceId: %s\r\n"
 					"Context: %s\r\n"
 					"Accountcode: %s\r\n",
-					l_name, new_name, l_lastms, l_address, l_context, l_accountcode);
+					l_name, new_name, l_lastms, l_address, l_dev_contact, l_dev_instance, l_context, l_accountcode);
 				/* BLF/presence: reachability changed -> re-evaluate hint. */
 				ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", l_name);
 				/* regextenonqualify: ADD on REACHABLE, REMOVE on UNREACHABLE (LAGGED neither). */
