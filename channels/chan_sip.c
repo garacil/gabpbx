@@ -14667,7 +14667,14 @@ static int expire_register(const void *data)
 		peer->socket.tcptls_session = NULL;
 	}
 
-	manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Unregistered\r\nCause: Expired\r\n", peer->name);
+	manager_event(EVENT_FLAG_SYSTEM, "PeerStatus", "ChannelType: SIP\r\nPeer: SIP/%s\r\nPeerStatus: Unregistered\r\nCause: Expired\r\n"
+		"Address: %s\r\n"
+		"Context: %s\r\n"
+		"Accountcode: %s\r\n",
+		peer->name,
+		ast_sockaddr_stringify(&peer->addr),
+		peer->context,
+		peer->accountcode);
 	register_peer_exten(peer, FALSE);	/* Remove regexten */
 	ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
 

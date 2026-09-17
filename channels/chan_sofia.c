@@ -11844,8 +11844,15 @@ void sofia_emit_register_side_effects(struct sofia_peer *peer, sip_t const *sip,
 			"ChannelType: SIP\r\n"
 			"Peer: SIP/%s\r\n"
 			"PeerStatus: Unregistered\r\n"
-			"Cause: %s\r\n",
-			peer->name, update->unregister_cause ? update->unregister_cause : "Unregister");
+			"Cause: %s\r\n"
+			"Address: %s\r\n"
+			"Context: %s\r\n"
+			"Accountcode: %s\r\n",
+			peer->name,
+			update->unregister_cause ? update->unregister_cause : "Unregister",
+			ast_sockaddr_isnull(&update->new_src) ? "" : ast_sockaddr_stringify(&update->new_src),
+			peer->context,
+			peer->accountcode);
 		ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
 		return;	/* mutually exclusive with the registered tail */
 	}
@@ -13219,7 +13226,6 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 				"Peer: SIP/%s\r\n"
 				"PeerStatus: CallLimitExceeded\r\n"
 				"Address: %s\r\n"
-				"TuCloudPBXName: \r\n"
 				"Context: %s\r\n"
 				"Accountcode: %s\r\n"
 				"ActiveCalls: %d\r\n"
@@ -13241,7 +13247,6 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 				"Peer: SIP/%s\r\n"
 				"PeerStatus: CallCountUpdated\r\n"
 				"Address: %s\r\n"
-				"TuCloudPBXName: \r\n"
 				"Context: %s\r\n"
 				"Accountcode: %s\r\n"
 				"ActiveCalls: %d\r\n"
@@ -13302,7 +13307,7 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		if (l_call_limit || l_busy_level) {
 			manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
 				"ChannelType: SIP\r\n" "Peer: SIP/%s\r\n" "PeerStatus: CallCountUpdated\r\n"
-				"Address: %s\r\n" "TuCloudPBXName: \r\n" "Context: %s\r\n" "Accountcode: %s\r\n"
+				"Address: %s\r\n" "Context: %s\r\n" "Accountcode: %s\r\n"
 				"ActiveCalls: %d\r\n" "RingingCalls: %d\r\n" "CallLimit: %d\r\n" "Event: DEC_CALL_LIMIT\r\n",
 				l_name, l_address, l_context, l_accountcode, inUse_snap, inRinging_snap, l_call_limit);
 		}
@@ -13335,7 +13340,7 @@ static int sofia_update_call_counter(struct sofia_pvt *pvt, enum sofia_call_even
 		if (l_call_limit || l_busy_level) {
 			manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
 				"ChannelType: SIP\r\n" "Peer: SIP/%s\r\n" "PeerStatus: CallCountUpdated\r\n"
-				"Address: %s\r\n" "TuCloudPBXName: \r\n" "Context: %s\r\n" "Accountcode: %s\r\n"
+				"Address: %s\r\n" "Context: %s\r\n" "Accountcode: %s\r\n"
 				"ActiveCalls: %d\r\n" "RingingCalls: %d\r\n" "CallLimit: %d\r\n" "Event: DEC_CALL_RINGING\r\n",
 				l_name, l_address, l_context, l_accountcode, inUse_snap, inRinging_snap, l_call_limit);
 		}
@@ -16871,8 +16876,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					"Time: %d\r\n"
 					"Address: %s\r\n"
 					"Context: %s\r\n"
-					"Accountcode: %s\r\n"
-					"TuCloudPBXName: \r\n",
+					"Accountcode: %s\r\n",
 					l_name, new_name, l_lastms, l_address, l_context, l_accountcode);
 				/* BLF/presence: reachability changed -> re-evaluate hint. */
 				ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", l_name);
