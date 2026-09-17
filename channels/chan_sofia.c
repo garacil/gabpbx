@@ -11858,6 +11858,13 @@ void sofia_emit_register_side_effects(struct sofia_peer *peer, sip_t const *sip,
 	}
 	/* Registered / refresh: regexten + PeerStatus Registered fire on every real 200 OK,
 	 * devstate only on an actual registration transition (sofia_register_changed). */
+	char reg_contact[256] = "";	/* FULL Contact URI of this REGISTER (chan_sip parity: it sends peer->fullcontact) */
+	char reg_instance[128] = "";	/* RFC 5626 +sip.instance of that contact: the stable per-DEVICE id */
+	int reg_id = 0;			/* RFC 5626 reg-id: distinct flows of the same device */
+	if (sip && sip->sip_contact && sip->sip_contact->m_url) {
+		sofia_contact_uri_from_url(reg_contact, sizeof(reg_contact), sip->sip_contact->m_url);
+		sofia_contact_parse_instance(sip->sip_contact, reg_instance, sizeof(reg_instance), &reg_id);
+	}
 	register_peer_exten(peer, 1);
 	if (sofia_register_changed(update)) {
 		ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
@@ -11869,14 +11876,15 @@ void sofia_emit_register_side_effects(struct sofia_peer *peer, sip_t const *sip,
 		"Expire: %ld\r\n"
 		"Address: %s\r\n"
 		"RegContact: %s\r\n"
+		"InstanceId: %s\r\n"
 		"UserAgent: %s\r\n"
 		"Context: %s\r\n"
 		"Accountcode: %s\r\n",
 		peer->name,
 		(long)update->new_expires,	/* negotiated TTL (s) so the connector/presence can TTL-expire this reg */
 		ast_sockaddr_stringify(&update->new_src),	/* use the snapshot, not a post-unlock peer->src_addr read */
-		(sip && sip->sip_contact && sip->sip_contact->m_url->url_host) ?
-			sip->sip_contact->m_url->url_host : "",
+		reg_contact,
+		reg_instance,
 		(sip && sip->sip_user_agent && sip->sip_user_agent->g_string) ?
 			sip->sip_user_agent->g_string : "",
 		peer->context,
