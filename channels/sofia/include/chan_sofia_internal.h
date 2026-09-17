@@ -247,6 +247,7 @@ struct sofia_contact {
 	char transport[8];
 	char user_agent[64];
 	time_t expires;
+	int expiry_notified;       /* 1 = the expiry sweep already reported this binding as lapsed (RegisterExpired / Unregistered); cleared on every (re)bind */
 	struct ast_sockaddr src_addr;
 	int active_calls;          /* count of active calls on this contact */
 	char path[1024];           /* Path (RFC 3327) the device registered through, as a ready "<uri;lr>,..." Route value pre-loaded on requests we send to this contact. Empty = none. */
@@ -1059,6 +1060,11 @@ struct sofia_peer {
 	 * null; used at sofia_resolve_peer_target. */
 	struct ast_sockaddr defaddr;
 	struct ao2_container *contacts;
+	/* Earliest instant at which one of this peer's bindings becomes LAPSED (its expiry + the grace) and has not
+	 * been reported yet; 0 = nothing pending. Lets the expiry sweep skip a peer with ONE unlocked compare, so the
+	 * sweep costs nothing per idle peer however many peers there are. Written under peer->lock; read without it
+	 * (a stale read only delays or repeats one scan - the scan itself recomputes it under the lock). */
+	time_t next_expiry_check;
 	/* MWI per-peer mailbox list (NOLOCK; peer->lock guards). */
 	struct sofia_mailbox_list mailboxes;
 	nua_handle_t *mwi_subscription_handle; /* NULL until first SUBSCRIBE */

@@ -1279,6 +1279,7 @@ static int sofia_contact_rebind(struct sofia_peer *peer, struct sofia_contact *c
 	}
 	ast_copy_string(c->path, pathstr, sizeof(c->path));
 	c->expires = expires_at;
+	c->expiry_notified = 0;	/* bound again: a later lapse is reported again */
 	c->last_register = time(NULL);	/* diagnostic timestamp: this contact just (re)bound (Last-REGISTER gauge) */
 	memcpy(&c->src_addr, src, sizeof(*src));
 	ast_copy_string(c->instance_id, instance_id ? instance_id : "", sizeof(c->instance_id));
@@ -9338,6 +9339,40 @@ static void sofia_contact_uri_from_url(char *buf, size_t len, const url_t *url)
 		sofia_contact_url_port(url->url_port));
 }
 
+/* Registration expiry timing, used by the active expiry sweep (sofia_peer_expire_sweep, further down). */
+#define SOFIA_REGEXPIRE_SWEEP_SECS 10	/* how often the sweep runs */
+#define SOFIA_REGEXPIRE_GRACE_SECS 10	/* a binding is LAPSED this long after its expiry (chan_sip: Expires + 10 s) */
+#define SOFIA_REGEXPIRE_MAX 6		/* the max_contacts ceiling (sofia_clamp_max_contacts) */
+
+/* Recompute peer->next_expiry_check: the earliest lapse instant among the bindings not reported yet.
+ * Caller holds peer->lock. At most max_contacts (6) bindings, so this is cheap; it runs once per REGISTER
+ * and once per scan, never per sweep tick. */
+static void sofia_peer_expiry_hint_update(struct sofia_peer *peer)
+{
+	struct ao2_iterator ci;
+	struct sofia_contact *c;
+	time_t next = 0;
+
+	if (!peer->contacts) {
+		peer->next_expiry_check = 0;
+		return;
+	}
+	ci = ao2_iterator_init(peer->contacts, 0);
+	while ((c = ao2_iterator_next(&ci))) {
+		ao2_lock(c);	/* peer->lock -> contact lock */
+		if (c->expires > 0 && !c->expiry_notified) {
+			time_t at = c->expires + SOFIA_REGEXPIRE_GRACE_SECS;
+			if (!next || at < next) {
+				next = at;
+			}
+		}
+		ao2_unlock(c);
+		ao2_ref(c, -1);
+	}
+	ao2_iterator_destroy(&ci);
+	peer->next_expiry_check = next;
+}
+
 static int sofia_expire_contacts_cb(void *obj, void *arg, int flags)
 {
 	struct sofia_contact *c = obj;
@@ -9347,7 +9382,9 @@ static int sofia_expire_contacts_cb(void *obj, void *arg, int flags)
 	if (sofia_cfg.ignore_regexpire) {
 		return 0;
 	}
-	if (c->expires > 0 && c->expires < *now) {
+	/* Only collect a binding the expiry sweep has ALREADY reported (sofia_peer_expire_sweep): removing an
+	 * unreported one here would lose its RegisterExpired / Unregistered event. It is unroutable meanwhile. */
+	if (c->expires > 0 && c->expires < *now && c->expiry_notified) {
 		ast_verbose("Sofia: Expiring contact %s\n", c->contact_uri);
 		return CMP_MATCH;
 	}
@@ -9808,6 +9845,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 					}
 				}
 				c->expires = now + contact_expires;
+				c->expiry_notified = 0;	/* refreshed / new: a later lapse is reported again */
 				c->last_register = now;	/* diagnostic timestamp: contact refresh (Last-REGISTER gauge) */
 				memcpy(&c->src_addr, &src, sizeof(src));
 				/* Refresh transport too: a same-URI re-REGISTER may switch it. */
@@ -9891,6 +9929,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 					ast_copy_string(c->user_agent, sip->sip_user_agent->g_string,
 						sizeof(c->user_agent));
 				c->expires = now + contact_expires;
+				c->expiry_notified = 0;	/* refreshed / new: a later lapse is reported again */
 				c->last_register = now;	/* diagnostic timestamp: new contact (Last-REGISTER gauge) */
 				memcpy(&c->src_addr, &src, sizeof(src));
 				ast_copy_string(c->path, pathstr, sizeof(c->path));	/* RFC 3327 Path (empty if none/off) */
@@ -9959,6 +9998,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 	/* Opportunistic expiry sweep */
 	ao2_callback(peer->contacts, OBJ_UNLINK | OBJ_NODATA | OBJ_MULTIPLE,
 		sofia_expire_contacts_cb, &now);
+	sofia_peer_expiry_hint_update(peer);	/* bindings changed: tell the expiry sweep when to look at this peer next */
 
 	/* Update legacy src_addr from the newest contact + the registered flag. */
 	if (ao2_container_count(peer->contacts) > 0) {
@@ -9972,13 +10012,17 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 		peer->registered = 0;
 		memset(&peer->src_addr, 0, sizeof(peer->src_addr));
 		ast_copy_string(peer->reg_transport, "udp", sizeof(peer->reg_transport));
+		/* An explicit un-REGISTER (Expires: 0) that removed the last binding in THIS request is not an expiry:
+		 * leave the cause NULL so the event says "Unregister". "Expired" is for a binding that really lapsed,
+		 * which the expiry sweep reports (sofia_peer_expire_sweep). Read BEFORE contacts_removed is back-filled. */
+		int explicit_removal = update && update->contacts_removed > 0;
 		if (update && update->was_registered && !update->contacts_removed) {
 			update->contacts_removed = update->contacts_before;
 		}
 		/* Defer the unregister side-effects to the caller after unlock. */
 		if (update) {
 			update->emit_unregister = 1;
-			update->unregister_cause = "Expired";
+			update->unregister_cause = explicit_removal ? NULL : "Expired";
 		}
 	}
 	if (update) {
@@ -15764,13 +15808,145 @@ void sofia_qualify_peer(struct sofia_peer *peer)
 
 /* Aux pthread: per-second sweep that marshals each due peer's qualify onto
  * sofia_thread (nua_* must run there), like the AMI SIPqualify. */
+/* ---- Active registration expiry (RFC 3261 10.3 soft state; chan_sip expire_register parity) -----------
+ * A binding stops being ROUTABLE the moment its granted expiry passes (sofia_contact_is_unexpired), but
+ * nothing used to RUN at that moment: no manager event, the account stayed "registered" and the BLF stayed
+ * green. This sweep is the missing timer. It runs on the qualify thread every SOFIA_REGEXPIRE_SWEEP_SECS
+ * and treats a binding as lapsed SOFIA_REGEXPIRE_GRACE_SECS after its expiry (chan_sip: Expires + 10 s),
+ * so a refresh that arrives a little late does not flap.
+ *   - a device lapses while the account still has live ones -> PeerStatus RegisterExpired for that device
+ *   - the LAST live one lapses -> the account is unregistered exactly as `sip unregister` and a flow close
+ *     do it: registered=0, source cleared, then PeerStatus Unregistered (Cause: Expired) + regexten + devstate
+ * ignoreregexpire=yes keeps the lapsed binding in the container (chan_sip keeps the stored association):
+ * it stays unroutable, a returning phone still rebinds to it, and expiry_notified stops a second report. */
+struct sofia_lapsed_binding {
+	char uri[256];
+	char instance[128];
+	struct ast_sockaddr src;
+};
+
+static void sofia_ami_register_expired(const char *name, const char *address, const char *reg_contact,
+		const char *instance,
+		const char *context, const char *accountcode,
+		int remaining)
+{
+	manager_event(EVENT_FLAG_SYSTEM, "PeerStatus",
+		"ChannelType: SIP\r\n"
+		"Peer: SIP/%s\r\n"
+		"PeerStatus: RegisterExpired\r\n"
+		"Cause: Expired\r\n"
+		"Address: %s\r\n"
+		"RegContact: %s\r\n"
+		"InstanceId: %s\r\n"
+		"Context: %s\r\n"
+		"Accountcode: %s\r\n"
+		"ContactsRemaining: %d\r\n",
+		name, address, reg_contact, instance,
+		context, accountcode,
+		remaining);
+}
+
+static void sofia_peer_expire_sweep(struct sofia_peer *peer, time_t now)
+{
+	struct sofia_lapsed_binding gone[SOFIA_REGEXPIRE_MAX];
+	struct ao2_iterator ci;
+	struct sofia_contact *c;
+	char l_name[80], l_context[AST_MAX_CONTEXT], l_accountcode[256];
+	int ngone = 0, live = 0, unregistered = 0, i;
+	time_t due = peer->next_expiry_check;	/* unlocked on purpose: see the field */
+
+	if (!due || now < due) {
+		return;	/* nothing of this peer lapses yet: the common case costs one compare, no lock */
+	}
+	ast_mutex_lock(&peer->lock);
+	/* Inbound registrations only: a register => line carries its OWN upstream registration state. */
+	if (peer->is_register_line || !peer->contacts || ao2_container_count(peer->contacts) == 0) {
+		peer->next_expiry_check = 0;
+		ast_mutex_unlock(&peer->lock);
+		return;
+	}
+	ci = ao2_iterator_init(peer->contacts, 0);
+	while ((c = ao2_iterator_next(&ci))) {
+		int lapsed_now = 0;
+		ao2_lock(c);	/* peer->lock -> contact lock */
+		if (c->expires > 0 && now >= c->expires + SOFIA_REGEXPIRE_GRACE_SECS) {
+			if (!c->expiry_notified && ngone < SOFIA_REGEXPIRE_MAX) {
+				c->expiry_notified = 1;
+				ast_copy_string(gone[ngone].uri, c->contact_uri, sizeof(gone[ngone].uri));
+				ast_copy_string(gone[ngone].instance, c->instance_id, sizeof(gone[ngone].instance));
+				ast_sockaddr_copy(&gone[ngone].src, &c->src_addr);
+				ngone++;
+				lapsed_now = 1;
+			}
+		} else {
+			live++;	/* still valid, or inside the grace window */
+		}
+		ao2_unlock(c);
+		if (lapsed_now && !sofia_cfg.ignore_regexpire) {
+			ao2_unlink(peer->contacts, c);	/* contact destructor drops its REGISTER handle from any thread */
+		}
+		ao2_ref(c, -1);
+	}
+	ao2_iterator_destroy(&ci);
+	sofia_peer_expiry_hint_update(peer);	/* next time this peer needs a look (0 = never, until it registers again) */
+	if (!ngone) {
+		ast_mutex_unlock(&peer->lock);
+		return;
+	}
+	ast_copy_string(l_name, peer->name, sizeof(l_name));
+	ast_copy_string(l_context, peer->context, sizeof(l_context));
+	ast_copy_string(l_accountcode, S_OR(peer->accountcode, ""), sizeof(l_accountcode));
+	if (live == 0) {
+		/* No live binding left: same state change as `sip unregister` and the flow-close path. */
+		unregistered = 1;
+		peer->registered = 0;
+		memset(&peer->src_addr, 0, sizeof(peer->src_addr));
+		ast_copy_string(peer->reg_transport, "udp", sizeof(peer->reg_transport));
+		peer->expire = 0;
+		peer->reg_expiry = 0;
+	}
+	ast_mutex_unlock(&peer->lock);
+
+	if (unregistered) {
+		sofia_peer_ipport_reindex(peer);	/* src_addr cleared above -> drop the stale index entry */
+	}
+	for (i = 0; i < ngone; i++) {
+		int remaining = live + (ngone - 1 - i);	/* live ones + the lapsed ones still to be reported */
+		ast_verb(3, "Sofia: registration of '%s' expired (%s)%s\n", l_name, gone[i].uri,
+			remaining ? "" : " - no live contact left");
+		if (remaining > 0) {
+			sofia_ami_register_expired(l_name,
+				ast_sockaddr_isnull(&gone[i].src) ? "" : ast_sockaddr_stringify(&gone[i].src),
+				gone[i].uri, gone[i].instance,
+				l_context, l_accountcode,
+				remaining);
+		} else {
+			/* Side-effects AFTER the unlock, through the path every other unregister uses (regexten cleanup
+			 * + PeerStatus Unregistered + devstate/BLF). sip=NULL safe: that branch never derefs it. */
+			struct sofia_register_update upd = { 0 };
+			upd.emit_unregister = 1;
+			upd.unregister_cause = "Expired";
+			ast_copy_string(upd.changed_uri, gone[i].uri, sizeof(upd.changed_uri));
+			ast_copy_string(upd.changed_instance, gone[i].instance, sizeof(upd.changed_instance));
+			ast_sockaddr_copy(&upd.new_src, &gone[i].src);
+			sofia_emit_register_side_effects(peer, NULL, &upd);
+		}
+	}
+}
+
 static void *sofia_qualify_thread(void *data)
 {
+	int expire_tick = 0;
 	while (sofia_nua) {
 		struct sofia_peer *peer;
 		struct ao2_iterator i;
+		int do_expire;
 
 		sleep(1);
+		do_expire = (++expire_tick >= SOFIA_REGEXPIRE_SWEEP_SECS);	/* registration expiry: not every second */
+		if (do_expire) {
+			expire_tick = 0;
+		}
 
 		if (!sofia_nua)
 			break;
@@ -15814,6 +15990,9 @@ static void *sofia_qualify_thread(void *data)
 					peer->qualify_pending = 0;
 					ast_mutex_unlock(&peer->lock);
 				}
+			}
+			if (do_expire) {
+				sofia_peer_expire_sweep(peer, time(NULL));
 			}
 			ao2_ref(peer, -1);
 		}
