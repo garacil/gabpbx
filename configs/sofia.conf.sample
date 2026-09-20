@@ -75,6 +75,11 @@ context=default
 ;
 ; Address and port to bind to (UDP+TCP listener)
 ; Alias: udpbindaddr accepts "host:port" form (sip.conf compatibility)
+; Exactly udp and tcp are bound here (the stack is told ";transport=udp,tcp"):
+; ws lives on wsbindport and wss on wssbindport only. Before 2026-09-18 the
+; port was handed to the stack without a transport list and it also opened a
+; WebSocket listener on it, so a plain SIP-over-TCP connection was answered
+; "HTTP/1.1 400 Bad Request" at random (two TCP sockets on the same port).
 ;
 bindaddr=0.0.0.0
 bindport=5080

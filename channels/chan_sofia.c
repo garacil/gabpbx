@@ -17341,7 +17341,13 @@ static void *sofia_thread_func(void *data)
 		/* IPv6 bind: bracket-wrap an IPv6 host (RFC 3261 §19.1.2); IPv4/hostnames/`*`
 		 * pass through unchanged. */
 		char hbuf_udp[80], hbuf_tls[80], hbuf_ws[80], hbuf_wss[80];
-		snprintf(udp_url, sizeof(udp_url), "sip:%s:%d",
+		/* Explicit ;transport=udp,tcp: a bare "sip:" URL makes nta enumerate every transport of the sip
+		 * scheme - udp, tcp AND ws (nta.c tports_sip) - so a WebSocket listener was also bound on the SIP
+		 * port. The kernel then spread incoming TCP connections over the two TCP-family sockets, and a
+		 * plain SIP-over-TCP client landing on the ws one got "HTTP/1.1 400 Bad Request" (1 in 4 on a
+		 * production box). Same trap already handled below for sips: (;transport=tls); FreeSWITCH binds
+		 * ";transport=udp,tcp" for the same reason. ws stays on wsbindport, wss on wssbindport. */
+		snprintf(udp_url, sizeof(udp_url), "sip:%s:%d;transport=udp,tcp",
 			sofia_uri_format_host(
 				ast_strlen_zero(sofia_cfg.bindaddr) ? "*" : sofia_cfg.bindaddr,
 				hbuf_udp, sizeof(hbuf_udp)),
