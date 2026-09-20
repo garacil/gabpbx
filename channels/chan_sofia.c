@@ -15825,8 +15825,11 @@ struct sofia_lapsed_binding {
 	struct ast_sockaddr src;
 };
 
-static void sofia_ami_register_expired(const char *name, const char *address, const char *reg_contact,
-		const char *instance,
+/* One binding of the account is gone. cause = "Expired" (the expiry sweep) or "Flow closed" (its
+ * connection-oriented flow closed, RFC 5626). remaining = live bindings the account still has; it can be 0
+ * only with "Flow closed", where the account-level Unregistered stays gated by flowclose_emit_unregister. */
+static void sofia_ami_register_expired(const char *name, const char *cause, const char *address,
+		const char *reg_contact, const char *instance,
 		const char *context, const char *accountcode,
 		int remaining)
 {
@@ -15834,14 +15837,14 @@ static void sofia_ami_register_expired(const char *name, const char *address, co
 		"ChannelType: SIP\r\n"
 		"Peer: SIP/%s\r\n"
 		"PeerStatus: RegisterExpired\r\n"
-		"Cause: Expired\r\n"
+		"Cause: %s\r\n"
 		"Address: %s\r\n"
 		"RegContact: %s\r\n"
 		"InstanceId: %s\r\n"
 		"Context: %s\r\n"
 		"Accountcode: %s\r\n"
 		"ContactsRemaining: %d\r\n",
-		name, address, reg_contact, instance,
+		name, cause, address, reg_contact, instance,
 		context, accountcode,
 		remaining);
 }
@@ -15915,7 +15918,7 @@ static void sofia_peer_expire_sweep(struct sofia_peer *peer, time_t now)
 		ast_verb(3, "Sofia: registration of '%s' expired (%s)%s\n", l_name, gone[i].uri,
 			remaining ? "" : " - no live contact left");
 		if (remaining > 0) {
-			sofia_ami_register_expired(l_name,
+			sofia_ami_register_expired(l_name, "Expired",
 				ast_sockaddr_isnull(&gone[i].src) ? "" : ast_sockaddr_stringify(&gone[i].src),
 				gone[i].uri, gone[i].instance,
 				l_context, l_accountcode,
@@ -16106,12 +16109,26 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			peer = sofia_find_peer_cached(pname);		/* +1 or NULL (cache-only) */
 			if (peer) {
 				struct sofia_contact *c;
-				int became_empty = 0, emit_unregister = 0;
+				int became_empty = 0, emit_unregister = 0, removed = 0, remaining = 0;
+				/* Snapshot of the removed binding + the peer identity, taken under the locks and reported
+				 * after them (manager_event never under peer->lock, like every other emitter here). */
+				char gone_instance[128] = "";
+				struct ast_sockaddr gone_src;
+				char l_context[AST_MAX_CONTEXT] = "", l_accountcode[256] = "";
+				memset(&gone_src, 0, sizeof(gone_src));
 				ast_mutex_lock(&peer->lock);
 				c = ao2_find(peer->contacts, uri, OBJ_POINTER);	/* +1 finder */
 				if (c) {
 					if (c->reg_nh == nh) {		/* still the current binding for this handle */
+						ao2_lock(c);	/* peer->lock -> contact lock, the sweep's order */
+						ast_copy_string(gone_instance, c->instance_id, sizeof(gone_instance));
+						ast_sockaddr_copy(&gone_src, &c->src_addr);
+						ao2_unlock(c);
 						ao2_unlink(peer->contacts, c);	/* -> contact destructor drops reg_nh (sole dropper) */
+						removed = 1;
+						remaining = ao2_container_count(peer->contacts);
+						ast_copy_string(l_context, peer->context, sizeof(l_context));
+						ast_copy_string(l_accountcode, S_OR(peer->accountcode, ""), sizeof(l_accountcode));
 						if (sofia_forkdebug) {
 							char ubuf[256];
 							SOFIA_FORKDBG("media-error REMOVED contact %s of peer %s (nh=%p) — this browser leg is now de-registered",
@@ -16121,7 +16138,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 							ast_verbose("Sofia: flow closed (connection gone) - removed contact %s of peer %s\n",
 								uri, pname);
 						}
-						if (ao2_container_count(peer->contacts) == 0) {
+						if (remaining == 0) {
 							peer->registered = 0;
 							memset(&peer->src_addr, 0, sizeof(peer->src_addr));
 							ast_copy_string(peer->reg_transport, "udp", sizeof(peer->reg_transport));
@@ -16134,6 +16151,20 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					ao2_ref(c, -1);			/* finder */
 				}
 				ast_mutex_unlock(&peer->lock);
+				if (removed) {
+					/* The DEVICE is always reported (RegisterExpired, Cause: Flow closed, ContactsRemaining may be
+					 * 0): a consumer keeping one entry per device would otherwise hold this binding for ever, since
+					 * it can no longer lapse and a browser phone re-registers with a new Contact. This is NOT the
+					 * account-level unregister: that one stays gated by flowclose_emit_unregister below, so a
+					 * browser F5 still does not flap the BLF / regexten. */
+					ast_verb(3, "Sofia: flow closed for '%s' (%s)%s\n", pname, uri,
+						remaining ? "" : " - no live contact left");
+					sofia_ami_register_expired(pname, "Flow closed",
+						ast_sockaddr_isnull(&gone_src) ? "" : ast_sockaddr_stringify(&gone_src),
+						uri, gone_instance,
+						l_context, l_accountcode,
+						remaining);
+				}
 				if (became_empty) {
 					/* Internal routing state is ALWAYS corrected regardless of policy. */
 					sofia_peer_ipport_reindex(peer);

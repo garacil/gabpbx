@@ -3132,9 +3132,16 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;                  registration to expire (expiry remains the fallback for udp and
 ;                  for a flow that dies without a close event). This knob only
 ;                  controls the EXTERNAL side-effects of that removal: no (default)
-;                  removes silently (no AMI PeerStatus / BLF / regexten flap — best
-;                  for browsers that F5); yes also emits the full unregister
-;                  side-effects (accurate BLF/regexten, at a brief flap on reload)
+;                  removes silently (no account-level PeerStatus Unregistered, no
+;                  BLF / regexten flap — best for browsers that F5); yes also emits
+;                  the full unregister side-effects (accurate BLF/regexten, at a
+;                  brief flap on reload). Whatever this knob says, the removed
+;                  DEVICE is always reported with PeerStatus RegisterExpired,
+;                  Cause: Flow closed (RegContact, InstanceId, ContactsRemaining —
+;                  which can be 0 here), so a consumer that keeps one entry per
+;                  device (presence) drops it: a browser phone with no
+;                  +sip.instance re-registers with a NEW Contact and nothing else
+;                  would ever name the old one again.
 ;                  prohib_passed_screen, prohib_failed_screen, prohib, unavailable
 ; sendrpid       - outbound RPID/PAI emission: no (default), pai (RFC 3325), rpid
 ; trustrpid      - yes/no: trust inbound PAI/RPID (default: no);
