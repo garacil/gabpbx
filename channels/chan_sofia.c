@@ -12170,6 +12170,15 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			NUTAG_WITH_THIS(nua),
 			TAG_END());
 		ast_free(rsp_contacts);
+		/* The Registered event's "Expire" must be the TTL this 200 OK GRANTS (granted_top: the primary
+		 * Contact's ;expires= param, else the Expires header, capped), because that is the value the phone
+		 * honours for its refresh and the value a consumer expires the account on. sofia_update_peer_contacts
+		 * seeded it with the top-level Expires header, which is NOT the granted TTL when the Contact carries
+		 * its own ;expires= (SIP.js sends Expires: 360 with ;expires=3600 -> the event said 360 while the
+		 * binding lived 3600 s, so a manager consumer that expires an account Expire + 60 s after its last
+		 * Registered declared it unregistered 7 minutes after every refresh). 0 only when every Contact
+		 * de-registers. */
+		reg_update.new_expires = granted_top;
 		sofia_verbose_register_update(peer, &reg_update);
 		if (sofia_register_changed(&reg_update)) {
 			sofia_log_register_outcome("OK", peer->name, sip);
@@ -12298,6 +12307,15 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			NUTAG_WITH_THIS(nua),
 			TAG_END());
 		ast_free(rsp_contacts);
+		/* The Registered event's "Expire" must be the TTL this 200 OK GRANTS (granted_top: the primary
+		 * Contact's ;expires= param, else the Expires header, capped), because that is the value the phone
+		 * honours for its refresh and the value a consumer expires the account on. sofia_update_peer_contacts
+		 * seeded it with the top-level Expires header, which is NOT the granted TTL when the Contact carries
+		 * its own ;expires= (SIP.js sends Expires: 360 with ;expires=3600 -> the event said 360 while the
+		 * binding lived 3600 s, so a manager consumer that expires an account Expire + 60 s after its last
+		 * Registered declared it unregistered 7 minutes after every refresh). 0 only when every Contact
+		 * de-registers. */
+		reg_update.new_expires = granted_top;
 		sofia_verbose_register_update(peer, &reg_update);
 		if (sofia_register_changed(&reg_update)) {
 			sofia_log_register_outcome("OK", peer->name, sip);
