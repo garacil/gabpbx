@@ -15838,7 +15838,7 @@ void sofia_qualify_peer(struct sofia_peer *peer)
  * ignoreregexpire=yes keeps the lapsed binding in the container (chan_sip keeps the stored association):
  * it stays unroutable, a returning phone still rebinds to it, and expiry_notified stops a second report.
  * The third way a binding leaves, a closed flow (nua_i_media_error below), reports the device the same way
- * (RegisterExpired, Cause: Flow closed) so a presence consumer can drop it: a WSS softphone with no
+ * (RegisterExpired, Cause: Flow closed) so a consumer keeping one entry per device can drop it: a WSS softphone with no
  * +sip.instance comes back with a NEW Contact, and nothing else would ever name the old one again. */
 struct sofia_lapsed_binding {
 	char uri[256];

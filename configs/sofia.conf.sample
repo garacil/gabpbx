@@ -3144,7 +3144,7 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;                  DEVICE is always reported with PeerStatus RegisterExpired,
 ;                  Cause: Flow closed (RegContact, InstanceId, ContactsRemaining —
 ;                  which can be 0 here), so a consumer that keeps one entry per
-;                  device (presence) drops it: a browser phone with no
+;                  device drops it: a browser phone with no
 ;                  +sip.instance re-registers with a NEW Contact and nothing else
 ;                  would ever name the old one again.
 ;                  prohib_passed_screen, prohib_failed_screen, prohib, unavailable
