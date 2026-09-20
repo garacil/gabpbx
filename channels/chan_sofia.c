@@ -16482,7 +16482,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					"ChannelType: SIP\r\n"
 					"Username: %s\r\n"
 					"Domain: %s\r\n"
-					"Status: Registration Failed\r\n"	/* the ami_connector's Registry rule only acts on Registered/Unregistered/Registration Failed; "Failed" was silently dropped -> distinct outbound-trunk lamp */
+					"Status: Registration Failed\r\n"	/* manager consumers key on Registered/Unregistered/Registration Failed; a bare "Failed" was silently dropped -> distinct outbound-trunk lamp */
 					"Cause: %d %s\r\n",
 					peer->defaultuser, peer->host, status, phrase ? phrase : "");
 			}
