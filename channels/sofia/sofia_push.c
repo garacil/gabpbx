@@ -1985,14 +1985,19 @@ int sofia_push_count_asleep(struct sofia_peer *peer, const char *exclude_instanc
  * (the phone dedups push+INVITE by the shared uuid). No push_wait/NOANSWER is armed: the
  * live legs own the call outcome; the entry is reaped by sofia_push_on_pvt_hangup when the
  * master tears down. Caller holds the channel lock; pvt is a live fork master with
- * sip_callid set and (for a self-call) the exclude fields populated. */
-void sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_sockaddr *live_srcs,
-	char live_inst[][128], int n_live)
+ * sip_callid set and (for a self-call) the exclude fields populated.
+ *
+ * The push carries the REAL caller identity, read from `ast` exactly as the parked path does:
+ * a woken device shows the notification before its late-appended INVITE arrives, and on some
+ * platforms the incoming-call UI is built from the notification alone, so a placeholder here
+ * is what the callee would see as the caller. */
+void sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_channel *ast,
+	struct ast_sockaddr *live_srcs, char live_inst[][128], int n_live)
 {
 	struct sofia_push_park *e;
 	int i, queued, rate_limited = 0;
 
-	if (!sofia_push_parked || !pvt || !pvt->sip_callid[0]) {
+	if (!sofia_push_parked || !pvt || !ast || !pvt->sip_callid[0]) {
 		return;
 	}
 	if (!(e = ao2_alloc(sizeof(*e), sofia_push_park_destructor))) {
@@ -2005,8 +2010,10 @@ void sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_sockaddr *live_src
 		e->exclude_valid = 1;
 	}
 	ast_copy_string(e->callid, pvt->sip_callid, sizeof(e->callid));
-	ast_copy_string(e->cid_num, "assist", sizeof(e->cid_num));
-	ast_copy_string(e->cid_name, "assist", sizeof(e->cid_name));
+	/* Caller identity for the push payload, same source and lock contract as the parked
+	 * path: the channel lock is held by ast_call. */
+	ast_copy_string(e->cid_num, S_OR(ast->caller.id.number.str, "unknown"), sizeof(e->cid_num));
+	ast_copy_string(e->cid_name, S_OR(ast->caller.id.name.str, e->cid_num), sizeof(e->cid_name));
 	e->pvt = pvt;
 	ao2_ref(pvt, +1);
 	e->sched_id = -1;

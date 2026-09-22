@@ -6,7 +6,7 @@ It is **not** the complete changelog: the authoritative, up-to-date record is
 <https://github.com/garacil/gabpbx/releases>. A released-version overview is also
 published at <https://gabpbx.org/>.
 
-The current release is **1.9.0**.
+The current release is **1.9.1**.
 
 ## 1.3.4
 

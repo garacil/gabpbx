@@ -75,7 +75,7 @@ int sofia_push_peer_pushable(struct sofia_peer *peer);
  * (usable token, instance not the caller's nor any already-ringing live binding), and wake
  * them alongside the fork to the live ones. */
 int sofia_push_count_asleep(struct sofia_peer *peer, const char *exclude_instance, char live_inst[][128], int n_live);
-void sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_sockaddr *live_srcs, char live_inst[][128], int n_live);
+void sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_channel *ast, struct ast_sockaddr *live_srcs, char live_inst[][128], int n_live);
 /* Park a push_parked pvt (called from sofia_call under the CHANNEL lock): registry entry +
  * push_wait timer (+ sender jobs in a later stage). 0 = call parked (in progress); -1 =
  * fail-closed to today's failure (never park without an armed timer). */

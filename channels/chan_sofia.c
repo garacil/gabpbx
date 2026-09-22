@@ -6265,7 +6265,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 			}
 			rc = sofia_fork_dial(pvt);	/* ring the live devices now (fork of >=1) */
 			if (!rc) {
-				sofia_push_assist_wake(pvt, live_srcs, live_inst, n_live_ex);
+				sofia_push_assist_wake(pvt, ast, live_srcs, live_inst, n_live_ex);
 			}
 			return rc;
 		}

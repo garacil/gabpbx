@@ -1,3 +1,33 @@
+## 1.9.1 — the push wake-up that assists a ringing call now names the caller
+
+A one-line defect in the mobile push wake-up, fixed. When an account has devices that are
+reachable only by push alongside devices that are already registered, GABPBX rings the
+registered ones straight away and wakes the sleeping ones with a notification carrying the
+same Call-ID, so the woken device can join the same call as an extra branch. That wake
+notification was built with the placeholder string `assist` in both of its caller fields
+instead of the real caller, and it is those two fields — `caller` and `callerName` — that
+the payload delivers to the device. A phone woken this way therefore announced the call as
+coming from `assist`.
+
+The placeholder was deliberate but rested on a wrong assumption: that the woken device
+would render the INVITE it receives moments later, and never the notification. It does not.
+On the platforms this feature targets, the incoming-call screen is built from the
+notification alone, which is the whole point of waking the device with one, so whatever the
+notification says is what the callee reads.
+
+The identity now comes from the channel, from the same place and under the same lock the
+existing parked-call push has always used — the channel lock the core holds across the
+call, with the number falling back to `unknown` and the display name falling back to the
+number. The channel is passed in for it, mirroring the parked path, whose function already
+takes it for exactly this reason. Nothing else changes: the push log still records these
+wake-ups under the reason `assist`, which is what distinguishes them from a parked call in
+`sip show push` and in the push log.
+
+Worth knowing when reading that registry: a device counts as a wake target when it has a
+usable cached token whose `+sip.instance` matches none of the bindings already ringing. Its
+own registration does not have to have expired, and a token stored without an instance can
+never match one, so such a device is always woken.
+
 ## 1.9.0 — Ogg Opus file format, and Opus recordings at the right level
 
 An Opus release. GABPBX can now **record, play and convert `.opus` files** — the standard
