@@ -11859,16 +11859,69 @@ static void sofia_regpool_update(void)
 	sofia_regpool_enabled = (sofia_cfg.register_pool && sofia_regpool_n > 0);
 }
 
-/* Emit one NOTICE per REGISTER attempt (success or failure): AOR, source IP, User-Agent. */
-static void sofia_log_register_outcome(const char *result, const char *aor, sip_t const *sip)
+/* Emit one line per REGISTER attempt: AOR, source IP, User-Agent. notice=1 goes to the log a
+ * human reads, notice=0 to debug - same text, so nothing is lost, it just stops shouting. */
+static void sofia_log_register_outcome_lvl(const char *result, const char *aor, sip_t const *sip,
+                                           int notice)
 {
 	struct ast_sockaddr src;
 	const char *ua = (sip && sip->sip_user_agent && sip->sip_user_agent->g_string)
 		? sip->sip_user_agent->g_string : "(unknown)";
 
 	sofia_get_source_addr(sip, &src);
-	ast_log(LOG_NOTICE, "Sofia REGISTER %s: user='%s' ip=%s useragent='%s'\n",
-		result, S_OR(aor, "(unknown)"), ast_sockaddr_stringify(&src), ua);
+	if (notice) {
+		ast_log(LOG_NOTICE, "Sofia REGISTER %s: user='%s' ip=%s useragent='%s'\n",
+			result, S_OR(aor, "(unknown)"), ast_sockaddr_stringify(&src), ua);
+	} else {
+		ast_debug(2, "Sofia REGISTER %s (refresh): user='%s' ip=%s useragent='%s'\n",
+			result, S_OR(aor, "(unknown)"), ast_sockaddr_stringify(&src), ua);
+	}
+}
+
+/* Rejections always deserve a NOTICE: they are security- and provisioning-relevant, and rare
+ * by nature, so they are never de-duplicated. */
+static void sofia_log_register_outcome(const char *result, const char *aor, sip_t const *sip)
+{
+	sofia_log_register_outcome_lvl(result, aor, sip, 1);
+}
+
+/* True when a SUCCESSFUL REGISTER is worth telling a human about: the first one this peer
+ * completes, or one whose source IP or User-Agent differs from the one last announced.
+ *
+ * sofia_register_changed() below answers a different question - "did the bindings change?" -
+ * and a NATted phone refreshing from a new source port, or a browser client whose flow closes
+ * and immediately comes back, changes them on every single REGISTER. That is real churn, not
+ * a keepalive, so it passes that gate honestly and then repeats the same line every minute for
+ * ever. What an operator wants to see is the peer appearing, and afterwards only a move to a
+ * different address or a change of client.
+ *
+ * The port is deliberately excluded: comparing it would defeat the whole purpose. Call WITHOUT
+ * peer->lock; it takes the lock to read and update the snapshot. */
+static int sofia_register_log_worthy(struct sofia_peer *peer, sip_t const *sip)
+{
+	struct ast_sockaddr src;
+	const char *ip, *ua;
+	int worthy;
+
+	if (!peer) {
+		return 1;
+	}
+	sofia_get_source_addr(sip, &src);
+	ip = S_OR(ast_sockaddr_stringify_addr(&src), "");
+	ua = (sip && sip->sip_user_agent && sip->sip_user_agent->g_string)
+		? sip->sip_user_agent->g_string : "";
+
+	ast_mutex_lock(&peer->lock);
+	worthy = !peer->reg_log_seen
+		|| strcmp(peer->reg_log_ip, ip)
+		|| strcmp(peer->reg_log_ua, ua);
+	if (worthy) {
+		ast_copy_string(peer->reg_log_ip, ip, sizeof(peer->reg_log_ip));
+		ast_copy_string(peer->reg_log_ua, ua, sizeof(peer->reg_log_ua));
+		peer->reg_log_seen = 1;
+	}
+	ast_mutex_unlock(&peer->lock);
+	return worthy;
 }
 
 /* True when a REGISTER changed binding state (not a routine keepalive refresh); gates the
@@ -12181,7 +12234,8 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		reg_update.new_expires = granted_top;
 		sofia_verbose_register_update(peer, &reg_update);
 		if (sofia_register_changed(&reg_update)) {
-			sofia_log_register_outcome("OK", peer->name, sip);
+			sofia_log_register_outcome_lvl("OK", peer->name, sip,
+				sofia_register_log_worthy(peer, sip));
 		}
 		sofia_emit_register_side_effects(peer, sip, &reg_update);
 		/* Initial unsolicited MWI (chan_sip parity): a (re)registered peer with a mailbox= +
@@ -12318,7 +12372,8 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		reg_update.new_expires = granted_top;
 		sofia_verbose_register_update(peer, &reg_update);
 		if (sofia_register_changed(&reg_update)) {
-			sofia_log_register_outcome("OK", peer->name, sip);
+			sofia_log_register_outcome_lvl("OK", peer->name, sip,
+				sofia_register_log_worthy(peer, sip));
 		}
 		sofia_emit_register_side_effects(peer, sip, &reg_update);
 		/* Initial unsolicited MWI after an AUTHENTICATED register (the other 200 path is no-auth). */
@@ -16178,7 +16233,11 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					 * it can no longer lapse and a browser phone re-registers with a new Contact. This is NOT the
 					 * account-level unregister: that one stays gated by flowclose_emit_unregister below, so a
 					 * browser F5 still does not flap the BLF / regexten. */
-					ast_verb(3, "Sofia: flow closed for '%s' (%s)%s\n", pname, uri,
+					/* Debug, not verbose: a browser client re-registers with a new Contact on
+					 * every page load and its old flow dies seconds later, so this fires
+					 * constantly and tells an operator nothing. The AMI RegisterExpired below
+					 * is NOT gated - consumers still see every binding that goes away. */
+					ast_debug(1, "Sofia: flow closed for '%s' (%s)%s\n", pname, uri,
 						remaining ? "" : " - no live contact left");
 					sofia_ami_register_expired(pname, "Flow closed",
 						ast_sockaddr_isnull(&gone_src) ? "" : ast_sockaddr_stringify(&gone_src),

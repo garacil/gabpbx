@@ -966,6 +966,18 @@ struct sofia_peer {
 	 * never needs a lock. Outside reload, always 0. */
 	int _reload_marked;
 	struct ast_sockaddr src_addr;
+	/* Registration-log de-duplication. The human-readable "Sofia REGISTER OK" NOTICE is
+	 * emitted once per peer and afterwards only when something an operator would act on
+	 * changed: the source IP (the ADDRESS, never the port) or the User-Agent. A phone
+	 * behind NAT picks a new source port on every refresh, and a browser client whose
+	 * flow closes and comes straight back really does add and remove bindings, so both
+	 * pass sofia_register_changed() on every single REGISTER and used to flood the log
+	 * with lines that said nothing new. Only the log is gated: the AMI events and the
+	 * device-state updates still fire on every transition, so no consumer loses anything.
+	 * Written under peer->lock. */
+	char reg_log_ip[64];		/* address only (no port) of the last announced REGISTER OK */
+	char reg_log_ua[128];		/* User-Agent of the last announced REGISTER OK */
+	int reg_log_seen;		/* 1 once a REGISTER OK has been announced for this peer */
 	/* registration-route transport snapshot (paired with src_addr). Set under
 	 * peer->lock from the registering Contact's ;transport= so requests to a
 	 * TCP/TLS-registered phone don't silently default to UDP. "udp"/empty -> no
