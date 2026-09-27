@@ -745,6 +745,34 @@
 			<para>Show one SKINNY line with details on current status.</para>
 		</description>
 	</manager>
+	<manager name="SofiaMessageSend" language="en_US">
+		<synopsis>
+			Send an out-of-dialog SIP MESSAGE through chan_sofia.
+		</synopsis>
+		<syntax>
+			<xi:include xpointer="xpointer(/docs/manager[@name='Login']/syntax/parameter[@name='ActionID'])" />
+			<parameter name="To" required="true">
+				<para>The destination: a full <literal>sip:</literal> or <literal>sips:</literal> URI, sent
+				as given, or the name of a configured peer, sent to that peer's current target (its
+				registered contact, or its host).</para>
+			</parameter>
+			<parameter name="From">
+				<para>The identity to present. When absent, a peer destination uses the peer's
+				<literal>fromuser</literal>@<literal>fromdomain</literal> if configured, and otherwise
+				the stack's own default.</para>
+			</parameter>
+			<parameter name="Body" required="true">
+				<para>The text of the message, sent as <literal>text/plain</literal>.</para>
+			</parameter>
+		</syntax>
+		<description>
+			<para>Queues one SIP MESSAGE (RFC 3428) to <replaceable>To</replaceable> and answers
+			<literal>Message queued</literal>; the request itself leaves from the SIP thread and its
+			final response is not reported to the manager session. An error is returned when
+			<replaceable>To</replaceable> or <replaceable>Body</replaceable> is missing, or when the
+			destination is neither a URI nor a known peer.</para>
+		</description>
+	</manager>
 	<application name="AELSub" language="en_US">
 		<synopsis>
 			Launch subroutine built with AEL
@@ -3789,7 +3817,7 @@
 		</syntax>
 		<description>
 			<para>Executes mpg123 to play the given location, which typically would be a mp3 filename
-			or m3u playlist filename or a URL. Please read https://en.wikipedia.org/wiki/M3U
+			or m3u playlist filename or a URL. Please read http://en.wikipedia.org/wiki/M3U
 			to see how M3U playlist file format is like, Example usage would be
 			exten => 1234,1,MP3Player(/var/lib/gabpbx/playlist.m3u)
 			User can exit by pressing any key on the dialpad, or by hanging up.</para>
@@ -9541,7 +9569,7 @@
 		<description>
 		</description>
 	</manager>
-	<application name="Bridge" language="en_US">
+	<application name="astBridge" language="en_US">
 		<synopsis>
 			Bridge two channels.
 		</synopsis>

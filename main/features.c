@@ -127,7 +127,7 @@ GABPBX_FILE_VERSION(__FILE__, "$Revision: 388195 $")
 //#define ATXFER_NULL_TECH	1
 
 /*** DOCUMENTATION
-	<application name="Bridge" language="en_US">
+	<application name="astBridge" language="en_US">
 		<synopsis>
 			Bridge two channels.
 		</synopsis>

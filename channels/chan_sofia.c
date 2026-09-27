@@ -197,6 +197,37 @@
 #include <sofia-sip/nta_tport.h>
 #include <sofia-sip/tport_tag.h>	/* TPTAG_TOS for SIP-listener-side TOS */
 
+/*** DOCUMENTATION
+	<manager name="SofiaMessageSend" language="en_US">
+		<synopsis>
+			Send an out-of-dialog SIP MESSAGE through chan_sofia.
+		</synopsis>
+		<syntax>
+			<xi:include xpointer="xpointer(/docs/manager[@name='Login']/syntax/parameter[@name='ActionID'])" />
+			<parameter name="To" required="true">
+				<para>The destination: a full <literal>sip:</literal> or <literal>sips:</literal> URI, sent
+				as given, or the name of a configured peer, sent to that peer's current target (its
+				registered contact, or its host).</para>
+			</parameter>
+			<parameter name="From">
+				<para>The identity to present. When absent, a peer destination uses the peer's
+				<literal>fromuser</literal>@<literal>fromdomain</literal> if configured, and otherwise
+				the stack's own default.</para>
+			</parameter>
+			<parameter name="Body" required="true">
+				<para>The text of the message, sent as <literal>text/plain</literal>.</para>
+			</parameter>
+		</syntax>
+		<description>
+			<para>Queues one SIP MESSAGE (RFC 3428) to <replaceable>To</replaceable> and answers
+			<literal>Message queued</literal>; the request itself leaves from the SIP thread and its
+			final response is not reported to the manager session. An error is returned when
+			<replaceable>To</replaceable> or <replaceable>Body</replaceable> is missing, or when the
+			destination is neither a URI nor a known peer.</para>
+		</description>
+	</manager>
+ ***/
+
 #define SOFIA_CONFIG "sofia.conf"
 
 #define DEFAULT_CONTEXT "default"
