@@ -8180,6 +8180,8 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 	}
 }
 
+static void sofia_reap_unbound_handle(nua_handle_t *nh);	/* defined below sofia_process_cancel */
+
 static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
 		sip_t const *sip, tagi_t tags[])
 {
@@ -8189,8 +8191,12 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	char cid_num[80] = "";
 	char cid_name[80] = "";
 
+	/* Until pvt->nh = nh below, a rejected INVITE leaves behind the fresh handle (with its dialog leg)
+	 * that the stack created for it and will not destroy once we answered: every early reject reaps
+	 * it behind the queued response. From pvt->nh = nh on, dropping the pvt destroys the handle. */
 	if (!sip) {
 		nua_respond(nh, SIP_400_BAD_REQUEST, TAG_END());
+		sofia_reap_unbound_handle(nh);
 		return;
 	}
 
@@ -8203,12 +8209,14 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		ast_debug(1, "Sofia: Got INVITE to non-local domain '%s'; refusing request.\n",
 			sip->sip_request->rq_url->url_host);
 		nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
+		sofia_reap_unbound_handle(nh);
 		return;
 	}
 
 	pvt = sofia_pvt_alloc();
 	if (!pvt) {
 		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, TAG_END());
+		sofia_reap_unbound_handle(nh);
 		return;
 	}
 
