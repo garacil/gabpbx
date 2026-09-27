@@ -140,6 +140,7 @@ static struct ast_config *pgsql_tablefunc;
 
 AST_MUTEX_DEFINE_STATIC(pgsql_cache_flag);      /* guards the refresh claim on ->update ONLY */
 static pthread_t pgsql_cache_update_thread = AST_PTHREADT_NULL;
+static volatile int pgsql_cache_update_stop;    /* set by unload_module(); the notifier polls it every second */
 
 /*
  * Membership and the item/size counters change together, under the CONTAINER lock (ao2_lock;
@@ -180,6 +181,9 @@ int pgsql_cache_add(char *sql, PGresult *res, char *func);
 int notify_item_status(const char *item);
 PGresult *execsql(char *sql, char *func, char *keyfield, int pgsqlCurrent);
 PGresult *sendsql(char *sql, char *func, char *keyfied);
+static int pgsql_pool_take(void);
+static void pgsql_pool_give(int slot);
+static size_t pgsql_escape(char *to, const char *from, size_t length, int *error);
 static void *do_pgsql_cache_update(void *data);
 static struct ast_pgsql_cache *pgsql_cache_get(char *sql, char *func);
 static void pgsql_cache_clear(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
@@ -304,7 +308,7 @@ static struct ast_cli_entry cli_realtime[] = {
 		if (ast_str_strlen(semi) > (ast_str_size(buffer) - 1) / 2) { \
 			ast_str_make_space(&buffer, ast_str_strlen(semi) * 2 + 1); \
 		} \
-		PQescapeStringConn(pgsqlConn[0], ast_str_buffer(buffer), ast_str_buffer(semi), ast_str_size(buffer), &pgresult); \
+		pgsql_escape(ast_str_buffer(buffer), ast_str_buffer(semi), ast_str_size(buffer), &pgresult); \
 	} while (0)
 
 static char *replace(const char *s, const char *old, const char *new)
@@ -447,18 +451,20 @@ PGresult *execsql(char *sql, char *func, char *keyfield, int pgsqlCurrent)
         return res;
 }
 
-PGresult *sendsql(char *sql, char *func, char *keyfied)
+/*! \brief Borrow a free connection of the pool, round robin; returns its slot.
+ *
+ * With every connection lent out, sleep until one is handed back instead of spinning: the old loop spun
+ * with pgsql_pool held, burning a core and keeping every other thread from even looking, and read
+ * pgsqlFlag[] without any synchronisation, so the compiler was free to never reload it and the spin could
+ * last for ever. Wake every 5 s to report the exhaustion; a caller still waits for its connection, it is
+ * never refused one. The borrower owns pgsqlConn[slot] (and may reconnect it) until pgsql_pool_give().
+ * Never take a second slot while holding one: with a small pool that would deadlock. */
+static int pgsql_pool_take(void)
 {
-        PGresult *result = NULL;
 	int localpgsqlCurrent = -1;
 	int i;
 	struct timeval start = ast_tvnow();
 
-	/* Borrow a free connection, round robin. With every connection lent out, sleep until one is handed
-	 * back instead of spinning: the old loop spun with pgsql_pool held, burning a core and keeping every
-	 * other thread from even looking, and read pgsqlFlag[] without any synchronisation, so the compiler
-	 * was free to never reload it and the spin could last for ever. Wake every 5 s to report the
-	 * exhaustion; a caller still waits for its connection, it is never refused one. */
 	ast_mutex_lock(&pgsql_pool);
 	for (;;) {
 		for (i = 0; i < PGSQL_MAX_POOL_CONN; i++) {
@@ -484,12 +490,44 @@ PGresult *sendsql(char *sql, char *func, char *keyfied)
 	}
 	ast_mutex_unlock(&pgsql_pool);
 
-	result = execsql(sql, func, keyfied, localpgsqlCurrent);
+	return localpgsqlCurrent;
+}
 
+/*! \brief Hand a borrowed connection back and wake one thread waiting for it. */
+static void pgsql_pool_give(int slot)
+{
 	ast_mutex_lock(&pgsql_pool);
-	pgsqlFlag[localpgsqlCurrent] = 0;
+	pgsqlFlag[slot] = 0;
 	ast_cond_signal(&pgsql_pool_cond);
 	ast_mutex_unlock(&pgsql_pool);
+}
+
+/*! \brief PQescapeStringConn() on a connection this thread has borrowed.
+ *
+ * Escaping is local work (the connection only supplies its client encoding and
+ * standard_conforming_strings), but it still reads the PGconn, libpq allows one thread per connection at
+ * a time, and the thread that owns a connection may PQfinish() and replace it in pgsql_reconnect(). The
+ * previous code escaped on pgsqlConn[0] without owning it, so it could race a query on that connection or
+ * read one that had just been freed. The connection is borrowed like a query borrows it, and connected
+ * first if it is not: PQescapeStringConn() with a NULL connection only reports an error. */
+static size_t pgsql_escape(char *to, const char *from, size_t length, int *error)
+{
+	int slot = pgsql_pool_take();
+	size_t res;
+
+	pgsql_reconnect(slot);
+	res = PQescapeStringConn(pgsqlConn[slot], to, from, length, error);
+	pgsql_pool_give(slot);
+
+	return res;
+}
+
+PGresult *sendsql(char *sql, char *func, char *keyfied)
+{
+	int slot = pgsql_pool_take();
+	PGresult *result = execsql(sql, func, keyfied, slot);
+
+	pgsql_pool_give(slot);
 
         return result;
 }
@@ -530,11 +568,17 @@ void *do_pgsql_cache_update(void *data)
 
         if (bind(sock,(struct sockaddr *)&server,length)<0) {
                 ast_log(LOG_ERROR, "Realtime Postgresql : Error bind port %u\n", cache_port);
+                close(sock);
                 return NULL;
         }
 
         fromlen = sizeof(struct sockaddr_in);
-        while (1) {
+        /* Wait at most a second for a datagram, so unload_module() can stop and join this thread: it
+         * used to block in recvfrom() for ever, so an unload left it running on a freed cache. */
+        while (!pgsql_cache_update_stop) {
+                if (ast_wait_for_input(sock, 1000) <= 0) {
+                        continue;
+                }
                 memset(buf, 0, sizeof(buf));
                 n = recvfrom(sock,buf,1024,0,(struct sockaddr *)&from,&fromlen);
                 if (n > 0) {
@@ -550,6 +594,7 @@ void *do_pgsql_cache_update(void *data)
 			usleep(1000);
                 }
         }
+        close(sock);
         return NULL;
 }
 
@@ -1761,6 +1806,7 @@ static int load_module(void)
         }
 
         if (pgsql_cache_update_thread == AST_PTHREADT_NULL) {
+                pgsql_cache_update_stop = 0;
                 if (ast_pthread_create(&pgsql_cache_update_thread, NULL, do_pgsql_cache_update, NULL) < 0) {
                         ast_log(LOG_ERROR, "Unable to start cache update thread.\n");
                 }
@@ -1806,6 +1852,47 @@ static int unload_module(void)
 	ast_cli_unregister_multiple(cli_realtime, ARRAY_LEN(cli_realtime));
 	ast_config_engine_deregister(&pgsql_engine);
 	ast_verb(1, "PostgreSQL RealTime unloaded.\n");
+
+	/* Stop the invalidation listener before the cache it flags goes away (it waits at most a second
+	 * per datagram, then sees the flag). */
+	if (pgsql_cache_update_thread != AST_PTHREADT_NULL) {
+		pgsql_cache_update_stop = 1;
+		pthread_join(pgsql_cache_update_thread, NULL);
+		pgsql_cache_update_thread = AST_PTHREADT_NULL;
+	}
+
+	/* Close the pool. The engine is deregistered, so no new query starts; give the ones in flight up
+	 * to 10 s to hand their connection back, then close every idle connection. One still lent out after
+	 * that is left open: closing it under the thread using it would free the PGconn it is reading. */
+	{
+		int i, busy, waits;
+
+		ast_mutex_lock(&pgsql_pool);
+		for (waits = 0; ; waits++) {
+			for (busy = 0, i = 0; i < PGSQL_MAX_POOL_CONN; i++) {
+				busy += pgsqlFlag[i] ? 1 : 0;
+			}
+			if (!busy || waits >= 10) {
+				break;
+			}
+			{
+				struct timeval until = ast_tvadd(ast_tvnow(), ast_samp2tv(1, 1));
+				struct timespec ts = { .tv_sec = until.tv_sec, .tv_nsec = until.tv_usec * 1000 };
+
+				ast_cond_timedwait(&pgsql_pool_cond, &pgsql_pool, &ts);
+			}
+		}
+		for (i = 0; i < PGSQL_MAX_POOL_CONN; i++) {
+			if (!pgsqlFlag[i] && pgsqlConn[i]) {
+				PQfinish(pgsqlConn[i]);
+				pgsqlConn[i] = NULL;
+			}
+		}
+		ast_mutex_unlock(&pgsql_pool);
+		if (busy) {
+			ast_log(LOG_WARNING, "Postgresql RealTime: %d connection(s) still in use at unload; left open\n", busy);
+		}
+	}
 
 	/* Destroy cached table info */
 	AST_LIST_LOCK(&psql_tables);
@@ -2077,10 +2164,25 @@ static char *handle_cli_realtime_pgsql_status(struct ast_cli_entry *e, int cmd, 
          * is N-1. Reading one past the end handed PQstatus() whatever followed the array and
          * killed the process -- twice on a production box on 2026-09-25, from a command whose
          * name suggests it only reads. The sibling loop at pgsql_reconnect() always used '<'. */
+        /* Snapshot under pgsql_pool, print after: a connection that is lent out belongs to the thread
+         * using it (which may PQfinish() and replace it while reconnecting), so only idle ones are asked
+         * for their status, and ast_cli() never runs with the pool locked. */
+        int busy[PGSQL_MAX_POOL_CONN], open[PGSQL_MAX_POOL_CONN], since[PGSQL_MAX_POOL_CONN];
+
+        ast_mutex_lock(&pgsql_pool);
         for (i = 0; i < PGSQL_MAX_POOL_CONN; i++) {
-                if (PQstatus(pgsqlConn[i]) == CONNECTION_OK) {
-                        ctime = time(NULL) - pgsqltime[i];
-                        snprintf(status, 255, "Connection %i Active %i open", i, pgsqlFlag[i]);
+                busy[i] = pgsqlFlag[i];
+                open[i] = !busy[i] && PQstatus(pgsqlConn[i]) == CONNECTION_OK;
+                since[i] = pgsqltime[i];
+        }
+        ast_mutex_unlock(&pgsql_pool);
+
+        for (i = 0; i < PGSQL_MAX_POOL_CONN; i++) {
+                if (busy[i]) {
+                        ast_cli(a->fd, "Connection %i Active 1 in use\n", i);
+                } else if (open[i]) {
+                        ctime = time(NULL) - since[i];
+                        snprintf(status, 255, "Connection %i Active 0 open", i);
                         if (ctime > 31536000) {
                                 ast_cli(a->fd, "%s for %d years, %d days, %d hours, %d minutes, %d seconds.\n",
                                                 status, ctime / 31536000, (ctime % 31536000) / 86400,
