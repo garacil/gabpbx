@@ -70,7 +70,12 @@ AST_THREADSTORAGE(semibuf_buf);
 #define PGSQL_MAX_POOL_CONN 31
 static int pgsqlCurrent = 0;
 
+/* pgsql_pool guards pgsqlCurrent and pgsqlFlag[] (which connection is lent out); a connection is used by
+ * exactly one thread between sendsql() taking it and handing it back. pgsql_pool_cond is signalled on
+ * every hand-back so a thread that finds the whole pool busy sleeps instead of spinning. */
 AST_MUTEX_DEFINE_STATIC(pgsql_pool);
+static ast_cond_t pgsql_pool_cond;
+static int pgsql_pool_cond_ready;
 
 static PGconn *pgsqlConn[PGSQL_MAX_POOL_CONN];
 static int pgsqlFlag[PGSQL_MAX_POOL_CONN];
@@ -445,26 +450,46 @@ PGresult *execsql(char *sql, char *func, char *keyfield, int pgsqlCurrent)
 PGresult *sendsql(char *sql, char *func, char *keyfied)
 {
         PGresult *result = NULL;
-	int localpgsqlCurrent;
+	int localpgsqlCurrent = -1;
+	int i;
+	struct timeval start = ast_tvnow();
 
-        ast_mutex_lock(&pgsql_pool);
-	pgsqlCurrent++;
-	if (pgsqlCurrent >= PGSQL_MAX_POOL_CONN)
-		pgsqlCurrent = 0;
-	while (1) {
-		if (pgsqlFlag[pgsqlCurrent] == 0) {
-			pgsqlFlag[pgsqlCurrent] = 1;
-			break;
+	/* Borrow a free connection, round robin. With every connection lent out, sleep until one is handed
+	 * back instead of spinning: the old loop spun with pgsql_pool held, burning a core and keeping every
+	 * other thread from even looking, and read pgsqlFlag[] without any synchronisation, so the compiler
+	 * was free to never reload it and the spin could last for ever. Wake every 5 s to report the
+	 * exhaustion; a caller still waits for its connection, it is never refused one. */
+	ast_mutex_lock(&pgsql_pool);
+	for (;;) {
+		for (i = 0; i < PGSQL_MAX_POOL_CONN; i++) {
+			if (++pgsqlCurrent >= PGSQL_MAX_POOL_CONN)
+				pgsqlCurrent = 0;
+			if (!pgsqlFlag[pgsqlCurrent]) {
+				pgsqlFlag[pgsqlCurrent] = 1;
+				localpgsqlCurrent = pgsqlCurrent;
+				break;
+			}
 		}
-		pgsqlCurrent++;
-		if (pgsqlCurrent >= PGSQL_MAX_POOL_CONN)
-			pgsqlCurrent = 0;
+		if (localpgsqlCurrent >= 0)
+			break;
+		{
+			struct timeval until = ast_tvadd(ast_tvnow(), ast_samp2tv(5, 1));
+			struct timespec ts = { .tv_sec = until.tv_sec, .tv_nsec = until.tv_usec * 1000 };
+
+			if (ast_cond_timedwait(&pgsql_pool_cond, &pgsql_pool, &ts) == ETIMEDOUT) {
+				ast_log(LOG_WARNING, "Postgresql RealTime: all %d connections busy for %ld ms; still waiting\n",
+					PGSQL_MAX_POOL_CONN, (long) ast_tvdiff_ms(ast_tvnow(), start));
+			}
+		}
 	}
-	localpgsqlCurrent = pgsqlCurrent;
 	ast_mutex_unlock(&pgsql_pool);
 
 	result = execsql(sql, func, keyfied, localpgsqlCurrent);
+
+	ast_mutex_lock(&pgsql_pool);
 	pgsqlFlag[localpgsqlCurrent] = 0;
+	ast_cond_signal(&pgsql_pool_cond);
+	ast_mutex_unlock(&pgsql_pool);
 
         return result;
 }
@@ -1739,6 +1764,12 @@ static int load_module(void)
                 if (ast_pthread_create(&pgsql_cache_update_thread, NULL, do_pgsql_cache_update, NULL) < 0) {
                         ast_log(LOG_ERROR, "Unable to start cache update thread.\n");
                 }
+        }
+
+        /* Once per process: a module reload must not re-initialise a condition threads may wait on. */
+        if (!pgsql_pool_cond_ready) {
+                ast_cond_init(&pgsql_pool_cond, NULL);
+                pgsql_pool_cond_ready = 1;
         }
 
         ast_mutex_lock(&pgsql_pool);
