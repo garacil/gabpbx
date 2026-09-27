@@ -15444,6 +15444,7 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 		ast_debug(1, "Sofia: Got REFER to non-local domain '%s'; refusing request.\n",
 			sip->sip_refer_to->r_url->url_host);
 		nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
+		sofia_reap_unbound_handle(nh);	/* out-of-dialog REFER: fresh handle (with a leg) nobody else destroys */
 		return;
 	}
 
@@ -15495,6 +15496,11 @@ static void sofia_process_refer(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *
 			nua_respond(nh, SIP_481_NO_TRANSACTION, NUTAG_WITH_THIS(nua), TAG_END());
 			ast_log(LOG_WARNING, "Sofia: REFER with no active call — 481 Call/Transaction Does Not Exist\n");
 		}
+		/* REFER creates a dialog (nua_notifier.c server methods: create_dialog=1), so an out-of-dialog
+		 * REFER arrives on a fresh, unbound handle carrying an nta leg that the stack never destroys
+		 * once we answered. Reap it behind the queued response; an in-dialog REFER's handle belongs
+		 * to its pvt and the magic guard leaves it alone. */
+		sofia_reap_unbound_handle(nh);
 		return;
 	}
 
