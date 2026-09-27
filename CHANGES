@@ -1,3 +1,76 @@
+## 1.9.7 — every request handle is released: a registrar's memory no longer grows with its registrations
+
+A memory release. Five leaks of one family are closed in `chan_sofia`: the Sofia-SIP handle
+the stack creates for an incoming request was never destroyed once the driver had answered
+it, so a registrar retained about 2 KB per REGISTER for the life of the process, and a few
+unauthenticated out-of-dialog requests could grow it from outside. Nothing to configure; one
+restart.
+
+### How the stack hands over a request
+
+Sofia-SIP creates a fresh, unbound handle for every incoming out-of-dialog request and, once
+the application has been given that request, never destroys it, whatever final status the
+application sends: from that moment the handle is the application's (the library's own
+documentation of `nua_i_register` says as much). `chan_sofia` destroyed it in some places —
+OPTIONS, MESSAGE, a rejected SUBSCRIBE, anything dropped by the IP blacklist — and relied,
+for the rest, on the connection-close event of a tcp/tls/ws/wss transport. Over udp that
+event never comes.
+
+### What leaked, and what changes
+
+- **REGISTER over udp, every one of them.** The 401 challenge, the 200 OK, a 403, a 423: each
+  left its handle behind. Measured: one live handle per REGISTER, still there long after the
+  binding had expired, about 100 MB of retained memory per 48 000 REGISTERs. A phone
+  refreshing every 60 s adds 1 440 handles a day, and an unauthenticated flood is a remote
+  memory-exhaustion vector. `sofia_process_register` now destroys the handle in one place,
+  right after the handler has queued its final response, unless something else owns it: the
+  flow watch keeps the handle of a single-Contact tcp/tls/ws/wss binding (its contact drops
+  it), and a User-Agent-lock rejection hands the handle to the delayed challenge timer, which
+  destroys it once the 401 has left — destroying it earlier would have made the stack answer
+  500 ahead of the challenge. `nua_respond()` and `nua_handle_destroy()` travel the same
+  FIFO, so the response always leaves before the destroy runs.
+- **An out-of-dialog INFO.** Answered 200 and left behind: one INFO from anywhere, no
+  authentication, one handle.
+- **An out-of-dialog REFER.** Answered 481 (no call), 400 (no Refer-To) or 403 (external
+  domain) and left behind, with a dialog leg, because REFER creates a dialog.
+- **A NOTIFY that matches no subscription.** Answered 200 and left behind, with a dialog leg
+  too.
+- **An INVITE rejected before its dialog object exists** (a malformed request, the
+  external-domain policy, an allocation failure). Every later rejection already released the
+  handle through that object's destructor.
+
+All five now reap the handle behind the queued response, through the same guarded helper
+that protects a handle bound to a live dialog, so an in-dialog INFO, REFER or NOTIFY is never
+touched. Verified on a live registrar: the handle count stays flat through REGISTER floods of
+both kinds (challenged and accepted) and through out-of-dialog INFO, REFER and NOTIFY; two
+consecutive 48 000-REGISTER storms leave memory at the same level, where the previous driver
+grew by 100 MB each; the replies on the wire are the same, and no 500 is ever produced.
+PUBLISH is not affected: the Allow list refuses it with 405 before any handle exists.
+
+### Also in this release
+
+- **A NOTIFY that matches no subscription is answered 481.** Once the MWI watcher, the generic
+  event-subscription watcher and the transfer hook have all declined a NOTIFY, the driver used to
+  answer 200 OK — telling the sender its notification had been accepted. RFC 6665 §4.1.3 requires
+  481 (Subscription does not exist), which is what the driver now sends: the same answer its
+  generic watcher already gave for a subscription it had torn down. An out-of-dialog INFO keeps
+  its 200; RFC 6086 puts no such requirement on the receiver.
+- **Two documentation gaps closed.** The `SofiaMessageSend` manager action and the `astBridge`
+  application (the core `Bridge()`, registered under that name in GABPBX) now carry their XML
+  documentation, so `manager show command SofiaMessageSend` and `core show application astBridge`
+  answer, and the two "Couldn't find … in XML documentation" warnings at start-up are gone.
+
+- **The REGISTER log no longer repeats itself** (on `main` since 1.9.1). The success `NOTICE`
+  was gated on whether the REGISTER changed any binding — the right question for a phone
+  refreshing the same one, the wrong one for a phone behind NAT that returns from a new source
+  port every time, or a browser client whose WebSocket flow closes and re-registers at once
+  with a new `Contact`: both genuinely add, move and remove bindings on every REGISTER, passed
+  that gate honestly, and repeated an identical line every minute. The `NOTICE` is now emitted
+  on the first REGISTER an account completes and afterwards only when the source IP (never
+  the port) or the `User-Agent` differs from the one last announced; everything else, and the
+  `flow closed` line, moved to `debug` under the same text. Rejections are never
+  de-duplicated, and the AMI events and device-state updates still fire on every transition.
+
 ## 1.9.1 — the push wake-up that assists a ringing call now names the caller
 
 A one-line defect in the mobile push wake-up, fixed. When an account has devices that are
