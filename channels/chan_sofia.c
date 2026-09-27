@@ -8802,9 +8802,13 @@ static void sofia_process_cancel(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 /* Reap the fresh UNBOUND nua handle sofia-sip creates for an out-of-dialog request the application
  * is discarding. Three callers:
  *
- *   0) every answered REGISTER (sofia_process_register), unless the handle was retained as a
- *      flow-watch owner or handed to the delayed-reject timer: the stack never destroys an
- *      application-answered REGISTER handle, and over udp nothing else ever would (see there).
+ *   0) every out-of-dialog request the application answers WITHOUT keeping the handle: REGISTER
+ *      (sofia_process_register, unless retained as a flow-watch owner or handed to the delayed-reject
+ *      timer), out-of-dialog INFO / NOTIFY / REFER, and an INVITE rejected before its pvt exists.
+ *      Once the application has been handed the request (sr_event set) the stack never destroys the
+ *      handle itself, whatever the final status (nua_base_server_report), and over udp nothing else
+ *      ever would. The response is always queued first: nua_respond and nua_handle_destroy travel
+ *      the same FIFO, so the destroy runs after the final response has left.
  *
  *   1) out-of-dialog OPTIONS (sofia_process_options): OPTIONS is deliberately NOT in our
  *      NUTAG_APPL_METHOD set, so the stack AUTO-ANSWERS it 200 — carrying our global NUTAG_ALLOW
@@ -15661,6 +15665,11 @@ static void sofia_process_info(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *o
 	nua_respond(nh, SIP_200_OK, NUTAG_WITH_THIS(nua), TAG_END());
 
 	if (!sip || !op || !op->owner) {
+		/* INFO is allowed outside a dialog (nua_session.c server methods: in_dialog=0), and such an
+		 * INFO arrives on a fresh, unbound handle the stack never destroys once we answered. Reap
+		 * it now that the 200 is queued ahead of the destroy; the magic guard leaves an in-dialog
+		 * INFO's handle (owned by its pvt) untouched. */
+		sofia_reap_unbound_handle(nh);
 		return;
 	}
 
@@ -16503,7 +16512,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	case nua_i_info:
 		sofia_process_info(nua, nh, pvt, sip, tags);
 		break;
-	/* No nua_i_publish case — PUBLISH is not APPL_METHOD'd, so the stack rejects it. */
+	/* No nua_i_publish case: PUBLISH is not in our NUTAG_ALLOW list, so nta_check_method() answers 405
+	 * inside nua_stack_process_request before any handle exists (it IS in sofia-sip's default
+	 * appl_method set, which NUTAG_APPL_METHOD merges into rather than replaces). */
 	case nua_i_prack:
 		sofia_process_prack(nua, nh, pvt, sip, tags);
 		break;
