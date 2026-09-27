@@ -8800,7 +8800,11 @@ static void sofia_process_cancel(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 }
 
 /* Reap the fresh UNBOUND nua handle sofia-sip creates for an out-of-dialog request the application
- * is discarding. Two callers:
+ * is discarding. Three callers:
+ *
+ *   0) every answered REGISTER (sofia_process_register), unless the handle was retained as a
+ *      flow-watch owner or handed to the delayed-reject timer: the stack never destroys an
+ *      application-answered REGISTER handle, and over udp nothing else ever would (see there).
  *
  *   1) out-of-dialog OPTIONS (sofia_process_options): OPTIONS is deliberately NOT in our
  *      NUTAG_APPL_METHOD set, so the stack AUTO-ANSWERS it 200 — carrying our global NUTAG_ALLOW
@@ -9442,9 +9446,10 @@ static int sofia_contact_acl_check(struct sofia_peer *peer, const url_t *url, co
  * media_error handler does a type-safe pointer-membership lookup and never dereferences an untyped hmagic. The
  * contact stores reg_nh and is the SOLE dropper: on supersede (refresh/rebind) and on every removal path via the
  * contact destructor, the registry entry is unlinked and the handle destroyed (deferred to sofia_thread) - exactly
- * once. media_error only UNLINKS the matched contact (-> destructor drops the handle). Orphaned registrar handles
- * (the 401-challenge / multi-Contact / non-stored ones, which the built-in watch also arms with hmagic=NULL) are
- * destroyed when their own media_error fires, so none leak. */
+ * once. media_error only UNLINKS the matched contact (-> destructor drops the handle). Registrar handles that are
+ * NOT retained (the 401-challenge / multi-Contact / non-stored ones, and everything over udp) are destroyed by
+ * sofia_process_register() right after their final response; the media_error registry-miss path below remains
+ * only as a backstop for a connection-oriented one that is still alive when its connection closes. */
 
 #define SOFIA_REGFLOW_BUCKETS 4093		/* prime */
 static struct ao2_container *sofia_regflow_handles;	/* nua_handle_t* (offset 0) -> {peer_name, contact_uri} */
@@ -9535,6 +9540,24 @@ static void sofia_regflow_drop(nua_handle_t *nh)
 		ao2_unlock(e);
 		ao2_ref(e, -1);				/* undo task ref */
 	}
+}
+
+/* Is `nh` a retained REGISTER handle (registry hit, whether or not a drop is already queued)? sofia_thread. A
+ * tracked handle is destroyed ONLY by its drop task; sofia_process_register() asks this before reaping the
+ * handle of a REGISTER it just answered, so a handle the binding kept is never destroyed twice. */
+static int sofia_regflow_owns(nua_handle_t *nh)
+{
+	struct sofia_regflow_entry key, *e;
+
+	if (!nh || !sofia_regflow_handles) {
+		return 0;
+	}
+	key.nh = nh;
+	if (!(e = ao2_find(sofia_regflow_handles, &key, OBJ_POINTER))) {
+		return 0;
+	}
+	ao2_ref(e, -1);					/* finder */
+	return 1;
 }
 
 /* Retain this REGISTER handle as the flow-watch owner of contact `c`, superseding any previous handle. sofia_thread
@@ -11561,7 +11584,8 @@ static void sofia_emit_subscribe_rejected(sip_t const *sip, const char *peer_nam
  * (no-secret + auth-OK).
  *
  * Returns 0 = PASS (caller continues), -1 = REJECT (401 + AMI already emitted;
- * caller MUST ao2_ref(peer,-1) and return). */
+ * caller MUST ao2_ref(peer,-1) and return SOFIA_REG_NH_DEFERRED: the deferred
+ * emit owns the server handle and reaps it after the 401). */
 static int sofia_check_lockuseragent(nua_t *nua, nua_handle_t *nh,
 		sip_t const *sip, struct sofia_peer *peer)
 {
@@ -11628,9 +11652,12 @@ static int sofia_check_lockuseragent(nua_t *nua, nua_handle_t *nh,
 	{
 		char realm_buf[MAXHOSTNAMELEN];
 		realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
-		/* REGISTER: no pvt pin and no reap — the REGISTER server handle is neither
-		 * pvt-bound here nor reaped by us, so it is unaffected by the residual-race fence. */
-		sofia_send_auth_challenge(nua, nh, sip, realm, "REGISTER", "UserAgentMismatch", NULL, 0);
+		/* REGISTER: no pvt pin (the REGISTER server handle is never pvt-bound), but
+		 * reap_handle_on_fire=1: the handle is a fresh, unbound one per REGISTER that nobody
+		 * else destroys, so the deferred emit reaps it right AFTER the 401 leaves. The caller
+		 * (sofia_process_register) must therefore NOT reap it: a destroy queued before the
+		 * timer fires would make nta_incoming_destroy answer 500 ahead of the challenge. */
+		sofia_send_auth_challenge(nua, nh, sip, realm, "REGISTER", "UserAgentMismatch", NULL, 1);
 	}
 
 	sofia_get_source_addr(sip, &src);
@@ -12027,7 +12054,16 @@ void sofia_emit_register_side_effects(struct sofia_peer *peer, sip_t const *sip,
 		peer->accountcode);	/* chan_sip parity: without this the connector's force-renewal wipes accountcode to "" every REGISTER */
 }
 
-static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
+/* What sofia_process_register_impl() did with the REGISTER server handle. */
+enum sofia_register_nh_fate {
+	SOFIA_REG_NH_ANSWERED = 0,	/* a final response is queued (or the handle was retained by the flow watch) */
+	SOFIA_REG_NH_DEFERRED,		/* the response is on the delayed-reject timer, which also reaps the handle */
+};
+
+/* Handles one incoming REGISTER end to end (peer lookup, ACL, auth, bindings, response). Every path
+ * queues exactly one final response, or hands it to the delayed-reject timer. The server handle is
+ * NOT destroyed here: sofia_process_register() below decides that from the returned fate, in one place. */
+static enum sofia_register_nh_fate sofia_process_register_impl(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
 		sip_t const *sip, tagi_t tags[])
 {
 	const char *user = NULL;
@@ -12040,7 +12076,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 
 	if (!sip || !sip->sip_from) {
 		nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
-		return;
+		return SOFIA_REG_NH_ANSWERED;
 	}
 	/* Authoritative transport from the actual delivering tport (the real connection), threaded into the
 	 * contact store so ws/wss WebSocket registrations are not mis-stored as udp from a synthetic Contact. */
@@ -12064,7 +12100,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		 * auth_algorithms so a sha256-only deployment never advertises MD5. */
 		sofia_emit_auth_challenge(nua, nh, realm, "empty", 0, NULL);
 		sofia_blacklist_add_sip(sip, "REGISTER missing user");
-		return;
+		return SOFIA_REG_NH_ANSWERED;
 	}
 
 	/* match_auth_username (chan_sip parity): override the peer-lookup key with the
@@ -12091,7 +12127,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		}
 		sofia_log_register_outcome("REJECT (unknown peer)", user, sip);
 		sofia_blacklist_add_sip(sip, "REGISTER unknown peer");
-		return;
+		return SOFIA_REG_NH_ANSWERED;
 	}
 
 	/* Per-peer ACL, BEFORE auth so a banned IP can't probe for valid credentials. */
@@ -12104,7 +12140,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 				NUTAG_WITH_THIS(nua), TAG_END());
 			sofia_blacklist_add_sip(sip, "REGISTER peer ACL reject");
 			ao2_ref(peer, -1);
-			return;
+			return SOFIA_REG_NH_ANSWERED;
 		}
 	}
 
@@ -12118,7 +12154,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			SIPTAG_UNSUPPORTED_STR("path"),
 			TAG_END());
 		ao2_ref(peer, -1);
-		return;
+		return SOFIA_REG_NH_ANSWERED;
 	}
 
 	/* No credential at all (neither secret nor md5secret) -> accept without auth.
@@ -12128,7 +12164,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		if (!sip->sip_contact) {
 			sofia_respond_register_query(nua, nh, peer);
 			ao2_ref(peer, -1);
-			return;
+			return SOFIA_REG_NH_ANSWERED;
 		}
 		/* RFC 3261 §10.3: `expires` here is the FALLBACK for a Contact that carries no ;expires= param of its
 		 * own (the Expires header value, else the local default). The actual per-Contact requested/granted TTL
@@ -12146,7 +12182,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 				if (sofia_check_register_expiry(nua, nh, peer, &req) < 0) {
 					sofia_log_register_outcome("REJECT (interval too brief)", peer->name, sip);
 					ao2_ref(peer, -1);
-					return;
+					return SOFIA_REG_NH_ANSWERED;
 				}
 			}
 		}
@@ -12155,7 +12191,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			sofia_log_register_outcome("REJECT (user-agent lock)", peer->name, sip);
 			sofia_blacklist_add_sip(sip, "REGISTER user-agent lock reject");
 			ao2_ref(peer, -1);
-			return;
+			return SOFIA_REG_NH_DEFERRED;
 		}
 		ast_mutex_lock(&peer->lock);
 		int rc = sofia_update_peer_contacts(peer, sip, expires, &reg_update, real_transport, nh);
@@ -12164,14 +12200,14 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		if (rc == -4) {	/* Path serialization overflow -> reject; never bind without the route vector (RFC 3327). */
 			nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
 			ao2_ref(peer, -1);
-			return;
+			return SOFIA_REG_NH_ANSWERED;
 		}
 		if (rc == -2) {
 			/* Wildcard "Contact: *" with non-zero Expires -> 400 (no-secret path). */
 			sofia_log_register_outcome("REJECT (bad wildcard contact)", peer->name, sip);
 			nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
 			ao2_ref(peer, -1);
-			return;
+			return SOFIA_REG_NH_ANSWERED;
 		}
 		if (rc == -3) {
 			/* Contact storage failed (ao2_link OOM) — answer 500, not a bogus 200 OK
@@ -12179,7 +12215,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			sofia_log_register_outcome("REJECT (contact storage failed)", peer->name, sip);
 			nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
 			ao2_ref(peer, -1);
-			return;
+			return SOFIA_REG_NH_ANSWERED;
 		}
 		if (rc < 0) {
 			ast_verbose("Sofia: REGISTER from peer '%s' rejected with 403 \xe2\x80\x94 too many registered devices (limit=%d)\n",
@@ -12189,7 +12225,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 				NUTAG_WITH_THIS(nua),
 				TAG_END());
 			ao2_ref(peer, -1);
-			return;
+			return SOFIA_REG_NH_ANSWERED;
 		}
 		/* rtupdate=no skips all realtime DB writes (chan_sip parity). */
 		if (peer->is_realtime && sofia_cfg.peer_rtupdate) {
@@ -12242,7 +12278,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		 * subscribemwi=no gets its current MWI pushed now, without subscribing. */
 		sofia_register_initial_mwi(peer);
 		ao2_ref(peer, -1);
-		return;
+		return SOFIA_REG_NH_ANSWERED;
 	}
 
 	/* Digest verification (shared with INVITE/SUBSCRIBE): helper emits the challenge /
@@ -12255,7 +12291,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 				sofia_log_register_outcome("REJECT (auth)", peer->name, sip);
 			}
 			ao2_ref(peer, -1);
-			return;
+			return SOFIA_REG_NH_ANSWERED;
 		}
 	}
 
@@ -12266,7 +12302,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			if (!sip->sip_contact) {
 				sofia_respond_register_query(nua, nh, peer);
 				ao2_ref(peer, -1);
-				return;
+				return SOFIA_REG_NH_ANSWERED;
 			}
 			/* RFC 3261 §10.3: `expires` = the FALLBACK for a Contact with no ;expires= param (the Expires
 			 * header value, else the local default); the per-Contact granted TTL is computed in
@@ -12282,7 +12318,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 					if (sofia_check_register_expiry(nua, nh, peer, &req) < 0) {
 						sofia_log_register_outcome("REJECT (interval too brief)", peer->name, sip);
 						ao2_ref(peer, -1);
-						return;
+						return SOFIA_REG_NH_ANSWERED;
 					}
 				}
 			}
@@ -12292,7 +12328,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 				sofia_log_register_outcome("REJECT (user-agent lock)", peer->name, sip);
 				sofia_blacklist_add_sip(sip, "REGISTER user-agent lock reject");
 				ao2_ref(peer, -1);
-				return;
+				return SOFIA_REG_NH_DEFERRED;
 			}
 			ast_mutex_lock(&peer->lock);
 			int rc = sofia_update_peer_contacts(peer, sip, expires, &reg_update, real_transport, nh);
@@ -12301,14 +12337,14 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 			if (rc == -4) {	/* Path serialization overflow -> reject; never bind without the route vector (RFC 3327). */
 				nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
 				ao2_ref(peer, -1);
-				return;
+				return SOFIA_REG_NH_ANSWERED;
 			}
 			if (rc == -2) {
 				/* Wildcard "Contact: *" with non-zero Expires -> 400. */
 				sofia_log_register_outcome("REJECT (bad wildcard contact)", peer->name, sip);
 				nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
 				ao2_ref(peer, -1);
-				return;
+				return SOFIA_REG_NH_ANSWERED;
 			}
 			if (rc == -3) {
 				/* Contact storage failed (ao2_link OOM) — answer 500, not a bogus
@@ -12316,7 +12352,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 				sofia_log_register_outcome("REJECT (contact storage failed)", peer->name, sip);
 				nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH_THIS(nua), TAG_END());
 				ao2_ref(peer, -1);
-				return;
+				return SOFIA_REG_NH_ANSWERED;
 			}
 			if (rc < 0) {
 				ast_verbose("Sofia: REGISTER from peer '%s' rejected with 403 \xe2\x80\x94 too many registered devices (limit=%d)\n",
@@ -12326,7 +12362,7 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 					NUTAG_WITH_THIS(nua),
 					TAG_END());
 				ao2_ref(peer, -1);
-				return;
+				return SOFIA_REG_NH_ANSWERED;
 			}
 		}
 
@@ -12379,6 +12415,39 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 		/* Initial unsolicited MWI after an AUTHENTICATED register (the other 200 path is no-auth). */
 		sofia_register_initial_mwi(peer);
 		ao2_ref(peer, -1);
+	return SOFIA_REG_NH_ANSWERED;
+}
+
+/* The stack creates a fresh, unbound handle for EVERY incoming REGISTER (create_dialog=0, hence no
+ * leg, hence the request always arrives on the default handle: nua_registrar.c server methods,
+ * nua_server.c nua_stack_process_request) and never destroys it once the application has answered,
+ * whatever the status: reporting nua_i_register sets sr_event, after which nua_base_server_report()
+ * leaves the handle to the application (the nua_i_register docs in nua_registrar.c say to destroy it
+ * after responding). The only stack-side reaper is the connection-close error of a tcp/tls/ws/wss
+ * transport, which never fires over udp: left alone, every udp REGISTER (401 challenge, 200 OK, 403,
+ * 423) leaked its nua_handle_t + su_home for the life of the process (measured: one handle per
+ * REGISTER, about 2 KB each, never returned after the binding expired).
+ *
+ * So the handle is destroyed HERE, once, after the handler ran, unless someone else owns it:
+ *   - sofia_regflow_attach() retained it as the flow-watch owner of a connection-oriented binding
+ *     (registry hit): the contact drops it, on supersede or in its destructor.
+ *   - the response went to the delayed-reject timer (lockuseragent mismatch): that timer reaps the
+ *     handle right after emitting (reap_handle_on_fire); destroying it earlier would make
+ *     nta_incoming_destroy answer 500 ahead of the deferred 401.
+ * nua_respond() and nua_handle_destroy() are both signals on the same FIFO (nua_signal ->
+ * su_msg_send_to), so the final response always leaves before the destroy runs, and the magic==NULL
+ * guard in sofia_reap_unbound_handle() keeps a bound handle out of reach, exactly as on the OPTIONS
+ * and blacklist-drop paths. The blacklist gate reaps before dispatch and never reaches this function. */
+static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
+		sip_t const *sip, tagi_t tags[])
+{
+	if (sofia_process_register_impl(nua, nh, op, sip, tags) == SOFIA_REG_NH_DEFERRED) {
+		return;
+	}
+	if (sofia_regflow_owns(nh)) {
+		return;
+	}
+	sofia_reap_unbound_handle(nh);
 }
 
 /* Resolve the source IP+port presented to `target` for outbound INVITE From/Contact/SDP
