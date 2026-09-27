@@ -68,7 +68,7 @@ requirements=warn
 ;
 ; Defaults in the source:
 ;
-;   max_items = 8000
+;   max_items = 200000
 ;   max_size  = 5120000 bytes
 ;
 ; max_items limits the number of cached SQL result sets.
@@ -78,7 +78,7 @@ requirements=warn
 ; Existing cached data remains valid until explicitly cleared or marked for
 ; update by the network invalidation listener.
 ;
-max_items=8000
+max_items=200000
 max_size=5120000
 
 [networkupd]

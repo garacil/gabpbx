@@ -153,7 +153,12 @@ struct ast_pgsql_cache {
 
 static int cache_port;
 
-#define PGSQL_CACHE_BUCKETS 1567        /* prime; the cache holds up to pgsql_cache_max_items */
+#define PGSQL_CACHE_DEFAULT_MAX_ITEMS 200000 /* [cache] max_items when res_pgsql.conf does not set it */
+/* The container gets one bucket per allowed entry (whatever [cache] max_items says), so the chains stay
+ * at about one entry each; a bucket is two pointers, so even 200000 entries cost about 3 MB. Bounded on
+ * both sides: never fewer than the default, never an absurd table from a wild max_items. */
+#define PGSQL_CACHE_BUCKETS_MIN PGSQL_CACHE_DEFAULT_MAX_ITEMS
+#define PGSQL_CACHE_BUCKETS_MAX 1048576
 
 static struct ao2_container *pgsql_cache = NULL;
 
@@ -161,7 +166,7 @@ static int pgsql_cache_items = 0; // Current cache items
 static long unsigned pgsql_cache_size = 0; // Current cache size
 
 // Config params
-static int pgsql_cache_max_items = 8000; // max items allocated
+static int pgsql_cache_max_items = PGSQL_CACHE_DEFAULT_MAX_ITEMS; // max items allocated
 static long unsigned pgsql_cache_max_size = 5120000; // bytes, if > then replace by old time access
 
 char *rep_quotation(const char *s);
@@ -176,7 +181,6 @@ static void pgsql_cache_clear(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 
 static int parse_config(int reload);
 static char *handle_cli_realtime_pgsql_status(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
-//static char *handle_cli_realtime_pgsql_cache(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static char *handle_cli_realtime_pgsql_cache_clear(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 
 static enum { RQ_WARN, RQ_CREATECLOSE, RQ_CREATECHAR } requirements;
@@ -276,7 +280,6 @@ static struct ast_pgsql_cache *pgsql_cache_entry_new(const char *sql, PGresult *
 
 static struct ast_cli_entry cli_realtime[] = {
 	AST_CLI_DEFINE(handle_cli_realtime_pgsql_status, "Shows connection information for the PostgreSQL RealTime driver"),
-//	AST_CLI_DEFINE(handle_cli_realtime_pgsql_cache, "Shows cached tables within the PostgreSQL realtime driver"),
 	AST_CLI_DEFINE(handle_cli_realtime_pgsql_cache_clear, "Clear realtime cache from ram")
 };
 
@@ -463,20 +466,6 @@ PGresult *sendsql(char *sql, char *func, char *keyfied)
 	result = execsql(sql, func, keyfied, localpgsqlCurrent);
 	pgsqlFlag[localpgsqlCurrent] = 0;
 
-/*        while (1) {
-                if (pgsqlFlag[pgsqlCurrent] == 0) {
-                        pgsqlFlag[pgsqlCurrent] = 1;
-			ast_mutex_unlock(&pgsql_pool);
-                        result = execsql(sql, func, keyfied, pgsqlCurrent);
-                        pgsqlFlag[pgsqlCurrent] = 0;
-                        break;
-                } else {
-	                pgsqlCurrent += 1;
-	                if (pgsqlCurrent >= PGSQL_MAX_POOL_CONN) {
-	                        pgsqlCurrent = 0;
-	                }
-		}
-        }*/
         return result;
 }
 
@@ -812,7 +801,6 @@ static struct tables *find_table(const char *orig_tablename)
 		flen = PQgetvalue(result, i, 2);
 		fnotnull = PQgetvalue(result, i, 3);
 		fdef = PQgetvalue(result, i, 4);
-		//ast_verb(4, "Found column '%s' of type '%s'\n", fname, ftype);
 
 		if (!(column = ast_calloc(1, sizeof(*column) + strlen(fname) + strlen(ftype) + 2))) {
 			ast_log(LOG_ERROR, "Unable to allocate column element for %s, %s\n", orig_tablename, fname);
@@ -930,8 +918,6 @@ static struct ast_variable *realtime_pgsql(const char *database, const char *tab
 	}
 	va_end(ap);
 
-//	ast_log(LOG_WARNING, "Postgresql RealTime: SQL %s\n", ast_str_buffer(sql));
-
 	if (func) {
 		if (!(centry = pgsql_cache_get(sql->__AST_STR_STR, func))) {
 			if (!(result = sendsql(sql->__AST_STR_STR, func, NULL))) {
@@ -1035,7 +1021,6 @@ static struct ast_config *realtime_multi_pgsql(const char *database, const char 
 
         if (pgsql_tablefunc)
 	        func = (char*) ast_variable_retrieve(pgsql_tablefunc, "selectfunc", table);
-
 
 	if (!(cfg = ast_config_new()))
 		return NULL;
@@ -1460,9 +1445,6 @@ static int destroy_pgsql(const char *database, const char *table, const char *ke
 	}
 
 	/* Get the first parameter and first value in our list of passed paramater/value pairs */
-	/*newparam = va_arg(ap, const char *);
-	newval = va_arg(ap, const char *);
-	if (!newparam || !newval) {*/
 	if (ast_strlen_zero(keyfield) || ast_strlen_zero(lookup))  {
 		ast_log(LOG_WARNING,
 				"PostgreSQL RealTime: Realtime destroy requires at least 1 parameter and 1 value to search on.\n");
@@ -1505,7 +1487,6 @@ static int destroy_pgsql(const char *database, const char *table, const char *ke
 
 	return -1;
 }
-
 
 static struct ast_config *config_pgsql(const char *database, const char *table,
 									   const char *file, struct ast_config *cfg,
@@ -1741,7 +1722,15 @@ static int load_module(void)
 		return AST_MODULE_LOAD_DECLINE;
 
         /* Build the cache before the notifier thread starts: it looks entries up. */
-        if (!(pgsql_cache = ao2_container_alloc(PGSQL_CACHE_BUCKETS, pgsql_cache_hash_fn, pgsql_cache_cmp_fn))) {
+        {
+                unsigned int buckets = pgsql_cache_max_items > PGSQL_CACHE_BUCKETS_MIN
+                        ? (unsigned int) pgsql_cache_max_items : PGSQL_CACHE_BUCKETS_MIN;
+                if (buckets > PGSQL_CACHE_BUCKETS_MAX) {
+                        buckets = PGSQL_CACHE_BUCKETS_MAX;
+                }
+                pgsql_cache = ao2_container_alloc(buckets, pgsql_cache_hash_fn, pgsql_cache_cmp_fn);
+        }
+        if (!pgsql_cache) {
                 ast_log(LOG_ERROR, "Postgresql RealTime: cannot allocate the SQL cache\n");
                 return AST_MODULE_LOAD_DECLINE;
         }
@@ -1807,11 +1796,6 @@ static int unload_module(void)
 
 static int reload(void)
 {
-	//ast_mutex_lock(&pgsql_pool);
-	//if (pgsql_tablefunc)
-	//	ast_config_destroy(pgsql_tablefunc);
-	//parse_config(1);
-	//ast_mutex_unlock(&pgsql_pool);
 
 	return 0;
 }
@@ -1924,8 +1908,8 @@ static int parse_config(int is_reload)
 
         if (!(s = ast_variable_retrieve(config, "cache", "max_items"))) {
                 ast_log(LOG_WARNING,
-                        "Postgresql RealTime: No cache max items, using 8000 as default.\n");
-                pgsql_cache_max_items = 8000;
+                        "Postgresql RealTime: No cache max items, using %d as default.\n", PGSQL_CACHE_DEFAULT_MAX_ITEMS);
+                pgsql_cache_max_items = PGSQL_CACHE_DEFAULT_MAX_ITEMS;
         } else {
                 pgsql_cache_max_items = atoi(s);
         }
@@ -2017,62 +2001,6 @@ static int parse_config(int is_reload)
 
 	return 1;
 }
-
-#if 0
-static char *handle_cli_realtime_pgsql_cache(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
-{
-	struct tables *cur;
-	int l, which;
-	char *ret = NULL;
-
-	switch (cmd) {
-	case CLI_INIT:
-		e->command = "realtime show pgsql cache";
-		e->usage =
-			"Usage: realtime show pgsql cache [<table>]\n"
-			"       Shows table cache for the PostgreSQL RealTime driver\n";
-		return NULL;
-	case CLI_GENERATE:
-		if (a->argc != 4) {
-			return NULL;
-		}
-		l = strlen(a->word);
-		which = 0;
-		AST_LIST_LOCK(&psql_tables);
-		AST_LIST_TRAVERSE(&psql_tables, cur, list) {
-			if (!strncasecmp(a->word, cur->name, l) && ++which > a->n) {
-				ret = ast_strdup(cur->name);
-				break;
-			}
-		}
-		AST_LIST_UNLOCK(&psql_tables);
-		return ret;
-	}
-
-	if (a->argc == 4) {
-		/* List of tables */
-		AST_LIST_LOCK(&psql_tables);
-		AST_LIST_TRAVERSE(&psql_tables, cur, list) {
-			ast_cli(a->fd, "%s\n", cur->name);
-		}
-		AST_LIST_UNLOCK(&psql_tables);
-	} else if (a->argc == 5) {
-		/* List of columns */
-		if ((cur = find_table(a->argv[4]))) {
-			struct columns *col;
-			ast_cli(a->fd, "Columns for Table Cache '%s':\n", a->argv[4]);
-			ast_cli(a->fd, "%-20.20s %-20.20s %-3.3s %-8.8s\n", "Name", "Type", "Len", "Nullable");
-			AST_LIST_TRAVERSE(&cur->columns, col, list) {
-				ast_cli(a->fd, "%-20.20s %-20.20s %3d %-8.8s\n", col->name, col->type, col->len, col->notnull ? "NOT NULL" : "");
-			}
-			release_table(cur);
-		} else {
-			ast_cli(a->fd, "No such table '%s'\n", a->argv[4]);
-		}
-	}
-	return 0;
-}
-#endif
 
 static char *handle_cli_realtime_pgsql_cache_clear(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
