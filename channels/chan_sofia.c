@@ -14505,6 +14505,12 @@ static void sofia_process_notify(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	}
 
 	nua_respond(nh, SIP_200_OK, NUTAG_WITH_THIS(nua), TAG_END());
+	/* Nobody consumed it: a NOTIFY outside any dialog we know. Such a NOTIFY creates a dialog
+	 * (nua_subnotref.c server methods: create_dialog=1), so it arrived on a fresh, unbound handle
+	 * with an nta leg that the stack never destroys once we answered. Reap it behind the queued 200.
+	 * Our own subscription handles carry sentinel magics and a refer NOTIFY's handle is pvt-bound,
+	 * so the magic guard leaves every owned handle alone. */
+	sofia_reap_unbound_handle(nh);
 }
 
 /* 3-method bridged-channel finder, used by the REFER ATTENDED + BLIND paths.
