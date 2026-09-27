@@ -55,6 +55,8 @@ GABPBX_FILE_VERSION(__FILE__, "$Revision: 284473 $")
 #include "gabpbx/utils.h"
 #include "gabpbx/cli.h"
 #include "gabpbx/paths.h"
+#include "gabpbx/astobj2.h"
+#include "gabpbx/strings.h"
 #include "../channels/sip/include/sip.h"
 
 AST_THREADSTORAGE(sql_buf);
@@ -113,14 +115,37 @@ static char dbport2[MAX_DB_OPTION_SIZE] = "";
 
 static struct ast_config *pgsql_tablefunc;
 
-// Cache implementation for realtie_pgsql and realtime_multi_pgsql
+/*
+ * Cache for realtime_pgsql and realtime_multi_pgsql.
+ *
+ * An ao2 container keyed by the SQL text. ao2 was chosen over a driver-private table for one
+ * reason that dominates every other consideration here: it REFERENCE-COUNTS the entries. The
+ * previous implementation was a sorted array under one global mutex, and that mutex had to be
+ * held not just for the lookup but for the WHOLE consumption of the PGresult -- every realtime
+ * read on the box serialised against every other while its rows were turned into variables.
+ * Handing the caller a reference instead of a lock removes that entirely: the lookup is O(1)
+ * under the container lock, and the result is then read with no lock held at all.
+ *
+ * INVARIANT: an entry is IMMUTABLE once published, except for 'last' (an access hint) and
+ * 'update' (the invalidation flag) -- both plain word writes whose worst race is one extra or
+ * one missed refresh. 'res' is NEVER replaced in place, because a reader holding only a
+ * reference would then be parsing memory that PQclear had freed. A refresh therefore builds a
+ * NEW entry and swaps it into the container; the old one dies when its last reader lets go.
+ */
 
-AST_MUTEX_DEFINE_STATIC(pgsql_cache_flag);
+AST_MUTEX_DEFINE_STATIC(pgsql_cache_flag);      /* guards the refresh claim on ->update ONLY */
 static pthread_t pgsql_cache_update_thread = AST_PTHREADT_NULL;
 
+/*
+ * Membership and the item/size counters change together, under the CONTAINER lock (ao2_lock;
+ * the mutex is recursive, so ao2_find/ao2_link inside it re-enter safely). Keeping them under
+ * one lock is what stops a clear racing a refresh or an add from leaving the counters
+ * describing entries that are no longer there -- or not counting ones that are.
+ */
 struct ast_pgsql_cache {
         char *sql;
         PGresult *res;
+        long unsigned weight;   /* what this entry added to pgsql_cache_size; fixed at birth */
         time_t last;
         int update;
         int autokillid; // Auto-kill ID (scheduler)
@@ -128,7 +153,9 @@ struct ast_pgsql_cache {
 
 static int cache_port;
 
-static struct ast_pgsql_cache **pgsql_cache = NULL; // order by sql
+#define PGSQL_CACHE_BUCKETS 1567        /* prime; the cache holds up to pgsql_cache_max_items */
+
+static struct ao2_container *pgsql_cache = NULL;
 
 static int pgsql_cache_items = 0; // Current cache items
 static long unsigned pgsql_cache_size = 0; // Current cache size
@@ -143,10 +170,8 @@ int pgsql_cache_add(char *sql, PGresult *res, char *func);
 int notify_item_status(const char *item);
 PGresult *execsql(char *sql, char *func, char *keyfield, int pgsqlCurrent);
 PGresult *sendsql(char *sql, char *func, char *keyfied);
-int pgsql_cache_item_number(char *sql);
 static void *do_pgsql_cache_update(void *data);
-int _pgsql_cache_add(struct ast_pgsql_cache *item);
-PGresult *pgsql_cache_pgresult(char *sql, char *func);
+static struct ast_pgsql_cache *pgsql_cache_get(char *sql, char *func);
 static void pgsql_cache_clear(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 
 static int parse_config(int reload);
@@ -155,6 +180,99 @@ static char *handle_cli_realtime_pgsql_status(struct ast_cli_entry *e, int cmd, 
 static char *handle_cli_realtime_pgsql_cache_clear(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 
 static enum { RQ_WARN, RQ_CREATECLOSE, RQ_CREATECHAR } requirements;
+
+/* ao2 plumbing for the SQL cache. The key is the SQL text; hash and compare read ONLY ->sql,
+ * which is what lets a plain stack struct carrying just that field be used as the lookup key
+ * with OBJ_POINTER (the same shim idiom chan_sofia uses for its peer containers). */
+static void pgsql_cache_entry_dtor(void *obj)
+{
+        struct ast_pgsql_cache *entry = obj;
+
+        if (entry->res) {
+                PQclear(entry->res);
+        }
+        if (entry->sql) {
+                ast_free(entry->sql);
+        }
+}
+
+static int pgsql_cache_hash_fn(const void *obj, const int flags)
+{
+        const struct ast_pgsql_cache *entry = obj;
+
+        return ast_str_hash(entry->sql);
+}
+
+static int pgsql_cache_cmp_fn(void *obj, void *arg, int flags)
+{
+        const struct ast_pgsql_cache *entry = obj;
+        const struct ast_pgsql_cache *key = arg;
+
+        return !strcmp(entry->sql, key->sql) ? (CMP_MATCH | CMP_STOP) : 0;
+}
+
+/*! \brief Match THIS entry, not merely one with the same SQL (used to unlink a known entry). */
+static int pgsql_cache_same_entry_fn(void *obj, void *arg, int flags)
+{
+        return obj == arg ? (CMP_MATCH | CMP_STOP) : 0;
+}
+
+/*! \brief Look the SQL up. Returns the entry with a reference held, or NULL. */
+static struct ast_pgsql_cache *pgsql_cache_find(const char *sql)
+{
+        struct ast_pgsql_cache key;
+
+        if (!pgsql_cache) {
+                return NULL;
+        }
+        memset(&key, 0, sizeof(key));
+        key.sql = (char *) sql;
+
+        return ao2_find(pgsql_cache, &key, OBJ_POINTER);
+}
+
+/*! \brief Bytes this result is charged against pgsql_cache_max_size.
+ * NOTE: the per-cell term is sizeof(a pointer), not the string length. That is what the
+ * original accounting did, and the max_size budget in every deployed pgsql.conf was tuned
+ * against it, so it is preserved deliberately rather than "fixed" into a different meaning. */
+static long unsigned pgsql_result_weight(PGresult *res)
+{
+        long unsigned bytes = 0;
+        int tuples = PQntuples(res);
+        int numFields = PQnfields(res);
+        int i, a;
+
+        for (i = 0; i < numFields; i++) {
+                bytes += strlen(PQfname(res, i)) + 1;
+        }
+        for (a = 0; a < tuples; a++) {
+                for (i = 0; i < numFields; i++) {
+                        bytes += sizeof(PQgetvalue(res, a, i));
+                }
+        }
+        return bytes;
+}
+
+/*! \brief Build a cache entry owning \a sql (copied) and \a res (taken). */
+static struct ast_pgsql_cache *pgsql_cache_entry_new(const char *sql, PGresult *res)
+{
+        struct ast_pgsql_cache *entry;
+
+        if (!(entry = ao2_alloc(sizeof(*entry), pgsql_cache_entry_dtor))) {
+                return NULL;
+        }
+        if (!(entry->sql = ast_strdup(sql))) {
+                ao2_ref(entry, -1);
+                return NULL;
+        }
+        entry->res = res;
+        entry->weight = pgsql_result_weight(res);
+        time(&entry->last);
+        entry->update = 0;
+        entry->autokillid = -1;
+
+        return entry;
+}
 
 static struct ast_cli_entry cli_realtime[] = {
 	AST_CLI_DEFINE(handle_cli_realtime_pgsql_status, "Shows connection information for the PostgreSQL RealTime driver"),
@@ -362,41 +480,15 @@ PGresult *sendsql(char *sql, char *func, char *keyfied)
         return result;
 }
 
-int pgsql_cache_item_number(char *sql)
-{
-        int unsigned inicio = 0;
-        int unsigned fin = pgsql_cache_items - 1;
-        int medio = -1;
-
-        if (pgsql_cache) {
-                while (inicio <= fin) {
-                        medio = (inicio + fin) / 2;
-                        if (!strcmp(pgsql_cache[medio]->sql, sql)) {
-                                return medio;
-                        }
-                        if (strcmp(pgsql_cache[medio]->sql, sql) > 0) {
-                                if (medio == 0)
-                                        break;
-                                fin = medio - 1;
-                        } else
-                                inicio = medio + 1;
-                }
-                if (strcmp(pgsql_cache[medio]->sql, sql) != 0)
-                        return -1;
-        }
-
-        return medio;
-}
-
 int notify_item_status(const char *item)
 {
-        int i, res = 0;
+        struct ast_pgsql_cache *entry;
+        int res = 0;
 
-        ast_mutex_lock(&pgsql_cache_flag);
-        i = pgsql_cache_item_number((char*) item);
-        if (i != -1)
-                res = pgsql_cache[i]->update;
-        ast_mutex_unlock(&pgsql_cache_flag);
+        if ((entry = pgsql_cache_find(item))) {
+                res = entry->update;
+                ao2_ref(entry, -1);
+        }
 
         return res;
 }
@@ -404,13 +496,11 @@ int notify_item_status(const char *item)
 void *do_pgsql_cache_update(void *data)
 {
         int sock, length, n;
-        int item;
         socklen_t fromlen;
         struct sockaddr_in server;
         struct sockaddr_in from;
         char buf[1024];
-        int unsigned inicio;
-        int unsigned fin;
+        struct ast_pgsql_cache *entry;
 
         sock=socket(AF_INET, SOCK_DGRAM, 0);
         if (sock < 0) {
@@ -434,211 +524,164 @@ void *do_pgsql_cache_update(void *data)
                 memset(buf, 0, sizeof(buf));
                 n = recvfrom(sock,buf,1024,0,(struct sockaddr *)&from,&fromlen);
                 if (n > 0) {
-			ast_mutex_lock(&pgsql_cache_flag);
-			if (pgsql_cache) {
-				item = -1;
-				inicio = 0;
-				fin = pgsql_cache_items - 1;
-				while (inicio <= fin) {
-					item = (inicio + fin) / 2;
-					if (!strcmp(pgsql_cache[item]->sql, buf)) {
-						break;
-					}
-					if (strcmp(pgsql_cache[item]->sql, buf) > 0) {
-						if (item == 0)
-							break;
-						fin = item - 1;
-					} else
-						inicio = item + 1;
-				}
-				if (strcmp(pgsql_cache[item]->sql, buf) != 0)
-					item = -1;
-				if ((item >= 0) && (item < pgsql_cache_items)) {
-					pgsql_cache[item]->update = 1;
-					if (option_verbose > 5)
-						ast_verbose(VERBOSE_PREFIX_1 "Setting item for update %08u\n", item);
-				}
+			entry = pgsql_cache_find(buf);
+			if (entry) {
+				/* Flag it; the next reader refreshes. A plain word write:
+				 * the worst race is a reader one lookup behind. */
+				entry->update = 1;
+				if (option_verbose > 5)
+					ast_verbose(VERBOSE_PREFIX_1 "Setting item for update: %s\n", entry->sql);
+				ao2_ref(entry, -1);
 			}
-			ast_mutex_unlock(&pgsql_cache_flag);
 			usleep(1000);
                 }
         }
         return NULL;
 }
 
-int _pgsql_cache_add(struct ast_pgsql_cache *item)
+/*!
+ * \brief Fetch a cached result, honouring the invalidation flag.
+ * \return the entry WITH A REFERENCE HELD (caller must ao2_ref(-1)), or NULL on a miss.
+ *
+ * The caller reads entry->res with NO lock held: the reference is what keeps it alive.
+ */
+static struct ast_pgsql_cache *pgsql_cache_get(char *sql, char *func)
 {
-        int medio = 0;
-        int inicio = 0;
-        int fin = pgsql_cache_items - 1;
-        int tmp;
+        struct ast_pgsql_cache *entry, *fresh, *old;
+        PGresult *res;
+        int claim;
 
-        if (pgsql_cache) {
-                while (inicio <= fin) {
-                        medio = (inicio + fin) / 2;
-                        if (strcmp(pgsql_cache[medio]->sql, item->sql) > 0) {
-                                if (medio == 0)
-                                        break;
-                                fin = medio - 1;
-                        } else
-                                inicio = medio + 1;
-                }
-                if (strcmp(pgsql_cache[medio]->sql, item->sql) < 0)
-                        medio++;
-        } else
-                medio = 0;
-
-        if (medio > pgsql_cache_items)
-                medio = pgsql_cache_items;
-
-        if (!(pgsql_cache = realloc(pgsql_cache, (pgsql_cache_items + 1) * sizeof(*item))))
-                return 0;
-
-        tmp = pgsql_cache_items;
-        while (tmp > medio) {
-                pgsql_cache[tmp] = pgsql_cache[tmp - 1];
-                tmp--;
+        if (!(entry = pgsql_cache_find(sql))) {
+                return NULL;
         }
-        time(&item->last);
-        item->update = 0;
-        pgsql_cache[medio] = item;
+        if (!entry->update) {
+                time(&entry->last);
+                return entry;
+        }
 
-        int tuples =  PQntuples(item->res);
-        int numFields = PQnfields(item->res);
+        /* Invalidated by the notifier. Exactly ONE thread re-queries: claim the flag under the
+         * accounting mutex (a word swap, nothing blocking inside it) and run the query with no
+         * lock held. A thread that loses the claim keeps using the current result, which is
+         * still a valid answer -- just one notification old. */
+        ast_mutex_lock(&pgsql_cache_flag);
+        claim = entry->update;
+        entry->update = 0;
+        ast_mutex_unlock(&pgsql_cache_flag);
 
-        int i;
-        for (i = 0; i < numFields; i++)
-                pgsql_cache_size += strlen(PQfname(item->res, i)) + 1;
+        if (!claim) {
+                time(&entry->last);
+                return entry;
+        }
 
-        int a;
-        for (a = 0; a < tuples; a++)
-                for (i = 0; i < numFields; i++)
-                        pgsql_cache_size += sizeof(PQgetvalue(item->res, a, i));
+        if (option_verbose > 5) {
+                ast_verbose(VERBOSE_PREFIX_1 "Updating cache item: %s\n", entry->sql);
+        }
 
-        pgsql_cache_items++;
-        return 1;
+        if (!(res = sendsql(sql, func, NULL))) {
+                ast_log(LOG_WARNING, "Postgresql RealTime: Closed\n");
+                entry->update = 1;              /* still invalid; let the next reader retry */
+                ao2_ref(entry, -1);
+                return NULL;                    /* miss: the caller queries for itself */
+        }
+
+        if (!(fresh = pgsql_cache_entry_new(sql, res))) {
+                PQclear(res);
+                entry->update = 1;
+                ao2_ref(entry, -1);
+                return NULL;
+        }
+        /* An empty answer is not accepted as the truth: keep it flagged so the next reader asks
+         * again. The array implementation did exactly this and the behaviour is preserved. */
+        if (PQntuples(res) == 0) {
+                fresh->update = 1;
+        }
+
+        /* SWAP, never mutate: a reader still holding the old entry keeps a result that is alive
+         * until it lets go. Item count is unchanged -- one out, one in. Done under the container
+         * lock so it is atomic against a clear: if the old entry is no longer in the container
+         * (a clear took it), the fresh one is NOT published -- it would be an entry the counters,
+         * just zeroed, do not know about. The caller still gets it, and it dies with that ref. */
+        ao2_lock(pgsql_cache);
+        if ((old = ao2_callback(pgsql_cache, OBJ_UNLINK | OBJ_POINTER, pgsql_cache_same_entry_fn, entry))) {
+                ao2_link(pgsql_cache, fresh);
+                pgsql_cache_size -= old->weight;
+                pgsql_cache_size += fresh->weight;
+                ao2_ref(old, -1);               /* the container's reference */
+        }
+        ao2_unlock(pgsql_cache);
+        ao2_ref(entry, -1);                     /* ours, from the lookup */
+
+        return fresh;
 }
 
-PGresult *pgsql_cache_pgresult(char *sql, char *func)
-{
-        int medio = 0;
-        int inicio = 0;
-        int fin = pgsql_cache_items - 1;
-
-        if (!pgsql_cache)
-                return NULL;
-
-        while (inicio <= fin) {
-                medio = (inicio + fin) / 2;
-                if (!strcmp(pgsql_cache[medio]->sql, sql))
-                        break;
-                if (strcmp(pgsql_cache[medio]->sql, sql) > 0) {
-                        if (medio == 0)
-                                break;
-                        fin = medio - 1;
-                } else
-                        inicio = medio + 1;
-        }
-
-        if (medio > pgsql_cache_items)
-                medio = pgsql_cache_items;
-
-        if (strcmp(pgsql_cache[medio]->sql, sql) != 0)
-                return NULL;
-
-        if (pgsql_cache[medio]->update == 1) {
-                if (option_verbose > 5)
-                        ast_verbose(VERBOSE_PREFIX_1 "Updating cache item %08u\n", medio);
-                PGresult *r = NULL;
-                if (!(r = sendsql(sql, func, NULL))) {
-                        ast_log(LOG_WARNING, "Postgresql RealTime: Closed\n");
-                        PQclear(r);
-                        return NULL;
-                }
-
-                int tuples =  PQntuples(pgsql_cache[medio]->res);
-                int numFields = PQnfields(pgsql_cache[medio]->res);
-
-                int i;
-                for (i = 0; i < numFields; i++)
-                        pgsql_cache_size -= strlen(PQfname(pgsql_cache[medio]->res, i)) + 1;
-
-                int a;
-                for (a = 0; a < tuples; a++)
-                        for (i = 0; i < numFields; i++)
-                                pgsql_cache_size -= sizeof(PQgetvalue(pgsql_cache[medio]->res, a, i));
-
-                tuples =  PQntuples(r);
-                numFields = PQnfields(r);
-
-                for (i = 0; i < numFields; i++)
-                        pgsql_cache_size += strlen(PQfname(r, i)) + 1;
-
-                for (a = 0; a < tuples; a++)
-                        for (i = 0; i < numFields; i++)
-                                pgsql_cache_size += sizeof(PQgetvalue(r, a, i));
-
-                PQclear(pgsql_cache[medio]->res);
-                pgsql_cache[medio]->res = r;
-                if (tuples == 0)
-                        pgsql_cache[medio]->update = 1;
-                else
-                        pgsql_cache[medio]->update = 0;
-        }
-
-        if (option_verbose > 5)
-                ast_verbose(VERBOSE_PREFIX_1 "Get cache item %08u\n", medio);
-
-        time(&pgsql_cache[medio]->last);
-        return pgsql_cache[medio]->res;
-}
-
+/*!
+ * \brief Publish \a res under \a sql.
+ * \retval 1 cached -- the cache OWNS res from here on.
+ * \retval 0 not cached -- the caller still owns res and must PQclear it.
+ */
 int pgsql_cache_add(char *sql, PGresult *res, char *func)
 {
-        struct ast_pgsql_cache *item = NULL;
+        struct ast_pgsql_cache *entry, *dup;
+        int full = 0;
 
+        if (!pgsql_cache) {
+                return 0;
+        }
+
+        /* Built outside the lock (strdup + weight walk) and discarded if it cannot be published.
+         * On failure res is untouched and still the caller's to clear. */
+        if (!(entry = pgsql_cache_entry_new(sql, res))) {
+                return 0;
+        }
+
+        /* Check-and-publish is one step under the container lock: two threads caching the same
+         * SQL cannot both link it, and a clear cannot land between the link and the count. */
+        ao2_lock(pgsql_cache);
         if (pgsql_cache_size >= pgsql_cache_max_size) {
+                full = 1;
+        } else if (pgsql_cache_items >= pgsql_cache_max_items) {
+                full = 2;
+        } else if ((dup = pgsql_cache_find(sql))) {
+                ao2_ref(dup, -1);               /* another thread got there first */
+                full = 3;
+        } else {
+                ao2_link(pgsql_cache, entry);
+                pgsql_cache_items++;
+                pgsql_cache_size += entry->weight;
+        }
+        ao2_unlock(pgsql_cache);
+
+        if (full) {
+                entry->res = NULL;              /* not ours to PQclear: the caller keeps it */
+        }
+        ao2_ref(entry, -1);                     /* published: the container holds it now */
+
+        /* Full means REFUSE, not evict. The original never evicted either -- 'last' is kept as
+         * an access hint but nothing has ever consumed it -- and changing that here would alter
+         * behaviour the deployment has been tuned around. Same two messages as before. */
+        if (full == 1) {
                 ast_log(LOG_ERROR, "CACHE FULL: memory full\n");
-                return 0;
-        }
-
-        if (pgsql_cache_items >= pgsql_cache_max_items) {
+        } else if (full == 2) {
                 ast_log(LOG_ERROR, "CACHE FULL: max items\n");
-                return 0;
         }
 
-        if (pgsql_cache_pgresult(sql, func)) {
-                return 0;
-        }
-
-        if (!(item = malloc(sizeof(*item))))
-                return 0;
-
-        if (!(item->sql = malloc(strlen(sql) + 1)))
-                return 0;
-        strcpy(item->sql, sql);
-
-        item->res = res;
-
-        return _pgsql_cache_add(item);
+        return !full;
 }
 
 static void pgsql_cache_clear(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
-        int i;
-
-        ast_mutex_lock(&pgsql_cache_flag);
-        for (i = 0;i < pgsql_cache_items; i++)
-        {
-                PQclear(pgsql_cache[i]->res);
-                free(pgsql_cache[i]->sql);
-                free(pgsql_cache[i]);
+        if (!pgsql_cache) {
+                return;
         }
-        free(pgsql_cache);
-        pgsql_cache = NULL;
+
+        /* Unlink everything; each entry dies when its last reader lets go, so a lookup in flight
+         * during a clear finishes safely on the result it already holds. The zeroing is inside
+         * the same container lock, so no add or swap can interleave between the two. */
+        ao2_lock(pgsql_cache);
+        ao2_callback(pgsql_cache, OBJ_UNLINK | OBJ_NODATA | OBJ_MULTIPLE, NULL, NULL);
         pgsql_cache_items = 0;
         pgsql_cache_size  = 0;
-        ast_mutex_unlock(&pgsql_cache_flag);
+        ao2_unlock(pgsql_cache);
 
         return;
 }
@@ -837,6 +880,7 @@ static struct ast_variable *realtime_pgsql(const char *database, const char *tab
 	const char *newparam, *newval;
 	struct ast_variable *var = NULL, *prev = NULL;
 	int cache;
+	struct ast_pgsql_cache *centry = NULL;
 	char *func = NULL;
 
 	if (!tablename) {
@@ -889,15 +933,14 @@ static struct ast_variable *realtime_pgsql(const char *database, const char *tab
 //	ast_log(LOG_WARNING, "Postgresql RealTime: SQL %s\n", ast_str_buffer(sql));
 
 	if (func) {
-		ast_mutex_lock(&pgsql_cache_flag);
-		if (!(result = pgsql_cache_pgresult(sql->__AST_STR_STR, func))) {
+		if (!(centry = pgsql_cache_get(sql->__AST_STR_STR, func))) {
 			if (!(result = sendsql(sql->__AST_STR_STR, func, NULL))) {
-				ast_mutex_unlock(&pgsql_cache_flag);
 				ast_log(LOG_WARNING, "Postgresql RealTime: Failed. Check debug for more info.\n");
 				return NULL;
 			}
 			cache = 1;
 		} else {
+			result = centry->res;	/* alive while we hold the reference */
 			cache = 0;
 		}
 	} else {
@@ -907,8 +950,6 @@ static struct ast_variable *realtime_pgsql(const char *database, const char *tab
 		}
 		cache = -1;
 	}
-	if (cache == 1)
-		ast_mutex_unlock(&pgsql_cache_flag);
 
 	ast_debug(1, "PostgreSQL RealTime: Result=%p\n", result);
 
@@ -921,10 +962,10 @@ static struct ast_variable *realtime_pgsql(const char *database, const char *tab
 		ast_debug(1, "PostgreSQL RealTime: Found %d rows.\n", num_rows);
 
 		if (!(fieldnames = ast_calloc(1, numFields * sizeof(char *)))) {
-			if (cache == 1)
-				PQclear(result);
+			if (cache == 0)
+				ao2_ref(centry, -1);
 			else
-				ast_mutex_unlock(&pgsql_cache_flag);
+				PQclear(result);
 			return NULL;
 		}
 		for (i = 0; i < numFields; i++)
@@ -949,21 +990,19 @@ static struct ast_variable *realtime_pgsql(const char *database, const char *tab
 		}
 		ast_free(fieldnames);
 		if (cache == 0)
-			ast_mutex_unlock(&pgsql_cache_flag);
+			ao2_ref(centry, -1);
 	} else {
 		ast_debug(1, "Postgresql RealTime: Could not find any rows in table %s@%s.\n", tablename, database);
-		if (cache == 1)
-			PQclear(result);
+		if (cache == 0)
+			ao2_ref(centry, -1);
 		else
-			ast_mutex_unlock(&pgsql_cache_flag);
+			PQclear(result);
 		return var;
 	}
 
 	if (cache == 1) {
-		ast_mutex_lock(&pgsql_cache_flag);
 		if (!pgsql_cache_add(sql->__AST_STR_STR, result, func))
 			PQclear(result);
-		ast_mutex_unlock(&pgsql_cache_flag);
 	}
 	if (cache == -1) 
 		PQclear(result);
@@ -986,6 +1025,7 @@ static struct ast_config *realtime_multi_pgsql(const char *database, const char 
 	struct ast_config *cfg = NULL;
 	struct ast_category *cat = NULL;
 	int cache;
+	struct ast_pgsql_cache *centry = NULL;
 	char *func = NULL;
 
 	if (!table) {
@@ -1058,19 +1098,16 @@ static struct ast_config *realtime_multi_pgsql(const char *database, const char 
 
 	va_end(ap);
 
-        ast_mutex_lock(&pgsql_cache_flag);
-        if (!(result = pgsql_cache_pgresult(sql->__AST_STR_STR, func))) {
+        if (!(centry = pgsql_cache_get(sql->__AST_STR_STR, func))) {
                 if (!(result = sendsql(sql->__AST_STR_STR, func, NULL))) {
-                        ast_mutex_unlock(&pgsql_cache_flag);
                         ast_log(LOG_WARNING, "Postgresql RealTime: Failed. Check debug for more info.\n");
                         return NULL;
                 }
                 cache = 1;
         } else {
+                result = centry->res;	/* alive while we hold the reference */
                 cache = 0;
         }
-        if (cache == 1)
-		ast_mutex_unlock(&pgsql_cache_flag);
 
 	ast_debug(1, "PostgreSQL RealTime: Result=%p\n", result);
 
@@ -1083,10 +1120,10 @@ static struct ast_config *realtime_multi_pgsql(const char *database, const char 
 		ast_debug(1, "PostgreSQL RealTime: Found %d rows.\n", num_rows);
 
 		if (!(fieldnames = ast_calloc(1, numFields * sizeof(char *)))) {
-			if (cache == 1)
-				PQclear(result);
+			if (cache == 0)
+				ao2_ref(centry, -1);
 			else
-				ast_mutex_unlock(&pgsql_cache_flag);
+				PQclear(result);
 			return NULL;
 		}
 		for (i = 0; i < numFields; i++)
@@ -1113,21 +1150,19 @@ static struct ast_config *realtime_multi_pgsql(const char *database, const char 
 		}
 		ast_free(fieldnames);
 		if (cache == 0)
-			ast_mutex_unlock(&pgsql_cache_flag);
+			ao2_ref(centry, -1);
 	} else {
 		ast_debug(1, "PostgreSQL RealTime: Could not find any rows in table %s.\n", table);
-		if (cache == 1)
-			PQclear(result);
+		if (cache == 0)
+			ao2_ref(centry, -1);
 		else
-			ast_mutex_unlock(&pgsql_cache_flag);
+			PQclear(result);
 		return cfg;
 	}
 
         if (cache == 1) {
-                ast_mutex_lock(&pgsql_cache_flag);
                 if (!pgsql_cache_add(sql->__AST_STR_STR, result, func))
                         PQclear(result);
-                ast_mutex_unlock(&pgsql_cache_flag);
         }
 
 	return cfg;
@@ -1705,6 +1740,12 @@ static int load_module(void)
 	if(!parse_config(0))
 		return AST_MODULE_LOAD_DECLINE;
 
+        /* Build the cache before the notifier thread starts: it looks entries up. */
+        if (!(pgsql_cache = ao2_container_alloc(PGSQL_CACHE_BUCKETS, pgsql_cache_hash_fn, pgsql_cache_cmp_fn))) {
+                ast_log(LOG_ERROR, "Postgresql RealTime: cannot allocate the SQL cache\n");
+                return AST_MODULE_LOAD_DECLINE;
+        }
+
         if (pgsql_cache_update_thread == AST_PTHREADT_NULL) {
                 if (ast_pthread_create(&pgsql_cache_update_thread, NULL, do_pgsql_cache_update, NULL) < 0) {
                         ast_log(LOG_ERROR, "Unable to start cache update thread.\n");
@@ -1752,6 +1793,14 @@ static int unload_module(void)
 		destroy_table(table);
 	}
 	AST_LIST_UNLOCK(&psql_tables);
+
+	/* Drop the SQL cache. Entries a reader still holds survive until it lets go. */
+	if (pgsql_cache) {
+		ao2_ref(pgsql_cache, -1);
+		pgsql_cache = NULL;
+	}
+	pgsql_cache_items = 0;
+	pgsql_cache_size  = 0;
 
 	return 0;
 }
@@ -2065,7 +2114,11 @@ static char *handle_cli_realtime_pgsql_status(struct ast_cli_entry *e, int cmd, 
 		return CLI_SHOWUSAGE;
 
 	int i;
-        for (i = 0; i <= PGSQL_MAX_POOL_CONN; i++) {
+        /* '<', not '<=': pgsqlConn[] has PGSQL_MAX_POOL_CONN entries, so the last valid index
+         * is N-1. Reading one past the end handed PQstatus() whatever followed the array and
+         * killed the process -- twice on a production box on 2026-09-25, from a command whose
+         * name suggests it only reads. The sibling loop at pgsql_reconnect() always used '<'. */
+        for (i = 0; i < PGSQL_MAX_POOL_CONN; i++) {
                 if (PQstatus(pgsqlConn[i]) == CONNECTION_OK) {
                         ctime = time(NULL) - pgsqltime[i];
                         snprintf(status, 255, "Connection %i Active %i open", i, pgsqlFlag[i]);
@@ -2091,15 +2144,18 @@ static char *handle_cli_realtime_pgsql_status(struct ast_cli_entry *e, int cmd, 
                 }
         }
 
-        if (option_verbose > 5) {
-                int l;
-                ast_mutex_lock(&pgsql_cache_flag);
-                for (i = 0;i < pgsql_cache_items;i++) {
-                        l = time(NULL) - pgsql_cache[i]->last;
-                        ast_cli(a->fd, "Item %08u, last access %02d:%02d:%02d, update = %d\n", i, \
-                                 l / 3600, (l % 3600) / 60, l % 60, pgsql_cache[i]->update);
+        if (option_verbose > 5 && pgsql_cache) {
+                struct ao2_iterator it = ao2_iterator_init(pgsql_cache, 0);
+                struct ast_pgsql_cache *entry;
+                int n = 0;
+
+                while ((entry = ao2_iterator_next(&it))) {
+                        int l = time(NULL) - entry->last;
+                        ast_cli(a->fd, "Item %08u, last access %02d:%02d:%02d, update = %d\n", n++, \
+                                 l / 3600, (l % 3600) / 60, l % 60, entry->update);
+                        ao2_ref(entry, -1);
                 }
-                ast_mutex_unlock(&pgsql_cache_flag);
+                ao2_iterator_destroy(&it);
         }
 
         ast_cli(a->fd, "Local cache SQL's count %u (%u max.), size %lu (%lu max.) bytes\n", pgsql_cache_items, \
