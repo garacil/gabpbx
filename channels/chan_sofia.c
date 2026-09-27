@@ -14512,12 +14512,15 @@ static void sofia_process_notify(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		}
 	}
 
-	nua_respond(nh, SIP_200_OK, NUTAG_WITH_THIS(nua), TAG_END());
-	/* Nobody consumed it: a NOTIFY outside any dialog we know. Such a NOTIFY creates a dialog
-	 * (nua_subnotref.c server methods: create_dialog=1), so it arrived on a fresh, unbound handle
-	 * with an nta leg that the stack never destroys once we answered. Reap it behind the queued 200.
-	 * Our own subscription handles carry sentinel magics and a refer NOTIFY's handle is pvt-bound,
-	 * so the magic guard leaves every owned handle alone. */
+	/* Nobody consumed it: a NOTIFY that matches none of our subscriptions. RFC 6665 §4.1.3: the
+	 * subscriber "MUST return a 481 (Subscription does not exist) response unless another 400- or
+	 * 500-class response is more appropriate" -- not a 200, which would tell the sender its
+	 * notification was accepted. Such a NOTIFY creates a dialog (nua_subnotref.c server methods:
+	 * create_dialog=1), so it arrived on a fresh, unbound handle with an nta leg that the stack never
+	 * destroys once we answered: reap it behind the queued response. Our own subscription handles
+	 * carry sentinel magics and a refer NOTIFY's handle is pvt-bound, so the magic guard leaves every
+	 * owned handle alone. */
+	nua_respond(nh, 481, "Subscription Does Not Exist", NUTAG_WITH_THIS(nua), TAG_END());
 	sofia_reap_unbound_handle(nh);
 }
 
