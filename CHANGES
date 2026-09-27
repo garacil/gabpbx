@@ -79,6 +79,14 @@ PUBLISH is not affected: the Allow list refuses it with 405 before any handle ex
   a condition, and an exhausted caller sleeps on it, logging every 5 s while the pool stays
   exhausted. With the pool cut to one connection for the test, eight parallel realtime readers went
   from 9 queries in 60 s (8 never answered, a core at 100%) to 4 584 in 10 s at 27% of a core.
+- **PostgreSQL driver: no connection is used without being borrowed, and unload cleans up.** Every
+  value was escaped on connection 0 without borrowing it, and `realtime show pgsql status` asked
+  every connection for its state, while the thread holding a connection may be querying on it or
+  closing and replacing it: a data race and a read of a freed connection. Escaping now borrows a
+  connection like a query does, and the status command only looks at idle ones, under the pool
+  lock. Unloading the module used to leave the invalidation listener running on the cache it had
+  just freed and all 31 connections open; it now stops and joins the listener, lets in-flight
+  queries finish, and closes the connections (31 -> 0 in a quarter of a second).
 - **The REGISTER log no longer repeats itself** (on `main` since 1.9.1). The success `NOTICE`
   was gated on whether the REGISTER changed any binding — the right question for a phone
   refreshing the same one, the wrong one for a phone behind NAT that returns from a new source
