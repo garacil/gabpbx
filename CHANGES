@@ -71,6 +71,14 @@ PUBLISH is not affected: the Allow list refuses it with 405 before any handle ex
   `[cache] max_items` is 200000 and the container gets one bucket per allowed entry, sized from the
   configured value at load; the commented-out code the file carried for years is gone. The commands,
   the counters and the invalidation protocol are unchanged.
+- **PostgreSQL connection pool: a caller waits, it no longer spins.** When all 31 pooled
+  connections were lent out, the next caller looped over the busy flags holding the pool lock,
+  without sleeping, while the flags were cleared without that lock: it burned a core, kept every
+  other caller from even picking a connection, and could spin for ever because nothing forced the
+  flag to be re-read. The flags now change only under the lock; handing a connection back signals
+  a condition, and an exhausted caller sleeps on it, logging every 5 s while the pool stays
+  exhausted. With the pool cut to one connection for the test, eight parallel realtime readers went
+  from 9 queries in 60 s (8 never answered, a core at 100%) to 4 584 in 10 s at 27% of a core.
 - **The REGISTER log no longer repeats itself** (on `main` since 1.9.1). The success `NOTICE`
   was gated on whether the REGISTER changed any binding — the right question for a phone
   refreshing the same one, the wrong one for a phone behind NAT that returns from a new source
