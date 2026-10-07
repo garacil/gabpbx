@@ -425,6 +425,23 @@ static void sofia_h264_profile4(const char *fmtp, char *out)
 	out[k] = '\0';
 }
 
+/* Is this H264 profile (sofia_h264_profile4 key) Baseline or Constrained Baseline (RFC 6184 §8.1 Table 5)?
+ * An absent profile-level-id means Baseline (§8.1). Every H264 decoder handles these, so when the choice is
+ * free they are what the far leg is most likely to accept: a door phone offering High, Main and Constrained
+ * Baseline in that order must not have High relayed to a phone that only decodes Baseline. */
+static int sofia_h264_profile_is_baseline(const char *prof4)
+{
+	unsigned int idc, iop;
+
+	if (ast_strlen_zero(prof4)) {
+		return 1;
+	}
+	if (strlen(prof4) < 4 || sscanf(prof4, "%2x%2x", &idc, &iop) != 2) {
+		return 0;
+	}
+	return idc == 0x42 || ((idc == 0x4d || idc == 0x58) && (iop & 0x80));
+}
+
 /* SIP-video<->WebRTC H264 fmtp relay (RFC 6184 §8.2.2). H264 with a different profile-level-id +
  * packetization-mode is effectively a DIFFERENT codec (mode0 forbids FU-A §6.2, mode1 allows it §6.3;
  * §8.1 one config point per PT), and passthrough cannot bridge them without repacketization.
@@ -440,8 +457,9 @@ static void sofia_h264_profile4(const char *fmtp, char *out)
  * profile-level-id) is rejected, but a side that OMITS profile-level-id is accepted for real-world legacy
  * interop (level may differ per §8.2.2; strict RFC fail-closed on absent profile is deferred). If NONE is
  * compatible, remove ALL H264 PTs (fall back to VP8/audio-only) rather than relay an incompatible config —
- * never bridge mode0<->mode1. With no desired config, free-select (prefer packetization-mode=1, else the
- * first H264 PT). Returns 1 if an H264 config was selected. Read-only on `media`. */
+ * never bridge mode0<->mode1. With no desired config, free-select: packetization-mode=1 first, then a
+ * Baseline/Constrained Baseline profile (sofia_h264_profile_is_baseline), then the m-line order. Returns 1
+ * if an H264 config was selected. Read-only on `media`. */
 static int sofia_sdp_select_h264(sdp_media_t *media, struct ast_rtp_codecs *staged,
 	int desired_valid, int desired_pmode, const char *desired_fmtp,
 	char *out_fmtp, size_t out_fmtp_sz, int *out_pmode)
@@ -452,6 +470,7 @@ static int sofia_sdp_select_h264(sdp_media_t *media, struct ast_rtp_codecs *stag
 	int i;
 	int chosen = -1;
 	int chosen_pmode = 0;
+	int chosen_rank = -1;
 	char chosen_fmtp[160] = "";
 	char desired_prof[8] = "";
 
@@ -472,30 +491,21 @@ static int sofia_sdp_select_h264(sdp_media_t *media, struct ast_rtp_codecs *stag
 		char fmtp[160] = "";
 		char prof[8] = "";
 		const char *pm;
-		sdp_attribute_t *a;
-		for (a = media->m_attributes; a; a = a->a_next) {
-			const char *v;
-			char *end;
-			long apt;
-			if (!a->a_name || !a->a_value || !su_casematch(a->a_name, "fmtp")) {
-				continue;
+		/* The parser attaches each a=fmtp line to its a=rtpmap entry (sdp_parse.c parse_fmtp: rm_fmtp,
+		 * the text after the payload type) and does NOT keep it among m_attributes, so it has to be
+		 * read from the rtpmap. Looking for it among the attributes found nothing, ever: every H264
+		 * PT was weighed as "no fmtp" (packetization-mode 0, first PT wins) and no a=fmtp was relayed. */
+		for (rm = media->m_rtpmaps; rm; rm = rm->rm_next) {
+			if ((int) rm->rm_pt == pt) {
+				if (rm->rm_fmtp) {
+					const char *v = rm->rm_fmtp;
+					while (*v == ' ' || *v == '\t') {
+						v++;
+					}
+					ast_copy_string(fmtp, v, sizeof(fmtp));
+				}
+				break;
 			}
-			/* Robust "a=fmtp:<pt> <params>" parse: skip leading whitespace, match the FULL PT integer
-			 * (strtol end-check, not atoi — so "99" != "990"), then the params follow SP or TAB. */
-			v = a->a_value;
-			while (*v == ' ' || *v == '\t') {
-				v++;
-			}
-			apt = strtol(v, &end, 10);
-			/* The PT must be delimited (end-of-string, SP or TAB) — else "a=fmtp:99foo" would match PT 99. */
-			if (end == v || apt != pt || (*end && *end != ' ' && *end != '\t')) {
-				continue;
-			}
-			while (*end == ' ' || *end == '\t') {
-				end++;
-			}
-			ast_copy_string(fmtp, end, sizeof(fmtp));
-			break;
 		}
 		if ((pm = strstr(fmtp, "packetization-mode="))) {
 			pmode = atoi(pm + 19);
@@ -519,11 +529,17 @@ static int sofia_sdp_select_h264(sdp_media_t *media, struct ast_rtp_codecs *stag
 				chosen_pmode = pmode;
 				ast_copy_string(chosen_fmtp, fmtp, sizeof(chosen_fmtp));
 			}
-		} else if (chosen < 0 || (pmode == 1 && chosen_pmode != 1)) {
-			/* free selection: first H264, upgrade to a packetization-mode=1 variant */
-			chosen = pt;
-			chosen_pmode = pmode;
-			ast_copy_string(chosen_fmtp, fmtp, sizeof(chosen_fmtp));
+		} else {
+			/* free selection: packetization-mode=1 first, then Baseline/Constrained Baseline, then the
+			 * m-line order (a later PT only wins with a strictly better rank) */
+			int rank = (pmode == 1 ? 2 : 0) + (sofia_h264_profile_is_baseline(prof) ? 1 : 0);
+
+			if (chosen < 0 || rank > chosen_rank) {
+				chosen = pt;
+				chosen_pmode = pmode;
+				chosen_rank = rank;
+				ast_copy_string(chosen_fmtp, fmtp, sizeof(chosen_fmtp));
+			}
 		}
 	}
 	if (chosen < 0) {

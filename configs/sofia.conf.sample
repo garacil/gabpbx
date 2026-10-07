@@ -2917,6 +2917,14 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;disallow=all                ; Reset codec list
 ;allow=ulaw                  ; Allow specific codecs
 ;allow=alaw
+;allow=h264                  ; H.264 video. Its media format configuration (profile-level-id and
+                             ; packetization-mode, RFC 6184 8.2.2) is negotiated automatically, with no
+                             ; key to set: the a=fmtp received is kept, ONE H.264 payload type is answered
+                             ; (packetization-mode 1 preferred, then a Baseline/Constrained Baseline
+                             ; profile, then the offered order) and the calling leg's configuration is
+                             ; offered to the callee, so both legs of a bridged call use the same one.
+                             ; Devices that only work in packetization-mode 1 (some video door phones)
+                             ; need this. In chan_sip the same is h264fmtp=yes in [general].
 ;context=from-remote
 ;qualify=yes
 ;nat=force_rport,comedia
