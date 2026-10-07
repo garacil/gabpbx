@@ -384,6 +384,17 @@ srvlookup=yes                   ; Enable DNS SRV lookups on outbound calls
                                 ; certain transferred calls to use always use video when
                                 ; available. [yes|NO|always]
 
+;h264fmtp=no                    ; H.264 media format configuration (RFC 6184 8.2.2): with yes,
+                                ; the profile-level-id and packetization-mode of H.264 video
+                                ; are read from the SDP, kept in the answer (only one H.264
+                                ; payload type is answered: packetization-mode=1 preferred,
+                                ; then Baseline/Constrained Baseline), and the calling leg's
+                                ; configuration is offered to the callee, so both legs of a
+                                ; bridged call use the same one. Needed by devices that only
+                                ; accept packetization-mode=1 (some door phones), which
+                                ; refuse or never send video when the SDP carries no a=fmtp
+                                ; for H.264. With no (default) H.264 is offered and answered
+                                ; without a=fmtp, as before. [yes|NO]
 ;maxcallbitrate=384             ; Maximum bitrate for video calls (default 384 kb/s)
                                 ; Videosupport and maxcallbitrate is settable
                                 ; for peers and users as well

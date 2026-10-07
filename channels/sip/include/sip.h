@@ -729,6 +729,7 @@ struct sip_settings {
 	format_t capability;        /*!< Supported codecs */
 	int tcp_enabled;
 	int default_max_forwards;    /*!< Default max forwards (SIP Anti-loop) */
+	int h264fmtp;               /*!< Negotiate and relay the H.264 media format configuration (RFC 6184 8.2.2) */
 };
 
 /*! \brief The SIP socket definition */
@@ -1155,6 +1156,12 @@ struct sip_pvt {
 	struct ast_cc_config_params *cc_params;
 	struct sip_epa_entry *epa_entry;
 	int fromdomainport;                 /*!< Domain port to show in from field */
+	/*! H.264 media format configuration of this dialog (RFC 6184 8.2.2), used with h264fmtp=yes:
+	 * the a=fmtp parameters of the one H.264 payload type in use, without the leading "<pt> ".
+	 * Set from the remote SDP, or copied from the calling leg so both legs share one configuration. */
+	int h264_fmtp_valid;
+	int h264_pmode;                     /*!< its packetization-mode (0 when absent, RFC 6184 6.2) */
+	char h264_fmtp[160];
 };
 
 /*! \brief sip packet - raw format for outbound packets that are sent or scheduled for transmission

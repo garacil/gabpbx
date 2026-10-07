@@ -1349,7 +1349,17 @@ static int process_sdp_o(const char *o, struct sip_pvt *p);
 static int process_sdp_c(const char *c, struct ast_sockaddr *addr);
 static int process_sdp_a_sendonly(const char *a, int *sendonly);
 static int process_sdp_a_audio(const char *a, struct sip_pvt *p, struct ast_rtp_codecs *newaudiortp, int *last_rtpmap_codec);
-static int process_sdp_a_video(const char *a, struct sip_pvt *p, struct ast_rtp_codecs *newvideortp, int *last_rtpmap_codec);
+/*! \brief The a=fmtp lines of one video m= section, kept for the H.264 selection (h264fmtp=yes) */
+#define SIP_VIDEO_FMTP_MAX 16
+struct sip_video_fmtps {
+	int count;
+	struct {
+		int pt;
+		char params[160];
+	} entry[SIP_VIDEO_FMTP_MAX];
+};
+static int process_sdp_a_video(const char *a, struct sip_pvt *p, struct ast_rtp_codecs *newvideortp, int *last_rtpmap_codec, struct sip_video_fmtps *vfmtps);
+static int sip_select_h264(struct sip_pvt *p, struct ast_rtp_codecs *codecs, const char *mline, const struct sip_video_fmtps *vfmtps);
 static int process_sdp_a_text(const char *a, struct sip_pvt *p, struct ast_rtp_codecs *newtextrtp, char *red_fmtp, int *red_num_gen, int *red_data_pt, int *last_rtpmap_codec);
 static int process_sdp_a_image(const char *a, struct sip_pvt *p);
 static void add_codec_to_sdp(const struct sip_pvt *p, format_t codec,
@@ -9637,6 +9647,7 @@ static int process_sdp(struct sip_pvt *p, struct sip_request *req, int t38action
 	int red_data_pt[10];		/* For T.140 RED */
 	int red_num_gen = 0;		/* For T.140 RED */
 	char red_fmtp[100] = "empty";	/* For T.140 RED */
+	struct sip_video_fmtps vfmtps;	/* video a=fmtp lines, for the H.264 selection */
 	int debug = sip_debug_test_pvt(p);
 
 	/* START UNKNOWN */
@@ -9653,6 +9664,7 @@ static int process_sdp(struct sip_pvt *p, struct sip_request *req, int t38action
 	ast_rtp_codecs_payloads_clear(&newaudiortp, NULL);
 	ast_rtp_codecs_payloads_clear(&newvideortp, NULL);
 	ast_rtp_codecs_payloads_clear(&newtextrtp, NULL);
+	memset(&vfmtps, 0, sizeof(vfmtps));
 
 	/* Update our last rtprx when we receive an SDP, too */
 	p->lastrtprx = p->lastrtptx = time(NULL); /* XXX why both ? */
@@ -9698,7 +9710,7 @@ static int process_sdp(struct sip_pvt *p, struct sip_request *req, int t38action
 			}
 			else if (process_sdp_a_audio(value, p, &newaudiortp, &last_rtpmap_codec))
 				processed = TRUE;
-			else if (process_sdp_a_video(value, p, &newvideortp, &last_rtpmap_codec))
+			else if (process_sdp_a_video(value, p, &newvideortp, &last_rtpmap_codec, &vfmtps))
 				processed = TRUE;
 			else if (process_sdp_a_text(value, p, &newtextrtp, red_fmtp, &red_num_gen, red_data_pt, &last_rtpmap_codec))
 				processed = TRUE;
@@ -9955,7 +9967,7 @@ static int process_sdp(struct sip_pvt *p, struct sip_request *req, int t38action
 					if (!processed_crypto && process_crypto(p, p->vrtp, &p->vsrtp, value)) {
 						processed_crypto = TRUE;
 						processed = TRUE;
-					} else if (process_sdp_a_video(value, p, &newvideortp, &last_rtpmap_codec)) {
+					} else if (process_sdp_a_video(value, p, &newvideortp, &last_rtpmap_codec, &vfmtps)) {
 						processed = TRUE;
 					}
 				}
@@ -10139,6 +10151,22 @@ static int process_sdp(struct sip_pvt *p, struct sip_request *req, int t38action
 			if (debug) {
 				ast_verbose("Peer video RTP is at port %s\n",
 					    ast_sockaddr_stringify(vsa));
+			}
+			if (sip_cfg.h264fmtp) {
+				int keep = sip_select_h264(p, &newvideortp, p->offered_media[SDP_VIDEO].codecs, &vfmtps);
+
+				if (keep >= 0) {
+					/* An H.264 payload type copied by an earlier negotiation must not shadow the chosen
+					 * one: the copy below only adds, and the lowest number would win. */
+					struct ast_rtp_codecs *live = ast_rtp_instance_get_codecs(p->vrtp);
+					int i;
+
+					for (i = 0; i < AST_RTP_MAX_PT; i++) {
+						if (i != keep && live->payloads[i].gabpbx_format && live->payloads[i].code == AST_FORMAT_H264) {
+							ast_rtp_codecs_payloads_unset(live, p->vrtp, i);
+						}
+					}
+				}
 			}
 			ast_rtp_codecs_payloads_copy(&newvideortp, ast_rtp_instance_get_codecs(p->vrtp), p->vrtp);
 		} else {
@@ -10494,10 +10522,11 @@ static int process_sdp_a_audio(const char *a, struct sip_pvt *p, struct ast_rtp_
 	return found;
 }
 
-static int process_sdp_a_video(const char *a, struct sip_pvt *p, struct ast_rtp_codecs *newvideortp, int *last_rtpmap_codec)
+static int process_sdp_a_video(const char *a, struct sip_pvt *p, struct ast_rtp_codecs *newvideortp, int *last_rtpmap_codec, struct sip_video_fmtps *vfmtps)
 {
 	int found = FALSE;
 	int codec;
+	int len = 0;
 	char mimeSubtype[128];
 	unsigned int sample_rate;
 	int debug = sip_debug_test_pvt(p);
@@ -10518,14 +10547,162 @@ static int process_sdp_a_video(const char *a, struct sip_pvt *p, struct ast_rtp_
 					if (debug)
 						ast_verbose("Found unknown media description format %s for ID %d\n", mimeSubtype, codec);
 				}
+			} else if (sip_cfg.h264fmtp) {
+				/* A dynamic payload type is what its rtpmap says (RFC 4566 6): an rtx, FEC or RED entry
+				 * must not keep the built-in video meaning of its number (98, 99 ...). */
+				ast_rtp_codecs_payloads_unset(newvideortp, NULL, codec);
 			}
 		} else {
 			if (debug)
 				ast_verbose("Discarded description format %s for ID %d\n", mimeSubtype, codec);
 		}
+	} else if (sip_cfg.h264fmtp && vfmtps && sscanf(a, "fmtp: %30u%n", &codec, &len) == 1 && len > 0
+		&& (a[len] == ' ' || a[len] == '\t' || a[len] == '\0')) {
+		/* Kept until the whole video section is read: the H.264 one is chosen from these
+		 * (sip_select_h264). The parameters may contain blanks ("...; packetization-mode=1"). */
+		if (vfmtps->count < SIP_VIDEO_FMTP_MAX) {
+			vfmtps->entry[vfmtps->count].pt = codec;
+			ast_copy_string(vfmtps->entry[vfmtps->count].params, ast_skip_blanks(a + len),
+				sizeof(vfmtps->entry[vfmtps->count].params));
+			ast_trim_blanks(vfmtps->entry[vfmtps->count].params);
+			vfmtps->count++;
+		}
+		found = TRUE;
 	}
 
 	return found;
+}
+
+/*! \brief The first four hex digits of an H.264 profile-level-id (profile_idc and profile-iop, RFC 6184 8.1),
+ * lowercased into out[5]; out[0] is '\0' when the parameter is absent. */
+static void sip_h264_profile4(const char *fmtp, char *out)
+{
+	const char *s = fmtp ? strcasestr(fmtp, "profile-level-id=") : NULL;
+	int k = 0;
+
+	out[0] = '\0';
+	if (!s) {
+		return;
+	}
+	s += 17;
+	while (k < 4 && isxdigit((unsigned char) s[k])) {
+		out[k] = tolower((unsigned char) s[k]);
+		k++;
+	}
+	out[k] = '\0';
+}
+
+/*! \brief Is this H.264 profile Baseline or Constrained Baseline (RFC 6184 8.1, Table 5)? An absent
+ * profile-level-id means Baseline (RFC 6184 8.1). Every H.264 decoder handles these. */
+static int sip_h264_profile_is_baseline(const char *prof4)
+{
+	unsigned int idc, iop;
+
+	if (ast_strlen_zero(prof4)) {
+		return 1;
+	}
+	if (strlen(prof4) < 4 || sscanf(prof4, "%2x%2x", &idc, &iop) != 2) {
+		return 0;
+	}
+	return idc == 0x42 || ((idc == 0x4d || idc == 0x58) && (iop & 0x80));
+}
+
+/*!
+ * \brief Choose the one H.264 payload type of a video m= section (h264fmtp=yes).
+ *
+ * H.264 with another packetization-mode or profile is in effect another format: the answerer keeps both
+ * or removes the payload type (RFC 6184 8.2.2), and the legs of a bridged call must use the same one,
+ * since the video is relayed as it comes. Every other H.264 payload type is removed from \a codecs, so
+ * the SDP written next carries only the chosen one, with its a=fmtp (add_vcodec_to_sdp).
+ *
+ * When the dialog already has a configuration (copied from the calling leg, or negotiated earlier), the
+ * first payload type compatible with it wins: the same packetization-mode, and the same profile unless one
+ * side does not state it (the level may differ). Otherwise, or when none is compatible, packetization-mode
+ * 1 is preferred, then a Baseline or Constrained Baseline profile, then the order of the m= line.
+ *
+ * \return the chosen payload type, -1 when the section has no H.264
+ */
+static int sip_select_h264(struct sip_pvt *p, struct ast_rtp_codecs *codecs, const char *mline, const struct sip_video_fmtps *vfmtps)
+{
+	int pts[SDP_MAX_RTPMAP_CODECS];
+	int pmodes[SDP_MAX_RTPMAP_CODECS];
+	char profs[SDP_MAX_RTPMAP_CODECS][5];
+	const char *params[SDP_MAX_RTPMAP_CODECS];
+	char desired_prof[5];
+	int n = 0, i, j, len, chosen = -1, best = -1;
+	unsigned int pt;
+
+	/* the H.264 payload types, in the order of the m= line */
+	for (; !ast_strlen_zero(mline) && n < SDP_MAX_RTPMAP_CODECS; mline = ast_skip_blanks(mline + len)) {
+		const char *pm;
+		int dup = 0;
+
+		if (sscanf(mline, "%30u%n", &pt, &len) != 1) {
+			break;
+		}
+		/* the negotiated table itself: a lookup would fall back to the built-in meaning of the number */
+		if (pt >= AST_RTP_MAX_PT || !codecs->payloads[pt].gabpbx_format || codecs->payloads[pt].code != AST_FORMAT_H264) {
+			continue;
+		}
+		for (j = 0; j < n; j++) {
+			if (pts[j] == (int) pt) {
+				dup = 1;
+			}
+		}
+		if (dup) {
+			continue;
+		}
+		pts[n] = (int) pt;
+		params[n] = "";
+		for (j = 0; vfmtps && j < vfmtps->count; j++) {
+			if (vfmtps->entry[j].pt == (int) pt) {
+				params[n] = vfmtps->entry[j].params;
+				break;
+			}
+		}
+		pm = strcasestr(params[n], "packetization-mode=");
+		pmodes[n] = pm ? atoi(pm + 19) : 0;	/* absent = 0, single NAL unit (RFC 6184 6.2) */
+		sip_h264_profile4(params[n], profs[n]);
+		n++;
+	}
+	if (!n) {
+		return -1;
+	}
+	if (p->h264_fmtp_valid) {
+		sip_h264_profile4(p->h264_fmtp, desired_prof);
+		for (i = 0; i < n && chosen < 0; i++) {
+			if (pmodes[i] == p->h264_pmode
+				&& (!desired_prof[0] || !profs[i][0] || !strcmp(desired_prof, profs[i]))) {
+				chosen = i;
+			}
+		}
+		if (chosen < 0) {
+			ast_log(LOG_NOTICE, "%s: no H.264 payload type matches the configuration in use (%s); choosing among the ones received\n",
+				p->callid, ast_strlen_zero(p->h264_fmtp) ? "none stated" : p->h264_fmtp);
+		}
+	}
+	if (chosen < 0) {
+		for (i = 0; i < n; i++) {
+			int rank = (pmodes[i] == 1 ? 2 : 0) + (sip_h264_profile_is_baseline(profs[i]) ? 1 : 0);
+
+			if (rank > best) {
+				best = rank;
+				chosen = i;
+			}
+		}
+	}
+	for (i = 0; i < n; i++) {
+		if (i != chosen) {
+			ast_rtp_codecs_payloads_unset(codecs, NULL, pts[i]);
+		}
+	}
+	ast_copy_string(p->h264_fmtp, params[chosen], sizeof(p->h264_fmtp));
+	p->h264_pmode = pmodes[chosen];
+	p->h264_fmtp_valid = 1;
+	if (sip_debug_test_pvt(p)) {
+		ast_verbose("H.264: payload type %d chosen (%s)\n", pts[chosen], ast_strlen_zero(params[chosen]) ? "no a=fmtp" : params[chosen]);
+	}
+	return pts[chosen];
 }
 
 static int process_sdp_a_text(const char *a, struct sip_pvt *p, struct ast_rtp_codecs *newtextrtp, char *red_fmtp, int *red_num_gen, int *red_data_pt, int *last_rtpmap_codec)
@@ -11926,7 +12103,7 @@ static void add_codec_to_sdp(const struct sip_pvt *p, format_t codec,
 /* This is different to the audio one now so we can add more caps later */
 static void add_vcodec_to_sdp(const struct sip_pvt *p, format_t codec,
 			     struct ast_str **m_buf, struct ast_str **a_buf,
-			     int debug, int *min_packet_size)
+			     int debug, int *min_packet_size, int answer)
 {
 	int rtp_code;
 
@@ -11943,7 +12120,31 @@ static void add_vcodec_to_sdp(const struct sip_pvt *p, format_t codec,
 	ast_str_append(a_buf, 0, "a=rtpmap:%d %s/%d\r\n", rtp_code,
 		       ast_rtp_lookup_mime_subtype2(1, codec, 0),
 		       ast_rtp_lookup_sample_rate2(1, codec));
-	/* Add fmtp code here */
+	/* H.264: the configuration in use, or the one of the calling leg when this is the offer to the
+	 * callee, so both legs agree on it (RFC 6184 8.2.2). Without a known one, nothing (as before).
+	 * In an answer the sprop-parameter-sets are left out: they describe the offerer's own stream
+	 * (RFC 6184 8.2.2), not the one it will receive from the other leg, which carries them in-band. */
+	if (sip_cfg.h264fmtp && codec == AST_FORMAT_H264 && p->h264_fmtp_valid && !ast_strlen_zero(p->h264_fmtp)) {
+		if (!answer) {
+			ast_str_append(a_buf, 0, "a=fmtp:%d %s\r\n", rtp_code, p->h264_fmtp);
+		} else {
+			char params[sizeof(p->h264_fmtp)];
+			char *param, *rest = params;
+			int first = 1;
+
+			ast_copy_string(params, p->h264_fmtp, sizeof(params));
+			ast_str_append(a_buf, 0, "a=fmtp:%d", rtp_code);
+			while ((param = strsep(&rest, ";"))) {
+				param = ast_skip_blanks(param);
+				if (ast_strlen_zero(param) || !strncasecmp(param, "sprop-", 6)) {
+					continue;
+				}
+				ast_str_append(a_buf, 0, "%s%s", first ? " " : ";", param);
+				first = 0;
+			}
+			ast_str_append(a_buf, 0, "\r\n");
+		}
+	}
 }
 
 /*! \brief Add text codec offer to SDP offer/answer body in INVITE or 200 OK */
@@ -12361,7 +12562,7 @@ static enum sip_result add_sdp(struct sip_request *resp, struct sip_pvt *p, int 
 			if (x & AST_FORMAT_AUDIO_MASK)
 				add_codec_to_sdp(p, x, &m_audio, &a_audio, debug, &min_audio_packet_size, invite);
 			else if (x & AST_FORMAT_VIDEO_MASK)
-				add_vcodec_to_sdp(p, x, &m_video, &a_video, debug, &min_video_packet_size);
+				add_vcodec_to_sdp(p, x, &m_video, &a_video, debug, &min_video_packet_size, resp->method == SIP_RESPONSE);
 			else if (x & AST_FORMAT_TEXT_MASK)
 				add_tcodec_to_sdp(p, x, &m_text, &a_text, debug, &min_text_packet_size);
 		}
@@ -19319,6 +19520,7 @@ static char *sip_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_
 	}
 	ast_cli(a->fd, "  Record SIP history:     %s\n", AST_CLI_ONOFF(recordhistory));
 	ast_cli(a->fd, "  Call Events:            %s\n", AST_CLI_ONOFF(sip_cfg.callevents));
+	ast_cli(a->fd, "  H.264 fmtp:             %s\n", AST_CLI_ONOFF(sip_cfg.h264fmtp));
 	ast_cli(a->fd, "  Auth. Failure Events:   %s\n", AST_CLI_ONOFF(global_authfailureevents));
 
 	ast_cli(a->fd, "  T.38 support:           %s\n", AST_CLI_YESNO(ast_test_flag(&global_flags[1], SIP_PAGE2_T38SUPPORT)));
@@ -28014,6 +28216,25 @@ static struct ast_channel *sip_request_call(const char *type, format_t format, c
 #endif
 	p->prefcodec = oldformat;				/* Format for this call */
 	p->jointcapability = oldformat & p->capability;
+	/* H.264: offer the callee the configuration the calling leg negotiated, so both legs use the same
+	 * one (RFC 6184 8.2.2); the video is relayed as it comes. No lock is held here: channel, then pvt. */
+	if (sip_cfg.h264fmtp && requestor) {
+		struct ast_channel *rq_chan = (struct ast_channel *) requestor;
+
+		ast_channel_lock(rq_chan);
+		if (IS_SIP_TECH(rq_chan->tech) && rq_chan->tech_pvt) {
+			struct sip_pvt *rq = rq_chan->tech_pvt;
+
+			sip_pvt_lock(rq);
+			if (rq->h264_fmtp_valid) {
+				ast_copy_string(p->h264_fmtp, rq->h264_fmtp, sizeof(p->h264_fmtp));
+				p->h264_pmode = rq->h264_pmode;
+				p->h264_fmtp_valid = 1;
+			}
+			sip_pvt_unlock(rq);
+		}
+		ast_channel_unlock(rq_chan);
+	}
 	sip_pvt_lock(p);
 	tmpc = sip_new(p, AST_STATE_DOWN, host, requestor ? requestor->linkedid : NULL);	/* Place the call */
 	if (sip_cfg.callevents)
@@ -29545,6 +29766,7 @@ static int reload_config(enum channelreloadreason reason)
 	/* Misc settings for the channel */
 	global_relaxdtmf = FALSE;
 	sip_cfg.callevents = DEFAULT_CALLEVENTS;
+	sip_cfg.h264fmtp = FALSE;
 	global_authfailureevents = FALSE;
 	global_t1 = DEFAULT_TIMER_T1;
 	global_timer_b = 64 * DEFAULT_TIMER_T1;
@@ -29973,6 +30195,8 @@ static int reload_config(enum channelreloadreason reason)
 			}
 		} else if (!strcasecmp(v->name, "callevents")) {
 			sip_cfg.callevents = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "h264fmtp")) {
+			sip_cfg.h264fmtp = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "authfailureevents")) {
 			global_authfailureevents = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "maxcallbitrate")) {
