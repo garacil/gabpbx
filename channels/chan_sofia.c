@@ -2784,6 +2784,8 @@ static struct sofia_pvt *sofia_pvt_alloc(void)
 /* Forward declarations (definitions live further down). */
 int sofia_dispatch_to_root_thread(void (*callback)(void *), void *data);
 static void transmit_mwi_notify_for_peer(struct sofia_peer *peer);
+static void sofia_mwi_notify_on_handle(struct sofia_peer *peer, nua_handle_t *nh, int terminate,
+	const char *proxy, long remaining);
 void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len);
 /* sofia_resolve_ourip mirrors ast_sip_ouraddrfor (kernel routing + externaddr remap). */
 void sofia_resolve_ourip(struct sofia_pvt *pvt, const struct ast_sockaddr *target);
@@ -2821,9 +2823,20 @@ static void sofia_update_redirecting(struct sofia_pvt *pvt);
 static void transmit_unsolicited_mwi_for_peer(struct sofia_peer *peer);
 static void sofia_register_initial_mwi(struct sofia_peer *peer);
 
+/* An inbound MWI subscription counts as ACTIVE only while the expiry we granted has not passed. A
+ * handle left behind by a device that vanished without unsubscribing (phone unplugged, NAT rebooted)
+ * must neither keep suppressing the unsolicited push to the account's other devices nor swallow the
+ * solicited NOTIFY in a dead dialog (RFC 6665 §3.1.1: the subscription lasts the granted Expires).
+ * Caller holds peer->lock. */
+static int sofia_peer_mwi_sub_active_locked(const struct sofia_peer *peer, time_t now)
+{
+	return peer->mwi_subscription_handle && peer->mwi_subscription_expires > now;
+}
+
 struct mwi_dispatch_data {
 	struct sofia_peer *peer;	/* +1 ref TRANSFERRED — callback drops */
-	int unsolicited;		/* 0 = solicited re-NOTIFY on the active sub; 1 = unsolicited push */
+	int solicited;			/* 1 = re-NOTIFY on the live inbound subscription dialog */
+	int unsolicited;		/* 1 = unsolicited push to every other registered contact (fan-out) */
 };
 
 /* Free the carrier; safe on any thread (ao2 unref + ast_free, no nua ops). */
@@ -2847,10 +2860,11 @@ static void mwi_notify_callback(void *arg)
 		return;
 	}
 	if (d->peer) {
+		if (d->solicited) {
+			transmit_mwi_notify_for_peer(d->peer);
+		}
 		if (d->unsolicited) {
 			transmit_unsolicited_mwi_for_peer(d->peer);
-		} else {
-			transmit_mwi_notify_for_peer(d->peer);
 		}
 	}
 	mwi_dispatch_data_free(d);
@@ -2903,24 +2917,27 @@ static void mwi_event_cb(const struct ast_event *event, void *userdata)
 {
 	struct sofia_peer *peer = userdata;
 	struct mwi_dispatch_data *d;
-	int unsolicited = 0;
+	int solicited, unsolicited;
 
 	if (!event || !peer) {
 		return;
 	}
 
-	if (!peer->mwi_subscription_handle) {
-		/* No active inbound subscription. Push an UNSOLICITED NOTIFY only when subscribemwi=no AND the
-		 * peer is registered (chan_sip parity); the sofia_thread callback re-checks registered under
-		 * peer->lock. Otherwise there is nothing to do (solicited-only or no contact). */
-		if (peer->subscribemwi != 0 || !peer->registered) {
-			if (sofia_debug) {
-				ast_debug(2, "Sofia MWI: peer %s event ignored "
-					"(no subscriber; unsolicited off or not registered)\n", peer->name);
-			}
-			return;
+	/* Solicited re-NOTIFY only on a subscription still within its granted expiry. The unsolicited
+	 * fan-out goes to every OTHER registered device of the account whenever subscribemwi=no, whether or
+	 * not one device subscribed: with several devices on one account the subscriber is one phone, not
+	 * the account, and a stale subscription must never silence the rest. The sofia_thread callback
+	 * re-checks registered/expiry under peer->lock. */
+	ast_mutex_lock(&peer->lock);
+	solicited = sofia_peer_mwi_sub_active_locked(peer, time(NULL));
+	unsolicited = (peer->subscribemwi == 0 && peer->registered);
+	ast_mutex_unlock(&peer->lock);
+	if (!solicited && !unsolicited) {
+		if (sofia_debug) {
+			ast_debug(2, "Sofia MWI: peer %s event ignored "
+				"(no live subscriber; unsolicited off or not registered)\n", peer->name);
 		}
-		unsolicited = 1;
+		return;
 	}
 
 	d = ast_calloc(1, sizeof(*d));
@@ -2932,6 +2949,7 @@ static void mwi_event_cb(const struct ast_event *event, void *userdata)
 	/* TRANSFER ref: take +1 here, dispatch carries, callback drops. */
 	ao2_ref(peer, +1);
 	d->peer = peer;
+	d->solicited = solicited;
 	d->unsolicited = unsolicited;
 
 	if (sofia_dispatch_to_root_thread(mwi_notify_callback, d) < 0) {
@@ -13757,56 +13775,317 @@ static struct ast_str *sofia_build_mwi_body(struct sofia_peer *peer, int *new_ou
 	return body;
 }
 
-/* SOLICITED MWI re-NOTIFY: emit on the peer's active inbound-SUBSCRIBE dialog handle. No-op without an
- * active subscription. sofia_thread only. */
-static void transmit_mwi_notify_for_peer(struct sofia_peer *peer)
+/* sofia_thread only: forget an inbound MWI subscription whose granted expiry has passed. sofia-sip does
+ * not expire a nua_respond()-accepted subscription by itself (same as the presence engine's sweep), so
+ * the final NOTIFY (terminated;reason=timeout, RFC 6665 §4.2.2) is sent here, then the handle goes. */
+static void sofia_peer_mwi_sub_drop_stale(struct sofia_peer *peer)
 {
-	struct ast_str *body;
-	const char *notifymime;
-	int total_new = 0, total_old = 0;
-	nua_handle_t *nh;
+	nua_handle_t *nh = NULL;
+	char proxy[128] = "";
 
 	if (!peer) {
 		return;
 	}
 	ast_mutex_lock(&peer->lock);
-	nh = peer->mwi_subscription_handle;
+	if (peer->mwi_subscription_handle && peer->mwi_subscription_expires <= time(NULL)) {
+		nh = peer->mwi_subscription_handle;
+		ast_copy_string(proxy, peer->mwi_subscription_proxy, sizeof(proxy));
+	}
 	ast_mutex_unlock(&peer->lock);
 	if (!nh) {
 		return;
+	}
+	sofia_mwi_notify_on_handle(peer, nh, 1, proxy, 0);
+	ast_mutex_lock(&peer->lock);
+	if (peer->mwi_subscription_handle == nh) {
+		peer->mwi_subscription_handle = NULL;
+		peer->mwi_subscription_expires = 0;
+		ast_sockaddr_setnull(&peer->mwi_subscription_src);
+		peer->mwi_subscription_proxy[0] = '\0';
+	} else {
+		nh = NULL;
+	}
+	ast_mutex_unlock(&peer->lock);
+	if (nh) {
+		nua_handle_bind(nh, NULL);
+		nua_handle_destroy(nh);
+		if (sofia_debug) {
+			ast_verbose("Sofia MWI: peer '%s' expired inbound subscription dropped\n", peer->name);
+		}
+	}
+}
+
+/* Match callback: the peer whose inbound MWI subscription lives on this handle (pointer compare). */
+static int sofia_peer_mwi_nh_cmp_cb(void *obj, void *arg, int flags)
+{
+	struct sofia_peer *peer = obj;
+	return peer->mwi_subscription_handle == arg ? CMP_MATCH | CMP_STOP : 0;
+}
+
+/* nua_r_notify on an inbound MWI subscription handle (RFC 6665 §4.2.2): sofia-sip sends the final
+ * NOTIFY at expiry or unsubscribe by itself and reports the usage terminated here; a NOTIFY that fails
+ * with a dialog-ending response (404, 405, 410, 416, 480-485, 489, 501, 604) or with timer F (408)
+ * removes the subscription as well. Correlate by handle and forget it. sofia_thread only. */
+static void sofia_mwi_sub_on_notify_response(nua_handle_t *nh, int status, tagi_t tags[])
+{
+	struct sofia_peer *peer;
+	int ends;
+
+	if (!nh) {
+		return;
+	}
+	ends = sofia_substate_terminated(tags)
+		|| status == 404 || status == 405 || status == 408 || status == 410 || status == 416
+		|| (status >= 480 && status <= 485) || status == 489 || status == 501 || status == 604;
+	if (!ends) {
+		return;
+	}
+	peer = ao2_callback(peers, 0, sofia_peer_mwi_nh_cmp_cb, nh);
+	if (!peer) {
+		return;
+	}
+	ast_mutex_lock(&peer->lock);
+	if (peer->mwi_subscription_handle == nh) {
+		peer->mwi_subscription_handle = NULL;
+		peer->mwi_subscription_expires = 0;
+		ast_sockaddr_setnull(&peer->mwi_subscription_src);
+	} else {
+		nh = NULL;	/* already replaced by a newer subscription: nothing to forget */
+	}
+	ast_mutex_unlock(&peer->lock);
+	if (nh) {
+		nua_handle_bind(nh, NULL);
+		nua_handle_destroy(nh);
+		if (sofia_debug) {
+			ast_verbose("Sofia MWI: peer '%s' inbound subscription ended (NOTIFY %d) - forgotten\n",
+				peer->name, status);
+		}
+	}
+	ao2_ref(peer, -1);
+}
+
+/* Emit a message-summary NOTIFY with the peer's current counts in the inbound subscription dialog on
+ * the given handle (no state checks: the caller decided the dialog is the right one). Same idiom as
+ * the presence engine: Subscription-State composed explicitly (RFC 6665 §8.2.1; sofia-sip does not add
+ * it for nua_respond()-accepted subscriptions), NUTAG_SUBSTATE keeps the library's usage state machine
+ * in step, and the NOTIFY is routed to the subscriber's learned source (NUTAG_PROXY): a NAT device or a
+ * WebSocket client is reachable there, never at its Contact. terminate = 1 sends the final NOTIFY
+ * (terminated;reason=timeout). sofia_thread only. */
+static void sofia_mwi_notify_on_handle(struct sofia_peer *peer, nua_handle_t *nh, int terminate,
+	const char *proxy, long remaining)
+{
+	struct ast_str *body;
+	const char *notifymime;
+	char ss[64];
+	int total_new = 0, total_old = 0;
+
+	if (!peer || !nh) {
+		return;
+	}
+	if (remaining < 0) {
+		remaining = 0;
 	}
 	if (!(body = sofia_build_mwi_body(peer, &total_new, &total_old))) {
 		return;
 	}
 	notifymime = !ast_strlen_zero(sofia_cfg.notifymime) ? sofia_cfg.notifymime
 		: "application/simple-message-summary";
+	if (terminate) {
+		ast_copy_string(ss, "terminated;reason=timeout", sizeof(ss));
+	} else {
+		snprintf(ss, sizeof(ss), "active;expires=%ld", remaining);
+	}
 	nua_notify(nh,
 		SIPTAG_EVENT_STR("message-summary"),
+		NUTAG_SUBSTATE(terminate ? nua_substate_terminated : nua_substate_active),
+		SIPTAG_SUBSCRIPTION_STATE_STR(ss),
 		SIPTAG_CONTENT_TYPE_STR(notifymime),
 		SIPTAG_PAYLOAD_STR(ast_str_buffer(body)),
+		TAG_IF(!ast_strlen_zero(proxy), NUTAG_PROXY(proxy)),
 		TAG_END());
 	if (sofia_debug) {
-		ast_verbose("Sofia MWI: solicited NOTIFY for peer '%s' (new=%d old=%d)\n",
-			peer->name, total_new, total_old);
+		ast_verbose("Sofia MWI: solicited NOTIFY for peer '%s' (%s, new=%d old=%d)%s%s\n",
+			peer->name, ss, total_new, total_old,
+			!ast_strlen_zero(proxy) ? " via " : "", !ast_strlen_zero(proxy) ? proxy : "");
 	}
 	ast_free(body);
 }
 
-/* UNSOLICITED MWI NOTIFY (RFC 3842, chan_sip subscribemwi=no parity): push message-summary to a
- * registered peer that has NOT subscribed, via a one-shot out-of-dialog handle to its registered
- * contact. Sent with nua_method NOTIFY (NOT nua_notify): this sofia-sip fork compiles out the notifier
- * client methods and the NUTAG_NEWSUB usage path is #if 0, so an out-of-dialog nua_notify is rejected
- * locally with 481; the generic-method path delivers it. Subscription-State: active is set explicitly.
- * The handle carries SOFIA_SIPNOTIFY_HMAGIC so the one-shot reap destroys it on the final nua_r_method
- * response. sofia_thread only. */
+/* SOLICITED MWI re-NOTIFY: emit on the peer's LIVE inbound-SUBSCRIBE dialog handle. No-op without a
+ * subscription inside its granted expiry (a stale one is dropped instead). sofia_thread only. */
+static void transmit_mwi_notify_for_peer(struct sofia_peer *peer)
+{
+	nua_handle_t *nh;
+	char proxy[128];
+	long remaining;
+
+	if (!peer) {
+		return;
+	}
+	sofia_peer_mwi_sub_drop_stale(peer);
+	ast_mutex_lock(&peer->lock);
+	nh = sofia_peer_mwi_sub_active_locked(peer, time(NULL)) ? peer->mwi_subscription_handle : NULL;
+	ast_copy_string(proxy, peer->mwi_subscription_proxy, sizeof(proxy));
+	remaining = (long) (peer->mwi_subscription_expires - time(NULL));
+	ast_mutex_unlock(&peer->lock);
+	if (!nh) {
+		return;
+	}
+	sofia_mwi_notify_on_handle(peer, nh, 0, proxy, remaining);
+}
+
+/* UNSOLICITED MWI NOTIFY (RFC 3842, chan_sip subscribemwi=no parity): message-summary pushed to a
+ * registered contact that has NOT subscribed, via a one-shot out-of-dialog handle. Sent with
+ * nua_method NOTIFY (NOT nua_notify): this sofia-sip fork compiles out the notifier client methods and
+ * the NUTAG_NEWSUB usage path is #if 0, so an out-of-dialog nua_notify is rejected locally with 481;
+ * the generic-method path delivers it. Subscription-State: active is set explicitly. The handle carries
+ * SOFIA_SIPNOTIFY_HMAGIC so the one-shot reap destroys it on the final nua_r_method response.
+ *
+ * Send ONE such NOTIFY carrying an already-built body to one target URI. route = the Path (RFC 3327)
+ * the registrar stored for that contact, pre-loaded as the initial Route, or "" when none.
+ * sofia_thread only. */
+static void sofia_send_unsolicited_mwi(struct sofia_peer *peer, const char *target, const char *route,
+	const char *body, int total_new, int total_old)
+{
+	const char *notifymime;
+	nua_handle_t *nh;
+
+	if (!peer || ast_strlen_zero(target) || !body) {
+		return;
+	}
+	notifymime = !ast_strlen_zero(sofia_cfg.notifymime) ? sofia_cfg.notifymime
+		: "application/simple-message-summary";
+
+	nh = nua_handle(sofia_nua, SOFIA_SIPNOTIFY_HMAGIC, NUTAG_URL(target), TAG_END());
+	if (nh) {
+		nua_method(nh,
+			NUTAG_METHOD("NOTIFY"),
+			SIPTAG_EVENT_STR("message-summary"),
+			SIPTAG_SUBSCRIPTION_STATE_STR("active"),
+			SIPTAG_CONTENT_TYPE_STR(notifymime),
+			SIPTAG_PAYLOAD_STR(body),
+			TAG_IF(!ast_strlen_zero(route), NUTAG_INITIAL_ROUTE_STR(route)),
+			TAG_END());
+		if (sofia_debug) {
+			ast_verbose("Sofia MWI: unsolicited NOTIFY for peer '%s' -> %s (new=%d old=%d)\n",
+				peer->name, target, total_new, total_old);
+		}
+	}
+}
+
+/* Target URI for an unsolicited NOTIFY to ONE registered contact: the contact's learned transport
+ * source when known (the only address a NAT device or a WebSocket client is reachable at), else the
+ * Contact host:port, always with the contact's own ;transport=. Path (RFC 3327) copied out when the
+ * registrar accepted one for this peer. */
+static void sofia_contact_mwi_target(struct sofia_contact *c, const char *user, int path_support,
+	char *out, size_t outlen, char *path_out, size_t path_outlen)
+{
+	char hbuf[80];
+	char c_transport[8];
+	char c_host[128];
+	int c_port;
+
+	ao2_lock(c);
+	ast_copy_string(c_transport, c->transport, sizeof(c_transport));
+	if (!ast_sockaddr_isnull(&c->src_addr)) {
+		ast_copy_string(c_host, ast_sockaddr_stringify_host(&c->src_addr), sizeof(c_host));
+		c_port = ast_sockaddr_port(&c->src_addr);
+	} else {
+		ast_copy_string(c_host, c->host, sizeof(c_host));
+		c_port = c->port;
+	}
+	if (path_out && path_outlen) {
+		if (path_support) {
+			ast_copy_string(path_out, c->path, path_outlen);
+		} else {
+			path_out[0] = '\0';
+		}
+	}
+	ao2_unlock(c);
+
+	snprintf(out, outlen, "sip:%s@%s:%d", user ? user : "",
+		sofia_uri_format_host(c_host, hbuf, sizeof(hbuf)), c_port);
+	sofia_uri_append_transport(out, outlen, c_transport);
+}
+
+/* UNSOLICITED MWI on a mailbox change: one NOTIFY per unexpired registered contact of the account,
+ * each over the transport/connection it registered through. One account, several devices (desk
+ * phone + mobile + web): all of them learn a new message at once, not only the last registrant. The
+ * live subscriber's own contact is skipped (it gets the solicited NOTIFY in its dialog). Falls back to
+ * the registration-source target when there is no contact binding to fan out to. sofia_thread only. */
 static void transmit_unsolicited_mwi_for_peer(struct sofia_peer *peer)
 {
 	struct ast_str *body;
-	const char *notifymime;
+	char target[300];
+	char path_buf[1024];
+	char defaultuser[256];
+	struct ast_sockaddr sub_src;
+	struct ao2_iterator ci;
+	struct sofia_contact *c;
+	int registered, path_support, skip_sub = 0, sent = 0, total_new = 0, total_old = 0;
+	time_t now = time(NULL);
+
+	if (!peer) {
+		return;
+	}
+	sofia_peer_mwi_sub_drop_stale(peer);
+	ast_mutex_lock(&peer->lock);
+	registered = peer->registered;
+	path_support = peer->path_support;
+	ast_copy_string(defaultuser,
+		!ast_strlen_zero(peer->defaultuser) ? peer->defaultuser : peer->name, sizeof(defaultuser));
+	if (sofia_peer_mwi_sub_active_locked(peer, now) && !ast_sockaddr_isnull(&peer->mwi_subscription_src)) {
+		ast_sockaddr_copy(&sub_src, &peer->mwi_subscription_src);
+		skip_sub = 1;
+	}
+	ast_mutex_unlock(&peer->lock);
+	if (!registered) {
+		return;		/* no registered contact to push to */
+	}
+	if (!(body = sofia_build_mwi_body(peer, &total_new, &total_old))) {
+		return;
+	}
+
+	if (peer->contacts) {
+		ci = ao2_iterator_init(peer->contacts, 0);
+		while ((c = ao2_iterator_next(&ci))) {
+			time_t c_exp;
+			struct ast_sockaddr c_src;
+			int wanted;
+
+			ao2_lock(c);
+			c_exp = c->expires;
+			ast_sockaddr_copy(&c_src, &c->src_addr);
+			ao2_unlock(c);
+			wanted = sofia_contact_is_unexpired(c_exp, now)
+				&& !(skip_sub && !ast_sockaddr_isnull(&c_src) && !ast_sockaddr_cmp(&c_src, &sub_src));
+			if (wanted) {
+				sofia_contact_mwi_target(c, defaultuser, path_support, target, sizeof(target),
+					path_buf, sizeof(path_buf));
+				sofia_send_unsolicited_mwi(peer, target, path_buf, ast_str_buffer(body), total_new, total_old);
+				sent++;
+			}
+			ao2_ref(c, -1);
+		}
+		ao2_iterator_destroy(&ci);
+	}
+	if (!sent && !skip_sub) {
+		/* No contact binding to fan out to (static host, or a registration that stored no contact
+		 * slot): the peer-level registration-source target, as before. */
+		sofia_resolve_peer_target(peer, defaultuser, target, sizeof(target));
+		sofia_send_unsolicited_mwi(peer, target, "", ast_str_buffer(body), total_new, total_old);
+	}
+	ast_free(body);
+}
+
+/* UNSOLICITED MWI to the device that just registered (REGISTER 200 path): the peer-level target is
+ * the registration source, i.e. that device. sofia_thread only. */
+static void transmit_unsolicited_mwi_to_registrant(struct sofia_peer *peer)
+{
+	struct ast_str *body;
 	char target[300];
 	char defaultuser[256];
 	int registered, total_new = 0, total_old = 0;
-	nua_handle_t *nh;
 
 	if (!peer) {
 		return;
@@ -13827,35 +14106,16 @@ static void transmit_unsolicited_mwi_for_peer(struct sofia_peer *peer)
 	if (!(body = sofia_build_mwi_body(peer, &total_new, &total_old))) {
 		return;
 	}
-	notifymime = !ast_strlen_zero(sofia_cfg.notifymime) ? sofia_cfg.notifymime
-		: "application/simple-message-summary";
-
-	nh = nua_handle(sofia_nua, SOFIA_SIPNOTIFY_HMAGIC, NUTAG_URL(target), TAG_END());
-	if (nh) {
-		/* nua_method NOTIFY — NOT nua_notify. This sofia-sip fork compiles out the notifier client
-		 * methods (nua_notify_client_methods are all NULL) and the NUTAG_NEWSUB usage-creation path is
-		 * #if 0, so an out-of-dialog nua_notify is rejected LOCALLY with 481 and never reaches the wire.
-		 * The generic-method path sends the NOTIFY on the wire (the same mechanism outbound PUBLISH uses);
-		 * the response arrives as nua_r_method, reaped by the SOFIA_SIPNOTIFY_HMAGIC one-shot reap. */
-		nua_method(nh,
-			NUTAG_METHOD("NOTIFY"),
-			SIPTAG_EVENT_STR("message-summary"),
-			SIPTAG_SUBSCRIPTION_STATE_STR("active"),
-			SIPTAG_CONTENT_TYPE_STR(notifymime),
-			SIPTAG_PAYLOAD_STR(ast_str_buffer(body)),
-			TAG_END());
-		if (sofia_debug) {
-			ast_verbose("Sofia MWI: unsolicited NOTIFY for peer '%s' -> %s (new=%d old=%d)\n",
-				peer->name, target, total_new, total_old);
-		}
-	}
+	sofia_send_unsolicited_mwi(peer, target, "", ast_str_buffer(body), total_new, total_old);
 	ast_free(body);
 }
 
-/* On a successful REGISTER, push the initial unsolicited MWI for a peer that has a mailbox= and
- * subscribemwi=no (chan_sip parity). Called from BOTH register-200 paths (no-auth + authenticated) on
- * sofia_thread, after the 200 OK + side-effects. No-op for solicited-only (subscribemwi=yes) or
- * mailbox-less peers; transmit_unsolicited re-checks registered under peer->lock. */
+/* On a successful REGISTER, push the initial unsolicited MWI to the device that just registered, for a
+ * peer that has a mailbox= and subscribemwi=no (chan_sip parity). Called from BOTH register-200 paths
+ * (no-auth + authenticated) on sofia_thread, after the 200 OK + side-effects. No-op for solicited-only
+ * (subscribemwi=yes) or mailbox-less peers. Skipped only when the registrant IS the live subscriber (it
+ * already gets the solicited NOTIFY on its dialog): another device of the same account gets its push
+ * even while one device holds a subscription. */
 static void sofia_register_initial_mwi(struct sofia_peer *peer)
 {
 	int want_mwi;
@@ -13863,15 +14123,15 @@ static void sofia_register_initial_mwi(struct sofia_peer *peer)
 	if (!peer) {
 		return;
 	}
+	sofia_peer_mwi_sub_drop_stale(peer);
 	ast_mutex_lock(&peer->lock);
-	/* Skip the unsolicited push when the phone has an ACTIVE inbound MWI subscription — it already gets
-	 * solicited NOTIFYs on that dialog; pushing here too would double-notify a subscribed phone on every
-	 * re-REGISTER. (The mwi_event_cb change path already gates on this.) */
 	want_mwi = (peer->subscribemwi == 0 && !AST_LIST_EMPTY(&peer->mailboxes)
-		&& !peer->mwi_subscription_handle);
+		&& !(sofia_peer_mwi_sub_active_locked(peer, time(NULL))
+			&& !ast_sockaddr_isnull(&peer->src_addr)
+			&& !ast_sockaddr_cmp(&peer->src_addr, &peer->mwi_subscription_src)));
 	ast_mutex_unlock(&peer->lock);
 	if (want_mwi) {
-		transmit_unsolicited_mwi_for_peer(peer);
+		transmit_unsolicited_mwi_to_registrant(peer);
 	}
 }
 
@@ -13889,6 +14149,22 @@ static void sofia_subscribe_reject_reap(nua_handle_t *nh)
 	nua_handle_destroy(nh);
 }
 
+/* Reap a SUBSCRIBE server handle on a non-accepted path of the MWI handler, UNLESS it is the handle of a
+ * live inbound MWI subscription: an in-dialog refresh or unsubscribe is challenged (401) and rejected
+ * through the same paths as a fresh request, and destroying the dialog's handle there leaves
+ * peer->mwi_subscription_handle dangling (the authenticated retry then arrives on a new handle and the
+ * old pointer is used after its destroy). The dialog lives on; the retry is processed on it. */
+static void sofia_mwi_reject_reap(nua_handle_t *nh)
+{
+	struct sofia_peer *owner = nh ? ao2_callback(peers, 0, sofia_peer_mwi_nh_cmp_cb, nh) : NULL;
+
+	if (owner) {
+		ao2_ref(owner, -1);
+		return;
+	}
+	sofia_subscribe_reject_reap(nh);
+}
+
 /* MWI SUBSCRIBE handler (Event:message-summary). Identifies the mailbox-owner peer
  * via the To user-part, enforces a 1-subscription-per-peer cap, binds nh as a
  * nua_notifier. Runs on sofia_thread; holds peer->lock only while mutating peer
@@ -13899,11 +14175,15 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 	struct sofia_peer *peer;
 	const char *to_user;
 	nua_handle_t *old_nh = NULL;
+	struct ast_sockaddr sub_src;
+	char sub_proxy[128] = "";
+	char expires_buf[16];
+	int requested = 0, granted = 0, terminating = 0, same_device = 0;
 
 	/* To URI user-part identifies the mailbox-owning peer */
 	if (!sip || !sip->sip_to || !sip->sip_to->a_url || !sip->sip_to->a_url->url_user) {
 		nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
-		sofia_subscribe_reject_reap(nh);	/* reap the challenge handle */
+		sofia_mwi_reject_reap(nh);	/* reap the challenge handle */
 		return;
 	}
 	to_user = sip->sip_to->a_url->url_user;
@@ -13924,7 +14204,7 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 		} else {
 			ast_log(LOG_NOTICE, "Sofia MWI: SUBSCRIBE for unknown peer '%s' — 404\n", to_user);
 			nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
-			sofia_subscribe_reject_reap(nh);	/* immediate reap — 404 branch (no deferred 401) */
+			sofia_mwi_reject_reap(nh);	/* immediate reap — 404 branch (no deferred 401) */
 		}
 		return;
 	}
@@ -13941,7 +14221,7 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 				peer->name);
 			nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
 			ao2_ref(peer, -1);
-			sofia_subscribe_reject_reap(nh);	/* reap the challenge handle */
+			sofia_mwi_reject_reap(nh);	/* reap the challenge handle */
 			return;
 		}
 	}
@@ -13957,7 +14237,7 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 		sofia_emit_subscribe_rejected(sip, peer->name, "message-summary",
 			"AllowSubscribeClosed");
 		ao2_ref(peer, -1);
-		sofia_subscribe_reject_reap(nh);	/* reap the challenge handle */
+		sofia_mwi_reject_reap(nh);	/* reap the challenge handle */
 		return;
 	}
 
@@ -13970,7 +14250,7 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 			nua, nh, sip, sip->sip_authorization, "SUBSCRIBE", realm);
 		if (auth_res != SOFIA_AUTH_OK) {
 			ao2_ref(peer, -1);
-			sofia_subscribe_reject_reap(nh);	/* reap the 401/4xx challenge handle */
+			sofia_mwi_reject_reap(nh);	/* reap the 401/4xx challenge handle */
 			return;
 		}
 	}
@@ -13985,57 +14265,138 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 			peer->name);
 		nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
 		ao2_ref(peer, -1);
-		sofia_subscribe_reject_reap(nh);	/* reap the challenge handle */
+		sofia_mwi_reject_reap(nh);	/* reap the challenge handle */
 		return;
 	}
 
-	/* 1-cap: capture existing handle (if any) for terminate-old; assign new. */
-	old_nh = peer->mwi_subscription_handle;
-	peer->mwi_subscription_handle = nh;
-
-	ast_mutex_unlock(&peer->lock);
-
-	/* Only terminate+destroy a DIFFERENT prior handle: on an in-dialog refresh
-	 * old_nh == nh and destroying it would tear down the live subscription (self-UAF). */
-	if (old_nh && old_nh != nh) {
-		nua_notify(old_nh,
-			SIPTAG_EVENT_STR("message-summary"),
-			SIPTAG_SUBSCRIPTION_STATE_STR("terminated;reason=deactivated"),
-			TAG_END());
-		/* Detach hmagic before destroy: a late event for old_nh would otherwise
-		 * reach sofia_event_callback with magic = peer (still alive) and act on a
-		 * stale subscription. Mirrors the peer-destructor discipline. */
-		nua_handle_bind(old_nh, NULL);
-		nua_handle_destroy(old_nh);
+	/* Subscription lifetime (RFC 6665 §3.1.1, §4.2.1.1): the duration is the requested Expires, which
+	 * the notifier may shorten to the configured mwi_expiry but never lengthen; no Expires = the
+	 * configured default. The same number goes into the 200 OK (sofia-sip clamps its answer to our
+	 * Expires tag) and into peer->mwi_subscription_expires, which from now on decides whether the dialog
+	 * is a LIVE subscriber. Expires: 0, or sofia-sip reporting the usage terminated, is an unsubscribe
+	 * (§4.1.2.3) or a fetch (§4.4.3): the stack answers it and emits the final NOTIFY
+	 * (terminated;reason=timeout) by itself; we only stop treating the dialog as a subscriber. */
+	{
+		int cfg_expiry = sofia_cfg.mwi_expiry > 0 ? sofia_cfg.mwi_expiry : 3600;
+		char tbuf[8] = "";
+		char hbuf[80];
+		requested = cfg_expiry;
+		if (sip->sip_expires) {
+			requested = sip->sip_expires->ex_delta > (unsigned long) INT_MAX
+				? INT_MAX : (int) sip->sip_expires->ex_delta;
+		}
+		granted = requested < cfg_expiry ? requested : cfg_expiry;
+		if (granted < 0) {
+			granted = 0;
+		}
+		terminating = (granted == 0) || sofia_substate_terminated(tags);
+		snprintf(expires_buf, sizeof(expires_buf), "%d", granted);
+		/* Next hop of every in-dialog NOTIFY: the source this SUBSCRIBE arrived from, over the
+		 * transport it arrived on (presence engine idiom; a NAT device or a WebSocket client is
+		 * reachable only there, never at the Contact it advertised). */
+		sofia_get_source_addr(sip, &sub_src);
+		sofia_incoming_transport(nua, tbuf, sizeof(tbuf));	/* the tport it was delivered on */
+		if (!tbuf[0]) {
+			sofia_register_transport_from_via(sip->sip_via, tbuf, sizeof(tbuf));	/* ws/wss from Via */
+		}
+		if (!tbuf[0] && sip->sip_via && sip->sip_via->v_protocol) {
+			/* "SIP/2.0/TCP" -> "tcp" (RFC 3261 §18.2.2: the transport the request came in on). */
+			const char *slash = strrchr(sip->sip_via->v_protocol, '/');
+			if (slash && *(slash + 1)) {
+				int i;
+				ast_copy_string(tbuf, slash + 1, sizeof(tbuf));
+				for (i = 0; tbuf[i]; i++) {
+					tbuf[i] = tolower((unsigned char) tbuf[i]);
+				}
+			}
+		}
+		if (!ast_sockaddr_isnull(&sub_src)) {
+			snprintf(sub_proxy, sizeof(sub_proxy), "sip:%s:%d",
+				sofia_uri_format_host(ast_sockaddr_stringify_host(&sub_src), hbuf, sizeof(hbuf)),
+				ast_sockaddr_port(&sub_src));
+			sofia_uri_append_transport(sub_proxy, sizeof(sub_proxy), tbuf);
+		}
 	}
 
-	/* Refresh on the SAME handle: sofia-sip already auto-answered the re-SUBSCRIBE, so
-	 * do NOT re-issue nua_notifier — just push a fresh MWI NOTIFY body. */
-	if (old_nh == nh) {
-		transmit_mwi_notify_for_peer(peer);
+	/* An in-dialog refresh or unsubscribe does not reliably arrive on the dialog's handle: this stack
+	 * accepts a SUBSCRIBE carrying a To-tag that matches no usage on a FRESH handle (nua_server.c, the
+	 * SUBSCRIBE exception). So, as the presence engine does, the subscriber is recognised by its
+	 * transport source, not by handle: the stored subscription from the same source is replaced
+	 * silently; one from another device is replaced with a terminated;reason=deactivated NOTIFY (one
+	 * subscription per peer). */
+	old_nh = peer->mwi_subscription_handle;
+	same_device = old_nh && !ast_sockaddr_isnull(&sub_src)
+		&& !ast_sockaddr_cmp(&sub_src, &peer->mwi_subscription_src);
+	if (terminating) {
+		if (old_nh && (old_nh == nh || same_device)) {
+			peer->mwi_subscription_handle = NULL;
+			peer->mwi_subscription_expires = 0;
+			ast_sockaddr_setnull(&peer->mwi_subscription_src);
+			peer->mwi_subscription_proxy[0] = '\0';
+		} else {
+			old_nh = NULL;	/* another device's live subscription stays */
+		}
+	} else {
+		peer->mwi_subscription_handle = nh;
+		peer->mwi_subscription_expires = time(NULL) + granted;
+		ast_sockaddr_copy(&peer->mwi_subscription_src, &sub_src);
+		ast_copy_string(peer->mwi_subscription_proxy, sub_proxy, sizeof(peer->mwi_subscription_proxy));
+	}
+	ast_mutex_unlock(&peer->lock);
+
+	/* SUBSCRIBE is an application method here (NUTAG_APPL_METHOD): the stack waits for OUR final
+	 * response, for the initial request and for every refresh alike (RFC 6665 §4.2.1.1, §4.1.2.2).
+	 * 200 with the granted Expires creates/refreshes the subscription in the dialog; the NOTIFY that
+	 * MUST follow (§4.2.2) is then sent in it. The old nua_notifier() call never answered the request
+	 * at all (it creates a separate event server), which left every subscribing phone with a timed-out
+	 * SUBSCRIBE and this peer with a dead "subscription" that silenced the unsolicited push to its
+	 * other devices. */
+	nua_respond(nh, SIP_200_OK,
+		NUTAG_WITH_THIS(nua),
+		SIPTAG_EXPIRES_STR(expires_buf),
+		TAG_END());
+
+	if (terminating) {
+		/* Unsubscribe (§4.1.2.3) or fetch (§4.4.3): the final NOTIFY, terminated;reason=timeout, with
+		 * the current counts, on THIS handle; then the dialog is gone. */
+		sofia_mwi_notify_on_handle(peer, nh, 1, sub_proxy, 0);
+		if (old_nh && old_nh != nh) {
+			nua_handle_bind(old_nh, NULL);
+			nua_handle_destroy(old_nh);	/* the same device's previous dialog handle, silently */
+		}
+		nua_handle_bind(nh, NULL);
+		nua_handle_destroy(nh);
 		if (sofia_debug) {
-			ast_verbose("Sofia MWI: SUBSCRIBE refresh for peer '%s'\n", peer->name);
+			ast_verbose("Sofia MWI: SUBSCRIBE %s for peer '%s'%s%s\n",
+				old_nh ? "unsubscribe" : "fetch", peer->name,
+				sub_proxy[0] ? " via " : "", sub_proxy[0] ? sub_proxy : "");
 		}
 		ao2_ref(peer, -1);
 		return;
 	}
 
-	/* Bind nh as nua_notifier (opens the dialog + auto-emits Subscription-State). */
-	{
-		char expires_buf[16];
-		int expiry = sofia_cfg.mwi_expiry > 0 ? sofia_cfg.mwi_expiry : 3600;
-		snprintf(expires_buf, sizeof(expires_buf), "%d", expiry);
-		nua_notifier(nh,
-			SIPTAG_EVENT_STR("message-summary"),
-			SIPTAG_EXPIRES_STR(expires_buf),
-			TAG_END());
+	if (old_nh && old_nh != nh) {
+		if (!same_device) {
+			nua_notify(old_nh,
+				SIPTAG_EVENT_STR("message-summary"),
+				NUTAG_SUBSTATE(nua_substate_terminated),
+				SIPTAG_SUBSCRIPTION_STATE_STR("terminated;reason=deactivated"),
+				TAG_END());
+		}
+		/* Detach hmagic before destroy: a late event for old_nh would otherwise reach
+		 * sofia_event_callback and act on a stale subscription. Mirrors the peer-destructor
+		 * discipline. */
+		nua_handle_bind(old_nh, NULL);
+		nua_handle_destroy(old_nh);
 	}
 
-	/* RFC 6665 §4.4.1 initial NOTIFY (transmit takes peer->lock internally). */
-	transmit_mwi_notify_for_peer(peer);
+	/* Initial NOTIFY of a new/renewed subscription (RFC 6665 §4.2.2). */
+	sofia_mwi_notify_on_handle(peer, nh, 0, sub_proxy, granted);
 
 	if (sofia_debug) {
-		ast_verbose("Sofia MWI: SUBSCRIBE accepted for peer '%s'\n", peer->name);
+		ast_verbose("Sofia MWI: SUBSCRIBE %s for peer '%s' (granted %ds)%s%s\n",
+			old_nh ? (same_device ? "refresh" : "replaced another device") : "accepted",
+			peer->name, granted, sub_proxy[0] ? " via " : "", sub_proxy[0] ? sub_proxy : "");
 	}
 
 	ao2_ref(peer, -1);
@@ -17425,6 +17786,8 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				ao2_ref(psub, -1);
 			}
 		}
+		/* Inbound MWI subscription: same contract (expiry, unsubscribe, dialog-ending failure). */
+		sofia_mwi_sub_on_notify_response(nh, status, tags);
 		break;
 	case nua_r_refer:
 		if (sofia_debug)

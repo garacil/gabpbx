@@ -1,3 +1,30 @@
+## Unreleased — chan_sofia: voicemail MWI reaches every device of an account
+
+An account registered on several devices (desk phone, mobile app, web client) only
+told the LAST device that registered about a new voicemail; and one device that had
+once subscribed to `message-summary` and vanished without unsubscribing kept its
+dead subscription on the peer forever, so chan_sofia sent the solicited NOTIFY into
+a dead dialog and suppressed the unsolicited push to every other device: no lamp
+anywhere, although the message was stored and the peer's `mailbox=` was right.
+
+- **chan_sofia**: on a mailbox change the unsolicited NOTIFY now goes to every
+  unexpired registered contact of the peer, each over the transport and connection it
+  registered through (a WebSocket client on its own socket, a NAT device at its
+  learned public source, RFC 3327 Path honoured); the push on REGISTER still goes to
+  the device that registered. An inbound MWI subscription is live only for the Expires
+  it was granted (the shorter of the request and `mwi_expiry`, RFC 6665 3.1.1, never
+  lengthened); it is forgotten when it expires, when the phone unsubscribes
+  (Expires: 0) or when its NOTIFY fails with a dialog-ending response (RFC 6665
+  4.2.2), and its own contact is the only one left out of the fan-out. `sip show peer
+  <name> detail` shows the subscription state. No configuration.
+- **chan_sofia**: the inbound `message-summary` SUBSCRIBE had never been answered: the
+  handler created a sofia-sip event server (`nua_notifier`) instead of responding, so the
+  phone's SUBSCRIBE timed out while the peer kept a dead "subscription". It is now
+  accepted like a presence subscription (200 with the granted Expires, then the NOTIFY in
+  the dialog, routed to the source and transport the SUBSCRIBE came from: a WebSocket
+  client on its own socket). A challenged (401) in-dialog refresh or unsubscribe no longer
+  destroys the live subscription's handle.
+
 ## 1.9.7 — every request handle is released: a registrar's memory no longer grows with its registrations
 
 A memory release. Five leaks of one family are closed in `chan_sofia`: the Sofia-SIP handle

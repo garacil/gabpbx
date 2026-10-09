@@ -1080,6 +1080,9 @@ struct sofia_peer {
 	/* MWI per-peer mailbox list (NOLOCK; peer->lock guards). */
 	struct sofia_mailbox_list mailboxes;
 	nua_handle_t *mwi_subscription_handle; /* NULL until first SUBSCRIBE */
+	time_t mwi_subscription_expires;       /* absolute expiry granted to that subscription; 0 = none. Past = stale: treated as no subscription and dropped on the next MWI event */
+	struct ast_sockaddr mwi_subscription_src; /* transport source of the subscribing device: its own contact is skipped by the unsolicited fan-out (it gets the solicited NOTIFY in its dialog) */
+	char mwi_subscription_proxy[128];      /* "sip:<src ip>:<port>;transport=<t>" of that source: next hop of the in-dialog NOTIFY (a NAT device or a WebSocket client is only reachable there, not at its Contact) */
 };
 
 

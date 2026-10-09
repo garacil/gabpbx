@@ -499,6 +499,20 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 		sofia_cli_peer_line(&buf, "Mailbox", "%s", first ? "(none)" : mailbox_buf);
 	}
 	{
+		/* Inbound MWI subscription (NOLOCK; peer->lock is held by the outer caller): live only
+		 * inside its granted expiry; a stale one no longer silences the unsolicited fan-out. */
+		time_t now = time(NULL);
+		if (!peer->mwi_subscription_handle) {
+			sofia_cli_peer_line(&buf, "MWI subscription", "none (unsolicited push to every registered contact)");
+		} else if (peer->mwi_subscription_expires > now) {
+			sofia_cli_peer_line(&buf, "MWI subscription", "live, %lds left, from %s (its contact gets the solicited NOTIFY; the others the unsolicited push)",
+				(long) (peer->mwi_subscription_expires - now), ast_sockaddr_stringify(&peer->mwi_subscription_src));
+		} else {
+			sofia_cli_peer_line(&buf, "MWI subscription", "stale (expired %lds ago; ignored, dropped at the next MWI event)",
+				(long) (now - peer->mwi_subscription_expires));
+		}
+	}
+	{
 		/* outboundproxy: peer value, else [general] inherit-marker, else (none). */
 		const char *peer_p = peer->outboundproxy;
 		if (!ast_strlen_zero(peer_p)) {

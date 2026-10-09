@@ -2075,12 +2075,18 @@ tos_video = af41
 ;   phone reflects. On a change, chan_sofia delivers MWI to the phone.
 ; subscribemwi (chan_sip parity, default no):
 ;   no  (default) — UNSOLICITED MWI: the phone does NOT need to SUBSCRIBE; chan_sofia pushes a
-;                   message-summary NOTIFY to its registered contact on each successful REGISTER and
-;                   whenever the mailbox count changes (RFC 3842, Subscription-State: active).
+;                   message-summary NOTIFY (RFC 3842, Subscription-State: active) to the device that
+;                   just registered on each successful REGISTER, and, whenever the mailbox count
+;                   changes, to EVERY unexpired registered contact of the peer, each over the
+;                   transport it registered through (desk phone, mobile app and web client of one
+;                   account all learn a new message at once).
 ;   yes           — SUBSCRIBE-only: MWI is sent only on an active inbound MWI SUBSCRIBE dialog; no
 ;                   unsolicited push. Use for phones that subscribe for MWI themselves.
-;   A subscribing phone keeps getting solicited NOTIFYs on its dialog regardless; the unsolicited push
-;   only fires when there is no active subscription, so there is no double-notify.
+;   A subscribing phone gets solicited NOTIFYs on its dialog for as long as the Expires it was granted
+;   (RFC 6665 3.1.1; the shorter of its request and mwi_expiry); its own contact is left out of the
+;   unsolicited fan-out, the peer's other contacts are not. When the subscription expires, the phone
+;   unsubscribes (Expires: 0) or its NOTIFY fails with a dialog-ending response (RFC 6665 4.2.2), the
+;   subscription is forgotten; a vanished subscriber never silences the other devices.
 ;mailbox=1234@default
 ;subscribemwi=no
 ;
