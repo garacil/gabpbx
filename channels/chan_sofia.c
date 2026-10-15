@@ -806,16 +806,19 @@ static void sofia_build_register_expires(char *out, size_t len)
 	snprintf(out, len, "%d", sofia_cfg.default_expiry > 0 ? sofia_cfg.default_expiry : DEFAULT_DEFAULT_EXPIRY);
 }
 
-/* Give up a register => attempt that cannot succeed as sent (its challenges are refused) and retry it
- * registertimeout seconds later, as chan_sip does when its registration timeout fires (sip_reg_timeout ->
- * transmit_register). The challenged request stays in sofia-sip waiting for credentials and blocks the
- * handle's queue, so the refresh thread rebuilds the handle (reg_handle_dirty) before that retry; the
- * registerattempts cap still applies there. Caller holds peer->lock. */
-static void sofia_register_attempt_failed(struct sofia_peer *peer)
+/* Give up a register => attempt and retry it registertimeout seconds later, as chan_sip does when its
+ * registration timeout fires (sip_reg_timeout -> transmit_register); the registerattempts cap still
+ * applies there. rebuild_handle: the attempt was dropped while its challenged request still waits in
+ * sofia-sip for credentials and blocks the handle's queue, so the refresh thread rebuilds the handle
+ * (reg_handle_dirty) before the retry. After a final response the request is over and the handle, with
+ * its Call-ID (RFC 3261 §10.2.4), is reused. Caller holds peer->lock. */
+static void sofia_register_attempt_failed(struct sofia_peer *peer, int rebuild_handle)
 {
 	peer->registered = 0;
 	peer->reg_auth_tries = 0;
-	peer->reg_handle_dirty = 1;
+	if (rebuild_handle) {
+		peer->reg_handle_dirty = 1;
+	}
 	peer->reg_expiry = time(NULL)
 		+ (sofia_cfg.register_timeout > 0 ? sofia_cfg.register_timeout : DEFAULT_REGISTRATION_TIMEOUT);
 }
@@ -17058,15 +17061,11 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					break;
 				}
 
-				/* registerattempts (chan_sip parity): at the cap, give up the
-				 * auth-challenge re-register to prevent runaway auth storms. */
-				if (sofia_cfg.register_attempts > 0 && peer->reg_attempts >= sofia_cfg.register_attempts) {
-					ast_log(LOG_NOTICE, "Sofia: Registration attempts exhausted for peer '%s' (reg_attempts=%d cap=%d) — giving up\n",
-						peer->name, peer->reg_attempts, sofia_cfg.register_attempts);
-					ast_mutex_unlock(&peer->lock);
-					ao2_ref(peer, -1);
-					break;
-				}
+				/* registerattempts is NOT checked here: chan_sip answers every challenge of an attempt
+				 * (handle_response_register) and applies the cap only when it schedules the next attempt
+				 * (sip_reg_timeout) — the refresh-thread gate here. Stopping mid-attempt left the
+				 * challenged request waiting in the handle queue for good. Challenge loops are bounded by
+				 * SOFIA_REG_MAX_AUTHTRIES below and by sofia-sip, which never resends refused credentials. */
 
 				/* Build the FULL Digest:"realm":user:secret cred for EACH challenge
 				 * present (a 2-field "user:secret" is silently rejected by auc_credentials).
@@ -17089,7 +17088,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 
 					ast_copy_string(l_user, peer->defaultuser, sizeof(l_user));
 					ast_copy_string(l_host, peer->host, sizeof(l_host));
-					sofia_register_attempt_failed(peer);
+					sofia_register_attempt_failed(peer, 1);
 					ast_mutex_unlock(&peer->lock);
 					ast_log(LOG_NOTICE, "Sofia: Failed to authenticate on REGISTER to '%s@%s' (tries %d%s)\n",
 						l_user, l_host, tries,
@@ -17123,20 +17122,45 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		} else if (status >= 300) {
 			ast_verbose("Sofia: Registration failed %d %s\n", status, phrase);
 			if (peer) {
+				char l_user[256], l_host[256];
+				int is_regline;
+
 				ast_mutex_lock(&peer->lock);
 				peer->registered = 0;
 				/* GRUU: do NOT clear learned GRUUs on a non-2xx REGISTER — RFC 5627 §4.2: a failed
 				 * request does not remove/invalidate a previously provided GRUU (a transient failed
 				 * refresh can arrive while the binding is still valid). They are cleared instead by the
 				 * consume path on a 2xx that returns no GRUU (de-registration / not re-issued). */
+				/* chan_sip parity (handle_response_register, sip_reg_timeout): 403 and 404 give the
+				 * registration up until the next reload; any other failure (408, 5xx, sofia-sip's 904 when
+				 * the only credentials left are the ones just refused, ...) is retried registertimeout
+				 * seconds later. The final response ended the request, so the handle is reusable as is. */
+				is_regline = peer->is_register_line;
+				if (is_regline) {
+					if (status == 403 || status == 404) {
+						peer->reg_expiry = 0;
+						peer->reg_auth_tries = 0;
+					} else {
+						sofia_register_attempt_failed(peer, 0);
+					}
+				}
+				ast_copy_string(l_user, peer->defaultuser, sizeof(l_user));
+				ast_copy_string(l_host, peer->host, sizeof(l_host));
 				ast_mutex_unlock(&peer->lock);
+				if (is_regline && status == 403) {
+					ast_log(LOG_WARNING, "Sofia: Forbidden - wrong password on authentication for REGISTER for '%s' to '%s', giving up\n",
+						l_user, l_host);
+				} else if (is_regline && status == 404) {
+					ast_log(LOG_WARNING, "Sofia: Got 404 Not found on SIP register to service %s@%s, giving up\n",
+						l_user, l_host);
+				}
 				manager_event(EVENT_FLAG_SYSTEM, "Registry",
 					"ChannelType: SIP\r\n"
 					"Username: %s\r\n"
 					"Domain: %s\r\n"
 					"Status: Registration Failed\r\n"	/* manager consumers key on Registered/Unregistered/Registration Failed; a bare "Failed" was silently dropped -> distinct outbound-trunk lamp */
 					"Cause: %d %s\r\n",
-					peer->defaultuser, peer->host, status, phrase ? phrase : "");
+					l_user, l_host, status, phrase ? phrase : "");
 			}
 		}
 		if (peer) {
@@ -20797,8 +20821,17 @@ static void *sofia_reg_thread_func(void *data)
 			    peer->nh && peer->reg_expiry > 0 &&
 			    !ast_strlen_zero(peer->secret) &&
 			    strcasecmp(peer->host, "dynamic") != 0 &&
-			    /* attempt-cap: skip when register_attempts > 0 and the cap is reached. */
-			    (sofia_cfg.register_attempts == 0 || peer->reg_attempts < sofia_cfg.register_attempts) &&
+			    now >= peer->reg_expiry &&
+			    /* registerattempts (chan_sip sip_reg_timeout): at the cap a due attempt is not sent;
+			     * the registration is given up until the next reload, with chan_sip's notice, once. */
+			    sofia_cfg.register_attempts > 0 && peer->reg_attempts >= sofia_cfg.register_attempts) {
+				ast_log(LOG_NOTICE, "Sofia:    -- Last Registration Attempt #%d failed, Giving up forever trying to register '%s@%s'\n",
+					peer->reg_attempts, peer->defaultuser, peer->host);
+				peer->reg_expiry = 0;
+			} else if (peer->is_register_line &&
+			    peer->nh && peer->reg_expiry > 0 &&
+			    !ast_strlen_zero(peer->secret) &&
+			    strcasecmp(peer->host, "dynamic") != 0 &&
 			    now >= peer->reg_expiry) {
 				char uri[256];
 				/* sip:user@host:port + ;transport= (UDP no-op); opt-in via is_register_line. */
@@ -20821,6 +20854,7 @@ static void *sofia_reg_thread_func(void *data)
 					peer->reg_handle_dirty = 0;
 				}
 				peer->reg_auth_tries = 0;	/* a new registration attempt */
+				peer->reg_attempts++;	/* chan_sip regattempts: every REGISTER counts toward registerattempts; a 200 resets it */
 				/* callbackextension: NUTAG_M_USERNAME override (as at initial register). */
 				nua_register(peer->nh,
 					NUTAG_URL(uri),
@@ -20917,6 +20951,11 @@ static void sofia_do_register(void)
 					TAG_IF(peer->gruu || peer->sip_outbound, NUTAG_M_FEATURES(instance_feature)),
 					TAG_IF(peer->sip_outbound, NUTAG_SUPPORTED("outbound, path")),	/* RFC 5626 §4.2.1 */
 					TAG_END());
+
+				/* As the refresh thread does after each REGISTER: if neither a 200 nor a scheduled retry
+				 * follows (e.g. a challenge whose answer sofia-sip no longer restarts), try again in 60 s. */
+				peer->reg_attempts++;
+				peer->reg_expiry = time(NULL) + 60;
 
 				if (sofia_debug) {
 					ast_verbose("Sofia: Registering %s\n", uri);
