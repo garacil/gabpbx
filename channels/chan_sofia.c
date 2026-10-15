@@ -238,6 +238,8 @@
 #define DEFAULT_MIN_EXPIRY      60
 #define DEFAULT_MAX_EXPIRY      3600
 #define DEFAULT_DEFAULT_EXPIRY  120
+/* Challenges answered per outbound registration attempt before giving it up (chan_sip MAX_AUTHTRIES). */
+#define SOFIA_REG_MAX_AUTHTRIES 3
 /* RFC 3261 §20.22 Max-Forwards default. */
 #define DEFAULT_MAX_FORWARDS    70
 /* RFC 3261 §17.1.1.2 T1 minimum; 100ms (chan_sip parity, vs RFC default 500ms). */
@@ -802,6 +804,20 @@ static void sofia_build_register_uri(struct sofia_peer *peer, char *out, size_t 
 static void sofia_build_register_expires(char *out, size_t len)
 {
 	snprintf(out, len, "%d", sofia_cfg.default_expiry > 0 ? sofia_cfg.default_expiry : DEFAULT_DEFAULT_EXPIRY);
+}
+
+/* Give up a register => attempt that cannot succeed as sent (its challenges are refused) and retry it
+ * registertimeout seconds later, as chan_sip does when its registration timeout fires (sip_reg_timeout ->
+ * transmit_register). The challenged request stays in sofia-sip waiting for credentials and blocks the
+ * handle's queue, so the refresh thread rebuilds the handle (reg_handle_dirty) before that retry; the
+ * registerattempts cap still applies there. Caller holds peer->lock. */
+static void sofia_register_attempt_failed(struct sofia_peer *peer)
+{
+	peer->registered = 0;
+	peer->reg_auth_tries = 0;
+	peer->reg_handle_dirty = 1;
+	peer->reg_expiry = time(NULL)
+		+ (sofia_cfg.register_timeout > 0 ? sofia_cfg.register_timeout : DEFAULT_REGISTRATION_TIMEOUT);
 }
 
 /* Build a NAT-traversal proxy URL from peer->src_addr for outbound in-dialog
@@ -16977,6 +16993,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					peer->registered = 1;
 					peer->reg_expiry = time(NULL) + expires - 10;
 					peer->reg_attempts = 0;
+					peer->reg_auth_tries = 0;
 					ast_mutex_unlock(&peer->lock);
 					manager_event(EVENT_FLAG_SYSTEM, "Registry",
 						"ChannelType: SIP\r\n"
@@ -17026,7 +17043,8 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				char www_creds[512] = "";
 				char proxy_creds[512] = "";
 				int have_www = 0, have_proxy = 0;
-				char uri[256];
+				int tries;
+				char l_name[256];
 
 				ast_mutex_lock(&peer->lock);
 
@@ -17061,35 +17079,46 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 						peer->defaultuser, peer->secret, proxy_creds, sizeof(proxy_creds)) == 0) {
 					have_proxy = 1;
 				}
-				/* sip:user@host:port + ;transport= for tls/tcp/ws/wss (UDP no-op). */
-				sofia_build_register_uri(peer, uri, sizeof(uri));
 
-				ast_verbose("Sofia: Responding to auth challenge for %s\n", peer->name);
+				/* chan_sip parity (handle_response_register): answer at most MAX_AUTHTRIES challenges per
+				 * registration attempt; a registrar that keeps challenging is refusing the credentials. Then
+				 * (or with no usable credential) give the attempt up and retry it after registertimeout. */
+				tries = peer->reg_auth_tries;
+				if (tries >= SOFIA_REG_MAX_AUTHTRIES || (!have_www && !have_proxy)) {
+					char l_user[256], l_host[256];
 
-				/* maxforwards: RFC 3261 §20.22 Max-Forwards on the REGISTER. */
-				char mf_str_reg[8];
-				char instance_feature_reg[120];
-				char expires_reg[16];
-				snprintf(mf_str_reg, sizeof(mf_str_reg), "%d", peer->maxforwards);
-				/* GRUU: keep the +sip.instance advertisement on the re-REGISTER too. */
-				sofia_build_instance_feature(peer, instance_feature_reg, sizeof(instance_feature_reg), peer->sip_outbound);
-				sofia_build_register_expires(expires_reg, sizeof(expires_reg));
-				/* callbackextension (chan_sip parity): override the Contact username. */
-				nua_register(peer->nh,
-					NUTAG_URL(uri),
-					SIPTAG_FROM_STR(uri),
+					ast_copy_string(l_user, peer->defaultuser, sizeof(l_user));
+					ast_copy_string(l_host, peer->host, sizeof(l_host));
+					sofia_register_attempt_failed(peer);
+					ast_mutex_unlock(&peer->lock);
+					ast_log(LOG_NOTICE, "Sofia: Failed to authenticate on REGISTER to '%s@%s' (tries %d%s)\n",
+						l_user, l_host, tries,
+						(have_www || have_proxy) ? "" : ", no usable cleartext credential");
+					manager_event(EVENT_FLAG_SYSTEM, "Registry",
+						"ChannelType: SIP\r\n"
+						"Username: %s\r\n"
+						"Domain: %s\r\n"
+						"Status: Registration Failed\r\n"
+						"Cause: %d %s\r\n",
+						l_user, l_host, status, phrase ? phrase : "");
+					ao2_ref(peer, -1);
+					break;
+				}
+				peer->reg_auth_tries++;
+				peer->reg_attempts++;
+				ast_copy_string(l_name, peer->name, sizeof(l_name));
+				ast_mutex_unlock(&peer->lock);
+
+				ast_verbose("Sofia: Responding to auth challenge for %s\n", l_name);
+				/* On sofia_thread, no lock held. sofia-sip keeps the challenged REGISTER at the head of the
+				 * handle queue waiting for credentials (nua_client.c nua_base_client_check_restart) and
+				 * nua_authenticate() resends it with them — same Request-URI, Expires, Contact and Route. A
+				 * new nua_register() here would queue behind the waiting one and never be sent. nh is this
+				 * event's handle, alive for the callback (peer->nh may be rebuilt by the refresh thread). */
+				nua_authenticate(nh,
 					TAG_IF(have_www, NUTAG_AUTH(www_creds)),
 					TAG_IF(have_proxy, NUTAG_AUTH(proxy_creds)),
-					SIPTAG_MAX_FORWARDS_STR(mf_str_reg),
-					SIPTAG_EXPIRES_STR(expires_reg),	/* chan_sip parity, see sofia_build_register_expires */
-					TAG_IF(!ast_strlen_zero(peer->callbackextension),
-						NUTAG_M_USERNAME(peer->callbackextension)),
-					TAG_IF(peer->gruu || peer->sip_outbound, NUTAG_M_FEATURES(instance_feature_reg)),
-					TAG_IF(peer->sip_outbound, NUTAG_SUPPORTED("outbound, path")),	/* RFC 5626 §4.2.1 */
 					TAG_END());
-
-				peer->reg_attempts++;
-				ast_mutex_unlock(&peer->lock);
 			}
 		} else if (status >= 300) {
 			ast_verbose("Sofia: Registration failed %d %s\n", status, phrase);
@@ -20791,6 +20820,7 @@ static void *sofia_reg_thread_func(void *data)
 					sofia_peer_recreate_register_handle(peer);
 					peer->reg_handle_dirty = 0;
 				}
+				peer->reg_auth_tries = 0;	/* a new registration attempt */
 				/* callbackextension: NUTAG_M_USERNAME override (as at initial register). */
 				nua_register(peer->nh,
 					NUTAG_URL(uri),

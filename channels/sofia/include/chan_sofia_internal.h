@@ -917,7 +917,7 @@ struct sofia_peer {
 	int sip_outbound;               /* RFC 5626 SIP Outbound (register=> trunks): when 1, the outbound REGISTER advertises Supported: outbound,path + carries a stable +sip.instance and reg-id=1 on the Contact, so the registrar/edge proxy maintains the client-initiated flow. Manual signals (no native outbound engine). Default 0 (opt-in). */
 	int sip_outbound_active;        /* RFC 5626 runtime: set when the REGISTER 2xx confirmed outbound (Require: outbound). Informational (shown in sip show peer); not config. */
 	int flow_timer;                 /* RFC 5626 Flow-Timer (seconds) learned from the REGISTER 2xx (§4.4); 0 = none advertised. Informational. */
-	int reg_handle_dirty;           /* set when a reload toggled gruu/sip_outbound: the surviving REGISTER handle carries merged Supported/M_FEATURES prefs that can only be dropped by rebuilding peer->nh, done on the next refresh. */
+	int reg_handle_dirty;           /* peer->nh must be rebuilt before the next REGISTER, done on the next refresh: a reload toggled gruu/sip_outbound (the surviving handle carries merged Supported/M_FEATURES prefs that can only be dropped that way), or a registration attempt was given up while its challenged request still waits for credentials in the handle queue (sofia_register_attempt_failed). */
 	/* Buggy-CISCO MWI fix (chan_sip parity): when set, the Voice-Message: NOTIFY
 	 * body line OMITS the trailing " (0/0)" suffix (some Cisco stacks reject it).
 	 * Per-peer only (no [general] default); default 0 = standard RFC 3842. */
@@ -947,6 +947,7 @@ struct sofia_peer {
 	time_t lastmsgsent;
 	time_t reg_expiry;
 	int reg_attempts;
+	int reg_auth_tries;	/* register => trunk: 401/407 answered in the current registration attempt; capped at SOFIA_REG_MAX_AUTHTRIES (chan_sip MAX_AUTHTRIES), reset when a new attempt starts and on 200. Under peer->lock. */
 	ast_mutex_t lock;
 	/* Qualify/NAT fields */
 	int qualify;
