@@ -790,6 +790,20 @@ static void sofia_build_register_uri(struct sofia_peer *peer, char *out, size_t 
 	sofia_uri_append_transport(out, len, sofia_transport_name(peer->transport));
 }
 
+/* The Expires every outbound REGISTER of a register => trunk asks for: [general] defaultexpiry.
+ * chan_sip parity: transmit_register always adds "Expires: r->expiry" (chan_sip.c), and r->expiry
+ * starts as default_expiry (sip/config_parser.c sip_parse_register_line). RFC 3261 §10.2.1.1 makes
+ * it a suggestion — the registrar picks the real interval — but some registrars refuse a REGISTER
+ * without it (403 "Missing Expires"). sofia-sip never adds one by itself except Expires: 0 on a
+ * de-registration (nua_register.c nua_register_client_request), and a SIPTAG_EXPIRES_STR given to
+ * nua_create() does not reach the requests. It keeps the tag in the request it refreshes on its own
+ * (cr_msg), and answers a 423 itself by raising Expires to Min-Expires and resending (nua_client.c,
+ * RFC 3261 §10.2.8). Read at send time, so where defaultexpiry sits in [general] does not matter. */
+static void sofia_build_register_expires(char *out, size_t len)
+{
+	snprintf(out, len, "%d", sofia_cfg.default_expiry > 0 ? sofia_cfg.default_expiry : DEFAULT_DEFAULT_EXPIRY);
+}
+
 /* Build a NAT-traversal proxy URL from peer->src_addr for outbound in-dialog
  * messages when peer has nat=force_rport (or comedia). Without it sofia-sip
  * routes the 2xx-ACK/BYE to the dialog remote_target (the Contact's unroutable
@@ -17055,9 +17069,11 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				/* maxforwards: RFC 3261 §20.22 Max-Forwards on the REGISTER. */
 				char mf_str_reg[8];
 				char instance_feature_reg[120];
+				char expires_reg[16];
 				snprintf(mf_str_reg, sizeof(mf_str_reg), "%d", peer->maxforwards);
 				/* GRUU: keep the +sip.instance advertisement on the re-REGISTER too. */
 				sofia_build_instance_feature(peer, instance_feature_reg, sizeof(instance_feature_reg), peer->sip_outbound);
+				sofia_build_register_expires(expires_reg, sizeof(expires_reg));
 				/* callbackextension (chan_sip parity): override the Contact username. */
 				nua_register(peer->nh,
 					NUTAG_URL(uri),
@@ -17065,6 +17081,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					TAG_IF(have_www, NUTAG_AUTH(www_creds)),
 					TAG_IF(have_proxy, NUTAG_AUTH(proxy_creds)),
 					SIPTAG_MAX_FORWARDS_STR(mf_str_reg),
+					SIPTAG_EXPIRES_STR(expires_reg),	/* chan_sip parity, see sofia_build_register_expires */
 					TAG_IF(!ast_strlen_zero(peer->callbackextension),
 						NUTAG_M_USERNAME(peer->callbackextension)),
 					TAG_IF(peer->gruu || peer->sip_outbound, NUTAG_M_FEATURES(instance_feature_reg)),
@@ -20762,9 +20779,11 @@ static void *sofia_reg_thread_func(void *data)
 				/* RFC 3261 §20.22 outbound REGISTER refresh. */
 				char mf_str_reregister[8];
 				char instance_feature_rereg[120];
+				char expires_rereg[16];
 				snprintf(mf_str_reregister, sizeof(mf_str_reregister), "%d", peer->maxforwards);
 				/* GRUU: re-advertise +sip.instance. */
 				sofia_build_instance_feature(peer, instance_feature_rereg, sizeof(instance_feature_rereg), peer->sip_outbound);
+				sofia_build_register_expires(expires_rereg, sizeof(expires_rereg));
 				/* A reload that toggled gruu/sip_outbound left stale merged Supported/M_FEATURES on
 				 * peer->nh (NUTAG_SUPPORTED only merges); rebuild the handle with the CURRENT tags before
 				 * this refresh so a disabled knob stops advertising (RFC 5626/5627). */
@@ -20777,6 +20796,7 @@ static void *sofia_reg_thread_func(void *data)
 					NUTAG_URL(uri),
 					SIPTAG_FROM_STR(uri),
 					SIPTAG_MAX_FORWARDS_STR(mf_str_reregister),
+					SIPTAG_EXPIRES_STR(expires_rereg),	/* chan_sip parity, see sofia_build_register_expires */
 					TAG_IF(!ast_strlen_zero(peer->callbackextension),
 						NUTAG_M_USERNAME(peer->callbackextension)),
 					TAG_IF(peer->gruu || peer->sip_outbound, NUTAG_M_FEATURES(instance_feature_rereg)),
@@ -20853,12 +20873,15 @@ static void sofia_do_register(void)
 
 				/* RFC 3261 §20.22 outbound REGISTER. */
 				char mf_str_initreg[8];
+				char expires_initreg[16];
 				snprintf(mf_str_initreg, sizeof(mf_str_initreg), "%d", peer->maxforwards);
+				sofia_build_register_expires(expires_initreg, sizeof(expires_initreg));
 				/* callbackextension: NUTAG_M_USERNAME drives the Contact URL username. */
 				nua_register(peer->nh,
 					NUTAG_URL(uri),
 					SIPTAG_FROM_STR(uri),
 					SIPTAG_MAX_FORWARDS_STR(mf_str_initreg),
+					SIPTAG_EXPIRES_STR(expires_initreg),	/* chan_sip parity, see sofia_build_register_expires */
 					TAG_IF(!ast_strlen_zero(peer->callbackextension),
 						NUTAG_M_USERNAME(peer->callbackextension)),
 					TAG_IF(peer->gruu || peer->sip_outbound, NUTAG_M_FEATURES(instance_feature)),
