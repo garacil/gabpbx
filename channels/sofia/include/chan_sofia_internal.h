@@ -855,6 +855,8 @@ struct sofia_peer {
 		AST_STRING_FIELD(temp_gruu);	/* GRUU: temporary GRUU (rotates per refresh). Opaque URI. Empty = none. */
 		AST_STRING_FIELD(service_route);	/* Service-Route (RFC 3608) learned from the REGISTER 200 (service_route=yes), as a ready "<uri;lr>,..." Route value pre-loaded on outbound INVITEs to the registrar domain. Empty = none. */
 		AST_STRING_FIELD(callbackextension);	/* when registering AS a client to an upstream provider, user-portion of our Contact URI telling upstream which local extension to call back; implemented via NUTAG_M_USERNAME at the 3 nua_register sites. Empty = no callback (chan_sip parity). */
+		AST_STRING_FIELD(regdomain);	/* register => user@DOMAIN: the registration domain - host of the To/From address of record and of the Request-URI (RFC 3261 §10.2) - when it is not the host the REGISTER is sent to (chan_sip regdomain). Empty = the host. Set only by the register => line. */
+		AST_STRING_FIELD(authuser);	/* register => ...:secret:AUTHUSER@host: digest username of the outbound REGISTER when it differs from the user (chan_sip authuser). Empty = defaultuser. Set only by the register => line. */
 		AST_STRING_FIELD(subscribecontext);	/* SUBSCRIBE-method dispatch context override (chan_sip parity); inherits default_subscribecontext when empty. LIMITATION: per-peer dialplan dispatch not yet implemented (MWI uses peer->mailboxes; unknown events auto-202). */
 		AST_STRING_FIELD(accountcode);	/* CDR billing-tag propagated to channel->accountcode at sofia_new (chan_sip parity); truncated to AST_MAX_ACCOUNT_CODE=20 at CDR-write. Per-peer only (no [general] default). */
 		AST_STRING_FIELD(disallowed_methods);	/* comma-separated SIP methods blocked from outbound Allow header (chan_sip parity); inherits sofia_cfg.disallowed_methods when empty. Parse-compatibility only: dynamic NUTAG_ALLOW generation deferred. */
@@ -947,6 +949,8 @@ struct sofia_peer {
 	time_t lastmsgsent;
 	time_t reg_expiry;
 	int reg_attempts;
+	int regdomainport;	/* register => user@domain:PORT: port of the registration domain in the Request-URI (chan_sip regdomainport); 0 = none. Set only by the register => line. */
+	int reg_requested_expiry;	/* register => ...~EXPIRY: Expires asked for in every outbound REGISTER (chan_sip configured_expiry); 0 = [general] defaultexpiry. Set only by the register => line. */
 	int reg_auth_tries;	/* register => trunk: 401/407 answered in the current registration attempt; capped at SOFIA_REG_MAX_AUTHTRIES (chan_sip MAX_AUTHTRIES), reset when a new attempt starts and on 200. Under peer->lock. */
 	ast_mutex_t lock;
 	/* Qualify/NAT fields */

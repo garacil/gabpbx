@@ -530,7 +530,7 @@ int manager_sofia_show_registry(struct mansession *s, const struct message *m)
 	while ((peer = ao2_iterator_next(&iter))) {
 		/* Snapshot the registry fields UNDER peer->lock, release, then astman_append: it
 		 * blocks on a slow AMI client, and holding peer->lock across it would stall REGISTER/reload. */
-		int is_regline, port = 5060, registered = 0;
+		int is_regline, port = 5060, registered = 0, domainport = 5060;
 		long refresh_secs = 0, reg_time = 0;
 		char l_host[256] = "", l_user[256] = "", l_domain[256] = "";
 		ast_mutex_lock(&peer->lock);
@@ -542,7 +542,10 @@ int manager_sofia_show_registry(struct mansession *s, const struct message *m)
 			reg_time = (long)peer->reg_expiry;
 			ast_copy_string(l_host, S_OR(peer->host, ""), sizeof(l_host));
 			ast_copy_string(l_user, S_OR(peer->defaultuser, ""), sizeof(l_user));
-			ast_copy_string(l_domain, S_OR(peer->fromdomain, ""), sizeof(l_domain));
+			/* chan_sip parity (manager_show_registry): Domain is the registration domain, else the
+			 * host; DomainPort its port, else 5060. */
+			ast_copy_string(l_domain, S_OR(peer->regdomain, S_OR(peer->host, "")), sizeof(l_domain));
+			domainport = peer->regdomainport ? peer->regdomainport : 5060;
 		}
 		ast_mutex_unlock(&peer->lock);
 		if (is_regline) {
@@ -558,7 +561,7 @@ int manager_sofia_show_registry(struct mansession *s, const struct message *m)
 				"State: %s\r\n"
 				"RegistrationTime: %ld\r\n"
 				"\r\n",
-				idText, l_host, port, l_user, l_domain, port,
+				idText, l_host, port, l_user, l_domain, domainport,
 				refresh_secs, registered ? "Registered" : "Unregistered", reg_time);
 			count++;
 		}

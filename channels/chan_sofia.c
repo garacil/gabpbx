@@ -777,33 +777,83 @@ const char *sofia_transport_name(int transport)
 	}
 }
 
-/* Build the outbound-REGISTER request URI (and the matching To/From URI) for a peer:
- * sip:defaultuser@host:port plus the peer's configured ;transport= so a tls/tcp/ws/wss
- * trunk's REGISTER routes over that transport instead of sofia-sip's default UDP. The
- * append helper is a no-op for udp/empty/unknown, so plain UDP peers stay byte-identical.
- * Mirrors the INVITE path (sofia_uri_append_transport + sofia_transport_name). Caller
- * serializes peer->host/port/defaultuser/transport (peer->lock or the load/reg thread). */
+/* Outbound REGISTER (register => trunk) addressing — chan_sip transmit_register and RFC 3261 §10.2.
+ * The Request-URI names the registration domain only: "The "userinfo" and "@" components of the SIP
+ * URI MUST NOT be present" (§10.2). It is sip:<regdomain>[:<regdomainport>] when the line names a
+ * domain (user@domain), else sip:<host>:<port> with the peer's ;transport=, so a tcp/tls trunk's
+ * REGISTER routes over that transport instead of sofia-sip's default UDP (the append helper is a no-op
+ * for udp/empty/unknown). Caller serializes the peer fields (peer->lock or the load/reg thread). */
 static void sofia_build_register_uri(struct sofia_peer *peer, char *out, size_t len)
 {
 	char hbuf[80];	/* IPv6-bracket-wrap (RFC 3261 §19.1.2); helper is idempotent */
 
+	if (!ast_strlen_zero(peer->regdomain)) {
+		/* chan_sip appends the domain port only when it is not 5060. */
+		if (peer->regdomainport > 0 && peer->regdomainport != DEFAULT_SIP_PORT) {
+			snprintf(out, len, "sip:%s:%d",
+				sofia_uri_format_host(peer->regdomain, hbuf, sizeof(hbuf)), peer->regdomainport);
+		} else {
+			snprintf(out, len, "sip:%s", sofia_uri_format_host(peer->regdomain, hbuf, sizeof(hbuf)));
+		}
+		return;
+	}
+	snprintf(out, len, "sip:%s:%d", sofia_uri_format_host(peer->host, hbuf, sizeof(hbuf)), peer->port);
+	sofia_uri_append_transport(out, len, sofia_transport_name(peer->transport));
+}
+
+/* The address of record a register => trunk registers (To and From, RFC 3261 §10.2): sip:<user>@<regdomain>
+ * when the line names a domain (chan_sip builds From/To from regdomain, without its port), else
+ * sip:<user>@<host>:<port> with the peer's ;transport=. Caller serializes the peer fields. */
+static void sofia_build_register_aor(struct sofia_peer *peer, char *out, size_t len)
+{
+	char hbuf[80];
+
+	if (!ast_strlen_zero(peer->regdomain)) {
+		snprintf(out, len, "sip:%s@%s", peer->defaultuser,
+			sofia_uri_format_host(peer->regdomain, hbuf, sizeof(hbuf)));
+		return;
+	}
 	snprintf(out, len, "sip:%s@%s:%d", peer->defaultuser,
 		sofia_uri_format_host(peer->host, hbuf, sizeof(hbuf)), peer->port);
 	sofia_uri_append_transport(out, len, sofia_transport_name(peer->transport));
 }
 
-/* The Expires every outbound REGISTER of a register => trunk asks for: [general] defaultexpiry.
- * chan_sip parity: transmit_register always adds "Expires: r->expiry" (chan_sip.c), and r->expiry
- * starts as default_expiry (sip/config_parser.c sip_parse_register_line). RFC 3261 §10.2.1.1 makes
+/* Where the REGISTER of a line that names a domain is sent: <host>:<port> with the peer's transport, whatever
+ * the Request-URI says — chan_sip resolves r->hostname and sends there. sofia-sip routes on the Request-URI
+ * unless given a next hop, and NUTAG_PROXY (NTATAG_DEFAULT_PROXY) is one that adds no Route header. Not when
+ * an outboundproxy applies: its initial Route (sofia_peer_recreate_register_handle) decides the next hop, as
+ * for every other trunk. Returns 1 and fills out when a next hop is needed. Caller serializes the peer. */
+static int sofia_build_register_next_hop(struct sofia_peer *peer, char *out, size_t len)
+{
+	char hbuf[80];
+	char route[256];
+
+	out[0] = '\0';
+	if (ast_strlen_zero(peer->regdomain)) {
+		return 0;
+	}
+	sofia_format_outboundproxy(peer, route, sizeof(route));
+	if (route[0]) {
+		return 0;
+	}
+	snprintf(out, len, "sip:%s:%d", sofia_uri_format_host(peer->host, hbuf, sizeof(hbuf)), peer->port);
+	sofia_uri_append_transport(out, len, sofia_transport_name(peer->transport));
+	return 1;
+}
+
+/* The Expires every outbound REGISTER of a register => trunk asks for: the line's ~expiry, else [general]
+ * defaultexpiry. chan_sip parity: transmit_register always adds "Expires: r->expiry" (chan_sip.c), and
+ * r->expiry starts as ~expiry or default_expiry (sip/config_parser.c sip_parse_register_line). RFC 3261 §10.2.1.1 makes
  * it a suggestion — the registrar picks the real interval — but some registrars refuse a REGISTER
  * without it (403 "Missing Expires"). sofia-sip never adds one by itself except Expires: 0 on a
  * de-registration (nua_register.c nua_register_client_request), and a SIPTAG_EXPIRES_STR given to
  * nua_create() does not reach the requests. It keeps the tag in the request it refreshes on its own
  * (cr_msg), and answers a 423 itself by raising Expires to Min-Expires and resending (nua_client.c,
  * RFC 3261 §10.2.8). Read at send time, so where defaultexpiry sits in [general] does not matter. */
-static void sofia_build_register_expires(char *out, size_t len)
+static void sofia_build_register_expires(struct sofia_peer *peer, char *out, size_t len)
 {
-	snprintf(out, len, "%d", sofia_cfg.default_expiry > 0 ? sofia_cfg.default_expiry : DEFAULT_DEFAULT_EXPIRY);
+	snprintf(out, len, "%d", peer->reg_requested_expiry > 0 ? peer->reg_requested_expiry
+		: (sofia_cfg.default_expiry > 0 ? sofia_cfg.default_expiry : DEFAULT_DEFAULT_EXPIRY));
 }
 
 /* Give up a register => attempt and retry it registertimeout seconds later, as chan_sip does when its
@@ -17069,13 +17119,15 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 
 				/* Build the FULL Digest:"realm":user:secret cred for EACH challenge
 				 * present (a 2-field "user:secret" is silently rejected by auc_credentials).
-				 * One response may carry both WWW- and Proxy-Authenticate; feed both. */
+				 * One response may carry both WWW- and Proxy-Authenticate; feed both.
+				 * The digest username is the line's authuser when it has one (chan_sip transmit_register:
+				 * authname = authuser, else username). */
 				if (sip->sip_www_authenticate && sofia_format_auth_creds(sip->sip_www_authenticate,
-						peer->defaultuser, peer->secret, www_creds, sizeof(www_creds)) == 0) {
+						S_OR(peer->authuser, peer->defaultuser), peer->secret, www_creds, sizeof(www_creds)) == 0) {
 					have_www = 1;
 				}
 				if (sip->sip_proxy_authenticate && sofia_format_auth_creds(sip->sip_proxy_authenticate,
-						peer->defaultuser, peer->secret, proxy_creds, sizeof(proxy_creds)) == 0) {
+						S_OR(peer->authuser, peer->defaultuser), peer->secret, proxy_creds, sizeof(proxy_creds)) == 0) {
 					have_proxy = 1;
 				}
 
@@ -18689,52 +18741,184 @@ static struct ast_cli_entry cli_sofia[] = {
 	AST_CLI_DEFINE(sofia_cli_blacklist_clear, "Clear local SIP blacklist"),
 };
 
-static void sofia_parse_register_line(const char *value)
+/* A register => field without its surrounding double quotes (chan_sip ast_strip_quoted); "" when absent. */
+static char *sofia_register_field(char *s)
+{
+	static char none[1];
+
+	return s ? ast_strip_quoted(s, "\"", "\"") : none;
+}
+
+/* A register => port, 0 when absent or not 1..65535 (chan_sip port_str2int with a 0 default). */
+static int sofia_register_port(const char *s)
+{
+	int port = 0;
+
+	if (ast_strlen_zero(s) || sscanf(s, "%30d", &port) != 1 || port < 1 || port > 65535) {
+		return 0;
+	}
+	return port;
+}
+
+#define SOFIA_REGISTER_FORMAT "[peer?][transport://]user[@domain][:secret[:authuser]]@host[:port][/extension][~expiry]"
+
+/* register => [peer?][transport://]user[@domain][:secret[:authuser]]@host[:port][/extension][~expiry]
+ * The chan_sip grammar, split exactly as sip/config_parser.c sip_parse_register_line does (same separators
+ * in the same order, same [:domainport]:secret:authuser reordering), so a chan_sip line works verbatim:
+ *   user@domain  the address of record and the Request-URI name the domain while the REGISTER goes to
+ *                host:port (a provider whose SIP domain is not the host of each line's proxy); an
+ *                optional domain port goes first: user@domain:domainport:secret:authuser@host;
+ *   authuser     digest username when it is not the user;
+ *   transport    udp (default), tcp or tls; tls makes the default port 5061;
+ *   /extension   user part of our Contact, the one the provider calls back (callbackextension);
+ *   ~expiry      Expires asked for in every REGISTER; default [general] defaultexpiry (a value <= 0,
+ *                which chan_sip would send as a de-registration, falls back to it with a notice).
+ * peer? names a separate chan_sip peer whose settings the registration borrows. Here the register =>
+ * line is itself the peer (named after user), so the prefix is accepted and ignored with a notice. Every
+ * field is set on every parse, so a reload that drops one from the line drops it from the peer; a
+ * section with the user's name parsed later can still override the common peer settings. The secret is
+ * never logged. */
+static void sofia_parse_register_line(const char *value, int lineno)
 {
 	char buf[256];
-	char *userpart, *hostpart, *user, *secret, *host, *portstr;
-	int port = DEFAULT_SIP_PORT;
+	char *userpart = NULL, *hostpart = NULL;
+	char *user, *domain, *secret, *authuser, *host, *extension;
+	int port, domainport, expiry = 0, transport = SOFIA_TRANSPORT_UDP;
 	struct sofia_peer *peer;
+	AST_DECLARE_APP_ARGS(pre1,
+		AST_APP_ARG(peer);
+		AST_APP_ARG(userpart);
+	);
+	AST_DECLARE_APP_ARGS(pre2,
+		AST_APP_ARG(transport);
+		AST_APP_ARG(blank);
+		AST_APP_ARG(userpart);
+	);
+	AST_DECLARE_APP_ARGS(user1,
+		AST_APP_ARG(userpart);
+		AST_APP_ARG(secret);
+		AST_APP_ARG(authuser);
+	);
+	AST_DECLARE_APP_ARGS(user2,
+		AST_APP_ARG(user);
+		AST_APP_ARG(domain);
+	);
+	AST_DECLARE_APP_ARGS(user3,
+		AST_APP_ARG(authuser);
+		AST_APP_ARG(domainport);
+	);
+	AST_DECLARE_APP_ARGS(host1,
+		AST_APP_ARG(hostpart);
+		AST_APP_ARG(expiry);
+	);
+	AST_DECLARE_APP_ARGS(host2,
+		AST_APP_ARG(hostpart);
+		AST_APP_ARG(extension);
+	);
+	AST_DECLARE_APP_ARGS(host3,
+		AST_APP_ARG(host);
+		AST_APP_ARG(port);
+	);
 
 	if (ast_strlen_zero(value)) {
-		ast_log(LOG_WARNING, "Sofia: Empty register=> line, ignoring\n");
+		ast_log(LOG_WARNING, "Sofia: Empty register=> line at line %d, ignoring\n", lineno);
 		return;
 	}
 
 	ast_copy_string(buf, value, sizeof(buf));
 
-	/* userpart@hostpart */
-	hostpart = strchr(buf, '@');
-	if (!hostpart) {
-		ast_log(LOG_WARNING, "Sofia: Invalid register=> format (missing @): %s\n", value);
+	/* userpart => [peer?][transport://]user[@domain][:secret[:authuser]], hostpart => host[:port][/extension][~expiry].
+	 * The LAST '@' splits them, so user@domain keeps its own. */
+	if ((hostpart = strrchr(buf, '@'))) {
+		*hostpart++ = '\0';
+		userpart = buf;
+	}
+	if (ast_strlen_zero(userpart) || ast_strlen_zero(hostpart)) {
+		ast_log(LOG_WARNING, "Sofia: Format for registration is " SOFIA_REGISTER_FORMAT " at line %d\n", lineno);
 		return;
 	}
-	*hostpart++ = '\0';
-	userpart = buf;
 
-	/* user[:secret] */
-	user = userpart;
-	secret = strchr(userpart, ':');
-	if (secret) {
-		*secret++ = '\0';
+	AST_NONSTANDARD_RAW_ARGS(pre1, userpart, '?');
+	if (ast_strlen_zero(pre1.userpart)) {
+		pre1.userpart = pre1.peer;
+		pre1.peer = NULL;
+	}
+	AST_NONSTANDARD_RAW_ARGS(pre2, pre1.userpart, '/');
+	if (ast_strlen_zero(pre2.userpart)) {
+		pre2.userpart = pre2.transport;
+		pre2.transport = NULL;
+	} else if (!ast_strlen_zero(pre2.transport)) {
+		pre2.transport[strlen(pre2.transport) - 1] = '\0';	/* drop the ':' of "tcp://" (chan_sip also writes here for "//user") */
+	}
+	if (!ast_strlen_zero(pre2.blank)) {
+		ast_log(LOG_WARNING, "Sofia: Format for registration is " SOFIA_REGISTER_FORMAT " at line %d\n", lineno);
+		return;
+	}
+	AST_NONSTANDARD_RAW_ARGS(user1, pre2.userpart, ':');
+	AST_NONSTANDARD_RAW_ARGS(host1, hostpart, '~');
+	AST_NONSTANDARD_RAW_ARGS(host2, host1.hostpart, '/');
+	AST_NONSTANDARD_RAW_ARGS(host3, host2.hostpart, ':');
+	AST_NONSTANDARD_RAW_ARGS(user2, user1.userpart, '@');
+	AST_NONSTANDARD_RAW_ARGS(user3, user1.authuser, ':');
+	/* The fields are (:secret[:authuser]) or (:domainport:secret:authuser) but split as
+	 * secret[:authuser[:domainport]]: put them back in place (chan_sip does the same). */
+	if (user3.argc == 2) {
+		char *reorder = user3.domainport;
+		user3.domainport = user1.secret;
+		user1.secret = user3.authuser;
+		user3.authuser = reorder;
 	}
 
-	/* host[:port] */
-	host = hostpart;
-	portstr = strchr(hostpart, ':');
-	if (portstr) {
-		*portstr++ = '\0';
-		port = atoi(portstr);
-		if (port <= 0) port = DEFAULT_SIP_PORT;
-	}
+	user = sofia_register_field(user2.user);
+	domain = sofia_register_field(user2.domain);
+	secret = sofia_register_field(user1.secret);
+	authuser = sofia_register_field(user3.authuser);
+	host = sofia_register_field(host3.host);
+	extension = sofia_register_field(host2.extension);
 
 	if (ast_strlen_zero(user) || ast_strlen_zero(host)) {
-		ast_log(LOG_WARNING, "Sofia: Invalid register=> format (empty user or host): %s\n", value);
+		ast_log(LOG_WARNING, "Sofia: Format for registration is " SOFIA_REGISTER_FORMAT " at line %d\n", lineno);
 		return;
 	}
 	if (ast_strlen_zero(secret)) {
 		ast_log(LOG_WARNING, "Sofia: register=> line for '%s' has no secret, skipping\n", user);
 		return;
+	}
+	if (!ast_strlen_zero(pre1.peer)) {
+		ast_log(LOG_NOTICE, "Sofia: register=> '%s?' at line %d: the peer prefix is accepted for chan_sip compatibility and ignored; the line is its own peer '%s'\n",
+			sofia_register_field(pre1.peer), lineno, user);
+	}
+
+	if (pre2.transport) {
+		if (!strncasecmp(pre2.transport, "tcp", 3)) {
+			transport = SOFIA_TRANSPORT_TCP;
+		} else if (!strncasecmp(pre2.transport, "tls", 3)) {
+			transport = SOFIA_TRANSPORT_TLS;
+		} else if (strncasecmp(pre2.transport, "udp", 3)) {
+			ast_log(LOG_NOTICE, "Sofia: '%.3s' is not a valid transport type on line %d of sofia.conf. defaulting to udp.\n",
+				pre2.transport, lineno);
+		}
+	}
+	port = sofia_register_port(host3.port);
+	if (!port) {
+		if (!ast_strlen_zero(host3.port)) {
+			ast_log(LOG_NOTICE, "Sofia: '%s' is not a valid port number on line %d of sofia.conf. using default.\n",
+				host3.port, lineno);
+		}
+		port = transport == SOFIA_TRANSPORT_TLS ? 5061 : DEFAULT_SIP_PORT;
+	}
+	domainport = sofia_register_port(user3.domainport);
+	if (!domainport && !ast_strlen_zero(user3.domainport)) {
+		ast_log(LOG_NOTICE, "Sofia: '%s' is not a valid domain port number on line %d of sofia.conf. using default.\n",
+			user3.domainport, lineno);
+	}
+	if (host1.expiry) {
+		expiry = atoi(sofia_register_field(host1.expiry));
+		if (expiry <= 0) {
+			ast_log(LOG_NOTICE, "Sofia: register=> '%s' at line %d: expiry '%s' is not a positive number of seconds, using defaultexpiry\n",
+				user, lineno, host1.expiry);
+			expiry = 0;
+		}
 	}
 
 	/* Find-or-alloc (ao2_link never dedups), else each reload re-parsing this line would link a
@@ -18755,7 +18939,13 @@ static void sofia_parse_register_line(const char *value)
 		ast_string_field_set(peer, secret, secret);
 		ast_string_field_set(peer, host, host);
 		ast_string_field_set(peer, defaultuser, user);
+		ast_string_field_set(peer, regdomain, domain);
+		ast_string_field_set(peer, authuser, authuser);
+		ast_string_field_set(peer, callbackextension, extension);
 		peer->port = port;
+		peer->regdomainport = domainport;
+		peer->reg_requested_expiry = expiry;
+		peer->transport = transport;
 		peer->type = SOFIA_TYPE_PEER;
 		peer->is_register_line = 1;
 		ast_mutex_unlock(&peer->lock);
@@ -18768,8 +18958,13 @@ static void sofia_parse_register_line(const char *value)
 				/* OOM — drain MWI before the destructor (normally a no-op for register=> peers). */
 				sofia_peer_drain_mwi(peer);
 			} else {
-				ast_verbose("Sofia: register=> peer '%s' created (target %s:%d)\n",
-					user, host, port);
+				if (ast_strlen_zero(domain)) {
+					ast_verbose("Sofia: register=> peer '%s' created (target %s:%d)\n",
+						user, host, port);
+				} else {
+					ast_verbose("Sofia: register=> peer '%s' created (%s@%s, target %s:%d)\n",
+						user, user, domain, host, port);
+				}
 				sofia_peer_ipport_reindex(peer);	/* B: index by host:port (parity with the O(N) scan) */
 			}
 		} else {
@@ -19661,7 +19856,7 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "disallow")) {
 			ast_parse_allow_disallow(&sofia_cfg.prefs, &sofia_cfg.capability, v->value, 0);
 		} else if (!strcasecmp(v->name, "register")) {
-			sofia_parse_register_line(v->value);
+			sofia_parse_register_line(v->value, v->lineno);
 		}
 	}
 }
@@ -20833,11 +21028,15 @@ static void *sofia_reg_thread_func(void *data)
 			    !ast_strlen_zero(peer->secret) &&
 			    strcasecmp(peer->host, "dynamic") != 0 &&
 			    now >= peer->reg_expiry) {
-				char uri[256];
-				/* sip:user@host:port + ;transport= (UDP no-op); opt-in via is_register_line. */
+				char uri[256], aor[256], next_hop[256];
+				int has_next_hop;
+				/* Request-URI, address of record and next hop (sofia_build_register_uri); opt-in via
+				 * is_register_line. */
 				sofia_build_register_uri(peer, uri, sizeof(uri));
+				sofia_build_register_aor(peer, aor, sizeof(aor));
+				has_next_hop = sofia_build_register_next_hop(peer, next_hop, sizeof(next_hop));
 				if (sofia_debug)
-					ast_verbose("Sofia: Re-registering %s\n", uri);
+					ast_verbose("Sofia: Re-registering %s\n", aor);
 				/* RFC 3261 §20.22 outbound REGISTER refresh. */
 				char mf_str_reregister[8];
 				char instance_feature_rereg[120];
@@ -20845,7 +21044,7 @@ static void *sofia_reg_thread_func(void *data)
 				snprintf(mf_str_reregister, sizeof(mf_str_reregister), "%d", peer->maxforwards);
 				/* GRUU: re-advertise +sip.instance. */
 				sofia_build_instance_feature(peer, instance_feature_rereg, sizeof(instance_feature_rereg), peer->sip_outbound);
-				sofia_build_register_expires(expires_rereg, sizeof(expires_rereg));
+				sofia_build_register_expires(peer, expires_rereg, sizeof(expires_rereg));
 				/* A reload that toggled gruu/sip_outbound left stale merged Supported/M_FEATURES on
 				 * peer->nh (NUTAG_SUPPORTED only merges); rebuild the handle with the CURRENT tags before
 				 * this refresh so a disabled knob stops advertising (RFC 5626/5627). */
@@ -20858,7 +21057,8 @@ static void *sofia_reg_thread_func(void *data)
 				/* callbackextension: NUTAG_M_USERNAME override (as at initial register). */
 				nua_register(peer->nh,
 					NUTAG_URL(uri),
-					SIPTAG_FROM_STR(uri),
+					SIPTAG_FROM_STR(aor),
+					TAG_IF(has_next_hop, NUTAG_PROXY(next_hop)),
 					SIPTAG_MAX_FORWARDS_STR(mf_str_reregister),
 					SIPTAG_EXPIRES_STR(expires_rereg),	/* chan_sip parity, see sofia_build_register_expires */
 					TAG_IF(!ast_strlen_zero(peer->callbackextension),
@@ -20885,9 +21085,10 @@ static void *sofia_reg_thread_func(void *data)
  * sofia_thread). */
 static void sofia_peer_recreate_register_handle(struct sofia_peer *peer)
 {
-	char uri[256], route_buf[256], instance_feature[120];
+	char uri[256], aor[256], route_buf[256], instance_feature[120];
 
 	sofia_build_register_uri(peer, uri, sizeof(uri));
+	sofia_build_register_aor(peer, aor, sizeof(aor));
 	sofia_format_outboundproxy(peer, route_buf, sizeof(route_buf));
 	sofia_build_instance_feature(peer, instance_feature, sizeof(instance_feature), peer->sip_outbound);
 
@@ -20899,7 +21100,7 @@ static void sofia_peer_recreate_register_handle(struct sofia_peer *peer)
 	}
 	peer->nh = nua_handle(sofia_nua, peer,
 		NUTAG_URL(uri),
-		SIPTAG_TO_STR(uri),
+		SIPTAG_TO_STR(aor),
 		TAG_IF(route_buf[0], NUTAG_INITIAL_ROUTE_STR(route_buf)),
 		TAG_IF(peer->gruu || peer->sip_outbound, NUTAG_M_FEATURES(instance_feature)),
 		TAG_IF(peer->sip_outbound, NUTAG_SUPPORTED("outbound, path")),	/* RFC 5626 §4.2.1 */
@@ -20911,7 +21112,8 @@ static void sofia_do_register(void)
 {
 	struct ao2_iterator i;
 	struct sofia_peer *peer;
-	char uri[256];
+	char uri[256], aor[256], next_hop[256];
+	int has_next_hop;
 
 	i = ao2_iterator_init(peers, 0);
 	while ((peer = ao2_iterator_next(&i))) {
@@ -20923,8 +21125,10 @@ static void sofia_do_register(void)
 			    !ast_strlen_zero(peer->secret) &&
 			    !ast_strlen_zero(peer->host) &&
 			    strcasecmp(peer->host, "dynamic") != 0) {
-				/* sip:user@host:port + ;transport= for tls/tcp/ws/wss (UDP no-op). */
+				/* Request-URI, address of record and next hop (sofia_build_register_uri). */
 				sofia_build_register_uri(peer, uri, sizeof(uri));
+				sofia_build_register_aor(peer, aor, sizeof(aor));
+				has_next_hop = sofia_build_register_next_hop(peer, next_hop, sizeof(next_hop));
 
 				/* Detach+destroy any stale handle and create a fresh one carrying the current
 				 * GRUU/SIP-Outbound advertisement tags — single source of truth for the tag set,
@@ -20939,11 +21143,12 @@ static void sofia_do_register(void)
 				char mf_str_initreg[8];
 				char expires_initreg[16];
 				snprintf(mf_str_initreg, sizeof(mf_str_initreg), "%d", peer->maxforwards);
-				sofia_build_register_expires(expires_initreg, sizeof(expires_initreg));
+				sofia_build_register_expires(peer, expires_initreg, sizeof(expires_initreg));
 				/* callbackextension: NUTAG_M_USERNAME drives the Contact URL username. */
 				nua_register(peer->nh,
 					NUTAG_URL(uri),
-					SIPTAG_FROM_STR(uri),
+					SIPTAG_FROM_STR(aor),
+					TAG_IF(has_next_hop, NUTAG_PROXY(next_hop)),
 					SIPTAG_MAX_FORWARDS_STR(mf_str_initreg),
 					SIPTAG_EXPIRES_STR(expires_initreg),	/* chan_sip parity, see sofia_build_register_expires */
 					TAG_IF(!ast_strlen_zero(peer->callbackextension),
@@ -20958,7 +21163,7 @@ static void sofia_do_register(void)
 				peer->reg_expiry = time(NULL) + 60;
 
 				if (sofia_debug) {
-					ast_verbose("Sofia: Registering %s\n", uri);
+					ast_verbose("Sofia: Registering %s\n", aor);
 				}
 			}
 		}

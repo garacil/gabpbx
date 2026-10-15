@@ -390,7 +390,11 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 	/* Expires (registration TTL) is meaningful ONLY when this peer takes part in registration: a
 	 * dynamic peer that registers TO us, or a register=> peer we register to. A static challenge-auth
 	 * trunk (host=<ip/fqdn>, no register=>) never registers either way, so a TTL there was misleading. */
-	if (peer->is_register_line || !strcasecmp(peer->host, "dynamic")) {
+	if (peer->is_register_line) {
+		/* What every outbound REGISTER asks for: the line's ~expiry, else [general] defaultexpiry. */
+		sofia_cli_peer_line(&buf, "Expires", "%ds (requested)",
+			peer->reg_requested_expiry > 0 ? peer->reg_requested_expiry : sofia_cfg.default_expiry);
+	} else if (!strcasecmp(peer->host, "dynamic")) {
 		sofia_cli_peer_line(&buf, "Expires", "%ds", peer->expiresecs);
 	}
 	sofia_cli_peer_line(&buf, "Secret", "%s", ast_strlen_zero(peer->secret) ? "(none)" : "(set)");
@@ -663,6 +667,17 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 			peer->host, peer->port,
 			peer->reg_expiry > 0 ? (long)(peer->reg_expiry - time(NULL)) : 0,
 			peer->reg_attempts);
+		/* register => user@domain[:port]: the domain registered at host:port (To/From/Request-URI). */
+		if (!ast_strlen_zero(peer->regdomain)) {
+			if (peer->regdomainport) {
+				sofia_cli_peer_line(&buf, "Reg. domain", "%s:%d", peer->regdomain, peer->regdomainport);
+			} else {
+				sofia_cli_peer_line(&buf, "Reg. domain", "%s", peer->regdomain);
+			}
+		}
+		if (!ast_strlen_zero(peer->authuser)) {
+			sofia_cli_peer_line(&buf, "Auth user", "%s", peer->authuser);
+		}
 	}
 
 	if (!ast_sockaddr_isnull(&peer->src_addr)) {
@@ -1368,7 +1383,8 @@ char *sofia_cli_show_registry(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 		e->usage =
 			"Usage: sip show registry\n"
 			"       List this server's outbound trunk registrations (register => lines)\n"
-			"       and their current state.\n";
+			"       and their current state. Host is where the REGISTER is sent; Username\n"
+			"       is user[@domain[:port]] when the line registers a domain (user@domain).\n";
 		return NULL;
 	case CLI_GENERATE:
 		return NULL;
@@ -1379,13 +1395,13 @@ char *sofia_cli_show_registry(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 	}
 
 	now = time(NULL);
-	ast_cli(a->fd, "%-42.42s  %-16.16s  %-8s  %s\n", "Host", "Username", "Refresh", "State");
+	ast_cli(a->fd, "%-42.42s  %-32.32s  %-8s  %s\n", "Host", "Username", "Refresh", "State");
 
 	iter = ao2_iterator_init(peers, 0);
 	while ((peer = ao2_iterator_next(&iter))) {
-		int is_regline, port = 5060, registered = 0, attempts = 0;
+		int is_regline, port = 5060, registered = 0, attempts = 0, domainport = 0;
 		long refresh_secs = 0;
-		char l_host[256] = "", l_user[256] = "";
+		char l_host[256] = "", l_user[256] = "", l_domain[256] = "";
 
 		ast_mutex_lock(&peer->lock);
 		is_regline = peer->is_register_line;
@@ -1397,8 +1413,20 @@ char *sofia_cli_show_registry(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 				? (long)(peer->reg_expiry - now) : 0;
 			ast_copy_string(l_host, S_OR(peer->host, ""), sizeof(l_host));
 			ast_copy_string(l_user, S_OR(peer->defaultuser, ""), sizeof(l_user));
+			ast_copy_string(l_domain, S_OR(peer->regdomain, ""), sizeof(l_domain));
+			domainport = peer->regdomainport;
 		}
 		ast_mutex_unlock(&peer->lock);
+
+		/* chan_sip parity (sip_show_registry): Username is user[@domain][:domainport]. */
+		if (is_regline && l_domain[0]) {
+			size_t used = strlen(l_user);
+			if (domainport) {
+				snprintf(l_user + used, sizeof(l_user) - used, "@%s:%d", l_domain, domainport);
+			} else {
+				snprintf(l_user + used, sizeof(l_user) - used, "@%s", l_domain);
+			}
+		}
 
 		if (is_regline) {
 			char hostport[300];
@@ -1412,7 +1440,7 @@ char *sofia_cli_show_registry(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 			} else {
 				ast_copy_string(state, "Unregistered", sizeof(state));
 			}
-			ast_cli(a->fd, "%-42.42s  %-16.16s  %-8ld  %s\n",
+			ast_cli(a->fd, "%-42.42s  %-32.32s  %-8ld  %s\n",
 				hostport, l_user, refresh_secs, state);
 			count++;
 		}
