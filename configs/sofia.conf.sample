@@ -833,7 +833,9 @@ srvlookup=yes
 ;     + Min-Expires:<minexpiry> header (RFC 3261 §10.2.8); peer retries with valid value
 ;   - peer-requested expires == 0: bypasses bounds (unregister) — standard processing
 ;   - defaultexpiry: fallback when peer omits Expires header from REGISTER + initial
-;     value for peer->expiresecs at sofia_peer_alloc when peer config omits expiresecs=
+;     value for peer->expiresecs at sofia_peer_alloc when peer config omits expiresecs=;
+;     it is also the Expires our own outbound REGISTERs (register => lines) ask for unless
+;     the line sets ~expiry (chan_sip parity)
 ;
 ; chan_sip historical TYPO-TOLERANCE (drop-in compat preserved): chan_sip parser
 ; accepts BOTH spellings of each key — chan_sofia mirrors. Operators with historical
@@ -902,7 +904,7 @@ maxexpiry      = 3600      ; maximum REGISTER expires (seconds); over-max silent
 ; when peer-set explicitly).
 ;
 ; Emitted via sofia-sip native SIPTAG_MAX_FORWARDS_STR at all outbound nua_invite +
-; nua_register callsites (8 sites total).
+; nua_register callsites (a challenge answer resends the same request).
 ;
 ;maxforwards = 70    ; [general] default OR per-peer override (1-255 valid range)
 
@@ -958,7 +960,13 @@ maxexpiry      = 3600      ; maximum REGISTER expires (seconds); over-max silent
 ; registerattempts — maximum scheduled-retry count per peer (0 = unlimited).
 ;   chan_sip parity at chan_sip.c:14092 + L29804-29805. Default 0 (unlimited)
 ;   per chan_sip global_regattempts_max static-zero init. When set, registration
-;   gives up after N failed attempts (auth-challenge or scheduled re-register).
+;   gives up after N REGISTERs without success — every REGISTER counts (each
+;   challenge answer and each retry, as chan_sip regattempts) and a successful
+;   registration resets the count; sip reload starts it over. Reaching it logs
+;   "Last Registration Attempt #N failed, Giving up forever trying to register"
+;   once, as chan_sip does.
+;   A failed registration (timeout, 5xx, refused credentials) is retried
+;   registertimeout seconds later; 403/404 give it up until the next reload.
 ;
 ; SEMANTIC NOTE: These are APPLICATION-LEVEL retry-policy flags, NOT sofia-sip
 ; per-transaction retry (NUTAG_RETRY_COUNT) which operates at a different
@@ -2869,20 +2877,58 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;domain = sip.example.com
 
 ;
-; SIP register string to register with a remote PBX or provider
-; Format: user:password@host[:port]
+; --- Outbound registration: register => (chan_sip syntax) ---
+; Registers this server with a remote PBX or provider, as chan_sip does:
 ;
+;   register => [peer?][transport://]user[@domain][:secret[:authuser]]@host[:port][/extension][~expiry]
+;
+;   user        the account; the line becomes a peer of that name (sip show peer <user>)
+;   @domain     registration domain when it is not the host the REGISTER is sent to: To, From and
+;               the Request-URI name sip:user@domain / sip:domain while the packet goes to host:port.
+;               A domain port goes right after it: user@domain:port:secret:authuser@host
+;   secret      the password (required; must not contain ':'; put it in double quotes when it
+;               contains '@', '/' or '?')
+;   authuser    digest username when it is not user
+;   transport   udp (default), tcp or tls; tls makes the default port 5061
+;   host:port   where the REGISTER is sent (default port 5060)
+;   /extension  user part of our Contact, the one the provider calls back (same as the per-peer
+;               callbackextension); without it the Contact keeps the driver's default user
+;   ~expiry     Expires asked for in every REGISTER; default [general] defaultexpiry
+;   peer?       accepted for chan_sip compatibility and ignored: the line is its own peer
+;
+; Every REGISTER carries Expires (the line's ~expiry, else [general] defaultexpiry); some
+; registrars refuse one without it ("403 Forbidden / Warning: 390 Missing Expires"). The
+; Request-URI never carries the user (RFC 3261 §10.2). A 423 Interval Too Brief is answered
+; with the registrar's Min-Expires automatically.
+;
+; Examples:
 ;register => myuser:mypassword@sip.provider.com
 ;register => test:15121972@192.0.2.47:60000
+;register => tcp://myuser:mypassword@sip.provider.com/1000~600
+; A provider whose SIP domain differs from the proxy of each line (e.g. domain sip-domain.example,
+; proxy line1.proxy.example): REGISTER sip:sip-domain.example, To/From sip:0033123456789@sip-domain.example,
+; sent to line1.proxy.example:5060.
+;register => 0033123456789@sip-domain.example:mypassword@line1.proxy.example
+;
+; Failures and retries (chan_sip behaviour):
+;   * A digest challenge is answered with the line's credentials, at most 3 times per attempt;
+;     credentials the registrar already refused are not sent again.
+;   * A failed attempt (timeout, 5xx, refused credentials) is retried every registertimeout
+;     seconds, up to registerattempts REGISTERs (0 = forever; a successful registration resets
+;     the count).
+;   * 403 Forbidden and 404 Not Found give the registration up until the next reload.
+;   * sip reload registers lines it adds or changes (the old binding is de-registered first) and
+;     retries lines that are not registered, within registertimeout seconds; a registered,
+;     unchanged line is left alone.
 
 ;
 ; --- Outbound trunk authentication (capability feature) ---
 ; chan_sofia answers a 401/407 digest challenge on BOTH its outbound REGISTER (the
 ; register => lines above) AND its outbound INVITEs (calls placed out through a peer
 ; trunk). The credentials used are the trunk peer's defaultuser/username + secret
-; (for a register => line, the user:password in the directive). No extra config is
-; required: if the upstream challenges, chan_sofia automatically re-sends the request
-; with an Authorization / Proxy-Authorization header.
+; (for a register => line, the user:password in the directive, or its authuser when it has
+; one). No extra config is required: if the upstream challenges, chan_sofia automatically
+; re-sends the request with an Authorization / Proxy-Authorization header.
 ;   * Use a PLAINTEXT secret= on the trunk peer. A md5secret= (pre-hashed MD5) CANNOT
 ;     be used for OUTBOUND digest — the cleartext password is needed to compute the
 ;     response — so an md5secret-only trunk will not authenticate outbound
@@ -2892,13 +2938,16 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;
 ; --- Monitoring outbound registrations: "sip show registry" (CLI) ---
 ; Lists every register => outbound registration and its current state:
-;     Host                          Username          Refresh   State
-;     sip.provider.com:5060         myuser            3590      Registered
-;     192.0.2.47:60000            test              0         Unregistered (3 attempts)
+;     Host                          Username                          Refresh   State
+;     sip.provider.com:5060         myuser                            3590      Registered
+;     line1.proxy.example:5060      0033123456789@sip-domain.example  590       Registered
+;     192.0.2.47:60000              test                              0         Unregistered (3 attempts)
+;   Host is where the REGISTER is sent; Username is user[@domain[:port]] (chan_sip format).
 ;   Refresh = seconds until the next refresh (0 when not registered). State is
-;   Registered or Unregistered; the "(N attempts)" hint appears when an upstream keeps
-;   rejecting the digest (verify the trunk secret). The same data is also available via
-;   the AMI SofiaShowRegistry action.
+;   Registered or Unregistered; the "(N attempts)" hint counts the REGISTERs sent since the
+;   last success (verify the trunk secret when it keeps growing). The same data is also
+;   available via the AMI SIPshowregistry action (Domain = the registration domain, else the
+;   host, as in chan_sip).
 ;
 ; --- Forcing a re-registration: "sip unregister <peer>" (CLI) ---
 ; Force-expires a DYNAMIC peer's INBOUND registration so the phone must register
@@ -3016,7 +3065,7 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;faxdetect=yes                   ; faxdetect per-peer multi-mode parity (chan_sip drop-in parse-compatibility only). 4-state values: no (default; NONE) / cng (1; CNG tone only) / t38 (2; T.38 reinvite only) / yes or cng,t38 (3; BOTH). chan_sip semantic: detect inband fax CNG via ast_dsp DSP_FEATURE_FAX_DETECT + T.38 reinvite from peer; auto-switch to fax handling. chan_sofia DSP infrastructure PRESENT (inband DTMF) but fax-CNG detection is not yet implemented; T.38 infrastructure ABSENT (a future T.38 enhancement). KNOWN LIMITATION faxdetect=yes/cng/t38 operators get parse-clean migration but chan_sofia continues to ignore CNG + T.38 reinvites regardless. Future-fix ~150-200+ LoC within a future T.38 enhancement. chan_sip parity chan_sip.c:28202-28221 verbatim multi-mode parser via handle_common_options + sip.h:341-344 verbatim 2-bit flag encoding + 5+ use sites L4945+L6282+L8186-8288+L10196.
 ;timert1=500                     ; timert1 per-peer parity (chan_sip drop-in, implemented at [general] via NTATAG_SIP_T1). RFC 3261 §17.1.1.1 T1 retransmission interval (default 500ms; ≥ 200ms minimum + ≥ t1min floor per chan_sip parity). Per-peer sscanf %30d + triple-clamp + LOG_WARNING + fallback peer->timer_t1 = sofia_cfg.t1min (chan_sip-faithful floor semantic). chan_sip parity chan_sip.c:28941-28946 verbatim DIRECT build_peer parser. Per-peer dynamic override deferred (future item).
 ;allowoverlap=yes                ; allowoverlap per-peer + [general] parity (chan_sip drop-in, implemented at 3 sites: sofia_process_invite ast_canmatch_extension MATCHMORE 484 emit + sofia_indicate AST_CONTROL_INCOMPLETE case + nua_r_invite 484 status special-case). RFC 3261 §3 digit-by-digit dialing tri-state. Default yes per chan_sip.c:29479 verbatim drop-in critical default. Values: yes (484 Address Incomplete on partial-match) / no (404 Not Found on partial-match) / dtmf (parsed + stored + displayed but treated as fall-through per chan_sip own design at chan_sip.c:23937-23943 verbatim dialplan-deferral comment "For SIP_PAGE2_ALLOWOVERLAP_DTMF it is better to do this in the dialplan using the Incomplete application rather than having the channel driver do it"). chan_sip parity chan_sip.c:28188-28195 verbatim handle_common_options parser + sip.h:318-322 verbatim 2-bit-flag-encoding-at-position-13. chan_sofia 3-site-additive implementation + AMI SIPshowpeer "OverlapDial" (chan_sofia extension over chan_sip AMI silent).
-;callbackextension=200           ; callbackextension per-peer parity (chan_sip drop-in, implemented via NUTAG_M_USERNAME at 3 nua_register call sites: chan_sofia.c:9313 auth-challenge re-REGISTER + L12730 qualify-cycle re-REGISTER + L12782 initial-REGISTER inside sofia_do_register). When chan_sofia registers AS A CLIENT to upstream provider (a `register =>` trunk — secret + non-dynamic host AND an explicit [general] register=> line; secret+static-host alone does NOT register), callbackextension overrides the user-portion of the Contact URI advertised in REGISTER. Upstream provider sends inbound calls back to the registered Contact URI; the user-part determines which extension lands in your local dialplan (typically a context entry like exten => 200,1,Goto(incoming,s,1) routes back-calls). chan_sip parity chan_sip.c:28869-28870 verbatim per-peer parser via DIRECT build_peer (chan_sip uses local-var `char callback[256]` at L28578 + auto-builds reg_string + sip_register at L29240-29246 + transmit_register sets p->exten = r->callback at L14267-14269 → set_contact_string state-machine derives Contact user-part). chan_sofia uses sofia-sip native NUTAG_M_USERNAME tag (per nua_tag.c:1955+L1983 verbatim "Username for Contact URI") via TAG_IF gate at all 3 nua_register call sites — chan_sofia uses a sofia-sip native tag instead of a state machine (1-tag implementation vs chan_sip indirect Contact-URI-user-derivation-via-pvt-state machine). chan_sofia extension over chan_sip CLI/AMI silent (chan_sip stores in build_peer local-var + discards never displayed; chan_sofia adds sip show peer "Callback ext: %s" + AMI SIPshowpeer "CallbackExtension: %s" CLI-exposure-where-chan_sip-silent). Empty-default = chan_sip drop-in baseline (no callback registered; Contact URI uses default-user instead). Per-peer-only ship — chan_sip [general] parser absence verified.
+;callbackextension=200           ; callbackextension per-peer parity (chan_sip drop-in, implemented via NUTAG_M_USERNAME on the outbound REGISTER; the /extension of a register => line sets it too). When chan_sofia registers AS A CLIENT to upstream provider (a `register =>` trunk — secret + non-dynamic host AND an explicit [general] register=> line; secret+static-host alone does NOT register), callbackextension overrides the user-portion of the Contact URI advertised in REGISTER. Upstream provider sends inbound calls back to the registered Contact URI; the user-part determines which extension lands in your local dialplan (typically a context entry like exten => 200,1,Goto(incoming,s,1) routes back-calls). chan_sip parity chan_sip.c:28869-28870 verbatim per-peer parser via DIRECT build_peer (chan_sip uses local-var `char callback[256]` at L28578 + auto-builds reg_string + sip_register at L29240-29246 + transmit_register sets p->exten = r->callback at L14267-14269 → set_contact_string state-machine derives Contact user-part). chan_sofia uses sofia-sip native NUTAG_M_USERNAME tag (per nua_tag.c:1955+L1983 verbatim "Username for Contact URI") via TAG_IF gate on the outbound REGISTER — chan_sofia uses a sofia-sip native tag instead of a state machine (1-tag implementation vs chan_sip indirect Contact-URI-user-derivation-via-pvt-state machine). chan_sofia extension over chan_sip CLI/AMI silent (chan_sip stores in build_peer local-var + discards never displayed; chan_sofia adds sip show peer "Callback ext: %s" + AMI SIPshowpeer "CallbackExtension: %s" CLI-exposure-where-chan_sip-silent). Empty-default = chan_sip drop-in baseline (no callback registered; Contact URI uses default-user instead). Per-peer-only ship — chan_sip [general] parser absence verified.
 ;setvar=ACCOUNTCODE=1234         ; setvar per-peer parity (chan_sip drop-in COMBINED setvar+header ship). Per-peer channel-variable injection at sofia_new — variable applied to the inbound/outbound channel via pbx_builtin_setvar_helper, then visible to dialplan as ${ACCOUNTCODE}. MULTI-LINE supported: specify multiple setvar= lines, each appends to peer->chanvars LIFO list (LAST setvar= in config takes precedence on duplicate-name). chan_sip parity chan_sip.c:28953-28954 verbatim per-peer parser via DIRECT build_peer + chan_sip.c:28415-28428 add_var helper (chan_sofia mirror helper sofia_add_var) + chan_sip.c:8007-8010 verbatim sip_new iteration (chan_sofia mirror at sofia_new direct peer iteration — chan_sofia extension via simpler-iteration-vs-chan_sip-3-step-machine; chan_sip copies peer->chanvars → pvt->chanvars at sip_alloc + find_peer; chan_sofia skips both copy steps via direct peer ao2-ref-held lifetime invariant). chan_sip [general] absence verified — NO sofia.conf [general] equivalent. Reload-required: changes take effect at module reload chan_sofia.so.
 ;header=X-Custom-Tag: trunk-A    ; header per-peer parity (chan_sip drop-in COMBINED setvar+header ship). Per-peer custom SIP header injection at OUTBOUND INVITE/REGISTER assembly — format `header=Header-Name: header-value` with the colon-space separator part of the value. MULTI-LINE supported: specify multiple header= lines, each appends to peer->chanvars list as `__SIPADDHEADERpre%2d=` channel-var (transparent to operator; just write `header=X-Custom-Tag: trunk-A` and chan_sofia handles the prefix internally). chan_sip parity chan_sip.c:28955-28958 verbatim per-peer parser via DIRECT build_peer + chan_sip.c:13160-13187 verbatim outbound __SIPADDHEADER prefix-recognition via 12-char strncasecmp on channel varshead. chan_sofia reuses existing dialplan-apps SIPAddHeader infrastructure at chan_sofia.c:4509 sofia_build_addheader_str absorbs header= seamlessly via channel-var prefix matching (12-char strncasecmp("SIPADDHEADER", 12)) at sofia_call (L4858) → SIPTAG_HEADER_STR injection. ZERO new outbound-builder code needed (existing-infrastructure-leverage). Implementation flow: peer->chanvars __SIPADDHEADERpre1=Name: value entry → sofia_new pbx_builtin_setvar_helper sets channel var → __ inheritance strips underscores → existing sofia_build_addheader_str picks up "SIPADDHEADERpre1" prefix at sofia_call → header emitted in outbound SIP request. chan_sip [general] absence verified. Reload-required: changes take effect at module reload chan_sofia.so.
 ;timerb=20000                    ; timerb per-peer parity (chan_sip drop-in, implemented at [general] via NTATAG_SIP_T1X64 nua_create). RFC 3261 §17.1.1.2 INVITE transaction timeout (Timer B = 64*T1 default 32000ms; ≥ 200ms minimum per chan_sip parity). Per-peer sscanf %30d + clamp-to-default-on-invalid + LOG_WARNING. chan_sip parity chan_sip.c:28947-28952 verbatim DIRECT build_peer parser. Per-peer dynamic override deferred per the t1min precedent (peer field stored + displayed; NTATAG_SIP_T1X64 nua_create implementation serves global default only).
