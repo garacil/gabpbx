@@ -950,6 +950,7 @@ struct sofia_peer {
 	time_t reg_expiry;
 	int reg_attempts;
 	int regdomainport;	/* register => user@domain:PORT: port of the registration domain in the Request-URI (chan_sip regdomainport); 0 = none. Set only by the register => line. */
+	char reg_signature[33];	/* register => trunk: MD5 hex of everything its REGISTER carries (sofia_register_signature), stored when its handle is built; a reload that changes it rebuilds the handle. Under peer->lock. */
 	int reg_requested_expiry;	/* register => ...~EXPIRY: Expires asked for in every outbound REGISTER (chan_sip configured_expiry); 0 = [general] defaultexpiry. Set only by the register => line. */
 	int reg_auth_tries;	/* register => trunk: 401/407 answered in the current registration attempt; capped at SOFIA_REG_MAX_AUTHTRIES (chan_sip MAX_AUTHTRIES), reset when a new attempt starts and on 200. Under peer->lock. */
 	ast_mutex_t lock;

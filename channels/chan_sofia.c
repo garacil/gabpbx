@@ -873,6 +873,26 @@ static void sofia_register_attempt_failed(struct sofia_peer *peer, int rebuild_h
 		+ (sofia_cfg.register_timeout > 0 ? sofia_cfg.register_timeout : DEFAULT_REGISTRATION_TIMEOUT);
 }
 
+/* Everything a register => trunk puts in its REGISTER (Request-URI, address of record, next hop or
+ * outboundproxy Route, Expires, digest user and secret, Contact user, Max-Forwards, GRUU/Outbound),
+ * digested into out[33], so a reload can tell whether the line changed. Caller holds peer->lock (or is
+ * the load thread). */
+static void sofia_register_signature(struct sofia_peer *peer, char *out)
+{
+	char uri[256], aor[256], next_hop[256], route[256], expires[16];
+	char buf[2048];
+
+	sofia_build_register_uri(peer, uri, sizeof(uri));
+	sofia_build_register_aor(peer, aor, sizeof(aor));
+	sofia_build_register_next_hop(peer, next_hop, sizeof(next_hop));
+	sofia_format_outboundproxy(peer, route, sizeof(route));
+	sofia_build_register_expires(peer, expires, sizeof(expires));
+	snprintf(buf, sizeof(buf), "%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%d\n%d\n%d",
+		uri, aor, next_hop, route, expires, S_OR(peer->authuser, peer->defaultuser), peer->secret,
+		peer->callbackextension, peer->maxforwards, peer->gruu, peer->sip_outbound);
+	ast_md5_hash(out, buf);
+}
+
 /* Build a NAT-traversal proxy URL from peer->src_addr for outbound in-dialog
  * messages when peer has nat=force_rport (or comedia). Without it sofia-sip
  * routes the 2xx-ACK/BYE to the dialog remote_target (the Contact's unroutable
@@ -17044,7 +17064,11 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				if (peer) {
 					ast_mutex_lock(&peer->lock);
 					peer->registered = 1;
-					peer->reg_expiry = time(NULL) + expires - 10;
+					/* A handle marked for rebuild (a reload changed the line) keeps the rebuild due:
+					 * sofia-sip's own refreshes of the old request would otherwise push it away forever. */
+					if (!peer->reg_handle_dirty) {
+						peer->reg_expiry = time(NULL) + expires - 10;
+					}
 					peer->reg_attempts = 0;
 					peer->reg_auth_tries = 0;
 					ast_mutex_unlock(&peer->lock);
@@ -21013,7 +21037,7 @@ static void *sofia_reg_thread_func(void *data)
 			 * reg_attempts / secret / host). */
 			ast_mutex_lock(&peer->lock);
 			if (peer->is_register_line &&
-			    peer->nh && peer->reg_expiry > 0 &&
+			    (peer->nh || peer->reg_handle_dirty) && peer->reg_expiry > 0 &&
 			    !ast_strlen_zero(peer->secret) &&
 			    strcasecmp(peer->host, "dynamic") != 0 &&
 			    now >= peer->reg_expiry &&
@@ -21024,7 +21048,7 @@ static void *sofia_reg_thread_func(void *data)
 					peer->reg_attempts, peer->defaultuser, peer->host);
 				peer->reg_expiry = 0;
 			} else if (peer->is_register_line &&
-			    peer->nh && peer->reg_expiry > 0 &&
+			    (peer->nh || peer->reg_handle_dirty) && peer->reg_expiry > 0 &&
 			    !ast_strlen_zero(peer->secret) &&
 			    strcasecmp(peer->host, "dynamic") != 0 &&
 			    now >= peer->reg_expiry) {
@@ -21045,9 +21069,11 @@ static void *sofia_reg_thread_func(void *data)
 				/* GRUU: re-advertise +sip.instance. */
 				sofia_build_instance_feature(peer, instance_feature_rereg, sizeof(instance_feature_rereg), peer->sip_outbound);
 				sofia_build_register_expires(peer, expires_rereg, sizeof(expires_rereg));
-				/* A reload that toggled gruu/sip_outbound left stale merged Supported/M_FEATURES on
-				 * peer->nh (NUTAG_SUPPORTED only merges); rebuild the handle with the CURRENT tags before
-				 * this refresh so a disabled knob stops advertising (RFC 5626/5627). */
+				/* Rebuild the handle with the CURRENT config before this REGISTER when it is marked: a line
+				 * a reload added or changed (sofia_register_reconcile; sofia-sip would otherwise keep
+				 * refreshing the old request), a reload that toggled gruu/sip_outbound (NUTAG_SUPPORTED
+				 * only merges on a handle, RFC 5626/5627), or an attempt given up while its challenged
+				 * request still waits for credentials (sofia_register_attempt_failed). */
 				if (peer->reg_handle_dirty) {
 					sofia_peer_recreate_register_handle(peer);
 					peer->reg_handle_dirty = 0;
@@ -21108,6 +21134,49 @@ static void sofia_peer_recreate_register_handle(struct sofia_peer *peer)
 		TAG_END());
 }
 
+/* After a reload (sofia_reload_worker, on sofia_thread): make every register => trunk follow the new
+ * sofia.conf. The REGISTER handle is built at load (sofia_do_register) and sofia-sip keeps refreshing
+ * the request it already has, so without this a line added by a reload never registered and a changed
+ * line kept registering the old way. chan_sip rebuilds every registration on reload; here a trunk is
+ * touched only when needed:
+ *   - new, or something its REGISTER carries changed (sofia_register_signature): the refresh thread
+ *     rebuilds the handle — sofia-sip de-registers the old binding as the old handle goes
+ *     (nua_stack_destroy_handle -> nua_dialog_shutdown) — and registers at its next pass
+ *     (<= registertimeout seconds);
+ *   - unchanged but not registered (failing, given up after 403/404 or registerattempts): tried again;
+ *   - registered and unchanged: left alone, so a reload sends no REGISTER at all.
+ * Attempt counters start over, as for a fresh chan_sip registry. */
+static void sofia_register_reconcile(void)
+{
+	struct ao2_iterator i;
+	struct sofia_peer *peer;
+
+	i = ao2_iterator_init(peers, 0);
+	while ((peer = ao2_iterator_next(&i))) {
+		char sig[33];
+		int changed;
+
+		ast_mutex_lock(&peer->lock);
+		if (peer->is_register_line) {
+			sofia_register_signature(peer, sig);
+			changed = !peer->nh || strcmp(sig, peer->reg_signature);
+			if (changed || !peer->registered) {
+				if (changed) {
+					ast_copy_string(peer->reg_signature, sig, sizeof(peer->reg_signature));
+					peer->reg_handle_dirty = 1;
+					peer->registered = 0;
+				}
+				peer->reg_attempts = 0;
+				peer->reg_auth_tries = 0;
+				peer->reg_expiry = 1;	/* due at the next refresh-thread pass */
+			}
+		}
+		ast_mutex_unlock(&peer->lock);
+		ao2_ref(peer, -1);
+	}
+	ao2_iterator_destroy(&i);
+}
+
 static void sofia_do_register(void)
 {
 	struct ao2_iterator i;
@@ -21134,6 +21203,8 @@ static void sofia_do_register(void)
 				 * GRUU/SIP-Outbound advertisement tags — single source of truth for the tag set,
 				 * shared with the reload-dirty rebuild path. */
 				sofia_peer_recreate_register_handle(peer);
+				peer->reg_handle_dirty = 0;
+				sofia_register_signature(peer, peer->reg_signature);
 
 				/* The same +sip.instance/reg-id advertisement also rides the REGISTER request below. */
 				char instance_feature[120];
@@ -21572,6 +21643,7 @@ static int sofia_peer_sweep_cb(void *obj, void *arg, int flags)
 	 * hmagic so late events skip. Under peer->lock vs the reg/qualify aux readers; bind/destroy
 	 * are non-blocking posts, so holding the lock is safe. */
 	ast_mutex_lock(&peer->lock);
+	peer->reg_handle_dirty = 0;	/* a removed register => line must not get a new handle from the refresh thread */
 	if (peer->nh) {
 		nua_handle_t *nh = peer->nh;
 		peer->nh = NULL;
@@ -21793,6 +21865,8 @@ static void sofia_reload_worker(void *data)
 		/* Outbound MWI-SUBSCRIBE reconcile: add/remove watchers to match the new config. */
 		sofia_subscribe_reconcile();
 		sofia_eventsub_reconcile();
+		/* Outbound REGISTER reconcile: register new/changed register => lines, retry failed ones. */
+		sofia_register_reconcile();
 	}
 
 	ast_config_destroy(cfg);
