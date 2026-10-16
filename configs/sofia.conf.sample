@@ -2878,7 +2878,8 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;outboundproxy  =
 
 ;
-; Local SIP domains for ${CHECKSIPDOMAIN(domain)} dialplan function.
+; Local SIP domains for ${CHECKSIPDOMAIN(domain)} dialplan function (e.g. ${CHECKSIPDOMAIN(${SIPDOMAIN})},
+; ${SIPDOMAIN} being the Request-URI host of an incoming call).
 ; List one or more domains your PBX serves. CHECKSIPDOMAIN(domain) returns
 ; the domain string if it matches a configured entry, else empty. Multi-line
 ; allowed; case-insensitive match.
@@ -2894,7 +2895,9 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ; %-escaped user that does not match as sent is tried decoded. The extension decides the 404 Not Found
 ; (unknown extension) and the 484 Address Incomplete (allowoverlap=yes). The 404 of a guest call (no
 ; peer matched) in the default context counts toward the blacklist (blacklist_ban); a call from a
-; matched peer never does.
+; matched peer never does. The host of the Request-URI, without its port, is set on the channel as
+; ${SIPDOMAIN}, as in chan_sip (empty on outbound calls), e.g. to tell calls addressed to a private
+; address: ${REGEX("^10\." ${SIPDOMAIN})}.
 ;
 ; --- Outbound registration: register => (chan_sip syntax) ---
 ; Registers this server with a remote PBX or provider, as chan_sip does:

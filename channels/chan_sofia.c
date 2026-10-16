@@ -2673,6 +2673,12 @@ static struct ast_channel *sofia_new(struct sofia_pvt *pvt, int state, const cha
 
 	chan->tech_pvt = pvt;
 
+	/* chan_sip sip_new parity: ${SIPDOMAIN} = the Request-URI host of an incoming call, set before the
+	 * peer's setvar= variables (which may override it) and before the PBX starts. */
+	if (!ast_strlen_zero(pvt->sipdomain)) {
+		pbx_builtin_setvar_helper(chan, "SIPDOMAIN", pvt->sipdomain);
+	}
+
 	if (pvt->peer) {
 		/* Outbound (PBX thread) these reads race the reload writer freeing the
 		 * peer stringfield pool, so hold peer->lock across the freeable reads
@@ -8456,6 +8462,12 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		if (url_str) {
 			ast_string_field_set(pvt, ruri, url_str);
 		}
+	}
+	/* ${SIPDOMAIN}: the Request-URI host without its port, as chan_sip (get_destination keeps it in
+	 * p->domain and sip_new sets the variable, chan_sip.c:8028). sofia-sip keeps url_host bare: no port,
+	 * no IPv6 brackets. Dialplans test it, e.g. to tell calls addressed over a private network. */
+	if (sip->sip_request && sip->sip_request->rq_url && !ast_strlen_zero(sip->sip_request->rq_url->url_host)) {
+		ast_string_field_set(pvt, sipdomain, sip->sip_request->rq_url->url_host);
 	}
 
 	if (sip->sip_call_id && sip->sip_call_id->i_id) {
