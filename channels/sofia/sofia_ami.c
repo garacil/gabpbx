@@ -421,6 +421,9 @@ int manager_sofia_show_peer(struct mansession *s, const struct message *m)
 	/* Emitted only when set; chan_sofia addition (chan_sip never exposes it in AMI). */
 	if (!ast_strlen_zero(peer->callbackextension)) {
 		ast_str_append(&buf, 0, "CallbackExtension: %s\r\n", peer->callbackextension);
+	} else if (peer->is_register_line) {
+		/* The Contact user a register => line registers without /extension (chan_sip default). */
+		ast_str_append(&buf, 0, "CallbackExtension: s\r\n");
 	}
 	/* ChanVariable iteration - both setvar= and header= entries (chan_sip parity). */
 	if (peer->chanvars) {

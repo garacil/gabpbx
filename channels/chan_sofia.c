@@ -801,6 +801,15 @@ static void sofia_build_register_uri(struct sofia_peer *peer, char *out, size_t 
 	sofia_uri_append_transport(out, len, sofia_transport_name(peer->transport));
 }
 
+/* The user part of the Contact a register => trunk registers: the line's /extension (callbackextension),
+ * else "s", as chan_sip (sip/config_parser.c: callback = S_OR(extension, "s")). The provider calls that
+ * Contact, and the user of an incoming Request-URI is the dialplan extension (sofia_process_invite), so
+ * the calls of a line without /extension land on "s" in its context, as with chan_sip. */
+static const char *sofia_register_contact_user(const struct sofia_peer *peer)
+{
+	return S_OR(peer->callbackextension, "s");
+}
+
 /* The address of record a register => trunk registers (To and From, RFC 3261 §10.2): sip:<user>@<regdomain>
  * when the line names a domain (chan_sip builds From/To from regdomain, without its port), else
  * sip:<user>@<host>:<port> with the peer's ;transport=. Caller serializes the peer fields. */
@@ -889,7 +898,7 @@ static void sofia_register_signature(struct sofia_peer *peer, char *out)
 	sofia_build_register_expires(peer, expires, sizeof(expires));
 	snprintf(buf, sizeof(buf), "%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%d\n%d\n%d",
 		uri, aor, next_hop, route, expires, S_OR(peer->authuser, peer->defaultuser), peer->secret,
-		peer->callbackextension, peer->maxforwards, peer->gruu, peer->sip_outbound);
+		sofia_register_contact_user(peer), peer->maxforwards, peer->gruu, peer->sip_outbound);
 	ast_md5_hash(out, buf);
 }
 
@@ -8483,8 +8492,13 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		}
 	}
 
-	if (sip->sip_to && sip->sip_to->a_url && sip->sip_to->a_url->url_user) {
-		exten = sip->sip_to->a_url->url_user;
+	/* The extension is the user part of the Request-URI, "s" when it has none (chan_sip get_destination,
+	 * chan_sip.c:16595). The Request-URI identifies what the request is for; the To names the original
+	 * recipient, which is somebody else on a forwarded call (RFC 3261 §8.2.2.1). On a register => trunk
+	 * the provider calls our registered Contact, so the extension is the line's /extension, else "s"
+	 * (sofia_register_contact_user). A %-escaped user is also tried decoded once the context is known. */
+	if (sip->sip_request && sip->sip_request->rq_url && !ast_strlen_zero(sip->sip_request->rq_url->url_user)) {
+		exten = sip->sip_request->rq_url->url_user;
 	} else {
 		exten = "s";
 	}
@@ -8737,6 +8751,26 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		}
 		ao2_ref(pvt, -1);
 		return;
+	}
+
+	/* chan_sip get_destination (chan_sip.c:16681-16743): dialplans are written unescaped, so an extension
+	 * that does not match as sent is tried %-decoded, for an exact match and for a partial one (the 484
+	 * below); the decoded form is kept only when it matches. sofia-sip has already unescaped what may be
+	 * unescaped (url.c), so every '%' left is one escape and one decode is exact. Decoded whole on the heap:
+	 * a stack copy cut at AST_MAX_EXTENSION would lose the tail of an escape-heavy user. */
+	if (strchr(pvt->exten, '%')
+	    && !ast_exists_extension(NULL, pvt->context, pvt->exten, 1, S_OR(pvt->cid_num, NULL))) {
+		char *decoded = ast_strdup(pvt->exten);
+
+		if (decoded) {
+			ast_uri_decode(decoded);
+			if (ast_exists_extension(NULL, pvt->context, decoded, 1, S_OR(pvt->cid_num, NULL))
+			    || (!ast_canmatch_extension(NULL, pvt->context, pvt->exten, 1, S_OR(pvt->cid_num, NULL))
+			        && ast_canmatch_extension(NULL, pvt->context, decoded, 1, S_OR(pvt->cid_num, NULL)))) {
+				ast_string_field_set(pvt, exten, decoded);
+			}
+			ast_free(decoded);
+		}
 	}
 
 	/* allowoverlap=YES + partial (canmatch but not exact) extension → 484 before
@@ -18794,7 +18828,8 @@ static int sofia_register_port(const char *s)
  *                optional domain port goes first: user@domain:domainport:secret:authuser@host;
  *   authuser     digest username when it is not the user;
  *   transport    udp (default), tcp or tls; tls makes the default port 5061;
- *   /extension   user part of our Contact, the one the provider calls back (callbackextension);
+ *   /extension   user part of our Contact, the one the provider calls back (callbackextension;
+ *                "s" without it, sofia_register_contact_user);
  *   ~expiry      Expires asked for in every REGISTER; default [general] defaultexpiry (a value <= 0,
  *                which chan_sip would send as a de-registration, falls back to it with a notice).
  * peer? names a separate chan_sip peer whose settings the registration borrows. Here the register =>
@@ -21080,15 +21115,14 @@ static void *sofia_reg_thread_func(void *data)
 				}
 				peer->reg_auth_tries = 0;	/* a new registration attempt */
 				peer->reg_attempts++;	/* chan_sip regattempts: every REGISTER counts toward registerattempts; a 200 resets it */
-				/* callbackextension: NUTAG_M_USERNAME override (as at initial register). */
+				/* Contact user: /extension, else "s" (sofia_register_contact_user), as at initial register. */
 				nua_register(peer->nh,
 					NUTAG_URL(uri),
 					SIPTAG_FROM_STR(aor),
 					TAG_IF(has_next_hop, NUTAG_PROXY(next_hop)),
 					SIPTAG_MAX_FORWARDS_STR(mf_str_reregister),
 					SIPTAG_EXPIRES_STR(expires_rereg),	/* chan_sip parity, see sofia_build_register_expires */
-					TAG_IF(!ast_strlen_zero(peer->callbackextension),
-						NUTAG_M_USERNAME(peer->callbackextension)),
+					NUTAG_M_USERNAME(sofia_register_contact_user(peer)),
 					TAG_IF(peer->gruu || peer->sip_outbound, NUTAG_M_FEATURES(instance_feature_rereg)),
 					TAG_IF(peer->sip_outbound, NUTAG_SUPPORTED("outbound, path")),	/* RFC 5626 §4.2.1 */
 					TAG_END());
@@ -21215,15 +21249,14 @@ static void sofia_do_register(void)
 				char expires_initreg[16];
 				snprintf(mf_str_initreg, sizeof(mf_str_initreg), "%d", peer->maxforwards);
 				sofia_build_register_expires(peer, expires_initreg, sizeof(expires_initreg));
-				/* callbackextension: NUTAG_M_USERNAME drives the Contact URL username. */
+				/* Contact user: /extension, else "s" (sofia_register_contact_user). */
 				nua_register(peer->nh,
 					NUTAG_URL(uri),
 					SIPTAG_FROM_STR(aor),
 					TAG_IF(has_next_hop, NUTAG_PROXY(next_hop)),
 					SIPTAG_MAX_FORWARDS_STR(mf_str_initreg),
 					SIPTAG_EXPIRES_STR(expires_initreg),	/* chan_sip parity, see sofia_build_register_expires */
-					TAG_IF(!ast_strlen_zero(peer->callbackextension),
-						NUTAG_M_USERNAME(peer->callbackextension)),
+					NUTAG_M_USERNAME(sofia_register_contact_user(peer)),
 					TAG_IF(peer->gruu || peer->sip_outbound, NUTAG_M_FEATURES(instance_feature)),
 					TAG_IF(peer->sip_outbound, NUTAG_SUPPORTED("outbound, path")),	/* RFC 5626 §4.2.1 */
 					TAG_END());

@@ -569,6 +569,9 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 	}
 	if (!ast_strlen_zero(peer->callbackextension)) {
 		sofia_cli_peer_line(&buf, "Callback ext", "%s", peer->callbackextension);
+	} else if (peer->is_register_line) {
+		/* The Contact user a register => line registers without /extension (chan_sip default). */
+		sofia_cli_peer_line(&buf, "Callback ext", "s (default)");
 	}
 	/* GRUU (RFC 5627): advertisement opt-in + any GRUU the registrar minted. */
 	if (peer->gruu) {
