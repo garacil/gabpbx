@@ -782,6 +782,9 @@ srvlookup=yes
 ; whose hints a watcher may subscribe to: a presence SUBSCRIBE for extension N
 ; resolves the hint as N@<subscribecontext> (falling back to the peer's voice
 ; context, then "default"). Use it to isolate which hints a peer can watch.
+; N is the user part of the SUBSCRIBE's Request-URI (s when it has none), as in
+; chan_sip; a %-escaped user with no hint as sent is tried decoded. The To only
+; names the entity in the NOTIFY body.
 ; Subscriptions are gated by allowsubscribe (above). Event: message-summary still
 ; routes to the MWI handler; unknown event packages are auto-202'd.
 ;subscribecontext = presence    ; in [general]: the default all peers inherit (the [general] key IS

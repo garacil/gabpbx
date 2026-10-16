@@ -14629,10 +14629,12 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	struct sofia_presence_sub *sub;
 	const char *from_user, *to_user, *event;
 	const char *to_host;
+	const char *watched, *watched_host;	/* the watched extension: Request-URI user and host */
+	char w_decoded[AST_MAX_EXTENSION * 3];	/* %-decoded watched user; longer raw users cannot fit a hint name */
 	char l_context[AST_MAX_CONTEXT];
 	char l_peername[80];
 	char l_proxy[128] = "";			/* NAT proxy target for the NOTIFY (empty = none) */
-	char l_exten[AST_MAX_EXTENSION];	/* bounded copy of To-user — keeps subkey consistent with sub->exten */
+	char l_exten[AST_MAX_EXTENSION];	/* bounded copy of the watched user — keeps subkey consistent with sub->exten */
 	char subkey[200];
 	char hint[AST_MAX_EXTENSION];
 	struct ast_sockaddr src = { {0,} };	/* zero-init: sofia_get_source_addr leaves it untouched if no Via */
@@ -14641,7 +14643,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 
 	event = (sip && sip->sip_event && sip->sip_event->o_type) ? sip->sip_event->o_type : "dialog";
 
-	/* To URI = watched resource; From URI = subscriber. */
+	/* From URI = subscriber; Request-URI = watched resource; To URI = entity of the NOTIFY body. */
 	if (!sip || !sip->sip_to || !sip->sip_to->a_url || !sip->sip_to->a_url->url_user
 			|| !sip->sip_from || !sip->sip_from->a_url || !sip->sip_from->a_url->url_user) {
 		nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
@@ -14651,6 +14653,15 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	to_user = sip->sip_to->a_url->url_user;
 	to_host = sip->sip_to->a_url->url_host;
 	from_user = sip->sip_from->a_url->url_user;
+	/* The watched extension is the user part of the Request-URI, "s" when it has none: chan_sip looks the
+	 * hint up with it (get_destination, chan_sip.c:16595, 26221-26223), as the INVITE path here does. The
+	 * To keeps naming the entity of the NOTIFY body, as chan_sip's mto (chan_sip.c:13926-13932). */
+	if (sip->sip_request && sip->sip_request->rq_url && !ast_strlen_zero(sip->sip_request->rq_url->url_user)) {
+		watched = sip->sip_request->rq_url->url_user;
+	} else {
+		watched = "s";
+	}
+	watched_host = (sip->sip_request && sip->sip_request->rq_url) ? sip->sip_request->rq_url->url_host : NULL;
 
 	/* Identify the subscriber peer (gating + context source). */
 	peer = sofia_find_peer(from_user);
@@ -14741,22 +14752,31 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	 * race), then re-check. Runs synchronously here on the single sofia_thread, so no cross-thread create
 	 * race. Only a genuinely unknown/unwatchable exten still 404s (a NORMAL condition, kept debug-only —
 	 * at NOTICE it floods the log; visible with `sip set debug on`). */
-	if (!ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, l_context, to_user)) {
-		/* Local-domain guard: only turn the To-user into a realtime lookup for our own domain(s)
+	/* chan_sip get_destination: a %-escaped user that has no hint as sent is tried decoded. */
+	if (strchr(watched, '%') && strlen(watched) < sizeof(w_decoded)
+	    && !ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, l_context, watched)) {
+		ast_copy_string(w_decoded, watched, sizeof(w_decoded));
+		ast_uri_decode(w_decoded);
+		if (ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, l_context, w_decoded)) {
+			watched = w_decoded;
+		}
+	}
+	if (!ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, l_context, watched)) {
+		/* Local-domain guard: only turn the watched user into a realtime lookup for our own domain(s)
 		 * (empty domain_list = no configured local-domain truth -> permissive, as the INVITE path). */
-		if (AST_LIST_EMPTY(&domain_list) || ast_strlen_zero(to_host)
-				|| sofia_check_sip_domain(to_host)) {
-			struct sofia_peer *target = sofia_find_peer(to_user);
+		if (AST_LIST_EMPTY(&domain_list) || ast_strlen_zero(watched_host)
+				|| sofia_check_sip_domain(watched_host)) {
+			struct sofia_peer *target = sofia_find_peer(watched);
 
 			if (target) {
 				sofia_create_peer_hint(target, "realtime");
 				ao2_ref(target, -1);
 			}
 		}
-		if (!ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, l_context, to_user)) {
+		if (!ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, l_context, watched)) {
 			if (sofia_debug) {
 				ast_verbose("Sofia presence: no hint for %s@%s (watcher SIP/%s) — 404\n",
-					to_user, l_context, l_peername);
+					watched, l_context, l_peername);
 			}
 			nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
 			sofia_subscribe_reject_reap(nh);	/* reap the challenge handle */
@@ -14767,7 +14787,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	/* Logical key: at most ONE sub per (watcher, watched-exten, context). Correlates a
 	 * re-SUBSCRIBE on a fresh dialog / Expires:0 unsubscribe here — NOT by nh, which
 	 * sofia-sip does not reliably reuse. */
-	ast_copy_string(l_exten, to_user, sizeof(l_exten));
+	ast_copy_string(l_exten, watched, sizeof(l_exten));
 	snprintf(subkey, sizeof(subkey), "%s|%s|%s", l_peername, l_exten, l_context);
 	/* Clamp ex_delta before the int cast: > INT_MAX wraps negative and would read as
 	 * an unsubscribe (expires <= 0). */
@@ -14795,7 +14815,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		if (sofia_debug) {
 			ast_verbose("Sofia presence: SUBSCRIBE Expires:%d below min %d — 423 Interval Too Brief "
 				"(watcher SIP/%s -> %s@%s)\n",
-				expires, sofia_cfg.min_expiry, l_peername, to_user, l_context);
+				expires, sofia_cfg.min_expiry, l_peername, l_exten, l_context);
 		}
 		return;
 	}
@@ -14836,7 +14856,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 			}
 			if (sofia_debug) {
 				ast_verbose("Sofia presence: UNSUBSCRIBE — watcher SIP/%s -> %s@%s\n",
-					l_peername, to_user, l_context);
+					l_peername, l_exten, l_context);
 			}
 			return;
 		}
