@@ -9021,7 +9021,8 @@ static void sofia_process_cancel(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
  *      nua_handle_t + su_home (+ a ds_leg for create_dialog methods like SUBSCRIBE -> PERMANENT).
  *      For a request the stack has NOT yet given a final response (a pending APPL_METHOD such as
  *      REGISTER/SUBSCRIBE/MESSAGE), nua_handle_destroy -> nta_incoming_destroy auto-sends a 500
- *      (nta.c:5673) as it frees the handle. That terse 500 to an already-blacklisted source is
+ *      (nta.c:5673) as it frees the handle; a pending INVITE gets 480 instead, when its session
+ *      usage goes (nua_session.c:1617). That terse answer to an already-blacklisted source is
  *      acceptable; the alternative is unbounded, remote, per-request memory growth exactly while
  *      the box is under a brute-force flood (the blacklist only engages under attack).
  *
@@ -16964,8 +16965,10 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				 * nua_handle_t + su_home per dropped packet — unbounded, remote, and triggered
 				 * exactly when the blacklist engages (i.e. under a brute-force flood: SUBSCRIBE
 				 * even holds a ds_leg, so its leak is permanent). The magic==NULL guard inside
-				 * the helper protects any bound in-dialog handle; a pending request is freed with
-				 * a stack-generated terse 500 (see sofia_reap_unbound_handle). */
+				 * the helper protects any bound in-dialog handle. The drop is not silent: freeing a
+				 * pending request makes the stack answer it - 500, or 480 for an INVITE (after its
+				 * 100 Trying) - and OPTIONS (200) and an out-of-dialog BYE (481) were answered by
+				 * the stack before this gate (see sofia_reap_unbound_handle). */
 				sofia_reap_unbound_handle(nh);
 				return;
 			}

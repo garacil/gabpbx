@@ -164,6 +164,12 @@ allowguest=yes
 ; in the default context, which is how a scanner probes extensions. A call from a matched peer (it
 ; passed its ACL and digest auth, or is trusted by address with insecure=invite) is never counted,
 ; so a trunk calling a missing extension gets its 404 without banning its own address.
+; A blocked address is not silent-dropped: its new requests never reach authentication, routing or
+; the dialplan, but the SIP stack still closes the transaction it opened for each one - an INVITE
+; gets 100 Trying and 480 Temporarily Unavailable, REGISTER/SUBSCRIBE/NOTIFY/MESSAGE/INFO get 500,
+; and OPTIONS (200) and an out-of-dialog BYE (481) are answered by the stack before the blacklist is
+; consulted. Requests inside a call that is already up are let through, so phones sharing a public
+; address with a blocked source keep their calls.
 ;
 ; blacklist_ban — how long (in MINUTES) a blocked IP stays banned after its last failure, and how
 ;                 long an accumulating failure counter is remembered before it is forgiven.
