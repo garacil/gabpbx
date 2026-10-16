@@ -160,6 +160,10 @@ allowguest=yes
 ; Local anti-abuse blacklist (fail2ban-style). Repeated authentication / registration / routing
 ; failures from the same source IP are counted; once the threshold is reached the IP is blocked at
 ; the gate. Inspect/manage it with the `sip show blacklist` / `sip blacklist ...` CLI.
+; The routing failure counted is a guest INVITE (no peer matched) to an extension that does not exist
+; in the default context, which is how a scanner probes extensions. A call from a matched peer (it
+; passed its ACL and digest auth, or is trusted by address with insecure=invite) is never counted,
+; so a trunk calling a missing extension gets its 404 without banning its own address.
 ;
 ; blacklist_ban — how long (in MINUTES) a blocked IP stays banned after its last failure, and how
 ;                 long an accumulating failure counter is remembered before it is forgiven.
@@ -2882,8 +2886,9 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ; none, as in chan_sip: the Request-URI names what the request is for, while the To names the
 ; original recipient, which is somebody else on a forwarded call (RFC 3261 section 8.2.2.1). A
 ; %-escaped user that does not match as sent is tried decoded. The extension decides the 404 Not Found
-; (unknown extension) and the 484 Address Incomplete (allowoverlap=yes). A 404 in the default context
-; counts toward the blacklist (blacklist_ban), so give each trunk peer its own context.
+; (unknown extension) and the 484 Address Incomplete (allowoverlap=yes). The 404 of a guest call (no
+; peer matched) in the default context counts toward the blacklist (blacklist_ban); a call from a
+; matched peer never does.
 ;
 ; --- Outbound registration: register => (chan_sip syntax) ---
 ; Registers this server with a remote PBX or provider, as chan_sip does:
@@ -2907,8 +2912,7 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ; Incoming calls on a register => trunk: the provider sends them to our registered Contact, and the
 ; dialplan extension of an incoming call is the user part of its Request-URI (see above), so they
 ; arrive on the line's /extension, or on s without one, in the context of the peer they match. Make
-; sure that context has it: an unknown extension is answered 404 and, in the default context, counts
-; toward the blacklist (blacklist_ban).
+; sure that context has it: an unknown extension is answered 404.
 ; After an upgrade from a version that registered the Contact user * (a line without /extension), the
 ; provider keeps that old binding until it expires; calls it sends there arrive on extension *.
 ;

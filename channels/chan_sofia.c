@@ -8793,14 +8793,17 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		}
 	}
 
-	/* Reject unknown inbound destinations before channel/PBX alloc; in the default
-	 * context count it as a blacklist failure. */
+	/* Reject unknown inbound destinations before channel/PBX alloc. A guest call (no peer matched) to the
+	 * default context counts as a blacklist failure: that is how a scanner probes extensions. A matched
+	 * peer does not count: it has passed its ACL and digest auth above, or is trusted by address
+	 * (insecure=invite). Counting it banned the trunk's own address for blacklist_ban minutes after five
+	 * calls to a missing extension, and let anyone spoofing that address over UDP get the trunk banned. */
 	if (!ast_strlen_zero(pvt->exten)
 	    && !ast_exists_extension(NULL, pvt->context, pvt->exten, 1, S_OR(pvt->cid_num, NULL))
 	    && !ast_canmatch_extension(NULL, pvt->context, pvt->exten, 1, S_OR(pvt->cid_num, NULL))) {
 		ast_log(LOG_NOTICE, "Sofia: call from '%s' to extension '%s' rejected because extension not found in context '%s'\n",
 			S_OR(pvt->cid_num, pvt->peername), pvt->exten, pvt->context);
-		if (!strcasecmp(pvt->context, sofia_cfg.context)) {
+		if (!pvt->peer && !strcasecmp(pvt->context, sofia_cfg.context)) {
 			sofia_blacklist_add_sip(sip, "INVITE unknown extension in default context");
 		}
 		sofia_update_call_counter(pvt, SOFIA_DEC_CALL_LIMIT);
