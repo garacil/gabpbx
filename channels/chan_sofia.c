@@ -7712,8 +7712,8 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 
 		/* reload-UAF: hold peer->lock across the whole freeable-stringfield read
 		 * span (runs on the PBX dialing thread vs the reload writer); release it
-		 * right before sofia_resolve_ourip (the only blocking call, reads no
-		 * freeable field). Takes no channel/pvt lock → no inversion. */
+		 * right before the our-address DNS lookup + sofia_resolve_ourip (the only
+		 * blocking calls, read no freeable field). Takes no channel/pvt lock → no inversion. */
 		ast_mutex_lock(&peer->lock);
 		ast_string_field_set(pvt, context, peer->context);
 		ast_string_field_set(pvt, username, peer->defaultuser);
@@ -7774,20 +7774,53 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 			/* Resolve our source IP toward this peer (for SDP + From/Contact). */
 			{
 				struct ast_sockaddr target;
+				char lookup_host[256] = "";	/* static host= name to resolve after the unlock */
+				int target_port = peer->port ? peer->port : 5060;
+
+				memset(&target, 0, sizeof(target));
 				if (peer->registered && !ast_sockaddr_isnull(&peer->src_addr)) {
 					target = peer->src_addr;
 					sel_src = peer->src_addr;	/* the binding the RURI routes to -> its Path below */
 					sel_ok = 1;
+				} else if (peer_is_dynamic) {
+					/* Unregistered host=dynamic: the RURI goes to defaultip= when set
+					 * (sofia_resolve_peer_target); chan_sip create_addr_from_peer uses defaddr. */
+					if (!ast_sockaddr_isnull(&peer->defaddr)) {
+						target = peer->defaddr;
+						if (!ast_sockaddr_port(&target)) {
+							ast_sockaddr_set_port(&target, target_port);
+						}
+					}
 				} else {
-					char target_url[128];
-					snprintf(target_url, sizeof(target_url), "%s:%d",
-						!ast_strlen_zero(peer->host) ? peer->host : "127.0.0.1",
-						peer->port ? peer->port : 5060);
-					ast_sockaddr_parse(&target, target_url, 0);
+					/* Static host=: the RURI is sip:user@host:port. An IP literal is that address. A
+					 * DNS name goes to the first A/AAAA record of the name (RFC 3263 §4.2: explicit
+					 * port -> A/AAAA lookup, first record), resolved into peer->src_addr at load and
+					 * refreshed when dnsmgr is enabled (chan_sip create_addr_from_peer routes to the
+					 * peer->addr its dnsmgr resolved). ast_sockaddr_parse is numeric-only: a name left
+					 * target unset, ourip fell back to bindaddr and 0.0.0.0 went out in c= and Contact. */
+					const char *host = !ast_strlen_zero(peer->host) ? peer->host : "127.0.0.1";
+
+					if (ast_sockaddr_parse(&target, host, PARSE_PORT_FORBID)) {
+						ast_sockaddr_set_port(&target, target_port);
+					} else if (!ast_sockaddr_isnull(&peer->src_addr)) {
+						target = peer->src_addr;
+						ast_sockaddr_set_port(&target, target_port);
+					} else {
+						ast_copy_string(lookup_host, host, sizeof(lookup_host));
+					}
 				}
-				/* Release peer->lock before sofia_resolve_ourip (blocks on DNS +
-				 * kernel route; reads no freeable field — target is a local copy). */
+				/* Release peer->lock before the DNS lookup and sofia_resolve_ourip (both block on
+				 * DNS / kernel route; read no freeable field — target and lookup_host are local). */
 				ast_mutex_unlock(&peer->lock);
+				if (lookup_host[0]) {
+					/* No address for the name (DNS failed at load, or src_addr was never filled): look it
+					 * up now with the load path's lookup. Not chan_sip parity: chan_sip refuses the call
+					 * (create_addr_from_peer, no addr and no defaddr); here the INVITE is still sent, as
+					 * before. On failure target stays null and ourip falls back to bindaddr, as before. */
+					if (!ast_get_ip_or_srv(&target, lookup_host, NULL)) {
+						ast_sockaddr_set_port(&target, target_port);
+					}
+				}
 				sofia_resolve_ourip(pvt, &target);
 			}
 			/* Path (RFC 3327, path=yes): pre-load THIS registered contact's stored Path as a Route so

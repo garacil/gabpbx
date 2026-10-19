@@ -1141,6 +1141,13 @@ maxexpiry      = 3600      ; maximum REGISTER expires (seconds); over-max silent
 ; host=hostname (e.g. host=trunk.example.com) → ast_dnsmgr_lookup_cb registers
 ; refresh handle if dnsmgr enabled.
 ;
+; OUTBOUND CALLS: our own address for a call to a static host=hostname peer (SDP
+; o=/c=, Contact) is worked out toward the address the name resolved to: the first
+; A/AAAA record, which is where the INVITE goes because its Request-URI carries the
+; port (RFC 3263 §4.2), as chan_sip does (create_addr_from_peer). A name that did not
+; resolve at load is looked up again when the call is placed (chan_sip refuses that
+; call instead). An unregistered host=dynamic peer with defaultip= uses that address.
+;
 ; chan_sofia extension over chan_sip silent: AMI DnsManagerUpdate event fires on
 ; every DNS change (Peer:SIP/<name> + OldAddr + NewAddr) for NMS visibility into
 ; upstream gateway IP changes. chan_sip emits no AMI signal at on_dns_update_peer.
