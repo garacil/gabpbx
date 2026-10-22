@@ -506,7 +506,7 @@ struct sofia_fork {
 	time_t fork_start;                /* timestamp when fork was initiated */
 	char fork_id[SOFIA_FORK_ID_LEN]; /* unique ID for debug logging */
 	ast_mutex_t lock;                 /* guards winner_picked, winner, child_count, children, state, posting_done, early_media_child,
-	                                   * best_status, best_q850, push_hold, ended */
+	                                   * best_status, best_q850, push_hold, ended, cancel_6xx */
 	int child_count;                  /* live children remaining */
 	int posting_done;                 /* 1 once the INVITE posting loop has forked every contact — child_count is only
 	                                   * authoritative after this (a 18x can arrive before all branches are posted), and
@@ -522,6 +522,8 @@ struct sofia_fork {
 	                                   * sofia_fork_push_hold_release. Guarded by lock. */
 	int ended;                        /* 1 once the end of the master's call has been decided: no branch may be
 	                                   * appended after it. Guarded by lock. */
+	int cancel_6xx;                   /* 1 once a 6xx made the fork cancel its pending branches (RFC 3261 §16.7
+	                                   * step 5, sofia_fork_cancel_on_6xx): claimed once. Guarded by lock. */
 };
 
 /* MWI per-peer mailbox node; defined before struct sofia_peer (which embeds the
@@ -2221,6 +2223,147 @@ static int sofia_fork_should_end_locked(struct sofia_fork *fork)
 	}
 	fork->ended = 1;
 	return 1;
+}
+
+/* Under fork->lock: no branch may be added any more. A winner was picked, the end of the call was
+ * decided, or a branch answered 6xx (RFC 3261 §16.7 step 5: no new branches after it). Tested when
+ * a branch is counted (sofia_fork_dial_one), so it also covers a late append and the posting loop. */
+static int sofia_fork_closed_locked(struct sofia_fork *fork)
+{
+	return fork->winner_picked || fork->ended || fork->best_status >= 600;
+}
+
+/* sofia_fork_closed_locked for a fork master (0 when pvt has no fork). Takes pvt->lock, then
+ * fork->lock; the channel lock may be held (channel -> pvt order). */
+static int sofia_fork_closed(struct sofia_pvt *pvt)
+{
+	struct sofia_fork *fork;
+	int closed;
+
+	ast_mutex_lock(&pvt->lock);
+	fork = pvt->is_fork_master ? pvt->fork : NULL;
+	if (fork) {
+		ao2_ref(fork, +1);
+	}
+	ast_mutex_unlock(&pvt->lock);
+	if (!fork) {
+		return 0;
+	}
+	ast_mutex_lock(&fork->lock);
+	closed = sofia_fork_closed_locked(fork);
+	ast_mutex_unlock(&fork->lock);
+	ao2_ref(fork, -1);
+	return closed;
+}
+
+/* Reason values carried on the CANCELs a 6xx triggers (RFC 3326 §2). */
+struct sofia_fork_6xx_reason {
+	const char *sip;	/* SIP;cause=<6xx>[;text="<phrase>"] */
+	const char *q850;	/* Q.850;cause=N built for that 6xx, or "" (use_q850_reason off) */
+};
+
+/* ao2_callback: CANCEL one pending fork branch after a 6xx. The branch stays linked: its INVITE
+ * still ends with exactly one final response, and that response runs the usual accounting
+ * (sofia_fork_child_failed, or sofia_fork_pick_winner for a 2xx that crossed the CANCEL). The
+ * final is the far end's 487, or one the stack makes up (RFC 3261 §9.1, "64*T1"): a 408 when Timer
+ * D expires with no final after the CANCEL went out (max(32 s, 64*T1)); a 408 at Timer B (64*T1
+ * after the INVITE) when no provisional ever came, the CANCEL then never leaving; a 487 at once when
+ * the destination was not resolved yet. sofia_thread only (child->nh is only changed there).
+ * If a cancelled branch then answers 2xx and wins, the CANCELs already sent keep this 6xx Reason:
+ * it states why each CANCEL was issued (RFC 3326 §1), and the stack sends no second CANCEL. */
+static int sofia_fork_cancel_6xx_cb(void *obj, void *arg, int flags)
+{
+	struct sofia_pvt *child = obj;
+	const struct sofia_fork_6xx_reason *r = arg;
+
+	SOFIA_FORKDBG("cancel-6xx branch=%s child_nh=%p reason=%s/%s",
+		child->fork_branch_id, (void *)child->nh, r->sip, S_OR(r->q850, "(none)"));
+	if (child->nh) {
+		nua_cancel(child->nh,
+			SIPTAG_REASON_STR(r->sip),
+			TAG_IF(!ast_strlen_zero(r->q850), SIPTAG_REASON_STR(r->q850)),
+			TAG_END());
+	}
+	return 0;
+}
+
+/* A branch answered 6xx (status, its Q.850 cause or 0). RFC 3261 §16.7 step 5: the 6xx is not
+ * forwarded at once; the pending client transactions SHOULD be cancelled and no new branch may be
+ * created. The caller gets the 6xx once the cancelled branches have answered (the fork ends through
+ * sofia_fork_child_failed, the 6xx being the best response of step 6), unless one of them answers
+ * 2xx first, which is forwarded (step 5, "Any 2xx response"). The CANCELs carry the 6xx in a SIP
+ * Reason value (RFC 3326 §2, e.g. SIP;cause=600;text="Busy Everywhere") and, with use_q850_reason,
+ * its Q.850 cause as a second value of another protocol (RFC 3326 §2 as updated by RFC 9366 §3).
+ *
+ * Every branch is posted under the master's channel lock (sofia_fork_dial_one) and none is posted
+ * once best_status is a 6xx (sofia_fork_closed_locked, already set by sofia_fork_note_failure).
+ * The posting loop (sofia_fork_dial, from sofia_call or the push collect window) runs on another
+ * thread; taking that channel lock once here waits it out, so every INVITE it handed to the stack
+ * is queued before its CANCEL, and the stack then holds a CANCEL until the branch's first
+ * provisional response (RFC 3261 §9.1, nta_outgoing_tcancel). A push late append runs on this
+ * thread (REGISTER side effects), never concurrently, and is refused from now on.
+ * sofia_thread only; no lock held on entry. */
+static void sofia_fork_cancel_on_6xx(struct sofia_fork *fork, int status, int q850)
+{
+	struct sofia_fork_6xx_reason r;
+	struct sofia_pvt *m;
+	char sip_reason[96];
+	char q850_reason[128] = "";
+	const char *phrase = sip_status_phrase(status);
+
+	ast_mutex_lock(&fork->lock);
+	if (fork->cancel_6xx || fork->winner_picked || fork->ended) {
+		ast_mutex_unlock(&fork->lock);
+		return;
+	}
+	fork->cancel_6xx = 1;
+	m = fork->master;
+	if (m) {
+		ao2_ref(m, +1);
+	}
+	ast_mutex_unlock(&fork->lock);
+
+	if (m) {
+		/* Wait out any posting under the master's channel lock (channel -> pvt order, owner
+		 * revalidated against a masquerade). A master without owner is being hung up: its
+		 * sofia_hangup cancels and unlinks every branch itself. */
+		for (;;) {
+			struct ast_channel *m_owner;
+			int same;
+
+			ast_mutex_lock(&m->lock);
+			m_owner = m->owner;
+			if (m_owner) {
+				ast_channel_ref(m_owner);
+			}
+			ast_mutex_unlock(&m->lock);
+			if (!m_owner) {
+				break;
+			}
+			ast_channel_lock(m_owner);
+			ast_mutex_lock(&m->lock);
+			same = (m->owner == m_owner);
+			ast_mutex_unlock(&m->lock);
+			ast_channel_unlock(m_owner);
+			ast_channel_unref(m_owner);
+			if (same) {
+				break;
+			}
+		}
+		ao2_ref(m, -1);
+	}
+
+	if (!ast_strlen_zero(phrase)) {
+		snprintf(sip_reason, sizeof(sip_reason), "SIP;cause=%d;text=\"%s\"", status, phrase);
+	} else {
+		snprintf(sip_reason, sizeof(sip_reason), "SIP;cause=%d", status);
+	}
+	if (sofia_cfg.use_q850_reason) {
+		sofia_reason_build(q850 ? q850 : sofia_reason_status2cause(status), q850_reason, sizeof(q850_reason));
+	}
+	r.sip = sip_reason;
+	r.q850 = q850_reason;
+	ao2_callback(fork->children, OBJ_NODATA | OBJ_MULTIPLE, sofia_fork_cancel_6xx_cb, &r);
 }
 
 /* A push assist no longer holds the fork open (no wake push went out, or push_wait expired):
@@ -6077,6 +6220,13 @@ static int sofia_fork_dial_one(struct sofia_pvt *pvt, struct sofia_fork *fork,
 	if (!sofia_contact_is_unexpired(c_exp, now)) {
 		return 0;
 	}
+	/* Nothing to build for a fork that takes no more branches (rechecked when counted below). */
+	ast_mutex_lock(&fork->lock);
+	if (sofia_fork_closed_locked(fork)) {
+		ast_mutex_unlock(&fork->lock);
+		return 0;
+	}
+	ast_mutex_unlock(&fork->lock);
 
 	child = sofia_pvt_alloc();
 	if (!child) {
@@ -6255,19 +6405,20 @@ static int sofia_fork_dial_one(struct sofia_pvt *pvt, struct sofia_fork *fork,
 				}
 			}
 			if (child_linked) {
-				/* A late append (sofia_fork_append_contact) checked fork->ended without holding
-				 * fork->lock up to here: a push_wait release on the scheduler thread may have
-				 * ended the call meanwhile. Count the branch and test ended in one section, so
-				 * no branch is ever posted for a call whose end was decided. */
-				int fork_ended;
+				/* The checks before this one (sofia_fork_append_contact, the top of this function)
+				 * did not hold fork->lock up to here: a push_wait release on the scheduler thread
+				 * may have ended the call, or a branch on sofia_thread may have won or answered 6xx,
+				 * meanwhile. Count the branch and test that in one section, so no branch is ever
+				 * posted once the fork is closed (RFC 3261 §16.7 step 5 for the 6xx). */
+				int fork_closed;
 
 				ast_mutex_lock(&fork->lock);
-				fork_ended = fork->ended;
-				if (!fork_ended) {
+				fork_closed = sofia_fork_closed_locked(fork);
+				if (!fork_closed) {
 					fork->child_count++;
 				}
 				ast_mutex_unlock(&fork->lock);
-				if (fork_ended) {
+				if (fork_closed) {
 					ao2_unlink(dialogs, child);
 					ao2_unlink(fork->children, child);
 					child_linked = 0;
@@ -6460,7 +6611,7 @@ int sofia_fork_append_contact(struct sofia_pvt *pvt, struct sofia_contact *c)
 	ast_mutex_unlock(&pvt->lock);
 
 	ast_mutex_lock(&fork->lock);
-	picked = fork->winner_picked || fork->ended || fork->best_status >= 600;
+	picked = sofia_fork_closed_locked(fork);
 	idx = fork->child_count;
 	ast_mutex_unlock(&fork->lock);
 	if (picked) {
@@ -6627,7 +6778,12 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 			/* ring the live devices now (fork of >=1), held open: a live binding that fails at once
 			 * (a dead ws/wss flow) must not end the call before the woken device can join */
 			rc = sofia_fork_dial(pvt, 1);
-			if (!rc && !sofia_push_assist_wake(pvt, ast, live_srcs, live_inst, n_live_ex)) {
+			/* No wake push once the fork takes no more branches (a branch already won or answered
+			 * 6xx while the others were posted, RFC 3261 §16.7 step 5): nothing to wait for. A win
+			 * or 6xx that lands after this check, or after the push, creates no branch either: the
+			 * woken device's late append is refused (sofia_fork_closed_locked). */
+			if (!rc && (sofia_fork_closed(pvt)
+					|| !sofia_push_assist_wake(pvt, ast, live_srcs, live_inst, n_live_ex))) {
 				sofia_fork_push_hold_release(pvt);	/* no wake push went out: nothing to wait for */
 			}
 			return rc;
@@ -17700,13 +17856,18 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				}
 			} else if (status >= 300) {
 				int remaining;
+				int fstatus = sofia_invite_failure_status(status, sip);
+				int q850 = (sofia_cfg.use_q850_reason && sip) ? sofia_reason_parse_cause(sip->sip_reason) : 0;
 
-				sofia_fork_note_failure(fork, sofia_invite_failure_status(status, sip),
-					(sofia_cfg.use_q850_reason && sip) ? sofia_reason_parse_cause(sip->sip_reason) : 0);
+				sofia_fork_note_failure(fork, fstatus, q850);
 				remaining = sofia_fork_child_failed(fork, pvt);
 				if (sofia_debug)
 					ast_verbose("Sofia: Fork child %s failed %d %s (remaining=%d)\n",
 						pvt->fork_branch_id, status, phrase, remaining);
+				if (fstatus >= 600) {
+					/* RFC 3261 §16.7 step 5: cancel the other branches (this one is unlinked) */
+					sofia_fork_cancel_on_6xx(fork, fstatus, q850);
+				}
 			}
 			break;
 		}
@@ -18075,10 +18236,11 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	case nua_r_cancel:
 		if (sofia_debug)
 			ast_verbose("Sofia: CANCEL response %d %s\n", status, phrase);
-		if (pvt && pvt->is_fork_child && pvt->fork) {
-			ao2_unlink(dialogs, pvt);
-			ao2_unlink(pvt->fork->children, pvt);
-		}
+		/* Nothing to do for a fork branch: the CANCEL and the INVITE complete independently
+		 * (RFC 3261 §9.1) and the branch ends with its INVITE's final response (nua_r_invite).
+		 * A branch cancelled after a 6xx stays linked until then; one cancelled because another
+		 * branch won or the caller hung up was unlinked when cancelled, so its CANCEL response
+		 * arrives here with no pvt. */
 		break;
 	case nua_r_options:
 			if (sofia_debug)

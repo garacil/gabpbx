@@ -2524,6 +2524,12 @@ tos_video = af41
 ; cause 18, as chan_sip. A call forked to several registered devices reports the best final response
 ; of its branches (RFC 3261 §16.7: a 6xx if there is one, else the lowest class). On a call already
 ; answered, a failed session-refresh re-INVITE ends the call with the status's cause.
+; A 6xx from one device (603 Decline, 600 Busy Everywhere) ends the ringing on all of them (RFC 3261
+; §16.7 step 5): the other devices get a CANCEL carrying "Reason: SIP;cause=<6xx>;text=..." (RFC 3326;
+; plus the Q.850 value with use_q850_reason=yes), no further device is rung or woken by push, and
+; the caller gets the 6xx once they have answered the CANCEL. A device that never answers it is given
+; up by the SIP stack after 32 s (64*T1, RFC 3261 §9.1). A device that answers 200 before taking the
+; CANCEL still gets the call. A 4xx/5xx from one device does not stop the others.
 
 ; --- fork_early_media ([general], default no) ---
 ; When a call to a peer forks to multiple registered contacts, chan_sofia keeps the caller muted
