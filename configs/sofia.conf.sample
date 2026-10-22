@@ -2499,9 +2499,22 @@ tos_video = af41
 ; When yes, chan_sofia stamps a "Reason: Q.850;cause=N;text=..." header on the BYE/CANCEL it sends AND on
 ; INVITE-rejection responses (404/480/484/486/488/503, etc.), built from the channel hangup cause or, for
 ; pre-channel rejects, mapped from the SIP status (chan_sip parity). It also maps a received Q.850 Reason
-; on an inbound BYE/CANCEL back to the AST hangup cause (for CDR/billing fidelity). Default no.
+; on an inbound BYE/CANCEL back to the AST hangup cause (for CDR/billing fidelity), and on a busy or
+; congestion answer to an outbound INVITE (see below). Default no.
 ;
 ;use_q850_reason = yes
+
+; --- Outbound call failures (always on, chan_sip parity) ---
+; A final error response to an outbound INVITE reaches the dialplan as it does with chan_sip:
+; 486/600/603 (and a 3xx, which is not followed) give DIALSTATUS=BUSY; 400/410/480/482/500/502/503/504
+; and a 401/407 that could not be answered give CONGESTION; any other error gives CHANUNAVAIL.
+; ${HANGUPCAUSE} is the status mapped to Q.850 (486 -> 17, 603 -> 21, 503 -> 34, 480 -> 19, 404 -> 1,
+; 488 -> 58), or, for BUSY/CONGESTION with use_q850_reason=yes, the cause of a received "Reason: Q.850".
+; A 484 gives cause 28 with allowoverlap=yes, else 1. A call the SIP stack could not deliver (no
+; answer, transport error, DNS failure: responses the stack makes up itself) gives CHANUNAVAIL with
+; cause 18, as chan_sip. A call forked to several registered devices reports the best final response
+; of its branches (RFC 3261 §16.7: a 6xx if there is one, else the lowest class). On a call already
+; answered, a failed session-refresh re-INVITE ends the call with the status's cause.
 
 ; --- fork_early_media ([general], default no) ---
 ; When a call to a peer forks to multiple registered contacts, chan_sofia keeps the caller muted

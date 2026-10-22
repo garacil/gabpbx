@@ -505,13 +505,17 @@ struct sofia_fork {
 	enum sofia_fork_state state;
 	time_t fork_start;                /* timestamp when fork was initiated */
 	char fork_id[SOFIA_FORK_ID_LEN]; /* unique ID for debug logging */
-	ast_mutex_t lock;                 /* guards winner_picked, winner, child_count, children, state, posting_done, early_media_child */
+	ast_mutex_t lock;                 /* guards winner_picked, winner, child_count, children, state, posting_done, early_media_child,
+	                                   * best_status, best_q850 */
 	int child_count;                  /* live children remaining */
 	int posting_done;                 /* 1 once the INVITE posting loop has forked every contact — child_count is only
 	                                   * authoritative after this (a 18x can arrive before all branches are posted). */
 	struct sofia_pvt *early_media_child; /* fork_early_media: the single-child branch whose rtp the master owner reads
 	                                   * receive-only for early media (ref'd). NULL unless a bind is live. Guarded by lock;
 	                                   * cleared BEFORE any child->rtp steal/NULL so sofia_read stops reading it. */
+	int best_status;                  /* best final >= 300 of the failed branches (RFC 3261 §16.7 step 6), 0 = none.
+	                                   * Guarded by lock. */
+	int best_q850;                    /* Q.850 cause of that response's Reason header (use_q850_reason), 0 = none */
 };
 
 /* MWI per-peer mailbox node; defined before struct sofia_peer (which embeds the
@@ -2084,13 +2088,100 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	return 0;
 }
 
+/* Set by sofia-sip's nta on the responses it makes up itself (outgoing_reply: transport error -> 503,
+ * DNS failure -> 503 "DNS Error"/500, no answer -> 408). Private to sofia-sip (nta_internal.h:41);
+ * it shows in the public sip_t::sip_flags. */
+#define SOFIA_NTA_INTERNAL_MSG (1 << 15)
+
+/* The status a failed INVITE is judged by. A response the stack made up itself, a nua-internal
+ * 9xx or no message at all carries no answer from the far end: chan_sip ends such a call with
+ * AST_CAUSE_NO_USER_RESPONSE when the INVITE cannot be delivered (chan_sip.c:4267-4304), which is
+ * a 408 here (also RFC 3261 §16.7 step 6: no final response -> 408). */
+static int sofia_invite_failure_status(int status, sip_t const *sip)
+{
+	if (status >= 700 || !sip || (sip->sip_flags & SOFIA_NTA_INTERNAL_MSG)) {
+		return 408;
+	}
+	return status;
+}
+
+/* A final non-2xx to our initial INVITE, turned into what the dialplan sees as chan_sip does
+ * (handle_response, chan_sip.c:22482-22500 and :22727-22797; handle_response_invite):
+ * - the channel's hangupcause is the Q.850 cause of a Reason header (use_q850_reason), else
+ *   hangup_sip2cause() of the status (sofia_reason_status2cause is the same table);
+ * - 486/600/603 and 300/301/302/305 queue BUSY (chan_sip also follows a 3xx Contact as a call
+ *   forward; not done here);
+ * - 400/410/480/482/500/502/503/504 queue CONGESTION, and so does a 401/407 left unanswered
+ *   (no usable credential, or the retries are spent);
+ * - 484 hangs up with INVALID_NUMBER_FORMAT when allowoverlap is yes, else UNALLOCATED (404);
+ * - 487 hangs up with NORMAL_CLEARING;
+ * - anything else hangs up with hangup_sip2cause() of the status, whose cause replaces the
+ *   Reason one when the frame is read, as in chan_sip.
+ * On a call already answered (the stack's own session-refresh re-INVITE failing) the call still
+ * ends, with the status's cause: BUSY/CONGESTION are dropped by a reader outside a bridge.
+ * No pvt or peer lock may be held. */
+static void sofia_queue_invite_failure(struct ast_channel *owner, int status, int q850,
+	int overlap_yes, int answered)
+{
+	int cause = sofia_reason_status2cause(status);
+
+	if (!cause) {
+		cause = AST_CAUSE_NORMAL;	/* hangup_sip2cause() default */
+	}
+	ast_channel_lock(owner);
+	owner->hangupcause = q850 ? q850 : cause;
+	ast_channel_unlock(owner);
+
+	if (answered) {
+		ast_queue_hangup_with_cause(owner, cause);
+		return;
+	}
+	switch (status) {
+	case 300: case 301: case 302: case 305:
+	case 486: case 600: case 603:
+		ast_queue_control(owner, AST_CONTROL_BUSY);
+		break;
+	case 400: case 401: case 407: case 410: case 480: case 482:
+	case 500: case 502: case 503: case 504:
+		ast_queue_control(owner, AST_CONTROL_CONGESTION);
+		break;
+	case 484:
+		ast_queue_hangup_with_cause(owner,
+			overlap_yes ? AST_CAUSE_INVALID_NUMBER_FORMAT : AST_CAUSE_UNALLOCATED);
+		break;
+	case 487:
+		ast_queue_hangup_with_cause(owner, AST_CAUSE_NORMAL_CLEARING);
+		break;
+	default:
+		ast_queue_hangup_with_cause(owner, cause);
+		break;
+	}
+}
+
+/* Keep the final response the caller is told about when every branch fails, per RFC 3261 §16.7
+ * step 6: a 6xx if there is one, else one of the lowest class (here the first received in that
+ * class). status is already sofia_invite_failure_status() (300..699). sofia_thread only; takes
+ * fork->lock. */
+static void sofia_fork_note_failure(struct sofia_fork *fork, int status, int q850)
+{
+	ast_mutex_lock(&fork->lock);
+	if (!fork->best_status
+			|| (status >= 600 && fork->best_status < 600)
+			|| (status < 600 && fork->best_status < 600 && status / 100 < fork->best_status / 100)) {
+		fork->best_status = status;
+		fork->best_q850 = q850;
+	}
+	ast_mutex_unlock(&fork->lock);
+}
+
 /* A fork child failed/was rejected: drop the live count, unlink from both
- * containers, and if it was the last branch with no winner, queue HANGUP on the
- * master. SIP teardown is the CALLER's job. Returns the remaining live count.
- * sofia_thread only. */
+ * containers, and if it was the last branch with no winner, end the master's call
+ * with the best final response kept by sofia_fork_note_failure (a bare HANGUP when
+ * no branch gave one). SIP teardown is the CALLER's job. Returns the remaining live
+ * count. sofia_thread only. */
 static int sofia_fork_child_failed(struct sofia_fork *fork, struct sofia_pvt *pvt)
 {
-	int empty, picked, remaining;
+	int empty, picked, remaining, best_status, best_q850;
 	struct sofia_pvt *m;
 	struct sofia_pvt *emc;
 
@@ -2115,6 +2206,8 @@ static int sofia_fork_child_failed(struct sofia_fork *fork, struct sofia_pvt *pv
 	empty = (fork->child_count == 0);
 	remaining = fork->child_count;
 	picked = fork->winner_picked;
+	best_status = fork->best_status;
+	best_q850 = fork->best_q850;
 	m = fork->master;
 	if (m) {
 		ao2_ref(m, +1);
@@ -2122,17 +2215,24 @@ static int sofia_fork_child_failed(struct sofia_fork *fork, struct sofia_pvt *pv
 	ast_mutex_unlock(&fork->lock);
 	if (m) {
 		if (empty && !picked) {
-			/* Snapshot+ref m->owner under m->lock, drop it, then queue HANGUP
+			/* Snapshot+ref m->owner under m->lock, drop it, then queue the end of the call
 			 * (never hold m->lock across the channel lock). */
 			struct ast_channel *m_owner;
+			int overlap_yes;
 			ast_mutex_lock(&m->lock);
 			m_owner = m->owner;
 			if (m_owner) {
 				ast_channel_ref(m_owner);
 			}
+			overlap_yes = ((m->peer ? m->peer->allowoverlap_mode : sofia_cfg.default_allowoverlap_mode)
+				== SOFIA_OVERLAP_YES);
 			ast_mutex_unlock(&m->lock);
 			if (m_owner) {
-				ast_queue_control(m_owner, AST_CONTROL_HANGUP);
+				if (best_status) {
+					sofia_queue_invite_failure(m_owner, best_status, best_q850, overlap_yes, 0);
+				} else {
+					ast_queue_control(m_owner, AST_CONTROL_HANGUP);
+				}
 				ast_channel_unref(m_owner);
 			}
 		}
@@ -17503,7 +17603,11 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					sofia_fork_child_failed(fork, pvt);
 				}
 			} else if (status >= 300) {
-				int remaining = sofia_fork_child_failed(fork, pvt);
+				int remaining;
+
+				sofia_fork_note_failure(fork, sofia_invite_failure_status(status, sip),
+					(sofia_cfg.use_q850_reason && sip) ? sofia_reason_parse_cause(sip->sip_reason) : 0);
+				remaining = sofia_fork_child_failed(fork, pvt);
 				if (sofia_debug)
 					ast_verbose("Sofia: Fork child %s failed %d %s (remaining=%d)\n",
 						pvt->fork_branch_id, status, phrase, remaining);
@@ -17838,36 +17942,26 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				}
 				ast_channel_unref(owner);
 				owner = NULL;
-			} else if (status == 484) {
-				/* allowoverlap (chan_sip parity, outbound 484): YES propagates
-				 * AST_CAUSE_INVALID_NUMBER_FORMAT (484); NO/DTMF propagates
-				 * AST_CAUSE_UNALLOCATED (404). Effective mode = peer else default.
-				 * Mark the dialog gone first so a late 2xx is ACK+BYE'd by the orphan
-				 * guard above (chan_sip sip_alreadygone parity). */
-				ast_mutex_lock(&pvt->lock);
-				sofia_alreadygone(pvt);
-				owner = pvt->owner;
-				if (owner) ast_channel_ref(owner);
-				ast_mutex_unlock(&pvt->lock);
-				if (owner) {
-					int overlap_mode = pvt->peer ? pvt->peer->allowoverlap_mode : sofia_cfg.default_allowoverlap_mode;
-					ast_queue_hangup_with_cause(owner,
-						(overlap_mode == SOFIA_OVERLAP_YES)
-							? AST_CAUSE_INVALID_NUMBER_FORMAT
-							: AST_CAUSE_UNALLOCATED);
-					ast_channel_unref(owner);
-					owner = NULL;
-				}
 			} else if (status >= 300) {
-				/* Mark the dialog gone (same reason as the 484 branch): lets the
-				 * status==200 orphan guard ACK+BYE a late 2xx per RFC 3261 §16.7. */
+				/* Mark the dialog gone first so a late 2xx is ACK+BYE'd by the orphan guard
+				 * above (chan_sip sip_alreadygone parity; RFC 3261 §16.7). */
+				int answered;
+
 				ast_mutex_lock(&pvt->lock);
+				answered = (pvt->state == SOFIA_DIALOG_STATE_UP);
 				sofia_alreadygone(pvt);
 				owner = pvt->owner;
 				if (owner) ast_channel_ref(owner);
 				ast_mutex_unlock(&pvt->lock);
 				if (owner) {
-					ast_queue_control(owner, AST_CONTROL_HANGUP);
+					/* BUSY / CONGESTION / hangup with the status's cause, as chan_sip (a bare
+					 * HANGUP left DIALSTATUS at CHANUNAVAIL even for a 486). allowoverlap for a
+					 * 484: the peer's mode, else the default. */
+					int overlap_mode = pvt->peer ? pvt->peer->allowoverlap_mode : sofia_cfg.default_allowoverlap_mode;
+
+					sofia_queue_invite_failure(owner, sofia_invite_failure_status(status, sip),
+						(sofia_cfg.use_q850_reason && sip) ? sofia_reason_parse_cause(sip->sip_reason) : 0,
+						overlap_mode == SOFIA_OVERLAP_YES, answered);
 					ast_channel_unref(owner);
 					owner = NULL;
 				}
