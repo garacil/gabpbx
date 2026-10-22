@@ -294,17 +294,84 @@ static void sofia_sdp_emit_webrtc_ssrc(char *buf, size_t buflen, unsigned int ss
 }
 
 /*!
+ * \brief Append the audio transport's ICE/DTLS lines for another bundled m= section of an INITIAL offer.
+ *
+ * RFC 8843 §7.1.3, first bullet: in the initial BUNDLE offer every bundled m= section that is not
+ * bundle-only carries the IDENTICAL and TRANSPORT attributes (RFC 8859: ice-ufrag, ice-pwd, candidate,
+ * fingerprint, setup; RFC 8842 §4: tls-id), and JSEP (RFC 9429 §5.8.3) checks them per m= section: a strict
+ * browser refuses the whole offer when the DataChannel or the bundled video section lacks them. Second
+ * bullet: in a subsequent offer or in an answer only the tagged section carries them, so callers emit this
+ * on the initial offer only. The values are the audio section's: the sections share its transport and port
+ * (bundle-only, port 0, is not used: browsers then created no video receiver).
+ */
+static void sofia_sdp_emit_bundle_transport(struct sofia_pvt *pvt, const char *host, int port,
+	char *out, size_t out_len, char *tmp_buf, size_t tmp_buf_size, int *overflow)
+{
+	struct ast_rtp_engine_dtls *dtls = pvt->rtp ? ast_rtp_instance_get_dtls(pvt->rtp) : NULL;
+	struct ast_rtp_engine_ice *ice = pvt->rtp ? ast_rtp_instance_get_ice(pvt->rtp) : NULL;
+	const char *lfp = dtls ? dtls->get_fingerprint(pvt->rtp) : NULL;
+	const char *lufrag = ice ? ice->get_ufrag(pvt->rtp) : NULL;
+	const char *lpwd = ice ? ice->get_password(pvt->rtp) : NULL;
+	enum ast_rtp_dtls_setup os = dtls ? dtls->get_setup(pvt->rtp) : AST_RTP_DTLS_SETUP_ACTIVE;
+	const char *ss = (os == AST_RTP_DTLS_SETUP_PASSIVE) ? "passive"
+		: (os == AST_RTP_DTLS_SETUP_ACTPASS) ? "actpass" : "active";
+
+	/* Same lines, same order and same values as the audio section's block in sofia_generate_sdp. */
+	if (snprintf(tmp_buf, tmp_buf_size, "a=setup:%s\r\n", ss) >= (int)tmp_buf_size) {
+		*overflow = 1;
+	} else {
+		*overflow |= sofia_sdp_cat(out, out_len, tmp_buf);
+	}
+	if (lfp) {
+		if (snprintf(tmp_buf, tmp_buf_size, "a=fingerprint:sha-256 %s\r\n", lfp) >= (int)tmp_buf_size) {
+			*overflow = 1;
+		} else {
+			*overflow |= sofia_sdp_cat(out, out_len, tmp_buf);
+		}
+	}
+	if (lufrag) {
+		if (snprintf(tmp_buf, tmp_buf_size, "a=ice-ufrag:%s\r\n", lufrag) >= (int)tmp_buf_size) {
+			*overflow = 1;
+		} else {
+			*overflow |= sofia_sdp_cat(out, out_len, tmp_buf);
+		}
+	}
+	if (lpwd) {
+		if (snprintf(tmp_buf, tmp_buf_size, "a=ice-pwd:%s\r\n", lpwd) >= (int)tmp_buf_size) {
+			*overflow = 1;
+		} else {
+			*overflow |= sofia_sdp_cat(out, out_len, tmp_buf);
+		}
+	}
+	if (snprintf(tmp_buf, tmp_buf_size, "a=candidate:0 1 UDP 2130706431 %s %d typ host\r\n", host, port) >= (int)tmp_buf_size) {
+		*overflow = 1;
+	} else {
+		*overflow |= sofia_sdp_cat(out, out_len, tmp_buf);
+	}
+	*overflow |= sofia_sdp_cat(out, out_len, "a=end-of-candidates\r\n");
+	if (!ast_strlen_zero(pvt->webrtc_tls_id)) {
+		if (snprintf(tmp_buf, tmp_buf_size, "a=tls-id:%s\r\n", pvt->webrtc_tls_id) >= (int)tmp_buf_size) {
+			*overflow = 1;
+		} else {
+			*overflow |= sofia_sdp_cat(out, out_len, tmp_buf);
+		}
+	}
+}
+
+/*!
  * \brief Append the BUNDLE'd WebRTC m=video section (RFC 8843 max-bundle) to \a buf.
  *
- * The video shares the AUDIO ICE/DTLS transport, so this section carries NO own ice/fingerprint/setup/
- * tls-id/candidate (all inherited from the audio bundle-tag, RFC 8843 §7.1.3/§7.3.3) — only m=video +
- * payloads + a=rtpmap + a=sendrecv + a=rtcp-mux + a=mid + a=ssrc + the MID extmap. PTs come from pvt->rtp's
- * codec map (the video PTs were merged there at parse/provision; disjoint from audio). BOTH offerer and
- * answerer emit the shared AUDIO port with NO a=bundle-only — the same-port max-bundle form browsers
+ * The video shares the AUDIO ICE/DTLS transport. In an answer or a subsequent offer this section carries
+ * NO own ice/fingerprint/setup/tls-id/candidate (inherited from the audio bundle-tag, RFC 8843 §7.1.3/§7.3.3);
+ * in the initial offer (\a initial_offer) it carries the audio's (sofia_sdp_emit_bundle_transport). Always
+ * m=video + payloads + a=rtpmap + a=sendrecv + a=rtcp-mux + a=mid + a=ssrc + the MID extmap. PTs come from
+ * pvt->rtp's codec map (the video PTs were merged there at parse/provision; disjoint from audio). BOTH offerer
+ * and answerer emit the shared AUDIO port with NO a=bundle-only — the same-port max-bundle form browsers
  * reliably create an inbound video receiver for. The video mid joins a=group:BUNDLE in the caller. No vrtp.
  */
 static void sofia_sdp_emit_bundled_video(struct sofia_pvt *pvt, char *buf, size_t len,
-	const char *host, const char *sdp_family, char *tmp_buf, size_t tmp_buf_size, int audio_port, const char *dir_attr, int *overflow)
+	const char *host, const char *sdp_family, char *tmp_buf, size_t tmp_buf_size, int audio_port, const char *dir_attr,
+	int initial_offer, int *overflow)
 {
 	char bvpayload_buf[128] = "";
 	char bvmap_buf[2048] = "";	/* bundled-video accumulator: same multi-PT rtcp-fb + ICE headroom as vmap_buf (was 1536, could fail-closed before the outer buffer) */
@@ -362,6 +429,9 @@ static void sofia_sdp_emit_bundled_video(struct sofia_pvt *pvt, char *buf, size_
 	}
 	*overflow |= sofia_sdp_cat(bvmap_buf, sizeof(bvmap_buf), dir_attr);	/* RFC 3264 §6.1 direction (mirror on answer) */
 	*overflow |= sofia_sdp_cat(bvmap_buf, sizeof(bvmap_buf), "a=rtcp-mux\r\n");	/* RTP+RTCP mux on the shared transport */
+	if (initial_offer) {
+		sofia_sdp_emit_bundle_transport(pvt, host, audio_port, bvmap_buf, sizeof(bvmap_buf), tmp_buf, tmp_buf_size, overflow);
+	}
 	if (snprintf(tmp_buf, tmp_buf_size, "a=mid:%s\r\n",
 		!ast_strlen_zero(pvt->webrtc_video_mid) ? pvt->webrtc_video_mid : "1") >= (int)tmp_buf_size) {
 		*overflow = 1;
@@ -1102,7 +1172,7 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 				/* BUNDLE: accepted video shares the audio transport → emit from pvt->rtp (no vrtp) at the
 				 * audio port; else the legacy separate-transport m=video on pvt->vrtp. */
 				if (pvt->webrtc_video_bundled) {
-					sofia_sdp_emit_bundled_video(pvt, buf, len, host, sdp_family, tmp_buf, sizeof(tmp_buf), port, video_dir, &overflow);
+					sofia_sdp_emit_bundled_video(pvt, buf, len, host, sdp_family, tmp_buf, sizeof(tmp_buf), port, video_dir, 0 /* answer */, &overflow);
 				} else if (pvt->vrtp) {
 					sofia_sdp_emit_webrtc_video(pvt, buf, len, host, sdp_family, tmp_buf, sizeof(tmp_buf), video_dir, &overflow);
 				}
@@ -1162,12 +1232,20 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 	 * remote offer to mirror). The accepted/offered m=video on pvt->vrtp's OWN transport (RFC 8843 §7),
 	 * placed right after m=audio so it matches the standard browser order (audio, video, [application]).
 	 * Same accept/offer gate as the former inline accepted-video emit. */
+	/* Initial BUNDLE offer (RFC 8843 §7.1.3, first bullet): an offer built before the dialog is up, i.e.
+	 * the INVITE of sofia_post_invite / sofia_fork_dial_one. Every re-INVITE chan_sofia builds runs on an
+	 * established dialog (sofia_reinvite_root and the directmedia revert require SOFIA_DIALOG_STATE_UP) and
+	 * keeps the transport lines in the tagged audio section only (second bullet). A session refresh sent by
+	 * the stack itself resends the initial INVITE as it was (nua_client_resend_request), values unchanged. */
+	int initial_bundle_offer = !is_answer && pvt->state != SOFIA_DIALOG_STATE_UP;
+
 	if (pvt->is_webrtc && !is_answer
 			&& (pvt->webrtc_video_accepted
 				|| (pvt->webrtc_video_offerer && (pvt->capability & AST_FORMAT_VIDEO_MASK)))) {	/* answerer-accepted OR offerer-offered (durable video-cap gate; see the a=group builder) */
 		/* BUNDLE: emit from pvt->rtp (no vrtp) at the audio port; else the legacy separate-transport m=video. */
 		if (pvt->webrtc_video_bundled) {
-			sofia_sdp_emit_bundled_video(pvt, buf, len, host, sdp_family, tmp_buf, sizeof(tmp_buf), port, video_dir, &overflow);
+			sofia_sdp_emit_bundled_video(pvt, buf, len, host, sdp_family, tmp_buf, sizeof(tmp_buf), port, video_dir,
+				initial_bundle_offer, &overflow);
 		} else if (pvt->vrtp) {
 			sofia_sdp_emit_webrtc_video(pvt, buf, len, host, sdp_family, tmp_buf, sizeof(tmp_buf), video_dir, &overflow);
 		}
@@ -1175,18 +1253,26 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 
 	/* WebRTC OFFER-build m=application (RFC 8841): the ORIGINATED outbound DataChannel (dc_offerer). It
 	 * RIDES THE BUNDLE'd audio transport (same port as m=audio; the SCTP runs over the audio DTLS via
-	 * usrsctp) with NO own ICE/fingerprint/setup. a=mid joins a=group:BUNDLE (session level above).
+	 * usrsctp). In the initial offer it carries the audio's ICE/DTLS lines (sofia_sdp_emit_bundle_transport,
+	 * RFC 8843 §7.1.3); in a re-offer built here it has none of its own. a=mid joins a=group:BUNDLE above.
 	 * dc_offerer required HAVE_USRSCTP (provision_offer's attach is #ifdef'd) → a non-DataChannel build never
 	 * emits this. (The answerer's dc_accepted m=application is emitted in the mirror loop above.) */
 	if (pvt->is_webrtc && !is_answer && pvt->dc_offerer && !ast_strlen_zero(pvt->dc_mid)) {
+		char dc_transport[1024] = "";
 		int dblen = strlen(buf);
+
+		if (initial_bundle_offer) {
+			sofia_sdp_emit_bundle_transport(pvt, host, port, dc_transport, sizeof(dc_transport),
+				tmp_buf, sizeof(tmp_buf), &overflow);
+		}
 		if (snprintf(buf + dblen, len - dblen,
 				"m=application %d UDP/DTLS/SCTP webrtc-datachannel\r\n"
 				"c=IN %s %s\r\n"
 				"a=sctp-port:5000\r\n"
 				"a=max-message-size:262144\r\n"
+				"%s"
 				"a=mid:%s\r\n",
-				port, sdp_family, host, pvt->dc_mid) >= (int)(len - dblen)) {
+				port, sdp_family, host, dc_transport, pvt->dc_mid) >= (int)(len - dblen)) {
 			overflow = 1;
 		}
 	}

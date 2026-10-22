@@ -391,6 +391,15 @@ srvlookup=yes
 ;       to today's separate-transport video. Per-peer webrtc_video_bundle= overrides
 ;       [general].
 ;
+;     BUNDLE in the INVITE we send to a WebRTC peer: in that first offer the bundled
+;       m=video and the DataChannel m=application also carry the audio's ICE/DTLS
+;       lines (ice-ufrag, ice-pwd, candidate, fingerprint, setup, tls-id — the same
+;       values, as they share its transport), as RFC 8843 §7.1.3 asks of an initial
+;       BUNDLE offer and JSEP (RFC 9429 §5.8.3) checks per section; a strict browser
+;       refused the whole offer without them, and another declined the DataChannel.
+;       Re-INVITEs built by chan_sofia and answers carry them in the audio section
+;       only; a session refresh sent by the SIP stack repeats the first INVITE as is.
+;
 ; (5) chan_sofia advantage over chan_sip on WS+WSS:
 ;     chan_sip has NO WebSocket support whatsoever (0 hits in chan_sip.c for
 ;     websocket / RFC 7118 / wsbindport). chan_sofia adds:
