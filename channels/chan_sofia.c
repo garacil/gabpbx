@@ -509,7 +509,8 @@ struct sofia_fork {
 	                                   * best_status, best_q850 */
 	int child_count;                  /* live children remaining */
 	int posting_done;                 /* 1 once the INVITE posting loop has forked every contact — child_count is only
-	                                   * authoritative after this (a 18x can arrive before all branches are posted). */
+	                                   * authoritative after this (a 18x can arrive before all branches are posted), and
+	                                   * the fork is never treated as empty before it (sofia_fork_child_failed). */
 	struct sofia_pvt *early_media_child; /* fork_early_media: the single-child branch whose rtp the master owner reads
 	                                   * receive-only for early media (ref'd). NULL unless a bind is live. Guarded by lock;
 	                                   * cleared BEFORE any child->rtp steal/NULL so sofia_read stops reading it. */
@@ -2174,11 +2175,37 @@ static void sofia_fork_note_failure(struct sofia_fork *fork, int status, int q85
 	ast_mutex_unlock(&fork->lock);
 }
 
+/* End the master's call once every branch of its fork has failed: the best final response kept
+ * by sofia_fork_note_failure, or a bare HANGUP when no branch gave one. Snapshots+refs m->owner
+ * under m->lock and queues outside it (never m->lock across the channel lock); callers may hold
+ * the channel lock (channel -> pvt order). */
+static void sofia_fork_end_master(struct sofia_pvt *m, int best_status, int best_q850)
+{
+	struct ast_channel *m_owner;
+	int overlap_yes;
+
+	ast_mutex_lock(&m->lock);
+	m_owner = m->owner;
+	if (m_owner) {
+		ast_channel_ref(m_owner);
+	}
+	overlap_yes = ((m->peer ? m->peer->allowoverlap_mode : sofia_cfg.default_allowoverlap_mode)
+		== SOFIA_OVERLAP_YES);
+	ast_mutex_unlock(&m->lock);
+	if (m_owner) {
+		if (best_status) {
+			sofia_queue_invite_failure(m_owner, best_status, best_q850, overlap_yes, 0);
+		} else {
+			ast_queue_control(m_owner, AST_CONTROL_HANGUP);
+		}
+		ast_channel_unref(m_owner);
+	}
+}
+
 /* A fork child failed/was rejected: drop the live count, unlink from both
- * containers, and if it was the last branch with no winner, end the master's call
- * with the best final response kept by sofia_fork_note_failure (a bare HANGUP when
- * no branch gave one). SIP teardown is the CALLER's job. Returns the remaining live
- * count. sofia_thread only. */
+ * containers, and if it was the last branch with no winner once every branch has
+ * been posted, end the master's call (sofia_fork_end_master). SIP teardown is the
+ * CALLER's job. Returns the remaining live count. sofia_thread only. */
 static int sofia_fork_child_failed(struct sofia_fork *fork, struct sofia_pvt *pvt)
 {
 	int empty, picked, remaining, best_status, best_q850;
@@ -2195,15 +2222,17 @@ static int sofia_fork_child_failed(struct sofia_fork *fork, struct sofia_pvt *pv
 		sofia_fork_early_media_unbind(fork);
 	}
 
+	/* The fork is empty only once the posting loop has sent every branch (posting_done): until then
+	 * child_count counts the branches posted so far, and a branch that fails at once (a local 503 for
+	 * a dead ws/wss flow) would end the call before the next, live branch is even sent. A fork whose
+	 * branches all failed during posting is ended by sofia_fork_dial when it sets posting_done. The
+	 * decrement and the decision share one critical section, so exactly one side ends the call; the
+	 * fork->master snapshot+ref is taken here too, so the end can't race a concurrent master
+	 * sofia_hangup into a UAF. */
 	ast_mutex_lock(&fork->lock);
 	fork->child_count--;
 	ao2_unlink(fork->children, pvt);
-	ast_mutex_unlock(&fork->lock);
-	ao2_unlink(dialogs, pvt);
-	/* Snapshot+ref fork->master under fork->lock so the HANGUP can't race a
-	 * concurrent master sofia_hangup into a UAF. */
-	ast_mutex_lock(&fork->lock);
-	empty = (fork->child_count == 0);
+	empty = (fork->child_count == 0) && fork->posting_done;
 	remaining = fork->child_count;
 	picked = fork->winner_picked;
 	best_status = fork->best_status;
@@ -2213,28 +2242,10 @@ static int sofia_fork_child_failed(struct sofia_fork *fork, struct sofia_pvt *pv
 		ao2_ref(m, +1);
 	}
 	ast_mutex_unlock(&fork->lock);
+	ao2_unlink(dialogs, pvt);
 	if (m) {
 		if (empty && !picked) {
-			/* Snapshot+ref m->owner under m->lock, drop it, then queue the end of the call
-			 * (never hold m->lock across the channel lock). */
-			struct ast_channel *m_owner;
-			int overlap_yes;
-			ast_mutex_lock(&m->lock);
-			m_owner = m->owner;
-			if (m_owner) {
-				ast_channel_ref(m_owner);
-			}
-			overlap_yes = ((m->peer ? m->peer->allowoverlap_mode : sofia_cfg.default_allowoverlap_mode)
-				== SOFIA_OVERLAP_YES);
-			ast_mutex_unlock(&m->lock);
-			if (m_owner) {
-				if (best_status) {
-					sofia_queue_invite_failure(m_owner, best_status, best_q850, overlap_yes, 0);
-				} else {
-					ast_queue_control(m_owner, AST_CONTROL_HANGUP);
-				}
-				ast_channel_unref(m_owner);
-			}
+			sofia_fork_end_master(m, best_status, best_q850);
 		}
 		ao2_ref(m, -1);
 	}
@@ -6252,11 +6263,13 @@ static int sofia_fork_dial_one(struct sofia_pvt *pvt, struct sofia_fork *fork,
  * pvt->sip_callid is preset (push resume) every branch INVITE carries it as Call-ID —
  * the phones dedup their push card against that uuid; when empty (every normal call)
  * the TAG_IF is inert and each branch keeps its stack-generated Call-ID (byte-identical
- * pre-extraction behavior). Returns 0 with >=1 INVITE posted, -1 when none was. */
+ * pre-extraction behavior). Returns 0 with >=1 INVITE posted (the end of the call may already be
+ * queued when every posted branch failed during posting), -1 when none was. */
 int sofia_fork_dial(struct sofia_pvt *pvt)
 {
 	time_t now = time(NULL);
 	int posted_any = 0;	/* #1: set once any child actually reaches nua_invite */
+	int all_failed, best_status, best_q850;
 	struct ao2_iterator ci;
 	struct sofia_contact *c;
 
@@ -6308,7 +6321,7 @@ int sofia_fork_dial(struct sofia_pvt *pvt)
 
 	/* No contact invited → no event can arrive → master would hang forever.
 	 * Fail now. posted_any (not child_count) is deliberate: children posted
-	 * then failed fast are handled by the event-driven all-failed HANGUP. */
+	 * then failed fast are handled at posting_done below. */
 	if (!posted_any) {
 		ast_log(LOG_WARNING,
 			"Sofia: fork to peer '%s' emitted no INVITE (all contacts failed setup) — failing call\n",
@@ -6318,10 +6331,19 @@ int sofia_fork_dial(struct sofia_pvt *pvt)
 
 	/* fork_early_media: the posting loop is complete, so fork->child_count is
 	 * now authoritative. A 18x that raced in before this point saw a partial count,
-	 * so the single-live-child early-media gate requires posting_done. */
+	 * so the single-live-child early-media gate requires posting_done. Every posted
+	 * branch may also have failed during the loop (sofia_fork_child_failed waits for
+	 * posting_done): that is decided in the same critical section that sets
+	 * posting_done, and the call is ended right after it, so exactly one side ends it. */
 	ast_mutex_lock(&fork->lock);
 	fork->posting_done = 1;
+	all_failed = (fork->child_count == 0 && !fork->winner_picked);
+	best_status = fork->best_status;
+	best_q850 = fork->best_q850;
 	ast_mutex_unlock(&fork->lock);
+	if (all_failed) {
+		sofia_fork_end_master(pvt, best_status, best_q850);
+	}
 
 	ast_mutex_lock(&pvt->lock);
 	/* A fast winner may already have advanced master->state during the loop.
