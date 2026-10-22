@@ -1,4 +1,73 @@
-## Unreleased — chan_sofia: voicemail MWI reaches every device of an account
+## 1.9.8 — trunks, incoming calls and failed calls behave as they do with `chan_sip`
+
+A `chan_sip`-parity release for `chan_sofia`, driven by real trunks and real calls. Outbound
+registration works with registrars that challenge or that require `Expires`; the Request-URI,
+not the `To`, decides the extension of an incoming call, its `${SIPDOMAIN}` and what a presence
+subscription watches; a failed outbound call reaches the dialplan as `BUSY`, `CONGESTION` or
+`CHANUNAVAIL` with its Q.850 cause; and a peer with `host=<name>` is offered our real address.
+Voicemail lamps reach every device of an account, and H.264 video carries its media format
+configuration. Nothing to configure except the opt-in `h264fmtp` of `chan_sip`; one restart.
+
+### Outbound registration (`register =>`) works with every registrar
+
+- **Every REGISTER carries `Expires`**: the line's `~expiry`, else `defaultexpiry`, as
+  `chan_sip` sends it. Without it some registrars answered `403 Forbidden` with
+  `Warning: 390 Missing Expires`, whatever `defaultexpiry` said.
+- **A digest challenge is answered** on the request that was challenged (`nua_authenticate`).
+  Before, a new REGISTER was queued behind the challenged one and never sent, with no event to
+  say so, so every trunk whose registrar challenges stayed unregistered. At most three
+  challenges are answered per attempt, as `chan_sip` does.
+- **A failed registration is retried** every `registertimeout` on the same Call-ID (RFC 3261
+  §10.2.4); `403` and `404` give it up until the next reload, with `chan_sip`'s warnings, and
+  `registerattempts` caps the retries. Before, a trunk whose provider was down at start-up was
+  never tried again.
+- **The full `chan_sip` line syntax**:
+  `[peer?][transport://]user[@domain][:secret[:authuser]]@host[:port][/extension][~expiry]`.
+  A provider whose SIP domain differs from each line's proxy is registered as `user@domain`
+  while the REGISTER goes to the proxy, and the Request-URI no longer carries the user (RFC 3261
+  §10.2). `sip show registry` and `SIPshowregistry` show the domain.
+- **`sip reload` registers the lines it adds or changes**, de-registering the old binding of a
+  changed line, and tries again a line that is not registered; a registered, unchanged line
+  sends nothing.
+
+### Incoming calls: the Request-URI decides, as in `chan_sip`
+
+- **The extension is the user of the Request-URI**, `s` when it has none. The `To` names the
+  original recipient, which is somebody else on a forwarded call (RFC 3261 §8.2.2.1), so a
+  forward from another PBX now reaches its target. A %-escaped user that does not match as sent
+  is tried decoded; `${EXTEN}`, the `404` and the `484` of `allowoverlap=yes` follow it. A
+  `register =>` line registers its Contact as the line's `/extension`, else `s`.
+- **`${SIPDOMAIN}` is set**: the host of the Request-URI without its port, before the peer's
+  `setvar=` variables.
+- **A presence/BLF `SUBSCRIBE` watches the extension of its Request-URI**; the `To` still
+  names the `entity` of the NOTIFY body.
+- **A missing extension called by a matched peer no longer bans its address.** Only a guest
+  INVITE (no peer matched) counts toward the blacklist; before, five calls from a trunk to a
+  missing extension banned the trunk's own address for `blacklist_ban` minutes, and spoofing
+  that address over UDP could get it banned on purpose. The documentation also says what a
+  blocked address receives: the stack still answers each new request (`480` to an INVITE,
+  `500` to a REGISTER, SUBSCRIBE, NOTIFY, MESSAGE or INFO, `200` to OPTIONS), so the drop is not
+  silent.
+
+### Outbound calls
+
+- **A failed outbound call reaches the dialplan as with `chan_sip`.** `486`, `600`, `603` and a
+  `3xx` (not followed as a forward) give `DIALSTATUS=BUSY`; `400`, `410`, `480`, `482`, `500`,
+  `502`, `503`, `504` and a `401`/`407` that could not be answered give `CONGESTION`; anything
+  else gives `CHANUNAVAIL`. `${HANGUPCAUSE}` is the status mapped to Q.850 (`486` → 17, `603` →
+  21, `503` → 34, `404` → 1), or, for `BUSY` and `CONGESTION` with `use_q850_reason=yes`, the
+  cause of a received `Reason: Q.850`. A call the SIP stack could not deliver (no answer,
+  transport error, DNS failure) is `CHANUNAVAIL` with cause 18, as `chan_sip` gives, and a call
+  forked to several registered devices reports the best final response of its branches (RFC
+  3261 §16.7). Before, every failure was `CHANUNAVAIL` with no cause, so a busy destination
+  looked unreachable and a dialplan kept trying other routes.
+- **A peer with `host=<name>` is offered our real address.** Our address for the SDP `o=`/`c=`
+  and the `Contact` is worked out toward the address the name resolved to, the first A/AAAA
+  record, where the INVITE goes because its Request-URI carries the port (RFC 3263 §4.2), as
+  `chan_sip` does. Before, with `bindaddr=0.0.0.0`, the INVITE offered `c=IN IP4 0.0.0.0` and a
+  `Contact` at `0.0.0.0`, and providers answered `488 Not Acceptable Here`.
+
+### Voicemail MWI reaches every device of an account
 
 An account registered on several devices (desk phone, mobile app, web client) only
 told the LAST device that registered about a new voicemail; and one device that had
@@ -24,6 +93,18 @@ anywhere, although the message was stored and the peer's `mailbox=` was right.
   the dialog, routed to the source and transport the SUBSCRIBE came from: a WebSocket
   client on its own socket). A challenged (401) in-dialog refresh or unsubscribe no longer
   destroys the live subscription's handle.
+
+### H.264 video carries its media format configuration
+
+- **`chan_sip`, `h264fmtp=yes`** in `[general]` (default no): the `a=fmtp` of an H.264 video
+  section is negotiated and relayed (RFC 6184 §8.1, §8.2.2). One H.264 payload type is chosen:
+  the one compatible with the configuration in use, otherwise packetization-mode 1, then a
+  Baseline or Constrained Baseline profile; the answer writes its `a=fmtp`, and the calling
+  leg's configuration is offered to the callee. A video door phone that only works in
+  packetization-mode 1 rejected our offer, or sent no video, before.
+- **`chan_sofia`** reads the `a=fmtp` where the Sofia-SIP parser keeps it (on the rtpmap), so
+  the configuration is now relayed to both legs, and prefers packetization-mode 1 and a
+  Baseline profile when the choice is free.
 
 ## 1.9.7 — every request handle is released: a registrar's memory no longer grows with its registrations
 
