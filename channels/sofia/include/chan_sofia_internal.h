@@ -51,12 +51,15 @@ int sofia_post_invite(struct sofia_pvt *pvt, struct ast_channel *ast, const char
  * Caller holds the channel lock (ast_call / the push multi-ring resume). When
  * pvt->sip_callid is set (push resume) every branch carries it as its Call-ID so the
  * phones dedup against the announced push uuid; empty (every normal call) = stack default
- * per branch, byte-identical to the pre-extraction behavior. Returns 0 with >=1 INVITE
- * posted, -1 when none could be. */
-int sofia_fork_dial(struct sofia_pvt *pvt);
+ * per branch, byte-identical to the pre-extraction behavior. push_hold: a push assist will
+ * wake more devices, so an empty fork waits for them. Returns 0 with >=1 INVITE posted,
+ * -1 when none could be. */
+int sofia_fork_dial(struct sofia_pvt *pvt, int push_hold);
+/* End a push assist's hold on the fork; ends the call if every branch already failed. */
+void sofia_fork_push_hold_release(struct sofia_pvt *pvt);
 /* Push multi-ring late append: add ONE branch to the still-unanswered fork for a device
  * whose wake REGISTER arrived after the fork was posted (channel lock held; refuses after
- * winner pick / answer). 0 = branch INVITE posted. */
+ * winner pick / answer / the decided end of the call / a 6xx). 0 = branch INVITE posted. */
 int sofia_fork_append_contact(struct sofia_pvt *pvt, struct sofia_contact *c);
 /* Requested Contact/Expires expiry of a REGISTER (Contact ;expires= wins; malformed -> 3600). */
 int sofia_contact_requested_expiry(sip_contact_t const *m, int fallback);
@@ -75,7 +78,8 @@ int sofia_push_peer_pushable(struct sofia_peer *peer);
  * (usable token, instance not the caller's nor any already-ringing live binding), and wake
  * them alongside the fork to the live ones. */
 int sofia_push_count_asleep(struct sofia_peer *peer, const char *exclude_instance, char live_inst[][128], int n_live);
-void sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_channel *ast, struct ast_sockaddr *live_srcs, char live_inst[][128], int n_live);
+/* Returns 1 while the assist waits for a woken device (entry kept, push_wait armed), 0 otherwise. */
+int sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_channel *ast, struct ast_sockaddr *live_srcs, char live_inst[][128], int n_live);
 /* Park a push_parked pvt (called from sofia_call under the CHANNEL lock): registry entry +
  * push_wait timer (+ sender jobs in a later stage). 0 = call parked (in progress); -1 =
  * fail-closed to today's failure (never park without an armed timer). */
@@ -1271,7 +1275,7 @@ struct sofia_config {
 	/* --- Mobile push wake-up ([general] push*; sofia_push.c). All sip-reload-safe. --- */
 	int push_enabled;          /* push=yes master enable; default 0 = feature fully off (no capture, no park) */
 	char push_scripts[256];    /* sender scripts dir (send_push.py / send_push_voip.py), default /etc/gabpbx/push */
-	int push_wait;             /* seconds a parked call waits for the wake REGISTER (clamp 5..28; must stay under the 30 s common Dial ringtimer) */
+	int push_wait;             /* seconds a parked call waits for the wake REGISTER, and the longest a push assist holds an empty fork open (clamp 5..28; must stay under the 30 s common Dial ringtimer) */
 	int push_token_ttl_days;   /* days a token survives without a REGISTER (stale devices are skipped + lazily purged); default 30 */
 	int push_max_devices;      /* devices pushed per peer per call (clamp 1..10, Kamailio devlist parity) */
 	int push_min_interval;     /* seconds per-device push floor (the phone itself cancels a push <5 s after the previous); 0 = off */

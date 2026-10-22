@@ -506,7 +506,7 @@ struct sofia_fork {
 	time_t fork_start;                /* timestamp when fork was initiated */
 	char fork_id[SOFIA_FORK_ID_LEN]; /* unique ID for debug logging */
 	ast_mutex_t lock;                 /* guards winner_picked, winner, child_count, children, state, posting_done, early_media_child,
-	                                   * best_status, best_q850, ended */
+	                                   * best_status, best_q850, push_hold, ended */
 	int child_count;                  /* live children remaining */
 	int posting_done;                 /* 1 once the INVITE posting loop has forked every contact — child_count is only
 	                                   * authoritative after this (a 18x can arrive before all branches are posted), and
@@ -517,6 +517,9 @@ struct sofia_fork {
 	int best_status;                  /* best final >= 300 of the failed branches (RFC 3261 §16.7 step 6), 0 = none.
 	                                   * Guarded by lock. */
 	int best_q850;                    /* Q.850 cause of that response's Reason header (use_q850_reason), 0 = none */
+	int push_hold;                    /* 1 while a push assist may still bring a woken device (a late-appended
+	                                   * branch): an empty fork then waits instead of ending the call. Cleared by
+	                                   * sofia_fork_push_hold_release. Guarded by lock. */
 	int ended;                        /* 1 once the end of the master's call has been decided: no branch may be
 	                                   * appended after it. Guarded by lock. */
 };
@@ -2205,21 +2208,55 @@ static void sofia_fork_end_master(struct sofia_pvt *m, int best_status, int best
 }
 
 /* Decide, under fork->lock, whether the master's call ends now: every posted branch has failed
- * (posting_done, child_count 0), none won, and the end was not decided already. Marks the fork
- * ended, so no branch is appended after it (sofia_fork_append_contact, sofia_fork_dial_one). */
+ * (posting_done, child_count 0), none won, the end was not decided already, and no push assist
+ * holds the fork open for a device being woken. A received 6xx overrides the hold: RFC 3261 §16.7
+ * step 5 forbids new branches after it, so nothing is left to wait for. Marks the fork ended. */
 static int sofia_fork_should_end_locked(struct sofia_fork *fork)
 {
 	if (fork->ended || fork->winner_picked || !fork->posting_done || fork->child_count > 0) {
+		return 0;
+	}
+	if (fork->push_hold && fork->best_status < 600) {
 		return 0;
 	}
 	fork->ended = 1;
 	return 1;
 }
 
+/* A push assist no longer holds the fork open (no wake push went out, or push_wait expired):
+ * if every branch has failed meanwhile, end the master's call now. Takes pvt->lock, then
+ * fork->lock; callers hold neither (the channel lock may be held: channel -> pvt order). */
+void sofia_fork_push_hold_release(struct sofia_pvt *pvt)
+{
+	struct sofia_fork *fork;
+	int end_now, best_status, best_q850;
+
+	ast_mutex_lock(&pvt->lock);
+	fork = pvt->is_fork_master ? pvt->fork : NULL;
+	if (fork) {
+		ao2_ref(fork, +1);
+	}
+	ast_mutex_unlock(&pvt->lock);
+	if (!fork) {
+		return;
+	}
+	ast_mutex_lock(&fork->lock);
+	fork->push_hold = 0;
+	end_now = sofia_fork_should_end_locked(fork);
+	best_status = fork->best_status;
+	best_q850 = fork->best_q850;
+	ast_mutex_unlock(&fork->lock);
+	if (end_now) {
+		sofia_fork_end_master(pvt, best_status, best_q850);
+	}
+	ao2_ref(fork, -1);
+}
+
 /* A fork child failed/was rejected: drop the live count, unlink from both
  * containers, and if it was the last branch with no winner once every branch has
- * been posted, end the master's call (sofia_fork_end_master). SIP teardown is the
- * CALLER's job. Returns the remaining live count. sofia_thread only. */
+ * been posted (and no push assist holds the fork open), end the master's call
+ * (sofia_fork_end_master). SIP teardown is the CALLER's job. Returns the remaining
+ * live count. sofia_thread only. */
 static int sofia_fork_child_failed(struct sofia_fork *fork, struct sofia_pvt *pvt)
 {
 	int end_now, remaining, best_status, best_q850;
@@ -2239,7 +2276,8 @@ static int sofia_fork_child_failed(struct sofia_fork *fork, struct sofia_pvt *pv
 	/* The fork is empty only once the posting loop has sent every branch (posting_done): until then
 	 * child_count counts the branches posted so far, and a branch that fails at once (a local 503 for
 	 * a dead ws/wss flow) would end the call before the next, live branch is even sent. A fork whose
-	 * branches all failed during posting is ended by sofia_fork_dial when it sets posting_done. The
+	 * branches all failed during posting is ended by sofia_fork_dial when it sets posting_done (or,
+	 * when a push assist holds it open, by sofia_fork_push_hold_release). The
 	 * decrement and the decision share one critical section, so exactly one side ends the call; the
 	 * fork->master snapshot+ref is taken here too, so the end can't race a concurrent master
 	 * sofia_hangup into a UAF. */
@@ -6218,8 +6256,9 @@ static int sofia_fork_dial_one(struct sofia_pvt *pvt, struct sofia_fork *fork,
 			}
 			if (child_linked) {
 				/* A late append (sofia_fork_append_contact) checked fork->ended without holding
-				 * fork->lock up to here. Count the branch and test ended in one section, so no
-				 * branch is ever posted for a call whose end was decided. */
+				 * fork->lock up to here: a push_wait release on the scheduler thread may have
+				 * ended the call meanwhile. Count the branch and test ended in one section, so
+				 * no branch is ever posted for a call whose end was decided. */
 				int fork_ended;
 
 				ast_mutex_lock(&fork->lock);
@@ -6291,9 +6330,11 @@ static int sofia_fork_dial_one(struct sofia_pvt *pvt, struct sofia_fork *fork,
  * pvt->sip_callid is preset (push resume) every branch INVITE carries it as Call-ID —
  * the phones dedup their push card against that uuid; when empty (every normal call)
  * the TAG_IF is inert and each branch keeps its stack-generated Call-ID (byte-identical
- * pre-extraction behavior). Returns 0 with >=1 INVITE posted (the end of the call may already be
- * queued when every posted branch failed during posting), -1 when none was. */
-int sofia_fork_dial(struct sofia_pvt *pvt)
+ * pre-extraction behavior). push_hold: a push assist is about to wake more devices, so an
+ * empty fork waits for them (sofia_fork_push_hold_release ends the wait). Returns 0 with >=1
+ * INVITE posted (the end of the call may already be queued when every posted branch failed
+ * during posting), -1 when none was. */
+int sofia_fork_dial(struct sofia_pvt *pvt, int push_hold)
 {
 	time_t now = time(NULL);
 	int posted_any = 0;	/* #1: set once any child actually reaches nua_invite */
@@ -6319,6 +6360,7 @@ int sofia_fork_dial(struct sofia_pvt *pvt)
 	fork->master = pvt;
 	ao2_ref(pvt, +1);
 	fork->fork_start = now;
+	fork->push_hold = push_hold ? 1 : 0;
 	ast_mutex_unlock(&fork->lock);
 
 	pvt->fork = fork;
@@ -6362,7 +6404,8 @@ int sofia_fork_dial(struct sofia_pvt *pvt)
 	 * so the single-live-child early-media gate requires posting_done. Every posted
 	 * branch may also have failed during the loop (sofia_fork_child_failed waits for
 	 * posting_done): that is decided in the same critical section that sets
-	 * posting_done, and the call is ended right after it, so exactly one side ends it. */
+	 * posting_done, and the call is ended right after it, so exactly one side ends it.
+	 * A fork held open by a push assist waits instead (sofia_fork_push_hold_release). */
 	ast_mutex_lock(&fork->lock);
 	fork->posting_done = 1;
 	all_failed = sofia_fork_should_end_locked(fork);
@@ -6581,15 +6624,17 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				su_guid_generate(g);
 				su_guid_sprintf(pvt->sip_callid, sizeof(pvt->sip_callid), g);
 			}
-			rc = sofia_fork_dial(pvt);	/* ring the live devices now (fork of >=1) */
-			if (!rc) {
-				sofia_push_assist_wake(pvt, ast, live_srcs, live_inst, n_live_ex);
+			/* ring the live devices now (fork of >=1), held open: a live binding that fails at once
+			 * (a dead ws/wss flow) must not end the call before the woken device can join */
+			rc = sofia_fork_dial(pvt, 1);
+			if (!rc && !sofia_push_assist_wake(pvt, ast, live_srcs, live_inst, n_live_ex)) {
+				sofia_fork_push_hold_release(pvt);	/* no wake push went out: nothing to wait for */
 			}
 			return rc;
 		}
 
 		if (live > 1) {
-			return sofia_fork_dial(pvt);	/* forking engine (extracted): one child per live contact */
+			return sofia_fork_dial(pvt, 0);	/* forking engine (extracted): one child per live contact */
 		}
 	}
 

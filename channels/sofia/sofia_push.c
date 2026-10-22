@@ -975,6 +975,18 @@ static int sofia_push_wait_cb(const void *data)
 
 	ao2_lock(e);
 	e->sched_id = -1;
+	if (e->state == SOFIA_PUSH_APPENDING) {
+		/* Push-assist deadline: the woken device had push_wait to join the fork. Release the
+		 * fork's hold, which ends the call now if every branch has failed meanwhile; the entry
+		 * stays for late appends until the call ends (hangup reaps it). */
+		pvt = e->pvt;	/* stable: the entry's own ref outlives this callback */
+		ao2_unlock(e);
+		if (pvt) {
+			sofia_fork_push_hold_release(pvt);
+		}
+		ao2_ref(e, -1);		/* the arm-time ref */
+		return 0;
+	}
 	if (e->state != SOFIA_PUSH_PARKED && e->state != SOFIA_PUSH_COLLECTING) {
 		ao2_unlock(e);
 		ao2_ref(e, -1);		/* the arm-time ref; resume/hangup owns the entry */
@@ -1508,7 +1520,7 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 		 * this fresh binding gets its own branch (same announced Call-ID - the phone is
 		 * already showing the card for that uuid). Only a binding identified by the
 		 * REGISTER source may append; a refresh of an already-dialed one dedups. */
-		int i, dup = 0;
+		int i, dup = 0, all_joined;
 		if (!c_from_update) {
 			ao2_unlock(e);
 			ao2_ref(c, -1);
@@ -1527,6 +1539,9 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 		}
 		ast_sockaddr_copy(&e->dialed[e->ndialed], &update->new_src);
 		e->ndialed++;		/* reserve BEFORE posting: a racing re-REGISTER dedups here */
+		/* Every pushed device has now joined: the fork no longer needs to be held open for a
+		 * woken device, so its own branches decide the outcome from here (released below). */
+		all_joined = (e->ndialed - e->n_live_inst) >= e->npushed;
 		ao2_unlock(e);
 		ast_mutex_lock(&pvt->lock);
 		owner = pvt->owner;
@@ -1546,6 +1561,9 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 				ast_verb(2, "Sofia PUSH: late append %s peer='%s' - extra branch INVITE to the just-woken binding\n",
 					e->callid, e->peername);
 				sofia_push_log_event(e->peername, "", e->callid, "resumed", "append");
+				if (all_joined) {
+					sofia_fork_push_hold_release(pvt);
+				}
 			}
 		}
 		ao2_ref(c, -1);
@@ -1844,7 +1862,7 @@ static int sofia_push_collect_cb(const void *data)
 	pvt->push_parked = 0;
 	ast_mutex_unlock(&pvt->lock);
 
-	rc = sofia_fork_dial(pvt);	/* the sofia_call live>1 engine, under the channel lock */
+	rc = sofia_fork_dial(pvt, 0);	/* the sofia_call live>1 engine, under the channel lock */
 	ast_channel_unlock(owner);
 	ast_channel_unref(owner);
 	owner = NULL;
@@ -1982,26 +2000,28 @@ int sofia_push_count_asleep(struct sofia_peer *peer, const char *exclude_instanc
  * master `pvt` (its sip_callid seeds every branch). Wake the ASLEEP devices too by pushing
  * them with that same Call-ID and leaving a parked-registry entry in APPENDING state, so
  * when a woken device re-registers the existing late-append path adds it a fork branch
- * (the phone dedups push+INVITE by the shared uuid). No push_wait/NOANSWER is armed: the
- * live legs own the call outcome; the entry is reaped by sofia_push_on_pvt_hangup when the
- * master tears down. Caller holds the channel lock; pvt is a live fork master with
+ * (the phone dedups push+INVITE by the shared uuid). The fork was posted held open
+ * (sofia_fork_dial push_hold) so a live binding that fails at once cannot end the call before
+ * a woken device joins; push_wait bounds that hold (released on expiry, or once every pushed
+ * device has joined), after which the branches own the call outcome. The entry is reaped by
+ * sofia_push_on_pvt_hangup when the master tears down. Caller holds the channel lock; pvt is a live fork master with
  * sip_callid set and (for a self-call) the exclude fields populated.
  *
  * The push carries the REAL caller identity, read from `ast` exactly as the parked path does:
  * a woken device shows the notification before its late-appended INVITE arrives, and on some
  * platforms the incoming-call UI is built from the notification alone, so a placeholder here
  * is what the callee would see as the caller. */
-void sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_channel *ast,
+int sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_channel *ast,
 	struct ast_sockaddr *live_srcs, char live_inst[][128], int n_live)
 {
 	struct sofia_push_park *e;
-	int i, queued, rate_limited = 0;
+	int i, queued, rate_limited = 0, held = 0;
 
 	if (!sofia_push_parked || !pvt || !ast || !pvt->sip_callid[0]) {
-		return;
+		return 0;
 	}
 	if (!(e = ao2_alloc(sizeof(*e), sofia_push_park_destructor))) {
-		return;
+		return 0;
 	}
 	ast_copy_string(e->peername, pvt->peername, sizeof(e->peername));
 	ast_copy_string(e->exclude_instance, pvt->push_exclude_instance, sizeof(e->exclude_instance));
@@ -2032,7 +2052,7 @@ void sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_channel *ast,
 
 	if (!ao2_link(sofia_push_parked, e)) {
 		ao2_ref(e, -1);
-		return;
+		return 0;
 	}
 	/* Mark the master so its hangup reaps this entry (push_appending gates the hook). */
 	ast_mutex_lock(&pvt->lock);
@@ -2048,12 +2068,30 @@ void sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_channel *ast,
 		ast_mutex_unlock(&pvt->lock);
 		ao2_unlink(sofia_push_parked, e);
 		ao2_ref(e, -1);
-		return;
+		return 0;
 	}
 	ast_verb(2, "Sofia PUSH: push-assist %s peer='%s' - ringing %d live device(s), woke the asleep one(s)\n",
 		e->callid, e->peername, n_live);
 	sofia_push_log_event(e->peername, "", e->callid, "sent", "assist");
+	/* push_wait bounds the fork's hold (sofia_fork_dial push_hold): when it fires,
+	 * sofia_push_wait_cb releases the hold and the call ends if every branch has failed by
+	 * then. Armed under the entry lock (defer-BYE idiom, as sofia_push_park_create). With no
+	 * timer there is no hold: the caller releases it at once. */
+	if (sofia_sched) {
+		ao2_lock(e);
+		ao2_ref(e, +1);		/* the timer's ref */
+		e->sched_id = ast_sched_thread_add(sofia_sched, sofia_cfg.push_wait * 1000, sofia_push_wait_cb, e);
+		if (e->sched_id < 0) {
+			e->sched_id = -1;
+			ao2_unlock(e);
+			ao2_ref(e, -1);	/* timer ref rollback */
+		} else {
+			ao2_unlock(e);
+			held = 1;
+		}
+	}
 	ao2_ref(e, -1);		/* container holds the entry; hangup reaps it */
+	return held;
 }
 
 static void sofia_push_try_resume(struct sofia_peer *peer, const struct sofia_register_update *update)
