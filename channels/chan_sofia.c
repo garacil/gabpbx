@@ -506,7 +506,7 @@ struct sofia_fork {
 	time_t fork_start;                /* timestamp when fork was initiated */
 	char fork_id[SOFIA_FORK_ID_LEN]; /* unique ID for debug logging */
 	ast_mutex_t lock;                 /* guards winner_picked, winner, child_count, children, state, posting_done, early_media_child,
-	                                   * best_status, best_q850 */
+	                                   * best_status, best_q850, ended */
 	int child_count;                  /* live children remaining */
 	int posting_done;                 /* 1 once the INVITE posting loop has forked every contact — child_count is only
 	                                   * authoritative after this (a 18x can arrive before all branches are posted), and
@@ -517,6 +517,8 @@ struct sofia_fork {
 	int best_status;                  /* best final >= 300 of the failed branches (RFC 3261 §16.7 step 6), 0 = none.
 	                                   * Guarded by lock. */
 	int best_q850;                    /* Q.850 cause of that response's Reason header (use_q850_reason), 0 = none */
+	int ended;                        /* 1 once the end of the master's call has been decided: no branch may be
+	                                   * appended after it. Guarded by lock. */
 };
 
 /* MWI per-peer mailbox node; defined before struct sofia_peer (which embeds the
@@ -2202,13 +2204,25 @@ static void sofia_fork_end_master(struct sofia_pvt *m, int best_status, int best
 	}
 }
 
+/* Decide, under fork->lock, whether the master's call ends now: every posted branch has failed
+ * (posting_done, child_count 0), none won, and the end was not decided already. Marks the fork
+ * ended, so no branch is appended after it (sofia_fork_append_contact, sofia_fork_dial_one). */
+static int sofia_fork_should_end_locked(struct sofia_fork *fork)
+{
+	if (fork->ended || fork->winner_picked || !fork->posting_done || fork->child_count > 0) {
+		return 0;
+	}
+	fork->ended = 1;
+	return 1;
+}
+
 /* A fork child failed/was rejected: drop the live count, unlink from both
  * containers, and if it was the last branch with no winner once every branch has
  * been posted, end the master's call (sofia_fork_end_master). SIP teardown is the
  * CALLER's job. Returns the remaining live count. sofia_thread only. */
 static int sofia_fork_child_failed(struct sofia_fork *fork, struct sofia_pvt *pvt)
 {
-	int empty, picked, remaining, best_status, best_q850;
+	int end_now, remaining, best_status, best_q850;
 	struct sofia_pvt *m;
 	struct sofia_pvt *emc;
 
@@ -2232,9 +2246,8 @@ static int sofia_fork_child_failed(struct sofia_fork *fork, struct sofia_pvt *pv
 	ast_mutex_lock(&fork->lock);
 	fork->child_count--;
 	ao2_unlink(fork->children, pvt);
-	empty = (fork->child_count == 0) && fork->posting_done;
+	end_now = sofia_fork_should_end_locked(fork);
 	remaining = fork->child_count;
-	picked = fork->winner_picked;
 	best_status = fork->best_status;
 	best_q850 = fork->best_q850;
 	m = fork->master;
@@ -2244,7 +2257,7 @@ static int sofia_fork_child_failed(struct sofia_fork *fork, struct sofia_pvt *pv
 	ast_mutex_unlock(&fork->lock);
 	ao2_unlink(dialogs, pvt);
 	if (m) {
-		if (empty && !picked) {
+		if (end_now) {
 			sofia_fork_end_master(m, best_status, best_q850);
 		}
 		ao2_ref(m, -1);
@@ -6204,9 +6217,24 @@ static int sofia_fork_dial_one(struct sofia_pvt *pvt, struct sofia_fork *fork,
 				}
 			}
 			if (child_linked) {
-			ast_mutex_lock(&fork->lock);
-			fork->child_count++;
-			ast_mutex_unlock(&fork->lock);
+				/* A late append (sofia_fork_append_contact) checked fork->ended without holding
+				 * fork->lock up to here. Count the branch and test ended in one section, so no
+				 * branch is ever posted for a call whose end was decided. */
+				int fork_ended;
+
+				ast_mutex_lock(&fork->lock);
+				fork_ended = fork->ended;
+				if (!fork_ended) {
+					fork->child_count++;
+				}
+				ast_mutex_unlock(&fork->lock);
+				if (fork_ended) {
+					ao2_unlink(dialogs, child);
+					ao2_unlink(fork->children, child);
+					child_linked = 0;
+				}
+			}
+			if (child_linked) {
 			posted = 1;
 			if (sofia_generate_sdp(child, sdp_buf, sizeof(sdp_buf), 0 /* offer */)) {
 				nua_invite(child->nh,
@@ -6337,7 +6365,7 @@ int sofia_fork_dial(struct sofia_pvt *pvt)
 	 * posting_done, and the call is ended right after it, so exactly one side ends it. */
 	ast_mutex_lock(&fork->lock);
 	fork->posting_done = 1;
-	all_failed = (fork->child_count == 0 && !fork->winner_picked);
+	all_failed = sofia_fork_should_end_locked(fork);
 	best_status = fork->best_status;
 	best_q850 = fork->best_q850;
 	ast_mutex_unlock(&fork->lock);
@@ -6371,8 +6399,9 @@ int sofia_fork_dial(struct sofia_pvt *pvt)
 /* Push multi-ring LATE APPEND: a device whose wake REGISTER lands while the fork-resumed
  * call is STILL UNANSWERED gets its own branch (same announced Call-ID via the master's
  * sip_callid, so the phone binds it to the push card it is already showing). Caller holds
- * the channel lock. Refuses once a winner was picked or the master is UP; returns 0 when
- * the branch INVITE was posted. */
+ * the channel lock. Refuses once a winner was picked, the master is UP, the end of the call
+ * was decided, or a 6xx was received (RFC 3261 §16.7 step 5: no new branches after it);
+ * returns 0 when the branch INVITE was posted. */
 int sofia_fork_append_contact(struct sofia_pvt *pvt, struct sofia_contact *c)
 {
 	struct sofia_fork *fork;
@@ -6388,7 +6417,7 @@ int sofia_fork_append_contact(struct sofia_pvt *pvt, struct sofia_contact *c)
 	ast_mutex_unlock(&pvt->lock);
 
 	ast_mutex_lock(&fork->lock);
-	picked = fork->winner_picked;
+	picked = fork->winner_picked || fork->ended || fork->best_status >= 600;
 	idx = fork->child_count;
 	ast_mutex_unlock(&fork->lock);
 	if (picked) {
