@@ -13049,9 +13049,16 @@ static void sofia_process_register(nua_t *nua, nua_handle_t *nh, struct sofia_pv
 	sofia_reap_unbound_handle(nh);
 }
 
-/* Resolve the source IP+port presented to `target` for outbound INVITE From/Contact/SDP
- * c= (chan_sip parity): kernel route (ast_ouraddrfor) -> externaddr if NAT -> bindport
- * fallback. Populates pvt->ourip. Not called on inbound (sofia_generate_sdp covers that). */
+/* Resolve the source IP+port presented to `target` for INVITE From/Contact/SDP c=
+ * (chan_sip parity): kernel route (ast_ouraddrfor) -> externaddr if NAT -> bindport
+ * fallback. Populates pvt->ourip. Called by sofia_request_call (outbound), by
+ * sofia_process_invite with the INVITE source (inbound) and by the push resume with the
+ * woken binding; only sofia_request_call can pass an empty target (no address known: an
+ * unregistered host=dynamic peer without defaultip, or a host= name that did not resolve).
+ * An empty target skips the route query, which could only fail on it and log "Cannot
+ * connect", and takes the bindaddr fallback directly; externaddr, when configured, still
+ * replaces it below. chan_sip never asks for a route without an address either: sip_alloc
+ * defaults ourip to internip (chan_sip.c:8558-8563) and sip_request_call refuses such a call. */
 void sofia_resolve_ourip(struct sofia_pvt *pvt, const struct ast_sockaddr *target)
 {
 	if (!pvt || !target) {
@@ -13080,8 +13087,9 @@ void sofia_resolve_ourip(struct sofia_pvt *pvt, const struct ast_sockaddr *targe
 	}
 
 	memset(&pvt->ourip, 0, sizeof(pvt->ourip));
-	if (ast_ouraddrfor(target, &pvt->ourip) != 0) {
-		/* Route query failed — fall back to bindaddr (better than 0.0.0.0 on the wire). */
+	if (ast_sockaddr_isnull(target) || ast_ouraddrfor(target, &pvt->ourip) != 0) {
+		/* No address to route to, or the route query failed — fall back to bindaddr (still
+		 * 0.0.0.0 with the default wildcard bind). */
 		ast_sockaddr_parse(&pvt->ourip, sofia_cfg.bindaddr, PARSE_PORT_FORBID);
 	}
 	if (sofia_should_use_externaddr(target)
