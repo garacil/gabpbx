@@ -1214,7 +1214,8 @@ void sofia_build_contact_ruri(struct sofia_contact *c, const char *user,
  * returning it with a +1 ref the caller must release. Also reports total binding count + unexpired
  * count so the caller distinguishes: unexpired==1 → route it; unexpired>1 → fork; total>0 &&
  * unexpired==0 → registration expired (CHANUNAVAIL on a dynamic peer, NOT the stale aggregate);
- * total==0 → never registered (unchanged). Lock order: iterates the contacts container + takes
+ * total==0 → no binding (the caller parks it for push, routes the aggregate when it has an address, or
+ * refuses it as UNREGISTERED). Lock order: iterates the contacts container + takes
  * per-contact ao2 locks; the caller must NOT hold peer->lock (mirrors the post-release Path lookup).
  */
 /* A binding is routable only while its granted Contact expiry is still in the future (RFC 3261 soft
@@ -1276,7 +1277,7 @@ struct sofia_contact *sofia_peer_select_single_live_contact(struct sofia_peer *p
 		*total_out = total;
 
 	if (unexpired != 1) {
-		/* 0 → caller decides (host=dynamic && total>0 → CHANUNAVAIL, else aggregate); >1 → fork. Drop candidate. */
+		/* 0 → caller decides (host=dynamic: total>0 → CHANUNAVAIL, total==0 → push, aggregate or UNREGISTERED); >1 → fork. Drop candidate. */
 		if (winner) {
 			ao2_ref(winner, -1);
 			winner = NULL;
@@ -6751,11 +6752,13 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		/* All-expired no-route guard. request_call classified contacts, but a binding can cross its expiry
 		 * between there and here. When NOTHING is unexpired now and request_call did NOT pin a single per-contact
 		 * route (!active_contact — it had seen live>1 and left the peer-aggregate URI), do NOT route to the stale
-		 * peer->src_addr aggregate (RFC 3261 soft state: expired = unavailable). Fail. Dynamic-only — a static
-		 * peer always keeps its configured target; total==0 (never registered) keeps existing behavior. */
+		 * peer->src_addr aggregate (RFC 3261 soft state: expired = unavailable). Fail with the cause the request
+		 * gives the same peer (AST_CAUSE_UNREGISTERED; app_dial copies a non-zero cause after a failed ast_call).
+		 * Dynamic-only — a static peer always keeps its configured target; total==0 was settled by request_call. */
 		if (live == 0 && total > 0 && !pvt->active_contact && peer_is_dynamic) {
 			ast_log(LOG_NOTICE, "Sofia: peer '%s' registration expired at call time - %d contact(s), 0 unexpired - no route\n",
 				S_OR(pvt->peername, "unknown"), total);
+			ast->hangupcause = AST_CAUSE_UNREGISTERED;
 			return -1;
 		}
 
@@ -8110,6 +8113,7 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 			char path_buf[1024] = "";	/* RFC 3327 Path of the registered contact (opt-in), pre-loaded as Route */
 			struct ast_sockaddr sel_src;	/* the selected binding's src_addr — picks WHICH contact's Path */
 			int sel_ok = 0;
+			int dyn_defaddr = 0;	/* unregistered host=dynamic: the aggregate url goes to its defaultip= */
 			char contact_proxy_url[128] = "";	/* B: contact-level NAT proxy for the single-live path */
 
 			sofia_resolve_peer_target(peer, exten, url, sizeof(url));
@@ -8142,6 +8146,7 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 						if (!ast_sockaddr_port(&target)) {
 							ast_sockaddr_set_port(&target, target_port);
 						}
+						dyn_defaddr = 1;
 					}
 				} else {
 					/* Static host=: the RURI is sip:user@host:port. An IP literal is that address. A
@@ -8193,9 +8198,13 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 			 * a SIP.js .invalid Contact host — the live transport is c->src_addr/wss). When the
 			 * peer has EXACTLY ONE live contact, rebuild url + Path from THAT contact using the
 			 * same builder the fork uses, so the nua_handle below targets the real binding. EXACTLY ONE
-			 * unexpired contact overrides here; unexpired>1 falls to the fork; a host=dynamic peer with
-			 * total>0 && unexpired==0 FAILS (CHANUNAVAIL, below); total==0 keeps the peer-aggregate url. Done after the
-			 * peer->lock release (the selector locks the contacts container + per-contact ao2). */
+			 * unexpired contact overrides here; unexpired>1 falls to the fork. A host=dynamic peer with no
+			 * live binding parks for push when it can be woken. Otherwise: with bindings that all expired
+			 * it FAILS (AST_CAUSE_UNREGISTERED, below); with none it keeps the peer-aggregate url only when
+			 * that url has an address (the registered source, e.g. restored from realtime at load; or
+			 * defaultip=) and is refused with AST_CAUSE_UNREGISTERED when it has none, as chan_sip
+			 * refuses it. Done after the peer->lock release (the selector locks the contacts container +
+			 * per-contact ao2). */
 			{
 				int n_unexpired = 0, n_total = 0;
 				struct sofia_contact *single;
@@ -8241,25 +8250,39 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 					 * is NOT routable: do NOT fall through to the peer-aggregate src_addr below (the SAME stale
 					 * flow — it would half-connect the call to a dead device). Fail (CHANUNAVAIL). Pure expiry,
 					 * transport-independent (UDP + WSS), any negotiated expiry (120/300/3600s). n_unexpired>1 forks
-					 * in sofia_call (single==NULL, guard false → fork path); n_total==0 (never registered) and
-					 * static peers (host != dynamic) keep existing aggregate behavior. Cleanup mirrors the
+					 * in sofia_call (single==NULL, guard false → fork path); n_total==0 is handled by the two
+					 * branches below; static peers (host != dynamic) keep the aggregate. Cleanup mirrors the
 					 * sofia_pvt_alloc fail: drop the local sofia_find_peer ref + destroy the half-built pvt (not
-					 * yet linked to dialogs; its destructor releases pvt->peer). peer->lock already released. */
+					 * yet linked to dialogs; its destructor releases pvt->peer). peer->lock already released.
+					 * Cause 20 (UNREGISTERED), the one chan_sip gives a peer with no address left
+					 * (sip_request_call, chan_sip.c:28220-28226); it was 3 (NO_ROUTE_DESTINATION). */
 					ast_log(LOG_NOTICE, "Sofia: peer '%s' registration expired - %d contact(s), 0 unexpired - no route (CHANUNAVAIL)\n",
 						peername, n_total);
 					ao2_ref(peer, -1);
 					ao2_ref(pvt, -1);
-					*cause = AST_CAUSE_NO_ROUTE_DESTINATION;
+					*cause = AST_CAUSE_UNREGISTERED;
 					return NULL;
 					}
 				} else if (n_total == 0 && peer_is_dynamic && sofia_push_peer_pushable(peer)) {
-					/* Never registered (post-reinstall / post-restart, binding never re-bound):
-					 * today this rides the peer-aggregate URL into a 32 s Timer-B black hole.
-					 * With stored tokens: park instead (Kamailio parity — its push fires on any
-					 * lookup("location") miss, which covers this case too). */
+					/* No binding (post-reinstall / post-restart, binding never re-bound) but stored push
+					 * tokens: park and wake the device instead of failing (without tokens the branch
+					 * below refuses the call, or the aggregate url carries the address it has). */
 					pvt->push_parked = 1;
 					ast_log(LOG_NOTICE, "Sofia PUSH: peer '%s' has no binding - will park for push\n",
 						peername);
+				} else if (n_total == 0 && peer_is_dynamic && !sel_ok && !dyn_defaddr) {
+					/* Never registered (or unregistered), not wakeable, no defaultip=: nowhere to send
+					 * the INVITE. The aggregate url would be sip:<exten>@dynamic, a host that does not
+					 * exist. chan_sip refuses this call before any signalling: create_addr_from_peer fails
+					 * with no addr and no defaddr (chan_sip.c:5937-5942), and sip_request_call returns
+					 * AST_CAUSE_UNREGISTERED with a debug line only (chan_sip.c:28220-28226).
+					 * Same cleanup as the expired branch above. */
+					ast_debug(3, "Sofia: peer '%s' is not registered and has no defaultip - refusing the call (UNREGISTERED)\n",
+						peername);
+					ao2_ref(peer, -1);
+					ao2_ref(pvt, -1);
+					*cause = AST_CAUSE_UNREGISTERED;
+					return NULL;
 				}
 			}
 			ast_string_field_set(pvt, ruri, url);

@@ -1156,6 +1156,12 @@ maxexpiry      = 3600      ; maximum REGISTER expires (seconds); over-max silent
 ; port (RFC 3263 §4.2), as chan_sip does (create_addr_from_peer). A name that did not
 ; resolve at load is looked up again when the call is placed (chan_sip refuses that
 ; call instead). An unregistered host=dynamic peer with defaultip= uses that address.
+; One with no registration and no defaultip= (and no push wake-up) has nowhere to
+; send the INVITE: the call is refused at once with cause 20 (UNREGISTERED), as
+; chan_sip does. While an expired binding is still listed (for some seconds after the
+; expiry, or for good with ignoreregexpire=yes) the call is refused the same way,
+; defaultip= or not: an expired binding is never called. Once the expiry has removed
+; it (ignoreregexpire=no), a peer with defaultip= is called there, as in chan_sip.
 ;
 ; chan_sofia extension over chan_sip silent: AMI DnsManagerUpdate event fires on
 ; every DNS change (Peer:SIP/<name> + OldAddr + NewAddr) for NMS visibility into
@@ -2521,8 +2527,13 @@ tos_video = af41
 ; 488 -> 58), or, for BUSY/CONGESTION with use_q850_reason=yes, the cause of a received "Reason: Q.850".
 ; A 484 gives cause 28 with allowoverlap=yes, else 1. A call the SIP stack could not deliver (no
 ; answer, transport error, DNS failure: responses the stack makes up itself) gives CHANUNAVAIL with
-; cause 18, as chan_sip. A call forked to several registered devices reports the best final response
-; of its branches (RFC 3261 §16.7: a 6xx if there is one, else the lowest class). On a call already
+; cause 18, as chan_sip. A call to a host=dynamic peer with no live registration that cannot be
+; woken by push is refused before any signalling with CHANUNAVAIL and cause 20 (UNREGISTERED), as
+; chan_sip, unless no binding is listed and the peer has defaultip=, which is then called. The address
+; a realtime peer brings from the database at load counts as a registration (chan_sip also drops it
+; once its regseconds has passed; chan_sofia does not check regseconds).
+; A call forked to several registered devices reports the best final response of its branches
+; (RFC 3261 §16.7: a 6xx if there is one, else the lowest class). On a call already
 ; answered, a failed session-refresh re-INVITE ends the call with the status's cause.
 ; A 6xx from one device (603 Decline, 600 Busy Everywhere) ends the ringing on all of them (RFC 3261
 ; §16.7 step 5): the other devices get a CANCEL carrying "Reason: SIP;cause=<6xx>;text=..." (RFC 3326;
