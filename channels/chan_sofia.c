@@ -7581,11 +7581,20 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 		}
 		break;
 	case AST_CONTROL_SRCCHANGE:
-		/* Source itself changed (masquerade/transfer): bump SSRC + marker so the
-		 * far end resets its jitter-buffer. Must return 0, not -1 (a -1 here caused
-		 * one-way silence after a REFER blind-transfer swap). */
+		/* Source itself changed (masquerade/transfer, or the bridged far end switched
+		 * its RTP SSRC mid-call): bump SSRC + marker so the far end resets its
+		 * jitter-buffer. Must return 0, not -1 (a -1 here caused one-way silence after
+		 * a REFER blind-transfer swap).
+		 * WebRTC legs keep their SSRC and only get the marker: our SDP pins that SSRC
+		 * (a=ssrc/a=msid, sofia_sdp.c) and no new SDP is sent, so a browser keeps its
+		 * receive track on the announced SSRC and plays silence for a new one
+		 * (Asterisk chan_pjsip does not change the SSRC on bundle legs either). */
 		if (pvt->rtp) {
-			ast_rtp_instance_change_source(pvt->rtp);
+			if (pvt->is_webrtc) {
+				ast_rtp_instance_update_source(pvt->rtp);
+			} else {
+				ast_rtp_instance_change_source(pvt->rtp);
+			}
 		}
 		break;
 	case AST_CONTROL_VIDUPDATE:
