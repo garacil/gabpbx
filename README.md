@@ -120,7 +120,7 @@ Every capability is enumerated below, grouped for scanning. Each is real and liv
 | **Multi-transport listener** | One `nua_create()` spins up UDP, TCP, TLS, WS and WSS, each enabled only when its bind port is non-zero. |
 | **Per-transport bind addresses/ports** | `bindaddr`/`bindport`, `tlsbindaddr`/`tlsbindport`, `wsbindaddr`/`wsbindport`, `wssbindaddr`/`wssbindport`, IPv6-aware per RFC 3261 §19.1.2. |
 | **TLS hardening** | `tlsverify`, `tlsverifyclient` (mutual TLS), `tls_min_version`, `tls_ciphers`, `tls_verify_depth`, and verify-date — closing the accept-any-cert MITM hole sofia-sip leaves open by default. |
-| **WSS certificate auto-aliasing** | Auto-creates the WSS-named cert/ca-bundle files the WebSocket transport expects from the standard `agent.pem`/`cafile.pem`. |
+| **WSS certificate auto-aliasing** | Auto-creates the WSS certificate name the WebSocket transport expects (`wss.pem`) from the standard `agent.pem`, so WSS serves the same full certificate chain as TLS (never the chain-only CA file). |
 | **Placeholder-Contact routing** | A browser's Contact host is a placeholder, so requests route over the live accepted WebSocket with `;transport=wss` appended. |
 
 ### 4. Operations & `chan_sip` parity

@@ -238,9 +238,13 @@ srvlookup=yes
 ; wssenable    = yes                          ; explicit on/off for the WSS listener (default yes)
 ;
 ; NOTE: TLS expects agent.pem (combined cert+key) + cafile.pem (CA cert) in the tlscertfile dir;
-; WSS additionally needs wss.pem + ca-bundle.crt. chan_sofia AUTO-LINKS the missing names at
-; startup: agent.pem -> tlscertfile (if it is a file), cafile.pem -> tlscafile, wss.pem -> agent.pem,
-; ca-bundle.crt -> cafile.pem (soft links, created only if missing, never overwriting your files).
+; WSS needs wss.pem (or wss.key + wss.crt + ca-bundle.crt). chan_sofia AUTO-LINKS the missing names at
+; startup: agent.pem -> tlscertfile (if it is a file), cafile.pem -> tlscafile, wss.pem -> agent.pem
+; (soft links, created only if missing, never overwriting your files). ca-bundle.crt is NOT created:
+; without it WSS takes its certificate chain from wss.pem, so tlscertfile must hold the full chain
+; starting at the server certificate (server certificate, then its intermediates; the key may come
+; first). A ca-bundle.crt left by an earlier version as a link to the CA file is removed at startup:
+; WSS reads that file as its chain and served it without the first intermediate certificate.
 ; So you only manage the real cert + CA; chan_sofia bridges them to the names sofia-sip opens.
 ; IMMUNITY: if a configured TLS/WSS listener has NO usable certificate, chan_sofia logs an ERROR and
 ; DISABLES only that listener (UDP/TCP/WS keep serving and the module still loads) instead of failing

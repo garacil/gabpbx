@@ -18587,7 +18587,8 @@ static void *sofia_thread_func(void *data)
 		 *     it is a regular file, else tlscertfile as-is.
 		 *   - when a sofia-expected name is missing in cert_dir, soft-link it to the real file the
 		 *     operator configured (agent.pem -> tlscertfile, cafile.pem -> tlscafile), then derive the
-		 *     WSS names from the TLS ones (wss.pem -> agent.pem, ca-bundle.crt -> cafile.pem).
+		 *     WSS certificate from the TLS one (wss.pem -> agent.pem). ca-bundle.crt is not created (see
+		 *     below), and one an earlier version linked to the CA file is removed.
 		 * Idempotent; only creates a MISSING name, never renames/overwrites the manager's own files. */
 		if (!ast_strlen_zero(sofia_cfg.tlscertfile)) {
 			struct stat st;
@@ -18633,15 +18634,38 @@ static void *sofia_thread_func(void *data)
 				}
 				/* WSS names from the TLS ones (only when the WSS listener is effective). */
 				if (wss_url[0]) {
-					if (access(wss_pem, R_OK) != 0 && access(agent, R_OK) == 0
-							&& symlink(agent, wss_pem) != 0) {
-						ast_log(LOG_WARNING, "Sofia: could not soft-link %s -> %s (%s); WSS may fail\n",
-							wss_pem, agent, strerror(errno));
+					if (access(wss_pem, R_OK) != 0 && access(agent, R_OK) == 0) {
+						if (symlink(agent, wss_pem) != 0) {
+							ast_log(LOG_WARNING, "Sofia: could not soft-link %s -> %s (%s); WSS may fail\n",
+								wss_pem, agent, strerror(errno));
+						} else {
+							ast_log(LOG_NOTICE, "Sofia: soft-linked %s -> %s for sofia-sip\n", wss_pem, agent);
+						}
 					}
-					if (access(ca_bundle, R_OK) != 0 && access(cafile, R_OK) == 0
-							&& symlink(cafile, ca_bundle) != 0) {
-						ast_log(LOG_WARNING, "Sofia: could not soft-link %s -> %s (%s); WSS may fail\n",
-							ca_bundle, cafile, strerror(errno));
+					/* ca-bundle.crt is NOT created. sofia-sip loads it with SSL_CTX_use_certificate_chain_file
+					 * (tport_type_ws.c:395-397), which takes the FIRST certificate of the file as the server
+					 * certificate and only the rest as the chain (OpenSSL SSL_CTX_use_certificate(3)). Without
+					 * it, sofia-sip takes the chain from wss.pem (tport_type_ws.c:366): the file that also gives
+					 * the WSS certificate, here agent.pem = the real cert file (server certificate, its
+					 * intermediates; the key block is skipped by the PEM reader), so the chain always matches the
+					 * certificate served. Earlier versions linked ca-bundle.crt to the CA file (intermediates
+					 * only): the first intermediate was then lost and WSS served an incomplete chain. Such a name
+					 * (it resolves to the same file as cafile.pem: a soft or hard link to it) is removed, only
+					 * when wss.pem is there to take over; any other ca-bundle.crt, e.g. a cert manager's link to
+					 * a full chain, is left as it is. An operator layout of wss.key + wss.crt still needs its own
+					 * ca-bundle.crt. */
+					{
+						struct stat sb, sc;
+						if (access(wss_pem, R_OK) == 0 && stat(ca_bundle, &sb) == 0 && stat(cafile, &sc) == 0
+								&& sb.st_dev == sc.st_dev && sb.st_ino == sc.st_ino) {
+							if (unlink(ca_bundle) != 0) {
+								ast_log(LOG_WARNING, "Sofia: could not remove %s, which points at the CA file (%s); WSS will serve an incomplete certificate chain\n",
+									ca_bundle, strerror(errno));
+							} else {
+								ast_log(LOG_NOTICE, "Sofia: removed %s left by an earlier version (it pointed at the CA file); WSS takes its chain from %s\n",
+									ca_bundle, wss_pem);
+							}
+						}
 					}
 				}
 			}
