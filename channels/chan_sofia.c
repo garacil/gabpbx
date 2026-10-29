@@ -16347,6 +16347,16 @@ static int sofia_local_attended_transfer(struct sofia_pvt *transferer, const str
 	}
 	ast_indicate(target_chan, AST_CONTROL_SRCCHANGE);
 	ast_indicate(target_chan, AST_CONTROL_UNHOLD);
+	/* Semi-attended transfer: the consult call was still ringing when the transfer completed. The
+	 * masquerade swapped the two channels' states, so transferee_chan (now the zombie) carries the
+	 * consult leg's state, and RING means its callee is still being alerted. The UNHOLD above removes
+	 * any generator (ast_moh_stop), including the ring tone the masquerade re-indicated, so indicate
+	 * RINGING again: the transferee, already up, hears the ring tone in-band until the callee answers.
+	 * chan_sip parity: local_attended_transfer re-indicates RINGING to target.chan1 after the UNHOLDs
+	 * when current->chan2 is in AST_STATE_RING. */
+	if (transferee_chan->_state == AST_STATE_RING) {
+		ast_indicate(target_chan, AST_CONTROL_RINGING);
+	}
 	res = 0;
 
 cleanup:
