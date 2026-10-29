@@ -1,3 +1,75 @@
+## 1.9.9 — ringback on answered calls, fixed-host peers no longer register, forks keep ringing the live device
+
+A `chan_sip`-parity release for `chan_sofia`, driven by real calls. A caller the dialplan has
+already answered (a menu option that dials an extension, a ring group, a queue, a transfer) hears
+ringback while the callee rings, `Busy()` and `Congestion()` after `Answer()` play their tones, and
+the transferee of a semi-attended transfer hears ringback too. A peer that is not `host=dynamic`
+can no longer register. A call forked to several devices keeps ringing the live one when another
+branch fails at once, stops all of them on a 6xx, and waits for a device woken by push. Browsers
+get a complete BUNDLE offer, keep hearing audio when the far end switches its RTP source, and WSS
+serves its full certificate chain. Set `country=` in `indications.conf` for local tones; one
+restart.
+
+### Tones on answered calls
+
+- **A caller answered before the Dial hears ringback.** `sofia_indicate` sent a `180` into the
+  established dialog, which the SIP stack refuses (RFC 3261 §17.2.1 allows provisional responses
+  only while the INVITE is pending), and reported the ringing as handled, so the core never
+  played the ring tone in-band: the caller heard silence. Like `chan_sip`, a channel that is not
+  ringing for its own INVITE now sends nothing and lets the core play the tone of its tone zone.
+- **`Busy()` and `Congestion()` after `Answer()` play their tones** instead of sending a `486` or
+  `503` into the established dialog; a `PROGRESS` on an answered channel sends no `183`.
+- **A stop-tones indication stops them.** It reported success without stopping anything, so a
+  ring tone kept playing after `Answer()`, after `Dial(...r)`, in a queue or after parking.
+- **The transferee of a semi-attended transfer hears ringback** while the target is still being
+  alerted, as with `chan_sip`; a fully attended transfer (target already answered) plays no tone.
+- The tones come from `indications.conf`: its stock `[general] country=us` gives the US ring tone;
+  set the local zone (for example `country=es`) or `CHANNEL(tonezone)` per call.
+  `sofia.conf.sample` now documents `progressinband` as implemented.
+
+### Registration
+
+- **A peer that is not `host=dynamic` can no longer register**, as in `chan_sip` (same log line:
+  `Peer '<name>' is trying to register, but not configured as host=dynamic`): its address comes
+  from `host=`, and a binding let a REGISTER redirect its calls. With `alwaysauthreject=yes` it
+  gets the answers of an unknown peer, otherwise `403`. Unlike `chan_sip`, this refusal never
+  counts toward the blacklist, so an address shared with a trunk or other devices is not banned.
+  **Behaviour change:** a device that must register needs `host=dynamic`.
+
+### Calls forked to several devices
+
+- **A branch that fails at once no longer ends the call before the others are sent.** A local
+  `503` for a dead WebSocket flow or a DNS error could end the whole call while the live device
+  registered after it never rang.
+- **No branch is added to a fork once the end of its call was decided**, nor after a 6xx (RFC 3261
+  §16.7 step 5).
+- **A 6xx from one device cancels the other branches** (`Reason: SIP;cause=<6xx>`, RFC 3326), and
+  the caller gets the 6xx once they answer the CANCEL: a `603 Decline` is no longer lost as
+  `NOANSWER`.
+- **A push-assisted call waits for the woken device** instead of ending when the only live
+  binding fails at once, until the device joins or `push_wait` runs out. **Behaviour change:**
+  in such a call a final 4xx/5xx from the live device no longer ends the call at once.
+
+### Peers with no address
+
+- **A call to an unregistered `host=dynamic` peer with no `defaultip=` and no push wake-up is
+  refused at once as `UNREGISTERED` (cause 20)**, as `chan_sip` does, instead of a DNS lookup of
+  the literal host `dynamic`. **Behaviour change:** `${HANGUPCAUSE}` is 20 for these peers.
+- **No `acl.c: Cannot connect` warning** for a call to a peer with no address yet; the call is
+  unchanged.
+
+### WebRTC and WSS
+
+- **The initial offer to a browser carries the ICE/DTLS lines in every bundled section** (RFC
+  8843 §7.1.3, RFC 9429 §5.8.3), so a strict browser no longer refuses it and the DataChannel is
+  no longer declined when video is offered.
+- **A WebRTC leg keeps its SSRC when the bridged source changes** (only the marker bit is set, as
+  Asterisk `chan_pjsip` does on bundle legs): a caller no longer goes silent after an
+  announcement played before an agent is bridged.
+- **WSS serves its full certificate chain.** `ca-bundle.crt` is no longer created from the
+  chain-only CA file, which made WSS send the server certificate without its intermediate; a
+  link left by an earlier version is removed at load.
+
 ## 1.9.8 — trunks, incoming calls and failed calls behave as they do with `chan_sip`
 
 A `chan_sip`-parity release for `chan_sofia`, driven by real trunks and real calls. Outbound
