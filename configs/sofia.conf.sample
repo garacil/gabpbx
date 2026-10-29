@@ -699,6 +699,11 @@ srvlookup=yes
 ;   host=dynamic
 ;   secret=...
 ;   path=yes
+;
+; Only a host=dynamic peer may REGISTER, as in chan_sip: a peer with a fixed host= takes
+; its address from it and its REGISTER is refused ("Peer '<name>' is trying to register, but
+; not configured as host=dynamic"; with alwaysauthreject=yes the answers of an unknown peer,
+; otherwise 403). Unlike chan_sip the refusal never counts toward the blacklist.
 
 ;
 ; --- rel100 (RFC 3262 reliable provisional responses / PRACK — per-peer) ---
@@ -1406,47 +1411,25 @@ tos_video = af41
 ;ignoresdpversion = yes
 
 ;
-; --- progressinband (chan_sip parity, tri-state early-media control) ---
-; chan_sip semantic: tri-state never/no/yes controlling whether SIP signals
-; ringing via 180 Ringing only OR allows in-band audio playback BEFORE 200 OK
-; answer. Use case: IVR/announcement playback before answer (e.g. carrier
-; "your call cannot be completed as dialed" recordings, custom ringback tones).
+; --- progressinband (chan_sip parity, tri-state) ---
+; How ringing reaches a caller whose INVITE is still pending (not answered yet)
+; while the dialled party is alerted:
+;   never (default) - a 180 Ringing only; the caller's phone plays its own
+;                     ringback (RFC 3960 §3.2).
+;   no              - a 180 Ringing; once a 183 with early media has gone out
+;                     (Progress(), or early media passed through from a carrier)
+;                     the ring tone is also played in-band over that media.
+;   yes             - a 180 Ringing and the ring tone in-band as well.
+; Any other value than yes/never reads as no, as in chan_sip.
 ;
-; Tri-state values:
-;   never  (default) - emit 180 Ringing only; never send in-band audio with
-;                      provisional response; chan_sofia behavior preserved
-;   no               - same effective behavior as never under chan_sofia's
-;                      partial implementation (KNOWN LIMITATION below)
-;   yes              - emit 180 Ringing + force in-band audio playback (returns
-;                      -1 to core which streams audio over RTP per chan_sip
-;                      verbatim semantic at chan_sip.c:7631)
-;
-; chan_sip parity citations: chan_sip.c:28166-28172 verbatim per-peer parser via
-; handle_common_options indirection (L29544 [general] call site shares parser
-; with L28671 per-peer call site) + sip.h:282-285 verbatim 3 macros (SIP_PROG_
-; INBAND (3<<25) + SIP_PROG_INBAND_NEVER (0<<25) + SIP_PROG_INBAND_NO (1<<25)
-; + SIP_PROG_INBAND_YES (2<<25)) + chan_sip.c:7616-7637 verbatim use site at
-; sip_indicate AST_CONTROL_RINGING + chan_sip.c:19425 verbatim "Progress inband"
-; sip show settings display.
-;
-; KNOWN LIMITATION: NO state degrades to NEVER behavior under chan_sofia
-; chan_sofia's partial implementation. chan_sip's NO-state semantic ("after-progress-sent
-; in-band 2nd-call behavior") requires SIP_PROGRESS_SENT per-pvt state-tracking
-; infrastructure — chan_sofia ABSENT today. Operators wanting full chan_sip
-; NO-state semantic must wait for future-fix follow-up (~30 LoC pvt->progress_
-; sent state-tracking).
-;
-; Operator action items:
-;   * progressinband=never operators: drop-in compat zero-rewrite (chan_sofia
-;     intrinsic baseline matches; current chan_sofia behavior preserved)
-;   * progressinband=yes operators: drop-in compat zero-rewrite (chan_sofia
-;     the partial implementation returns -1 forcing in-band audio per chan_sip verbatim)
-;   * progressinband=no operators: parse-clean migration; effective behavior
-;     matches NEVER (KNOWN LIMITATION — full chan_sip NO semantic deferred)
-;
-; A sofia.conf with `progressinband=no` (the setting intends NEVER-equivalent
-; disable-in-band) is honored on reload under chan_sofia's partial
-; implementation: NO-state effective behavior = NEVER, which matches operator intent.
+; A caller that the dialplan has already answered (a menu option that dials an
+; extension, a ring group, a queue, a transfer) can no longer receive a
+; provisional response (RFC 3261 §17.2.1): whatever this setting says, no SIP
+; message is sent and the core plays the ring tone in-band, as with chan_sip.
+; Busy() and Congestion() after Answer() play the busy and congestion tones the
+; same way. The tones come from indications.conf: set country= in its [general]
+; section to the local tone zone (the stock file says us), or CHANNEL(tonezone)
+; for a single call.
 ;
 ; Reload-required note: changing progressinband= requires
 ; `module reload chan_sofia.so` to update parsed value; in-flight calls retain
