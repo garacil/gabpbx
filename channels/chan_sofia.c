@@ -7425,6 +7425,16 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 
 	switch (condition) {
 	case AST_CONTROL_RINGING:
+		/* A 180 exists only while our own inbound INVITE is still pending: RFC 3261 17.2.1 allows
+		 * provisional responses only in the Proceeding state, and once a final response went out
+		 * sofia-sip refuses it ("Already Sent Final Response"). A channel that is not in RING state -
+		 * already answered by the dialplan (menu, ring group, queue, transfer) or an outbound leg - gets
+		 * no SIP message: return -1 so the core plays the tone zone's ring tone in-band
+		 * (ast_indicate_data), which is what the caller must hear while the callee is alerted.
+		 * chan_sip parity: sip_indicate sends 180 only in AST_STATE_RING and otherwise returns -1. */
+		if (ast->_state != AST_STATE_RING) {
+			return -1;
+		}
 	{
 		/* Contact from pvt->ourip; see sofia_answer. reload-UAF: hold peer->lock
 		 * across sofia_build_contact (reads freeable fromuser). */
@@ -7458,6 +7468,12 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 		}
 		break;
 	case AST_CONTROL_BUSY:
+		/* On an answered channel there is no INVITE left to reject (RFC 3261 17.2.1): return -1 so the
+		 * core plays the busy tone in-band, as Busy() expects ("just indicate busy in audio") and as
+		 * chan_sip does (486 only when the channel is not up, otherwise -1). */
+		if (ast->_state == AST_STATE_UP) {
+			return -1;
+		}
 		{
 			char rb[128] = "";	/* RFC 3326 Q.850 Reason (chan_sip parity); status->cause map */
 			int hr = sofia_cfg.use_q850_reason && sofia_reason_build_for_status(486, rb, sizeof(rb));
@@ -7493,6 +7509,10 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 		}
 		break;
 	case AST_CONTROL_CONGESTION:
+		/* Same as BUSY: on an answered channel the core plays the congestion tone in-band (chan_sip parity). */
+		if (ast->_state == AST_STATE_UP) {
+			return -1;
+		}
 		{
 			char rb[128] = "";
 			int hr = sofia_cfg.use_q850_reason && sofia_reason_build_for_status(503, rb, sizeof(rb));
@@ -7501,6 +7521,11 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 		sofia_mark_uas_final_sent(pvt);
 		break;
 	case AST_CONTROL_PROGRESS:
+		/* No 183 into a confirmed dialog (RFC 3261 17.2.1); the core has no tone for PROGRESS, so -1 is
+		 * silent. chan_sip also returns -1 once the channel is up (it also refuses outgoing legs). */
+		if (ast->_state == AST_STATE_UP) {
+			return -1;
+		}
 		/* prematuremedia: INVERTED-SEMANTIC chan_sip quirk preserved — filter TRUE
 		 * (default) SUPPRESSES 183 even on an explicit dialplan Progress(); the
 		 * "prematuremedia=yes" key reads counter-intuitively but matches drop-in. */
@@ -7624,8 +7649,11 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 		}
 		break;
 	case -1:
-		/* "stop indication" — chan_sofia has no pending state; succeed silently. */
-		break;
+		/* "Stop indications": the tones are the core's (ring/busy/congestion played in-band after a -1
+		 * above), and ast_indicate_data stops them only when the driver returns non-zero. Returning 0
+		 * here left a ring tone playing after Dial r, Queue, parking or a bridge forwarded the stop.
+		 * chan_sip parity: sip_indicate returns -1 for -1. */
+		return -1;
 	case AST_CONTROL_T38_PARAMETERS:
 		/* res_fax queues this to drive T.38 negotiation; see
 		 * sofia_interpret_t38_parameters for the op-table. */
