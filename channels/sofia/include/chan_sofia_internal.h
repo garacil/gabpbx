@@ -1236,9 +1236,9 @@ struct sofia_config {
 	int  sip_capture_id;           /* sip_capture_id=<uint32>: HEP capture-agent id (default 200). */
 	char sip_capture_file[256];    /* sip_capture_file=<path>: append every decrypted SIP message to this file -> TPTAG_DUMP. Empty=OFF. */
 	/* MWI message-summary defaults (RFC 3842). */
-	char mwi_from[80];        /* From header used in MWI NOTIFY; empty -> peer->fromdomain or sofia_cfg.realm fallback */
+	char mwi_from[80];        /* parsed for sip.conf compatibility; not used (the unsolicited NOTIFY From user is "*") */
 	char notifymime[80];      /* Content-Type for MWI NOTIFY body; default "application/simple-message-summary" */
-	char vmexten[80];         /* Voicemail user-part for Message-Account URI; default "asterisk" */
+	char vmexten[80];         /* Voicemail user-part for Message-Account URI; default "gabpbx" (chan_sip DEFAULT_VMEXTEN) */
 	int  mwi_expiry;          /* MWI subscription default expiry seconds; default 3600 (RFC 3842/6665). Dual-key parse: mwi_expiry / mwiexpiry / mwiexpirey. Used SERVER-side for outbound NOTIFY Expires. */
 	/* outbound proxy default for outbound INVITE + REGISTER. Per-peer outboundproxy= overrides; empty = no Route header injection. */
 	char outboundproxy[80];

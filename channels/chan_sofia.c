@@ -14366,25 +14366,36 @@ void sofia_format_outboundproxy(struct sofia_peer *peer, char *buf, size_t len)
 	}
 }
 
-/* Build + send one RFC 3842 MWI NOTIFY (aggregated inbox counts) to a peer's active
- * subscriber. Runs on sofia_thread. Caller owns a peer ref; takes peer->lock
- * internally (caller must NOT hold it) and releases before nua_notify. */
-/* Build the RFC 3842 simple-message-summary body for a peer's mailboxes. Snapshots the mailbox specs +
+/* Message counts and the per-peer part of an MWI body, read once and shared by every NOTIFY sent for one
+ * mailbox change. */
+struct sofia_mwi_summary {
+	int new_msgs;
+	int old_msgs;
+	int buggymwi;
+	char fromdomain[256];	/* the peer's fromdomain=, "" when unset */
+};
+
+/* Our own address as the target of one MWI NOTIFY sees it, over the transport its URI names. */
+struct sofia_mwi_local {
+	char host[80];		/* IPv6 literals bracket-wrapped (RFC 3261 §19.1.2) */
+	int port;
+	char transport[8];	/* lowercase token; "udp" when the target URI names none */
+	int known;		/* 1 = a concrete address (routed or externaddr), 0 = only the bind fallback */
+};
+
+/* Read a peer's message counts for an RFC 3842 simple-message-summary body. Snapshots the mailbox specs +
  * fromdomain/buggymwi under peer->lock, then counts OFF the lock (ast_app_inboxcount2 does unbounded
- * backend I/O — IMAP/ODBC/dir-scan). Returns a new ast_str (NULL on failure); new_out and old_out get
- * the totals for logging. Caller must NOT hold peer->lock. Shared by the solicited + unsolicited NOTIFY. */
-static struct ast_str *sofia_build_mwi_body(struct sofia_peer *peer, int *new_out, int *old_out)
+ * backend I/O — IMAP/ODBC/dir-scan). Returns 0, or -1 without a peer. Caller must NOT hold peer->lock.
+ * Shared by the solicited + unsolicited NOTIFY. */
+static int sofia_mwi_summary_read(struct sofia_peer *peer, struct sofia_mwi_summary *sum)
 {
 	struct sofia_mailbox *mb;
-	struct ast_str *body;
-	int total_new = 0, total_old = 0;
-	const char *vmexten;
 	char mboxes[32][160];
-	char l_fromdomain[256];
-	int nmb = 0, i, l_buggymwi;
+	int nmb = 0, i;
 
+	memset(sum, 0, sizeof(*sum));
 	if (!peer) {
-		return NULL;
+		return -1;
 	}
 	ast_mutex_lock(&peer->lock);
 	AST_LIST_TRAVERSE(&peer->mailboxes, mb, list) {
@@ -14396,37 +14407,166 @@ static struct ast_str *sofia_build_mwi_body(struct sofia_peer *peer, int *new_ou
 	}
 	/* Snapshot the unbounded stringfield + the flag into locals (the reload writer can free/rewrite
 	 * peer->fromdomain under the lock; never deref it after unlock). */
-	ast_copy_string(l_fromdomain,
-		!ast_strlen_zero(peer->fromdomain) ? peer->fromdomain : S_OR(sofia_cfg.realm, "gabpbx"),
-		sizeof(l_fromdomain));
-	l_buggymwi = peer->buggymwi;
+	ast_copy_string(sum->fromdomain, S_OR(peer->fromdomain, ""), sizeof(sum->fromdomain));
+	sum->buggymwi = peer->buggymwi;
 	ast_mutex_unlock(&peer->lock);
 
 	for (i = 0; i < nmb; i++) {
 		int new_msgs = 0, old_msgs = 0, urgent_msgs = 0;
 		if (ast_app_inboxcount2(mboxes[i], &urgent_msgs, &new_msgs, &old_msgs) == 0) {
-			total_new += new_msgs;
-			total_old += old_msgs;
+			sum->new_msgs += new_msgs;
+			sum->old_msgs += old_msgs;
 		}
 	}
+	return 0;
+}
+
+/* Our address as the target of an MWI NOTIFY sees it, over the transport the target URI names (chan_sip
+ * ast_sip_ouraddrfor parity, the address steps of sofia_resolve_ourip without its externhost refresh,
+ * which runs on the call path): the kernel route to the target, then externaddr when the target is
+ * outside localnet (externtcpport/externtlsport for tcp/tls), and the port of our listener for that
+ * transport when no external port applies. A target URI that names a host instead of an address routes
+ * to hint (the peer's resolved address) when given. Without a route, the bindaddr fallback is used and
+ * loc->known stays 0 when it is the wildcard. */
+static void sofia_mwi_local_addr(const char *target_uri, const struct ast_sockaddr *hint,
+	struct sofia_mwi_local *loc)
+{
+	su_home_t home[1] = { SU_HOME_INIT(home) };
+	struct ast_sockaddr dst, ours;
+	url_t *url;
+	int port = 0;
+
+	ast_sockaddr_setnull(&dst);
+	ast_sockaddr_setnull(&ours);
+	ast_copy_string(loc->transport, "udp", sizeof(loc->transport));
+	loc->known = 0;
+	url = !ast_strlen_zero(target_uri) ? url_make(home, target_uri) : NULL;
+	if (url && url->url_host) {
+		char hostport[160];
+
+		snprintf(hostport, sizeof(hostport), "%s:%s", url->url_host, S_OR(url->url_port, "5060"));
+		if (!ast_sockaddr_parse(&dst, hostport, 0)) {
+			ast_sockaddr_setnull(&dst);
+			if (hint && !ast_sockaddr_isnull(hint)) {
+				ast_sockaddr_copy(&dst, hint);
+			}
+		}
+		sofia_contact_transport_from_url(url, loc->transport, sizeof(loc->transport));
+	}
+	su_home_deinit(home);
+
+	if (!ast_sockaddr_isnull(&dst) && ast_ouraddrfor(&dst, &ours) == 0) {
+		loc->known = !ast_sockaddr_is_any(&ours);
+	} else {
+		ast_sockaddr_setnull(&ours);
+		ast_sockaddr_parse(&ours, sofia_cfg.bindaddr, PARSE_PORT_FORBID);
+		loc->known = !ast_sockaddr_isnull(&ours) && !ast_sockaddr_is_any(&ours);
+	}
+	if (sofia_should_use_externaddr(&dst) && !ast_strlen_zero(sofia_cfg.externaddr)
+			&& ast_sockaddr_parse(&ours, sofia_cfg.externaddr, PARSE_PORT_FORBID)) {
+		loc->known = 1;
+		if (!strcmp(loc->transport, "tcp")) {
+			port = sofia_cfg.externtcpport;
+		} else if (!strcmp(loc->transport, "tls")) {
+			port = sofia_cfg.externtlsport;
+		}
+	}
+	if (port <= 0) {
+		if (!strcmp(loc->transport, "tls")) {
+			port = sofia_cfg.tlsbindport;
+		} else if (!strcmp(loc->transport, "ws")) {
+			port = sofia_cfg.wsbindport;
+		} else if (!strcmp(loc->transport, "wss")) {
+			port = sofia_cfg.wssbindport;
+		} else {
+			port = sofia_cfg.bindport;
+		}
+	}
+	if (port <= 0) {
+		port = sofia_cfg.bindport > 0 ? sofia_cfg.bindport : DEFAULT_SIP_PORT;
+	}
+	loc->port = port;
+	/* _remote: no IPv6 %scope suffix in a URI (chan_sip build_contact). */
+	sofia_uri_format_host(ast_sockaddr_isnull(&ours)
+			? S_OR(sofia_cfg.bindaddr, "127.0.0.1") : ast_sockaddr_stringify_host_remote(&ours),
+		loc->host, sizeof(loc->host));
+}
+
+/* Contact of an MWI NOTIFY (RFC 3265 §7.1: mandatory in a NOTIFY request; the stack adds none to a
+ * client request), built like chan_sip initreqprep + build_contact: the From user at our address and
+ * port, with ;transport= when the transport is not udp. The user is the stack default "*"
+ * (NUTAG_M_USERNAME), the From user of the unsolicited NOTIFY and the Contact user of the 200 to an MWI
+ * SUBSCRIBE. Callers leave the Contact out when loc->known is 0 rather than advertise the wildcard
+ * address: inside a subscription the dialog then keeps its earlier target. */
+static void sofia_mwi_contact(const struct sofia_mwi_local *loc, char *buf, size_t len)
+{
+	char uri[160];
+
+	snprintf(uri, sizeof(uri), "sip:*@%s:%d", loc->host, loc->port);
+	sofia_uri_append_transport(uri, sizeof(uri), loc->transport);
+	snprintf(buf, len, "<%s>", uri);
+}
+
+/* Build the RFC 3842 simple-message-summary body for one target. Message-Account as chan_sip
+ * transmit_notify_with_mwi builds it: sip:<vmexten>@<fromdomain, else our address>, then :<port> when
+ * the port (the one in fromdomain=host:port, else ours) is not the standard one of the transport (5061
+ * for tls, 5060 for the rest), and ;transport= when the transport is not udp. RFC 3842 §5.2: the
+ * Account-URI is a SIP-URI, SIPS-URI or absoluteURI. Returns a new ast_str (NULL on failure). */
+static struct ast_str *sofia_mwi_body(const struct sofia_mwi_summary *sum, const struct sofia_mwi_local *loc)
+{
+	struct ast_str *body;
+	char domain[256];
+	char hbuf[260];
+	char account[400];
+	const char *vmexten = !ast_strlen_zero(sofia_cfg.vmexten) ? sofia_cfg.vmexten : "gabpbx";
+	int port = loc->port;
+	size_t cur;
+
+	if (!ast_strlen_zero(sum->fromdomain)) {
+		char *portstr;
+
+		/* fromdomain=host[:port]: the port replaces ours (chan_sip fromdomainport). A bracketed IPv6
+		 * literal keeps its own colons and its closing bracket; a bare IPv6 literal (more than one
+		 * colon) is all host and gets its brackets below. */
+		ast_copy_string(domain, sum->fromdomain, sizeof(domain));
+		if (domain[0] == '[') {
+			portstr = strstr(domain, "]:");
+		} else {
+			portstr = strchr(domain, ':');
+			if (portstr && strchr(portstr + 1, ':')) {
+				portstr = NULL;
+			}
+		}
+		if (portstr) {
+			if (*portstr == ']') {
+				portstr++;
+			}
+			*portstr++ = '\0';
+			if (atoi(portstr) > 0 && atoi(portstr) <= 65535) {
+				port = atoi(portstr);
+			}
+		}
+	} else {
+		ast_copy_string(domain, loc->host, sizeof(domain));
+	}
+	snprintf(account, sizeof(account), "sip:%s@%s", vmexten,
+		sofia_uri_format_host(domain, hbuf, sizeof(hbuf)));
+	if (port != (!strcmp(loc->transport, "tls") ? 5061 : DEFAULT_SIP_PORT)) {
+		cur = strlen(account);
+		snprintf(account + cur, sizeof(account) - cur, ":%d", port);
+	}
+	sofia_uri_append_transport(account, sizeof(account), loc->transport);
 
 	if (!(body = ast_str_create(256))) {
-		ast_log(LOG_WARNING, "Sofia MWI: ast_str_create failed for peer %s\n", peer->name);
+		ast_log(LOG_WARNING, "Sofia MWI: ast_str_create failed\n");
 		return NULL;
 	}
-	vmexten = !ast_strlen_zero(sofia_cfg.vmexten) ? sofia_cfg.vmexten : "asterisk";
 	/* RFC 3842 body (chan_sip parity). */
-	ast_str_append(&body, 0, "Messages-Waiting: %s\r\n", total_new ? "yes" : "no");
-	ast_str_append(&body, 0, "Message-Account: sip:%s@%s\r\n", vmexten, l_fromdomain);
+	ast_str_append(&body, 0, "Messages-Waiting: %s\r\n", sum->new_msgs ? "yes" : "no");
+	ast_str_append(&body, 0, "Message-Account: %s\r\n", account);
 	/* buggymwi=yes omits the "(0/0)" suffix some stacks reject (default = RFC 3842). */
-	ast_str_append(&body, 0, "Voice-Message: %d/%d%s\r\n", total_new, total_old, l_buggymwi ? "" : " (0/0)");
-
-	if (new_out) {
-		*new_out = total_new;
-	}
-	if (old_out) {
-		*old_out = total_old;
-	}
+	ast_str_append(&body, 0, "Voice-Message: %d/%d%s\r\n", sum->new_msgs, sum->old_msgs,
+		sum->buggymwi ? "" : " (0/0)");
 	return body;
 }
 
@@ -14524,15 +14664,18 @@ static void sofia_mwi_sub_on_notify_response(nua_handle_t *nh, int status, tagi_
  * the presence engine: Subscription-State composed explicitly (RFC 6665 §8.2.1; sofia-sip does not add
  * it for nua_respond()-accepted subscriptions), NUTAG_SUBSTATE keeps the library's usage state machine
  * in step, and the NOTIFY is routed to the subscriber's learned source (NUTAG_PROXY): a NAT device or a
- * WebSocket client is reachable there, never at its Contact. terminate = 1 sends the final NOTIFY
- * (terminated;reason=timeout). sofia_thread only. */
+ * WebSocket client is reachable there, never at its Contact. Our address in the Contact and in the
+ * Message-Account is the one that source sees, over the transport the SUBSCRIBE came in on. terminate = 1
+ * sends the final NOTIFY (terminated;reason=timeout). sofia_thread only. */
 static void sofia_mwi_notify_on_handle(struct sofia_peer *peer, nua_handle_t *nh, int terminate,
 	const char *proxy, long remaining)
 {
+	struct sofia_mwi_summary sum;
+	struct sofia_mwi_local loc;
 	struct ast_str *body;
 	const char *notifymime;
 	char ss[64];
-	int total_new = 0, total_old = 0;
+	char contact[200];
 
 	if (!peer || !nh) {
 		return;
@@ -14540,9 +14683,14 @@ static void sofia_mwi_notify_on_handle(struct sofia_peer *peer, nua_handle_t *nh
 	if (remaining < 0) {
 		remaining = 0;
 	}
-	if (!(body = sofia_build_mwi_body(peer, &total_new, &total_old))) {
+	if (sofia_mwi_summary_read(peer, &sum)) {
 		return;
 	}
+	sofia_mwi_local_addr(proxy, NULL, &loc);
+	if (!(body = sofia_mwi_body(&sum, &loc))) {
+		return;
+	}
+	sofia_mwi_contact(&loc, contact, sizeof(contact));
 	notifymime = !ast_strlen_zero(sofia_cfg.notifymime) ? sofia_cfg.notifymime
 		: "application/simple-message-summary";
 	if (terminate) {
@@ -14554,13 +14702,14 @@ static void sofia_mwi_notify_on_handle(struct sofia_peer *peer, nua_handle_t *nh
 		SIPTAG_EVENT_STR("message-summary"),
 		NUTAG_SUBSTATE(terminate ? nua_substate_terminated : nua_substate_active),
 		SIPTAG_SUBSCRIPTION_STATE_STR(ss),
+		TAG_IF(loc.known, SIPTAG_CONTACT_STR(contact)),
 		SIPTAG_CONTENT_TYPE_STR(notifymime),
 		SIPTAG_PAYLOAD_STR(ast_str_buffer(body)),
 		TAG_IF(!ast_strlen_zero(proxy), NUTAG_PROXY(proxy)),
 		TAG_END());
 	if (sofia_debug) {
 		ast_verbose("Sofia MWI: solicited NOTIFY for peer '%s' (%s, new=%d old=%d)%s%s\n",
-			peer->name, ss, total_new, total_old,
+			peer->name, ss, sum.new_msgs, sum.old_msgs,
 			!ast_strlen_zero(proxy) ? " via " : "", !ast_strlen_zero(proxy) ? proxy : "");
 	}
 	ast_free(body);
@@ -14596,18 +14745,32 @@ static void transmit_mwi_notify_for_peer(struct sofia_peer *peer)
  * the generic-method path delivers it. Subscription-State: active is set explicitly. The handle carries
  * SOFIA_SIPNOTIFY_HMAGIC so the one-shot reap destroys it on the final nua_r_method response.
  *
- * Send ONE such NOTIFY carrying an already-built body to one target URI. route = the Path (RFC 3327)
- * the registrar stored for that contact, pre-loaded as the initial Route, or "" when none.
- * sofia_thread only. */
+ * Send ONE such NOTIFY with the peer's counts to one target URI. Its body (Message-Account) and its
+ * Contact carry our address as that target sees it, over the transport the target URI names (chan_sip
+ * transmit_notify_with_mwi + initreqprep). route = the Path (RFC 3327) the registrar stored for that
+ * contact, pre-loaded as the initial Route, or "" when none. sofia_thread only. */
 static void sofia_send_unsolicited_mwi(struct sofia_peer *peer, const char *target, const char *route,
-	const char *body, int total_new, int total_old)
+	const struct sofia_mwi_summary *sum)
 {
+	struct sofia_mwi_local loc;
+	struct ast_sockaddr hint;
+	struct ast_str *body;
 	const char *notifymime;
+	char contact[200];
 	nua_handle_t *nh;
 
-	if (!peer || ast_strlen_zero(target) || !body) {
+	if (!peer || ast_strlen_zero(target) || !sum) {
 		return;
 	}
+	/* A static host=<name> target URI carries the name: route to its resolved address instead. */
+	ast_mutex_lock(&peer->lock);
+	ast_sockaddr_copy(&hint, &peer->src_addr);
+	ast_mutex_unlock(&peer->lock);
+	sofia_mwi_local_addr(target, &hint, &loc);
+	if (!(body = sofia_mwi_body(sum, &loc))) {
+		return;
+	}
+	sofia_mwi_contact(&loc, contact, sizeof(contact));
 	notifymime = !ast_strlen_zero(sofia_cfg.notifymime) ? sofia_cfg.notifymime
 		: "application/simple-message-summary";
 
@@ -14617,15 +14780,17 @@ static void sofia_send_unsolicited_mwi(struct sofia_peer *peer, const char *targ
 			NUTAG_METHOD("NOTIFY"),
 			SIPTAG_EVENT_STR("message-summary"),
 			SIPTAG_SUBSCRIPTION_STATE_STR("active"),
+			TAG_IF(loc.known, SIPTAG_CONTACT_STR(contact)),
 			SIPTAG_CONTENT_TYPE_STR(notifymime),
-			SIPTAG_PAYLOAD_STR(body),
+			SIPTAG_PAYLOAD_STR(ast_str_buffer(body)),
 			TAG_IF(!ast_strlen_zero(route), NUTAG_INITIAL_ROUTE_STR(route)),
 			TAG_END());
 		if (sofia_debug) {
 			ast_verbose("Sofia MWI: unsolicited NOTIFY for peer '%s' -> %s (new=%d old=%d)\n",
-				peer->name, target, total_new, total_old);
+				peer->name, target, sum->new_msgs, sum->old_msgs);
 		}
 	}
+	ast_free(body);
 }
 
 /* Target URI for an unsolicited NOTIFY to ONE registered contact: the contact's learned transport
@@ -14670,14 +14835,14 @@ static void sofia_contact_mwi_target(struct sofia_contact *c, const char *user, 
  * the registration-source target when there is no contact binding to fan out to. sofia_thread only. */
 static void transmit_unsolicited_mwi_for_peer(struct sofia_peer *peer)
 {
-	struct ast_str *body;
+	struct sofia_mwi_summary sum;
 	char target[300];
 	char path_buf[1024];
 	char defaultuser[256];
 	struct ast_sockaddr sub_src;
 	struct ao2_iterator ci;
 	struct sofia_contact *c;
-	int registered, path_support, skip_sub = 0, sent = 0, total_new = 0, total_old = 0;
+	int registered, path_support, skip_sub = 0, sent = 0;
 	time_t now = time(NULL);
 
 	if (!peer) {
@@ -14697,7 +14862,7 @@ static void transmit_unsolicited_mwi_for_peer(struct sofia_peer *peer)
 	if (!registered) {
 		return;		/* no registered contact to push to */
 	}
-	if (!(body = sofia_build_mwi_body(peer, &total_new, &total_old))) {
+	if (sofia_mwi_summary_read(peer, &sum)) {
 		return;
 	}
 
@@ -14717,7 +14882,7 @@ static void transmit_unsolicited_mwi_for_peer(struct sofia_peer *peer)
 			if (wanted) {
 				sofia_contact_mwi_target(c, defaultuser, path_support, target, sizeof(target),
 					path_buf, sizeof(path_buf));
-				sofia_send_unsolicited_mwi(peer, target, path_buf, ast_str_buffer(body), total_new, total_old);
+				sofia_send_unsolicited_mwi(peer, target, path_buf, &sum);
 				sent++;
 			}
 			ao2_ref(c, -1);
@@ -14728,19 +14893,18 @@ static void transmit_unsolicited_mwi_for_peer(struct sofia_peer *peer)
 		/* No contact binding to fan out to (static host, or a registration that stored no contact
 		 * slot): the peer-level registration-source target, as before. */
 		sofia_resolve_peer_target(peer, defaultuser, target, sizeof(target));
-		sofia_send_unsolicited_mwi(peer, target, "", ast_str_buffer(body), total_new, total_old);
+		sofia_send_unsolicited_mwi(peer, target, "", &sum);
 	}
-	ast_free(body);
 }
 
 /* UNSOLICITED MWI to the device that just registered (REGISTER 200 path): the peer-level target is
  * the registration source, i.e. that device. sofia_thread only. */
 static void transmit_unsolicited_mwi_to_registrant(struct sofia_peer *peer)
 {
-	struct ast_str *body;
+	struct sofia_mwi_summary sum;
 	char target[300];
 	char defaultuser[256];
-	int registered, total_new = 0, total_old = 0;
+	int registered;
 
 	if (!peer) {
 		return;
@@ -14758,11 +14922,10 @@ static void transmit_unsolicited_mwi_to_registrant(struct sofia_peer *peer)
 	if (ast_strlen_zero(target)) {
 		return;
 	}
-	if (!(body = sofia_build_mwi_body(peer, &total_new, &total_old))) {
+	if (sofia_mwi_summary_read(peer, &sum)) {
 		return;
 	}
-	sofia_send_unsolicited_mwi(peer, target, "", ast_str_buffer(body), total_new, total_old);
-	ast_free(body);
+	sofia_send_unsolicited_mwi(peer, target, "", &sum);
 }
 
 /* On a successful REGISTER, push the initial unsolicited MWI to the device that just registered, for a
@@ -21400,7 +21563,8 @@ static int sofia_apply_config(struct ast_config *cfg)
 	/* MWI defaults (RFC 3842). */
 	sofia_cfg.mwi_from[0] = '\0';
 	ast_copy_string(sofia_cfg.notifymime, "application/simple-message-summary", sizeof(sofia_cfg.notifymime));
-	ast_copy_string(sofia_cfg.vmexten, "asterisk", sizeof(sofia_cfg.vmexten));
+	/* chan_sip DEFAULT_VMEXTEN: the user part of the Message-Account URI. */
+	ast_copy_string(sofia_cfg.vmexten, "gabpbx", sizeof(sofia_cfg.vmexten));
 	sofia_cfg.mwi_expiry = 3600;
 	sofia_cfg.outboundproxy[0] = '\0';
 	/* Default minimum TLS to 1.2 (enables TLS 1.2 + 1.3). Sofia's tport default when TPTAG_TLS_VERSION is left

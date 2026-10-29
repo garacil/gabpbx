@@ -2889,10 +2889,17 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ; The peer's UA SUBSCRIBEs Event:message-summary; chan_sofia accepts + sends NOTIFY
 ; with Messages-Waiting + Voice-Message + Message-Account headers.
 ;
-;mwi_from       =                                       ; From header for MWI NOTIFY (empty -> peer->fromdomain or realm fallback)
+; Every MWI NOTIFY carries a Contact with our address and port as the device sees
+; them, with ;transport= when the transport is not udp (RFC 3265 section 7.1).
+; Message-Account is built as chan_sip builds it: sip:<vmexten>@<the peer's
+; fromdomain, else our address>, then :<port> when the port is not the standard one
+; of the transport (5061 for tls, 5060 for the rest), and ;transport= when the
+; transport is not udp. A port in fromdomain=host:port replaces ours.
+;
+;mwi_from       =                                       ; accepted for sip.conf compatibility; not used (the From user of an unsolicited NOTIFY is "*")
 ;notifymime     = application/simple-message-summary    ; Content-Type for MWI NOTIFY body (RFC 3842). Alias 'notifymimetype' accepted per chan_sip drop-in compat (chan_sip uses verbose form only per chan_sip.c:29685-29686).
 ;notifymimetype = application/simple-message-summary    ; chan_sip-canonical alias for notifymime (alias acceptance ship); identical effect
-;vmexten        = asterisk                              ; user-part of Message-Account URI
+;vmexten        = gabpbx                                ; user-part of Message-Account URI (default gabpbx, as chan_sip)
 ;mwi_expiry     = 3600                                  ; default subscription expiry seconds (chan_sip parity)
 
 ;
