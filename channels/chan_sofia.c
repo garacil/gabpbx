@@ -11293,15 +11293,24 @@ static int sofia_nonce_replay_check(const char *nonce, unsigned int nc, time_t i
 	return 0;
 }
 
+/* A digest failure counts toward the blacklist unless the caller asked otherwise (the refusal of a
+ * peer that is not host=dynamic must not ban an address that also carries trunks or other devices). */
+static void sofia_auth_blacklist_add(sip_t const *sip, int blacklist, const char *reason)
+{
+	if (blacklist) {
+		sofia_blacklist_add_sip(sip, reason);
+	}
+}
+
 /* Unified digest verifier (REGISTER/INVITE/SUBSCRIBE). Caller holds a peer ao2 ref
  * across the call. On CHALLENGE/REJECT the 401/4xx is already emitted; caller
  * ao2_ref(peer,-1)s on every return. */
-static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
+static enum sofia_auth_result sofia_verify_digest_auth_ex(struct sofia_peer *peer,
 		nua_t *nua, nua_handle_t *nh,
 		sip_t const *sip,
 		sip_authorization_t const *au,
 		const char *method,
-		const char *realm)
+		const char *realm, int blacklist)
 {
 	char auth_realm_buf[128] = "";
 	char auth_nonce_buf[128] = "";
@@ -11380,7 +11389,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 					nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
 					ast_verbose("Sofia: %s auth rejected for '%s' - MD5 not offered (auth_algorithms)\n",
 						method, peer->name);
-					sofia_blacklist_add_sip(sip, "digest algorithm not offered");
+					sofia_auth_blacklist_add(sip, blacklist, "digest algorithm not offered");
 					return SOFIA_AUTH_REJECT;
 				}
 				algorithm = SOFIA_DIGEST_MD5;
@@ -11389,7 +11398,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 					nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
 					ast_verbose("Sofia: %s auth rejected for '%s' - SHA-256 not offered (auth_algorithms)\n",
 						method, peer->name);
-					sofia_blacklist_add_sip(sip, "digest algorithm not offered");
+					sofia_auth_blacklist_add(sip, blacklist, "digest algorithm not offered");
 					return SOFIA_AUTH_REJECT;
 				}
 				algorithm = SOFIA_DIGEST_SHA256;
@@ -11397,14 +11406,14 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 				nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
 				ast_verbose("Sofia: %s auth rejected for '%s' - unknown algorithm '%s'\n",
 					method, peer->name, auth_algorithm);
-				sofia_blacklist_add_sip(sip, "digest unknown algorithm");
+				sofia_auth_blacklist_add(sip, blacklist, "digest unknown algorithm");
 				return SOFIA_AUTH_REJECT;
 			}
 		} else if (!want_md5) {
 			nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
 			ast_verbose("Sofia: %s auth rejected for '%s' - algorithm= required (MD5 not offered)\n",
 				method, peer->name);
-			sofia_blacklist_add_sip(sip, "digest algorithm required");
+			sofia_auth_blacklist_add(sip, blacklist, "digest algorithm required");
 			return SOFIA_AUTH_REJECT;
 		}
 	}
@@ -11415,7 +11424,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
 		ast_verbose("Sofia: %s auth rejected for '%s' - uri= missing\n",
 			method, peer->name);
-		sofia_blacklist_add_sip(sip, "digest missing uri");
+		sofia_auth_blacklist_add(sip, blacklist, "digest missing uri");
 		return SOFIA_AUTH_REJECT;
 	}
 
@@ -11441,7 +11450,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 			nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
 			ast_verbose("Sofia: %s auth rejected for '%s' - digest uri='%s' does not match Request-URI '%s'\n",
 				method, peer->name, auth_uri, ruri_str);
-			sofia_blacklist_add_sip(sip, "digest uri mismatch");
+			sofia_auth_blacklist_add(sip, blacklist, "digest uri mismatch");
 			return SOFIA_AUTH_REJECT;
 		}
 	}
@@ -11470,7 +11479,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
 		ast_verbose("Sofia: %s auth rejected for '%s' - unsupported/oversized qop (only qop=auth is offered)\n",
 			method, peer->name);
-		sofia_blacklist_add_sip(sip, "digest unsupported qop");
+		sofia_auth_blacklist_add(sip, blacklist, "digest unsupported qop");
 		return SOFIA_AUTH_REJECT;
 	}
 
@@ -11479,7 +11488,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
 		ast_verbose("Sofia: %s auth rejected for '%s' - qop without nc/cnonce\n",
 			method, peer->name);
-		sofia_blacklist_add_sip(sip, "digest malformed qop");
+		sofia_auth_blacklist_add(sip, blacklist, "digest malformed qop");
 		return SOFIA_AUTH_REJECT;
 	}
 
@@ -11492,7 +11501,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 			nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
 			ast_verbose("Sofia: %s auth rejected for '%s' - nc not 8 hex digits: %s\n",
 				method, peer->name, auth_nc);
-			sofia_blacklist_add_sip(sip, "digest malformed nc");
+			sofia_auth_blacklist_add(sip, blacklist, "digest malformed nc");
 			return SOFIA_AUTH_REJECT;
 		}
 		new_nc = (unsigned int)strtoul(auth_nc, &endptr, 16);
@@ -11500,7 +11509,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 			nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
 			ast_verbose("Sofia: %s auth rejected for '%s' - malformed nc=%s\n",
 				method, peer->name, auth_nc);
-			sofia_blacklist_add_sip(sip, "digest malformed nc");
+			sofia_auth_blacklist_add(sip, blacklist, "digest malformed nc");
 			return SOFIA_AUTH_REJECT;
 		}
 	}
@@ -11543,12 +11552,12 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 			if (missing) {
 				nua_respond(nh, SIP_400_BAD_REQUEST, NUTAG_WITH_THIS(nua), TAG_END());
 				ast_verbose("Sofia: %s auth rejected for '%s' - username= missing\n", method, snap_name);
-				sofia_blacklist_add_sip(sip, "digest missing username");
+				sofia_auth_blacklist_add(sip, blacklist, "digest missing username");
 			} else {
 				nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
 				ast_verbose("Sofia: %s auth rejected for '%s' - username '%s' != configured '%s'\n",
 					method, snap_name, auth_username, snap_exp);
-				sofia_blacklist_add_sip(sip, "digest username mismatch");
+				sofia_auth_blacklist_add(sip, blacklist, "digest username mismatch");
 			}
 			return SOFIA_AUTH_REJECT;
 		}
@@ -11615,7 +11624,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
 		ast_verbose("Sofia: %s auth failed for '%s' - bad response\n",
 			method, peer->name);
-		sofia_blacklist_add_sip(sip, "digest bad response");
+		sofia_auth_blacklist_add(sip, blacklist, "digest bad response");
 		return SOFIA_AUTH_REJECT;
 	}
 
@@ -11641,6 +11650,17 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	}
 
 	return SOFIA_AUTH_OK;
+}
+
+/* The verifier as every caller but one uses it: failures count toward the blacklist. */
+static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
+		nua_t *nua, nua_handle_t *nh,
+		sip_t const *sip,
+		sip_authorization_t const *au,
+		const char *method,
+		const char *realm)
+{
+	return sofia_verify_digest_auth_ex(peer, nua, nh, sip, au, method, realm, 1);
 }
 
 /* Out-of-dialog MESSAGE digest gate (RFC 3428): a MESSAGE from a configured, credentialed
@@ -12798,6 +12818,35 @@ static enum sofia_register_nh_fate sofia_process_register_impl(nua_t *nua, nua_h
 			nua_respond(nh, SIP_403_FORBIDDEN,
 				NUTAG_WITH_THIS(nua), TAG_END());
 			sofia_blacklist_add_sip(sip, "REGISTER peer ACL reject");
+			ao2_ref(peer, -1);
+			return SOFIA_REG_NH_ANSWERED;
+		}
+	}
+
+	/* Only a host=dynamic peer registers (chan_sip register_verify, AUTH_PEER_NOT_DYNAMIC): any other
+	 * peer takes its address from host=, and a binding would let a REGISTER redirect its calls. Refused
+	 * as chan_sip does, after the ACL and before auth: with alwaysauthreject the same answers an unknown
+	 * peer gets (the verifier against the bogus peer, so they reveal nothing about the account),
+	 * otherwise 403. Unlike chan_sip it never counts toward the blacklist (the verifier runs with
+	 * blacklisting off): a refused registration must not ban an address that also carries a trunk,
+	 * a provider or other devices. host is a stringfield a reload may rewrite under peer->lock. */
+	{
+		int not_dynamic;
+
+		ast_mutex_lock(&peer->lock);
+		not_dynamic = strcasecmp(S_OR(peer->host, ""), "dynamic") != 0;
+		ast_mutex_unlock(&peer->lock);
+		if (not_dynamic) {
+			ast_log(LOG_ERROR, "Peer '%s' is trying to register, but not configured as host=dynamic\n", peer->name);
+			sofia_log_register_outcome("REJECT (not host=dynamic)", peer->name, sip);
+			if (sofia_cfg.alwaysauthreject) {
+				sip_authorization_t const *au = sip->sip_authorization
+					? sip->sip_authorization
+					: (sip_authorization_t const *)sip->sip_proxy_authorization;
+				sofia_verify_digest_auth_ex(sofia_bogus_peer, nua, nh, sip, au, "REGISTER", realm, 0);
+			} else {
+				nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
+			}
 			ao2_ref(peer, -1);
 			return SOFIA_REG_NH_ANSWERED;
 		}
