@@ -2130,8 +2130,17 @@ static void rt_handle_member_record(struct call_queue *q, char *interface, const
  		if (!strcasecmp(m->rt_uniqueid, rt_uniqueid)) {
  			m->dead = 0;	/* Do not delete this one. */
  			ast_copy_string(m->rt_uniqueid, rt_uniqueid, sizeof(m->rt_uniqueid));
- 			if (paused_str)
- 				m->paused = paused;
+			if (paused_str && m->paused != paused) {
+				/* A pause changed in the database: the same event PauseQueueMember gives, so an AMI
+				 * consumer is not left with the old state (until now only a reload noticed it). */
+				m->paused = paused;
+				manager_event(EVENT_FLAG_AGENT, "QueueMemberPaused",
+					"Queue: %s\r\n"
+					"Location: %s\r\n"
+					"MemberName: %s\r\n"
+					"Paused: %d\r\n",
+					q->name, m->interface, m->membername, m->paused);
+			}
  			if (strcasecmp(state_interface, m->state_interface)) {
  				ast_copy_string(m->state_interface, state_interface, sizeof(m->state_interface));
  			}	   
@@ -2151,11 +2160,47 @@ static void rt_handle_member_record(struct call_queue *q, char *interface, const
 			m->realtime = 1;
 			ast_copy_string(m->rt_uniqueid, rt_uniqueid, sizeof(m->rt_uniqueid));
 			ast_queue_log(q->name, "REALTIME", m->interface, "ADDMEMBER", "%s", paused ? "PAUSED" : "");
+			/* A member that appears in the database gets the event an AddQueueMember member gets, so an AMI
+			 * consumer sees every member come (until now only the queue_log recorded it). */
+			manager_event(EVENT_FLAG_AGENT, "QueueMemberAdded",
+				"Queue: %s\r\n"
+				"Location: %s\r\n"
+				"MemberName: %s\r\n"
+				"Membership: %s\r\n"
+				"Penalty: %d\r\n"
+				"CallsTaken: %d\r\n"
+				"LastCall: %d\r\n"
+				"Status: %d\r\n"
+				"Paused: %d\r\n",
+				q->name, m->interface, m->membername, "realtime",
+				m->penalty, m->calls, (int) m->lastcall, m->status, m->paused);
 			ao2_link(q->members, m);
 			ao2_ref(m, -1);
 			m = NULL;
 		}
 	}
+}
+
+/*!
+ * \brief Whether another live member of the queue has the interface of a realtime member about to be swept.
+ *
+ * A realtime member row deleted and inserted again for the same interface comes back with a new uniqueid:
+ * rt_handle_member_record has already created (and announced with QueueMemberAdded) the new member when the old
+ * object is swept, so announcing the old one's removal would end, for an AMI consumer, the member that stays
+ * (both share the Location). The caller holds the queue lock.
+ */
+static int rt_member_interface_survives(struct call_queue *q, struct member *gone)
+{
+	struct member *m;
+	struct ao2_iterator it = ao2_iterator_init(q->members, 0);
+	int found = 0;
+
+	while (!found && (m = ao2_iterator_next(&it))) {
+		found = (m != gone && !m->dead && !strcasecmp(m->interface, gone->interface));
+		ao2_ref(m, -1);
+	}
+	ao2_iterator_destroy(&it);
+	return found;
 }
 
 /*! \brief Iterate through queue's member list and delete them */
@@ -2332,6 +2377,15 @@ static struct call_queue *find_queue_by_name_rt(const char *queuename, struct as
 	while ((m = ao2_iterator_next(&mem_iter))) {
 		if (m->dead) {
 			ast_queue_log(q->name, "REALTIME", m->interface, "REMOVEMEMBER", "%s", "");
+			/* Gone from the database: the event a RemoveQueueMember member gets (see QueueMemberAdded above),
+			 * unless the row came back for the same interface (see rt_member_interface_survives). */
+			if (!rt_member_interface_survives(q, m)) {
+				manager_event(EVENT_FLAG_AGENT, "QueueMemberRemoved",
+					"Queue: %s\r\n"
+					"Location: %s\r\n"
+					"MemberName: %s\r\n",
+					q->name, m->interface, m->membername);
+			}
 			ao2_unlink(q->members, m);
 		}
 		ao2_ref(m, -1);
@@ -2451,6 +2505,15 @@ static void update_realtime_members(struct call_queue *q)
 	while ((m = ao2_iterator_next(&mem_iter))) {
 		if (m->dead) {
 			ast_queue_log(q->name, "REALTIME", m->interface, "REMOVEMEMBER", "%s", "");
+			/* Gone from the database: the event a RemoveQueueMember member gets (see QueueMemberAdded above),
+			 * unless the row came back for the same interface (see rt_member_interface_survives). */
+			if (!rt_member_interface_survives(q, m)) {
+				manager_event(EVENT_FLAG_AGENT, "QueueMemberRemoved",
+					"Queue: %s\r\n"
+					"Location: %s\r\n"
+					"MemberName: %s\r\n",
+					q->name, m->interface, m->membername);
+			}
 			ao2_unlink(q->members, m);
 		}
 		ao2_ref(m, -1);
@@ -6971,6 +7034,37 @@ static void do_print(struct mansession *s, int fd, const char *str)
 		ast_cli(fd, "%s\n", str);
 }
 
+/*!
+ * \brief Bring realtime queues into the in-core container before listing them.
+ *
+ * One named queue, or every realtime queue when the name is empty: a realtime queue nobody has
+ * called since the start is not in the container, so a listing that only walks it would miss it.
+ */
+static void load_realtime_queues_for_listing(const char *queuename)
+{
+	struct call_queue *q;
+
+	if (!ast_strlen_zero(queuename)) { /* specific queue */
+		if ((q = load_realtime_queue(queuename))) {
+			queue_t_unref(q, "Done with temporary pointer");
+		}
+	} else if (ast_check_realtime("queues")) {
+		/* This block is to find any queues which are defined in realtime but
+		 * which have not yet been added to the in-core container
+		 */
+		struct ast_config *cfg = ast_load_realtime_multientry("queues", "name LIKE", "%", SENTINEL);
+		char *name;
+		if (cfg) {
+			for (name = ast_category_browse(cfg, NULL); !ast_strlen_zero(name); name = ast_category_browse(cfg, name)) {
+				if ((q = load_realtime_queue(name))) {
+					queue_t_unref(q, "Done with temporary pointer");
+				}
+			}
+			ast_config_destroy(cfg);
+		}
+	}
+}
+
 /*! 
  * \brief Show queue(s) status and statistics 
  * 
@@ -6989,25 +7083,7 @@ static char *__queues_show(struct mansession *s, int fd, int argc, const char * 
 	if (argc != 2 && argc != 3)
 		return CLI_SHOWUSAGE;
 
-	if (argc == 3)	{ /* specific queue */
-		if ((q = load_realtime_queue(argv[2]))) {
-			queue_t_unref(q, "Done with temporary pointer");
-		}
-	} else if (ast_check_realtime("queues")) {
-		/* This block is to find any queues which are defined in realtime but
-		 * which have not yet been added to the in-core container
-		 */
-		struct ast_config *cfg = ast_load_realtime_multientry("queues", "name LIKE", "%", SENTINEL);
-		char *queuename;
-		if (cfg) {
-			for (queuename = ast_category_browse(cfg, NULL); !ast_strlen_zero(queuename); queuename = ast_category_browse(cfg, queuename)) {
-				if ((q = load_realtime_queue(queuename))) {
-					queue_t_unref(q, "Done with temporary pointer");
-				}
-			}
-			ast_config_destroy(cfg);
-		}
-	}
+	load_realtime_queues_for_listing(argc == 3 ? argv[2] : NULL);
 
 	ao2_lock(queues);
 	queue_iter = ao2_iterator_init(queues, AO2_ITERATOR_DONTLOCK);
@@ -7291,6 +7367,10 @@ static int manager_queues_status(struct mansession *s, const struct message *m)
 	struct ao2_iterator queue_iter;
 	struct ao2_iterator mem_iter;
 
+	/* Realtime queues not called since the start are not in the container yet: load them first, as
+	 * "queue show" does, so the status covers every queue and not only the ones already used. */
+	load_realtime_queues_for_listing(queuefilter);
+
 	astman_send_ack(s, m, "Queue status will follow");
 	time(&now);
 	if (!ast_strlen_zero(id))
@@ -7335,7 +7415,7 @@ static int manager_queues_status(struct mansession *s, const struct message *m)
 						"Paused: %d\r\n"
 						"%s"
 						"\r\n",
-						q->name, mem->membername, mem->interface, mem->dynamic ? "dynamic" : "static",
+						q->name, mem->membername, mem->interface, mem->dynamic ? "dynamic" : mem->realtime ? "realtime" : "static",
 						mem->penalty, mem->calls, (int)mem->lastcall, mem->status, mem->paused, idText);
 				}
 				ao2_ref(mem, -1);
