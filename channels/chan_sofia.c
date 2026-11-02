@@ -2938,7 +2938,13 @@ static int sofia_rtp_init(struct sofia_pvt *pvt)
  * unchanged. audio_was_new/video_was_new = the context didn't exist before. */
 
 
-static struct ast_channel *sofia_new(struct sofia_pvt *pvt, int state, const char *linkedid)
+static unsigned int sofia_chan_idx;	/* channel name serial, as chan_sip chan_idx */
+
+/* title = the device the channel is named after, as chan_sip sip_new (chan_sip.c:7851-7859): the peer that
+ * was matched for an inbound call (else the From domain), the dialled host for an outbound one. The name is
+ * SIP/<title>-<8 hex digits>, unique per call: what PickupChan, SoftHangup, the attended-transfer callback,
+ * the parking return and the device-state updates of the core expect when they cut it at the last '-'. */
+static struct ast_channel *sofia_new(struct sofia_pvt *pvt, int state, const char *title, const char *linkedid)
 {
 	struct ast_channel *chan;
 
@@ -2950,8 +2956,8 @@ static struct ast_channel *sofia_new(struct sofia_pvt *pvt, int state, const cha
 	 * (populated via dialog inheritance from peer->accountcode), NOT the SIP auth
 	 * user. chan_sip parity. */
 	chan = ast_channel_alloc(1, state, pvt->fromuser, NULL, pvt->accountcode,
-			pvt->exten, pvt->context, linkedid, 0, "%s/%s",
-			SOFIA_CHANNEL_TYPE, pvt->peername);
+			pvt->exten, pvt->context, linkedid, 0, "%s/%s-%08x",
+			SOFIA_CHANNEL_TYPE, S_OR(title, ""), ast_atomic_fetchadd_int((int *)&sofia_chan_idx, +1));
 	if (!chan) {
 		ast_log(LOG_ERROR, "Unable to allocate Sofia channel\n");
 		return NULL;
@@ -8387,7 +8393,9 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 		return NULL;
 	}
 
-	chan = sofia_new(pvt, AST_STATE_DOWN, requestor ? requestor->linkedid : NULL);
+	/* Named after the dialled host, as chan_sip sip_request_call (chan_sip.c:28280): pvt->peername holds it,
+	 * the part after '@' of exten@host or before '/' of host/exten, else the whole dial string. */
+	chan = sofia_new(pvt, AST_STATE_DOWN, pvt->peername, requestor ? requestor->linkedid : NULL);
 	if (!chan) {
 		ao2_unlink(dialogs, pvt);
 		ao2_ref(pvt, -1);
@@ -9256,7 +9264,7 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		if (decoded) {
 			ast_uri_decode(decoded);
 			if (ast_exists_extension(NULL, pvt->context, decoded, 1, S_OR(pvt->cid_num, NULL))
-			    || !strcmp(decoded, ast_pickup_ext())
+			    || !strncmp(decoded, ast_pickup_ext(), strlen(decoded))	/* the pickupexten or a beginning of it (chan_sip tests the decoded form, :16709, :16738) */
 			    || (!ast_canmatch_extension(NULL, pvt->context, pvt->exten, 1, S_OR(pvt->cid_num, NULL))
 			        && ast_canmatch_extension(NULL, pvt->context, decoded, 1, S_OR(pvt->cid_num, NULL)))) {
 				ast_string_field_set(pvt, exten, decoded);
@@ -9373,7 +9381,13 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	 * added a redundant duplicate 100 on the wire. The stack's automatic (and earlier) 100 is the
 	 * legitimate one. */
 
-	chan = sofia_new(pvt, AST_STATE_RING, NULL);
+	/* Named after the peer the call was matched to (by name, address or digest), else the From domain, as
+	 * chan_sip (check_peer_ok sets p->peername = peer->name, get_destination p->fromdomain; sip_new is
+	 * called with S_OR(p->peername, NULL), chan_sip.c:17324, 16651, 24251). A peer's name never changes. */
+	chan = sofia_new(pvt, AST_STATE_RING,
+		pvt->peer ? pvt->peer->name
+			: (sip->sip_from && sip->sip_from->a_url ? sip->sip_from->a_url->url_host : NULL),
+		NULL);
 	if (!chan) {
 		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, TAG_END());
 		ao2_ref(pvt, -1);
