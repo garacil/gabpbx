@@ -138,6 +138,7 @@
 #include "gabpbx/logger.h"
 #include "gabpbx/module.h"
 #include "gabpbx/pbx.h"
+#include "gabpbx/features.h"
 #include "gabpbx/taskprocessor.h"
 #include "gabpbx/utils.h"
 #include "gabpbx/lock.h"
@@ -8794,6 +8795,39 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 
 static void sofia_reap_unbound_handle(nua_handle_t *nh);	/* defined below sofia_process_cancel */
 
+/* Group call pickup, as chan_sip sip_pickup_thread (chan_sip.c:23052-23065): an INVITE to the
+ * features.conf pickupexten takes a ringing channel whose callgroup matches our pickupgroup
+ * (ast_pickup_call), in its own thread, then hangs up whatever is left of this channel. */
+static void *sofia_pickup_thread(void *data)
+{
+	struct ast_channel *chan = data;
+
+	if (ast_pickup_call(chan)) {
+		chan->hangupcause = AST_CAUSE_CALL_REJECTED;
+	} else {
+		chan->hangupcause = AST_CAUSE_NORMAL_CLEARING;
+	}
+	ast_hangup(chan);
+	ast_channel_unref(chan);
+	return NULL;
+}
+
+/* chan_sip sip_pickup (chan_sip.c:23071-23083). */
+static int sofia_pickup(struct ast_channel *chan)
+{
+	pthread_t threadid;
+
+	ast_channel_ref(chan);
+
+	if (ast_pthread_create_detached_background(&threadid, NULL, sofia_pickup_thread, chan)) {
+		ast_debug(1, "Unable to start Group pickup thread on channel %s\n", chan->name);
+		ast_channel_unref(chan);
+		return -1;
+	}
+	ast_debug(1, "Started Group pickup thread on channel %s\n", chan->name);
+	return 0;
+}
+
 static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
 		sip_t const *sip, tagi_t tags[])
 {
@@ -9222,6 +9256,7 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		if (decoded) {
 			ast_uri_decode(decoded);
 			if (ast_exists_extension(NULL, pvt->context, decoded, 1, S_OR(pvt->cid_num, NULL))
+			    || !strcmp(decoded, ast_pickup_ext())
 			    || (!ast_canmatch_extension(NULL, pvt->context, pvt->exten, 1, S_OR(pvt->cid_num, NULL))
 			        && ast_canmatch_extension(NULL, pvt->context, decoded, 1, S_OR(pvt->cid_num, NULL)))) {
 				ast_string_field_set(pvt, exten, decoded);
@@ -9232,13 +9267,16 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 
 	/* allowoverlap=YES + partial (canmatch but not exact) extension → 484 before
 	 * sofia_new. DTMF/NO fall through (the PBX 404s if truly absent). pvt not yet in
-	 * dialogs → ao2_ref drop. */
+	 * dialogs → ao2_ref drop. As chan_sip get_destination (chan_sip.c:16736-16742), the
+	 * pickupexten is a destination and a beginning of it asks for more digits. */
 	{
 		int overlap_mode = pvt->peer ? pvt->peer->allowoverlap_mode : sofia_cfg.default_allowoverlap_mode;
 		if (overlap_mode == SOFIA_OVERLAP_YES
 		    && !ast_strlen_zero(pvt->exten)
 		    && !ast_exists_extension(NULL, pvt->context, pvt->exten, 1, S_OR(pvt->cid_num, NULL))
-		    && ast_canmatch_extension(NULL, pvt->context, pvt->exten, 1, S_OR(pvt->cid_num, NULL))) {
+		    && strcmp(pvt->exten, ast_pickup_ext())
+		    && (ast_canmatch_extension(NULL, pvt->context, pvt->exten, 1, S_OR(pvt->cid_num, NULL))
+		        || !strncmp(pvt->exten, ast_pickup_ext(), strlen(pvt->exten)))) {
 			char rb[128] = "";	/* RFC 3326 Q.850 Reason (chan_sip parity) */
 			int hr = sofia_cfg.use_q850_reason && sofia_reason_build_for_status(484, rb, sizeof(rb));
 			ast_log(LOG_NOTICE, "Sofia: inbound INVITE exten '%s'@'%s' partial-match — 484 Address Incomplete (overlap=yes)\n",
@@ -9257,7 +9295,8 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	 * calls to a missing extension, and let anyone spoofing that address over UDP get the trunk banned. */
 	if (!ast_strlen_zero(pvt->exten)
 	    && !ast_exists_extension(NULL, pvt->context, pvt->exten, 1, S_OR(pvt->cid_num, NULL))
-	    && !ast_canmatch_extension(NULL, pvt->context, pvt->exten, 1, S_OR(pvt->cid_num, NULL))) {
+	    && !ast_canmatch_extension(NULL, pvt->context, pvt->exten, 1, S_OR(pvt->cid_num, NULL))
+	    && strcmp(pvt->exten, ast_pickup_ext())) {	/* the pickupexten is found (chan_sip get_destination) */
 		ast_log(LOG_NOTICE, "Sofia: call from '%s' to extension '%s' rejected because extension not found in context '%s'\n",
 			S_OR(pvt->cid_num, pvt->peername), pvt->exten, pvt->context);
 		if (!pvt->peer && !strcasecmp(pvt->context, sofia_cfg.context)) {
@@ -9358,6 +9397,19 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	sofia_change_redirecting_info(pvt, pvt->owner, sip);
 
 	ao2_link(dialogs, pvt);
+
+	/* chan_sip handle_request_invite (chan_sip.c:24493-24526): a call to the pickupexten does not run the
+	 * dialplan, it picks up a ringing call of our pickup group. */
+	if (!ast_strlen_zero(pvt->exten) && !strcmp(pvt->exten, ast_pickup_ext())) {
+		if (sofia_pickup(chan)) {
+			ast_log(LOG_WARNING, "Failed to start Group pickup by %s\n", chan->name);
+			nua_respond(nh, SIP_480_TEMPORARILY_UNAVAILABLE, TAG_END());
+			sofia_mark_uas_final_sent(pvt);
+			chan->hangupcause = AST_CAUSE_FAILURE;
+			ast_hangup(chan);
+		}
+		return;
+	}
 
 	if (ast_pbx_start(chan)) {
 		ast_log(LOG_ERROR, "Failed to start PBX on incoming Sofia call\n");
