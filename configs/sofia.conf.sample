@@ -489,8 +489,11 @@ srvlookup=yes
 ; chan_sip drop-in defaults — peers omitting callingpres / sendrpid / trustrpid
 ; inherit from this [general] block. Per-peer keys override.
 ;
-; callingpres   - default presentation for outbound calls. Accepted values mirror
-;                 chan_sip exactly (see callerid.h AST_PRES_* table):
+; callingpres   - presentation applied to calls FROM the peer when no trusted
+;                 PAI/RPID set one (chan_sip parity). It never hides the caller of
+;                 a call TO the peer: the From / PAI / RPID / push of an outbound
+;                 call follow the caller's own presentation (connected line).
+;                 Accepted values mirror chan_sip exactly (see callerid.h AST_PRES_* table):
 ;                   allowed_not_screened   (DEFAULT — Allowed, Not Screened)
 ;                   allowed_passed_screen  (Allowed, Passed Screen)
 ;                   allowed_failed_screen  (Allowed, Failed Screen)
@@ -3094,7 +3097,7 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;mailbox=1234@phones         ; explicit context form
 ;mailbox=1234@a,5678@b       ; comma-separated multi-mailbox (per-mailbox NOTIFY emission)
                              ; chan_sofia honors at-most-1 active subscription per peer; new SUBSCRIBE replaces old (terminated;reason=deactivated).
-;callingpres=allowed_not_screened ; per-peer presentation override; AST_PRES_* values per [general] callingpres list
+;callingpres=allowed_not_screened ; per-peer presentation of calls FROM this peer (chan_sip parity); AST_PRES_* values per [general] callingpres list
 ;sendrpid=pai                ; per-peer RPID/PAI emission: no / pai / rpid (yes = rpid, chan_sip parity); typical trunk: pai
 ;trustrpid=yes               ; per-peer trust on inbound PAI/RPID; typical trunk: yes (trusted upstream)
 ;forceddiversion=34931234567 ; CLI-forward compliance (RFC 5806): force a trunk-owned DID as the diverting party in the outbound Diversion header on FORWARDED (desvio) calls, so the carrier validates the diversion against a number it provisions for this trunk (RULE 2). Emitted ONLY when the channel carries a redirect marker — set REDIRECTING(from-num) or REDIRECTING(reason) in the dialplan before Dial(); a non-forwarded direct call NEVER gets a Diversion. Keep RULE 1 (From=original caller): do NOT overwrite CALLERID(num) and do NOT set fromuser= to the DID. Empty = disabled (legacy data-driven Diversion).

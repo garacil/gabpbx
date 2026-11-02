@@ -6652,16 +6652,10 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		return -1;
 	}
 
-	/* callingpres from channel.caller.id, then let a configured peer override win. */
+	/* chan_sip sip_call parity (chan_sip.c:6327): the presentation of this channel's caller id.
+	 * A peer's callingpres= applies to calls from that peer only (chan_sip.c:17297), and the
+	 * From/RPID/PAI follow the connected line (sofia_resolve_identity). */
 	pvt->callingpres = ast_party_id_presentation(&ast->caller.id);
-	if (pvt->peer && pvt->peer->callingpres) {
-		pvt->callingpres = pvt->peer->callingpres;
-	}
-	/* Write the resolved presentation back so dialplan reads + RPID emission agree. */
-	if (ast) {
-		ast->caller.id.number.presentation = pvt->callingpres;
-		ast->caller.id.name.presentation = pvt->callingpres;
-	}
 
 	/* Busy-on-active: reject if any contact has an active call. On a SELF-CALL (a device
 	 * dialing its own extension) the caller's own binding is inherently "active" (it is
@@ -13435,9 +13429,10 @@ static int sofia_resolve_identity(struct sofia_pvt *pvt, char **lid_num_out,
 		lid_name_src = pvt->owner->connected.id.name.str;
 	}
 
-	if (pvt && pvt->callingpres) {
-		lid_pres = pvt->callingpres;
-	} else if (pvt && pvt->owner) {
+	/* The presentation is the connected line's, as chan_sip initreqprep (chan_sip.c:13083) and
+	 * add_rpid: pvt->callingpres describes our own channel's caller (the dialled party outbound,
+	 * the remote caller inbound) and must not hide the party we announce. */
+	if (pvt && pvt->owner) {
 		lid_pres = ast_party_id_presentation(&pvt->owner->connected.id);
 	}
 

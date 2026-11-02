@@ -1091,14 +1091,12 @@ static void sofia_push_collect_cancel_timer(struct sofia_push_park *e)
 /* Caller identity for the push payload: the calling party exactly as the INVITE's From
  * carries it (sofia_resolve_identity). On an outbound leg Dial stores the dialled extension
  * in caller.id and the calling party in connected.id (Originate sets both), so caller.id
- * would show the callee its own number. A restricted presentation sends "anonymous", as the
- * From does. Caller holds the channel lock. */
-static void sofia_push_caller_id(struct ast_channel *ast, int callingpres,
+ * would show the callee its own number. A restricted presentation of the connected line
+ * sends "anonymous", as the From does. Caller holds the channel lock. */
+static void sofia_push_caller_id(struct ast_channel *ast,
 	char *num, size_t num_len, char *name, size_t name_len)
 {
-	int pres = callingpres ? callingpres : ast_party_id_presentation(&ast->connected.id);
-
-	if ((pres & AST_PRES_RESTRICTION) != AST_PRES_ALLOWED) {
+	if ((ast_party_id_presentation(&ast->connected.id) & AST_PRES_RESTRICTION) != AST_PRES_ALLOWED) {
 		ast_copy_string(num, "anonymous", num_len);
 		ast_copy_string(name, "Anonymous", name_len);
 		return;
@@ -1204,7 +1202,7 @@ static int sofia_push_guard_cb(const void *data)
 	struct ast_channel *owner = NULL;
 	struct sofia_push_park *e;
 	char callid[64] = "", cid_num[80] = "unknown", cid_name[80] = "";
-	int fire = 0, callingpres = 0;
+	int fire = 0;
 
 	ast_mutex_lock(&pvt->lock);
 	pvt->push_guard_sched_id = -1;
@@ -1212,7 +1210,6 @@ static int sofia_push_guard_cb(const void *data)
 		&& pvt->state == SOFIA_DIALOG_STATE_TRYING && pvt->owner && pvt->sip_callid[0]) {
 		fire = 1;
 		ast_copy_string(callid, pvt->sip_callid, sizeof(callid));
-		callingpres = pvt->callingpres;
 		owner = pvt->owner;
 		ast_channel_ref(owner);
 	}
@@ -1221,7 +1218,7 @@ static int sofia_push_guard_cb(const void *data)
 	if (fire) {
 		/* caller identity for the push payload: channel lock, nothing else held */
 		ast_channel_lock(owner);
-		sofia_push_caller_id(owner, callingpres, cid_num, sizeof(cid_num), cid_name, sizeof(cid_name));
+		sofia_push_caller_id(owner, cid_num, sizeof(cid_num), cid_name, sizeof(cid_name));
 		ast_channel_unlock(owner);
 		ast_channel_unref(owner);
 
@@ -1392,8 +1389,7 @@ int sofia_push_park_and_notify(struct sofia_pvt *pvt, struct ast_channel *ast)
 	}
 	ast_mutex_unlock(&pvt->lock);
 
-	sofia_push_caller_id(ast, pvt->callingpres, cid_num, sizeof(cid_num),	/* channel lock held by ast_call */
-		cid_name, sizeof(cid_name));
+	sofia_push_caller_id(ast, cid_num, sizeof(cid_num), cid_name, sizeof(cid_name));	/* channel lock held by ast_call */
 	e = sofia_push_park_create(pvt, pvt->sip_callid, cid_num, cid_name,
 		0 /* not inflight: no INVITE exists yet */);
 	if (!e) {
@@ -2054,8 +2050,7 @@ int sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_channel *ast,
 	ast_copy_string(e->callid, pvt->sip_callid, sizeof(e->callid));
 	/* Caller identity for the push payload, same source and lock contract as the parked
 	 * path: the channel lock is held by ast_call. */
-	sofia_push_caller_id(ast, pvt->callingpres, e->cid_num, sizeof(e->cid_num),
-		e->cid_name, sizeof(e->cid_name));
+	sofia_push_caller_id(ast, e->cid_num, sizeof(e->cid_num), e->cid_name, sizeof(e->cid_name));
 	e->pvt = pvt;
 	ao2_ref(pvt, +1);
 	e->sched_id = -1;
