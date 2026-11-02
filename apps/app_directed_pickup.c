@@ -135,6 +135,7 @@ static const char app2[] = "PickupChan";
 struct pickup_by_name_args {
 	const char *name;
 	size_t len;
+	int exact;	/*!< compare the whole channel name, not a prefix */
 };
 
 static int pickup_by_name_cb(void *obj, void *arg, void *data, int flags)
@@ -143,7 +144,8 @@ static int pickup_by_name_cb(void *obj, void *arg, void *data, int flags)
 	struct pickup_by_name_args *args = data;
 
 	ast_channel_lock(target);
-	if (!strncasecmp(target->name, args->name, args->len) && ast_can_pickup(target)) {
+	if ((args->exact ? !strcasecmp(target->name, args->name) : !strncasecmp(target->name, args->name, args->len))
+		&& ast_can_pickup(target)) {
 		/* Return with the channel still locked on purpose */
 		return CMP_MATCH | CMP_STOP;
 	}
@@ -156,26 +158,27 @@ static int pickup_by_name_cb(void *obj, void *arg, void *data, int flags)
 static struct ast_channel *my_ast_get_channel_by_name_locked(const char *channame)
 {
 	char *chkchan;
-	struct pickup_by_name_args pickup_args;
+	struct pickup_by_name_args pickup_args = { 0, };
+	struct ast_channel *target;
 
-	/* Check if channel name contains a '-'.
-	 * In this case the channel name will be interpreted as full channel name.
-	 */
-	if (strchr(channame, '-')) {
-		/* check full channel name */
-		pickup_args.len = strlen(channame);
-		pickup_args.name = channame;
-	} else {
-		/* need to append a '-' for the comparison so we check full channel name,
-		 * i.e SIP/hgc- , use a temporary variable so original stays the same for
-		 * debugging.
-		 */
-		pickup_args.len = strlen(channame) + 1;
-		chkchan = alloca(pickup_args.len + 1);
-		strcpy(chkchan, channame);
-		strcat(chkchan, "-");
-		pickup_args.name = chkchan;
+	/* First the channel named exactly so: a full channel name (SIP/hgc-00000001), or a
+	 * device of a driver that names its channels after the device alone, with no per-call
+	 * suffix (chan_sofia: SIP/<peer>). */
+	pickup_args.name = channame;
+	pickup_args.exact = 1;
+	if ((target = ast_channel_callback(pickup_by_name_cb, NULL, &pickup_args, 0))) {
+		return target;
 	}
+
+	/* Then a channel of that device with the usual per-call suffix: append a '-' for the
+	 * comparison, i.e SIP/hgc- , use a temporary variable so original stays the same for
+	 * debugging. Never the bare name as a prefix: SIP/hgc-2 must not take SIP/hgc-20. */
+	pickup_args.len = strlen(channame) + 1;
+	chkchan = alloca(pickup_args.len + 1);
+	strcpy(chkchan, channame);
+	strcat(chkchan, "-");
+	pickup_args.name = chkchan;
+	pickup_args.exact = 0;
 
 	return ast_channel_callback(pickup_by_name_cb, NULL, &pickup_args, 0);
 }
