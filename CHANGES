@@ -1,3 +1,50 @@
+## 1.9.13 — an Android phone woken by push stops ringing when the call ends
+
+A release for phones woken by push. An Android phone shows the incoming-call card as soon as
+the push arrives. When its app cannot register again (some vendors stop the background work
+that does it), it never gets the INVITE, so it never gets the CANCEL either, and the card and a
+connected headset kept ringing after the call was over. GABPBX now tells the phone with a second
+push. A parked call left behind by the no-answer guard is also fixed. The packages for Debian 12
+and 13, Ubuntu 22.04 and 24.04 and RHEL 9 are attached to the release with `SHA256SUMS`.
+
+### New
+
+- **`call_cancel` push to the Android devices a call never reached.** Every pushed Android
+  device (`X-Push-Platform: android`, FCM token) that did not get an INVITE for a call now
+  receives an FCM data message `type=call_cancel` with the call push's `uuid`, `caller` and
+  `callerName`, and a `reason`:
+  - `cancelled`: the caller gave up, or Dial's timeout ended the attempt, while the call waited
+    for the device; or a call delivered to other devices of the account ended unanswered.
+  - `answered_elsewhere`: another destination of the Dial answered, another device of the
+    account answered, or the call went to one device only.
+  - `timeout`: no device registered within `push_wait`.
+
+  Priority HIGH, `ttl` 30 s, no APNs block. Devices that got the INVITE get the SIP CANCEL as
+  before, recognised by their `+sip.instance`. iOS devices never get one, since a VoIP push
+  must report a call. One cancel per device per call.
+- **Both senders send it.** The native sender, and the script sender through a new
+  `send_push_cancel.py <token> <caller> <callerName> <uuid> <reason>` in `push_scripts`, with
+  the same bytes. Without that script the script sender sends no cancel and says so in the log
+  once a minute.
+  - Cancels use at most half of either sender's queue, so call pushes always find room.
+  - The result is logged in `push_log` as `cancel`. It never changes the device's last result
+    and never purges its token.
+- **A cancelled device is announced again when it is needed.**
+  - A redial right after a cancel pushes the device again, even inside `push_min_interval`,
+    since its card is gone.
+  - A second call to the same account that arrived inside `push_min_interval`, and so was
+    waiting on the first call's card, is pushed to the device when that card is cancelled.
+
+### Fixes
+
+- **A call parked by the no-answer guard is released when the caller hangs up.** When a
+  suspended phone's connection-oriented binding gave no provisional, the guard pushed with the
+  Call-ID already on the wire and parked the call in flight. A hangup by the caller did not
+  release it: the entry stayed until `push_wait`. It then counted a failed wake against the
+  device (five purge its token) and logged a no-answer timeout for a call that had already
+  ended. The hangup now releases it at once, so the cancel goes out with the right reason. The
+  guard also checks that the call is still there before pushing.
+
 ## 1.9.12 — calls answered after a push wake-up have audio
 
 A fix release, and the first with its binary packages published. A call to an extension whose
