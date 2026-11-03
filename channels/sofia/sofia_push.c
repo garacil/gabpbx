@@ -884,15 +884,23 @@ static void sofia_push_collect_cancel_timer(struct sofia_push_park *e);
  * (a park with 0 jobs is still valid if a push went out moments ago — the phone is
  * already waking; a second push inside the phone's own 5 s dedup window would be
  * actively harmful — iOS reports-and-cancels it). Also records the pushed device ids. */
-static int sofia_push_notify_devices(struct sofia_push_park *entry, int *rate_limited)
+static int sofia_push_notify_devices(struct sofia_push_park *entry, int *rate_limited, int only_cancelled)
 {
 	struct sofia_push_tokens *e;
 	struct sofia_push_device snap[SOFIA_PUSH_MAX_DEVICES];
-	int nsnap = 0, i, queued = 0;
+	char already[SOFIA_PUSH_MAX_DEVICES][SOFIA_PUSH_DEVID_MAX];
+	int nsnap = 0, nalready = 0, i, queued = 0;
 	time_t now = time(NULL);
 	int cap = sofia_cfg.push_max_devices;
 
 	*rate_limited = 0;
+	if (only_cancelled) {
+		/* outside the cache lock: two leaf locks never nest */
+		ao2_lock(entry);
+		nalready = entry->npushed;
+		memcpy(already, entry->pushed_dev, sizeof(already));
+		ao2_unlock(entry);
+	}
 	if (cap < 1 || cap > SOFIA_PUSH_MAX_DEVICES) {
 		cap = SOFIA_PUSH_MAX_DEVICES;
 	}
@@ -906,6 +914,23 @@ static int sofia_push_notify_devices(struct sofia_push_park *entry, int *rate_li
 	for (i = 0; i < e->ndev && nsnap < cap; i++) {
 		if (sofia_push_device_stale(&e->dev[i], now)) {
 			continue;
+		}
+		if (only_cancelled) {
+			/* Re-announce: only a device whose card for another call was just cancelled,
+			 * and only if this call has not pushed it yet. */
+			int k, dup = 0;
+			if (!e->dev[i].cancelled) {
+				continue;
+			}
+			for (k = 0; k < nalready; k++) {
+				if (!strcasecmp(already[k], e->dev[i].device_id)) {
+					dup = 1;
+					break;
+				}
+			}
+			if (dup) {
+				continue;
+			}
 		}
 		/* Self-call: never push the device that is PLACING this call (matched by the
 		 * normalized +sip.instance both sides store via sofia_contact_parse_instance). */
@@ -1012,6 +1037,39 @@ static void sofia_push_pvt_instance(struct sofia_pvt *pvt, char *buf, size_t len
 	ao2_lock(pvt);
 	ast_copy_string(buf, pvt->dev_instance, len);
 	ao2_unlock(pvt);
+}
+
+/* Another call to the same account that arrived inside push_min_interval did not push a device
+ * (its card for this call was already showing) and now waits on a card that was just
+ * cancelled: announce that call to the device. Same lock context as sofia_push_send_cancels. */
+static void sofia_push_renotify_waiting(const char *peername, struct sofia_push_park *done)
+{
+	struct ao2_iterator it;
+	struct sofia_push_park *o;
+
+	if (!sofia_push_parked) {
+		return;
+	}
+	it = ao2_iterator_init(sofia_push_parked, 0);
+	while ((o = ao2_iterator_next(&it))) {
+		int waiting = 0;
+		if (o != done && !strcasecmp(o->peername, peername)) {
+			ao2_lock(o);
+			waiting = (o->state == SOFIA_PUSH_PARKED || o->state == SOFIA_PUSH_COLLECTING);
+			ao2_unlock(o);
+		}
+		if (waiting) {
+			int rate_limited = 0;
+			int queued = sofia_push_notify_devices(o, &rate_limited, 1);
+			if (queued) {
+				ast_verb(2, "Sofia PUSH: %s peer='%s' - pushed %d device(s) whose card for another call was cancelled\n",
+					o->callid, o->peername, queued);
+				sofia_push_log_event(o->peername, "", o->callid, "sent", "renotify");
+			}
+		}
+		ao2_ref(o, -1);
+	}
+	ao2_iterator_destroy(&it);
 }
 
 /* call_cancel: the call announced by this entry's push will never reach these devices as an
@@ -1139,6 +1197,7 @@ static void sofia_push_send_cancels(struct sofia_push_park *e, const char *reaso
 	if (nsnap) {
 		ast_verb(2, "Sofia PUSH: call_cancel %s peer='%s' reason=%s -> %d of %d Android device(s)\n",
 			callid, peername, reason, sent, nsnap);
+		sofia_push_renotify_waiting(peername, e);
 	}
 }
 
@@ -1327,7 +1386,7 @@ static struct sofia_push_park *sofia_push_park_create(struct sofia_pvt *pvt, con
 	 * per-device rate limit (a push from moments ago is already waking the phone). */
 	{
 		int rate_limited = 0;
-		int queued = sofia_push_notify_devices(e, &rate_limited);
+		int queued = sofia_push_notify_devices(e, &rate_limited, 0);
 		if (!queued && !rate_limited) {
 			ao2_unlink(sofia_push_parked, e);
 			ao2_ref(e, -1);
@@ -1795,7 +1854,6 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 			return;
 		}
 		ast_sockaddr_copy(&e->dialed[e->ndialed], &update->new_src);
-		ast_copy_string(e->dialed_inst[e->ndialed], bound_inst, sizeof(e->dialed_inst[0]));
 		slot = e->ndialed++;	/* reserve BEFORE posting: a racing re-REGISTER dedups here */
 		/* Every pushed device has now joined: the fork no longer needs to be held open for a
 		 * woken device, so its own branches decide the outcome from here (released below). */
@@ -1812,6 +1870,13 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 			ast_channel_lock(owner);
 			if (pvt->owner == owner) {
 				arc = sofia_fork_append_contact(pvt, c);
+				if (!arc) {
+					/* This device got the INVITE: no call_cancel for it. Recorded under the
+					 * channel lock, which the hangup's cancels also run under. */
+					ao2_lock(e);
+					ast_copy_string(e->dialed_inst[slot], bound_inst, sizeof(e->dialed_inst[0]));
+					ao2_unlock(e);
+				}
 			}
 			ast_channel_unlock(owner);
 			ast_channel_unref(owner);
@@ -1822,12 +1887,6 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 				if (all_joined) {
 					sofia_fork_push_hold_release(pvt);
 				}
-			} else {
-				/* No branch went out: this device got no INVITE, so it stays a cancel target
-				 * (dialed[] keeps the source for the dedup). */
-				ao2_lock(e);
-				e->dialed_inst[slot][0] = '\0';
-				ao2_unlock(e);
 			}
 		}
 		ao2_ref(c, -1);
@@ -2345,7 +2404,7 @@ int sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_channel *ast,
 	pvt->push_appending = 1;
 	ast_mutex_unlock(&pvt->lock);
 
-	queued = sofia_push_notify_devices(e, &rate_limited);
+	queued = sofia_push_notify_devices(e, &rate_limited, 0);
 	if (!queued && !rate_limited) {
 		/* No asleep device could be pushed (all rang, or none usable): nothing to assist.
 		 * Drop the entry; the fork to the live devices stands on its own. */
