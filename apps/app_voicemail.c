@@ -10992,7 +10992,7 @@ static int append_mailbox(const char *context, const char *box, const char *data
 		read_password_from_file(secretfn, vmu->password, sizeof(vmu->password));
 	}
 
-	mailbox_full = ast_alloca(strlen(box) + strlen(context) + 1);
+	mailbox_full = ast_alloca(strlen(box) + strlen(context) + 2);	/* box, '@', context, NUL */
 	strcpy(mailbox_full, box);
 	strcat(mailbox_full, "@");
 	strcat(mailbox_full, context);
