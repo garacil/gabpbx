@@ -30,7 +30,7 @@ changes in `chan_sofia` since 1.9.10.
 
 - **amd64 packages for five distributions** (first published with 1.9.12, which also fixes the
   audio of calls answered after a push wake-up), with `SHA256SUMS`:
-  `gabpbx_1.9.11-1~debian12_amd64.deb`, `~debian13`, `~ubuntu22.04`, `~ubuntu24.04`, and
+  `gabpbx_1.9.11-1.debian12_amd64.deb`, `.debian13`, `.ubuntu22.04`, `.ubuntu24.04`, and
   `gabpbx-1.9.11-1.el9.x86_64.rpm` (tested on AlmaLinux 9 and Rocky Linux 9), plus a `.tar.gz` of
   each tree. Install with `apt install ./gabpbx_…deb`, or `dnf install epel-release` and then
   `dnf install ./gabpbx-…rpm` (some libraries come from EPEL).
