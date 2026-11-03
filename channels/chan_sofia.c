@@ -1957,6 +1957,7 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	 * later master re-INVITE/hold would emit plain RTP/AVP on a DTLS-SRTP leg and lose video. */
 	master->is_webrtc = child->is_webrtc;
 	ast_string_field_set(master, outbound_proxy, child->outbound_proxy);	/* NAT: keep routing master re-INVITEs to the winner contact's public source */
+	ast_sockaddr_copy(&master->ourip, &child->ourip);	/* our address toward the winner: later re-INVITE/UPDATE SDP and Contact */
 	master->webrtc_offerer = child->webrtc_offerer;
 	master->webrtc_bundle = child->webrtc_bundle;	/* sofia_generate_sdp emits the session a=group:BUNDLE only when is_webrtc && webrtc_bundle — a forked winner must keep it */
 	master->webrtc_answer_applied = child->webrtc_answer_applied;
@@ -6267,6 +6268,21 @@ static int sofia_fork_dial_one(struct sofia_pvt *pvt, struct sofia_fork *fork,
 	 * header builders below) so forked INVITEs carry the real caller. */
 	child->callingpres = pvt->callingpres;
 	ast_sockaddr_copy(&child->ourip, &pvt->ourip);
+	/* Our address toward THIS contact (SDP c=, ICE candidate, Contact), resolved per branch as the
+	 * single-binding push resume does (sofia_push.c). A call parked for push had no binding when it
+	 * was requested, so the master's ourip is empty and the offer went out with c=0.0.0.0 (the
+	 * wildcard RTP bind): the woken device had nowhere to send media. The master's value stays
+	 * only when the contact has no source address. */
+	{
+		struct ast_sockaddr target;
+
+		ao2_lock(c);
+		ast_sockaddr_copy(&target, &c->src_addr);
+		ao2_unlock(c);
+		if (!ast_sockaddr_isnull(&target)) {
+			sofia_resolve_ourip(child, &target);
+		}
+	}
 	char child_path[1024] = "";	/* RFC 3327 Path of THIS contact, pre-loaded as Route on its forked INVITE */
 
 	/* Build RURI for this contact via the shared per-contact builder
