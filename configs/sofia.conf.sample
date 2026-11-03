@@ -3257,7 +3257,7 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;                  yes requires RTP/SAVP + a=crypto in offer/answer or 488
 ;
 ; --- Identity headers (identity-headers parity) ---
-; callingpres    - default presentation (AST_PRES_*); chan_sip parity values:
+; callingpres    - presentation of calls FROM the peer (AST_PRES_*); chan_sip parity values:
 ;                  allowed_not_screened (default), allowed_passed_screen,
 ;                  allowed_failed_screen, allowed, prohib_not_screened,
 ; datachannel    - yes/no: accept the WebRTC m=application SCTP DataChannel

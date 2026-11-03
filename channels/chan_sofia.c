@@ -13376,7 +13376,13 @@ static void sofia_build_contact(struct sofia_pvt *pvt, char *buf, size_t len)
 	if (pvt && pvt->owner
 			&& pvt->owner->connected.id.number.valid
 			&& !ast_strlen_zero(pvt->owner->connected.id.number.str)) {
-		user = pvt->owner->connected.id.number.str;
+		/* A restricted number never goes out in the Contact either: chan_sip uses the From user
+		 * there (initreqprep, chan_sip.c:13083-13093 and 13204), "anonymous" or the fromuser. */
+		if ((ast_party_id_presentation(&pvt->owner->connected.id) & AST_PRES_RESTRICTION) != AST_PRES_ALLOWED) {
+			user = (pvt->peer && !ast_strlen_zero(pvt->peer->fromuser)) ? pvt->peer->fromuser : "anonymous";
+		} else {
+			user = pvt->owner->connected.id.number.str;
+		}
 	}
 	if (ast_strlen_zero(user) && pvt && pvt->peer) {
 		if (!ast_strlen_zero(pvt->peer->fromuser)) {

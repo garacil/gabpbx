@@ -678,7 +678,7 @@ struct sofia_pvt {
 	struct ast_variable *initreq_headers; /* inbound INVITE headers for ${SIP_HEADER()}; freed in destructor */
 	struct ast_sockaddr last_src_addr; /* INVITE transport-source for ${SIPCHANINFO(peerip|recvip)} */
 	struct ast_sockaddr ourip; /* kernel-routed source IP for outbound From/Contact + SDP c= (sofia_resolve_ourip) */
-	int callingpres; /* AST_PRES_* mask; inherits peer->callingpres */
+	int callingpres; /* AST_PRES_* of our channel's caller: inbound from PAI/RPID or the peer's callingpres=; never hides the From (connected line) */
 	int outgoing; /* 1=outbound dial, 0=inbound INVITE; drives RPID ;party=calling/called */
 	/* A connected-line update arrived before the call was up, so it had no request of its own to ride on; the next
 	 * 180/183 we emit carries the RPID/PAI and clears this (chan_sip SIP_PAGE2_CONNECTLINEUPDATE_PEND parity).
