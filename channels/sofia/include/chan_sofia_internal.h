@@ -85,8 +85,13 @@ int sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_channel *ast, struc
  * fail-closed to today's failure (never park without an armed timer). */
 int sofia_push_park_and_notify(struct sofia_pvt *pvt, struct ast_channel *ast);
 /* Hangup notification for a pvt whose push_parked flag was set (called from sofia_hangup
- * AFTER pvt->lock is released, before the final unref): terminal-CAS + timer cancel. */
-void sofia_push_on_pvt_hangup(struct sofia_pvt *pvt);
+ * AFTER pvt->lock is released, before the final unref): terminal-CAS + timer cancel, and the
+ * call_cancel push to the pushed devices that never got the INVITE (answered_elsewhere = the
+ * leg ended because another destination of the Dial answered). */
+void sofia_push_on_pvt_hangup(struct sofia_pvt *pvt, int answered_elsewhere);
+/* A fork branch of a push-resumed (or push-assisted) master answered (sofia_thread, no locks
+ * held): call_cancel to the pushed devices that never joined the fork. */
+void sofia_push_on_fork_answered(struct sofia_pvt *master);
 /* P2 no-provisional guard (sofia_push.c). Arm after the single-contact nua_invite (PBX
  * thread, channel lock held, no pvt/peer lock); progress on ANY >=100 response (sofia_thread)
  * disarms it and unparks a pending inflight entry; cancel from hangup/destructor. */
@@ -108,25 +113,29 @@ void sofia_push_log_event(const char *peer, const char *device_id, const char *c
 enum sofia_push_purpose {
 	SOFIA_PUSH_PURPOSE_CALL = 0,	/* incoming-call wake: APNs VoIP (voip) / FCM type=call (fcm) */
 	SOFIA_PUSH_PURPOSE_REREGISTER,	/* P3 silent re-register: ALWAYS FCM-shaped, NEVER APNs VoIP (phantom CallKit); no caller today */
+	SOFIA_PUSH_PURPOSE_CANCEL,	/* FCM type=call_cancel to an Android device whose call push will get no INVITE; NEVER APNs (a VoIP push must report a call) */
 };
 int sofia_push_sender_init(void);		/* create queue + thread (idempotent); 0 = native lane came up */
 void sofia_push_sender_stop(void);		/* load-failure unwind ONLY (err_cleanup ladder; module refuses runtime unload) */
 int sofia_push_sender_available(void);		/* 1 = lane usable right now (thread up, curl ready) */
 int sofia_push_sender_natq_depth(void);		/* queued + in-flight jobs, for `sip show push` */
 /* Queue one push on the native lane. purpose=REREGISTER reuses cid_num as the username and
- * ignores cid_name. Returns 0 = queued; 1 = lane cannot serve this job right now (down, or
+ * ignores cid_name; reason is read only by purpose=CANCEL (cancelled | answered_elsewhere |
+ * timeout). Returns 0 = queued; 1 = lane cannot serve this job right now (down, or
  * that push type's credentials are sick) -> caller falls back to the SCRIPT sender;
  * -1 = native queue full -> caller DROPS the device (bounded; a burst must never degrade
  * into fork/exec). */
 int sofia_push_sender_submit(enum sofia_push_purpose purpose, const char *push_type,
 	const char *token, const char *cid_num, const char *cid_name, const char *callid,
-	const char *peername, const char *device_id);
+	const char *peername, const char *device_id, const char *reason);
 /* Completion contract (implemented in sofia_push.c beside its static consumers): replicates the
  * script-sender record path verbatim — first-line truncate, redacted verb line, push_log 'sent',
- * last_result cache+DB update, dead-token purge. sender_label is the verb-line name (e.g.
- * "native/apns-voip"). Runs on the native sender thread (same safety class as the script lane). */
-void sofia_push_sender_complete(const char *peername, const char *device_id, const char *callid,
-	const char *sender_label, const char *token_redacted, const char *out, long ms);
+ * last_result cache+DB update, dead-token purge; for purpose=CANCEL only the verb line and a
+ * push_log 'cancel' row. sender_label is the verb-line name (e.g. "native/apns-voip"). Runs on
+ * the native sender thread (same safety class as the script lane). */
+void sofia_push_sender_complete(enum sofia_push_purpose purpose, const char *peername,
+	const char *device_id, const char *callid, const char *reason, const char *sender_label,
+	const char *token_redacted, const char *out, long ms);
 int sofia_format_auth_creds(msg_auth_t const *challenge, const char *user, const char *secret, char *buf, size_t len);
 void sofia_split_hostport_from_uri(const char *hostport, char *host, size_t hostlen, int *port);
 void sofia_presence_state_map(int state, const char **statestring, const char **pidfstate, const char **pidfnote, int *local_state);

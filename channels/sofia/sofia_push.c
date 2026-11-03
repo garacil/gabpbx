@@ -85,6 +85,7 @@ struct sofia_push_device {
 	time_t last_push_at;
 	int fail_count;
 	char last_result[121];
+	int cancelled;			/* a call_cancel went out after the last push: its card is gone, so the next call pushes even inside push_min_interval (cache only) */
 };
 
 /* One cache entry per peer name; devices mutated ONLY under ao2_lock(entry).
@@ -562,13 +563,15 @@ int sofia_push_peer_pushable(struct sofia_peer *peer)
 static struct ast_taskprocessor *sofia_push_tps;
 
 struct sofia_push_send_job {
-	char script[300];		/* absolute path (push_scripts + send_push[_voip].py) */
+	char script[300];		/* absolute path (push_scripts + send_push[_voip|_cancel].py) */
 	char token[SOFIA_PUSH_TOKEN_MAX];
 	char cid_num[80];
 	char cid_name[80];
 	char callid[64];
 	char peername[128];
 	char device_id[SOFIA_PUSH_DEVID_MAX];
+	int cancel;			/* call_cancel job: argv gains the reason, the result only goes to push_log */
+	char reason[24];
 };
 
 /* Dead-token classification from the scripts' stdout markers (verified live):
@@ -640,13 +643,26 @@ static void sofia_push_record_result(const char *peername, const char *device_id
 	sofia_pushdb_queue(&fj);
 }
 
+/* A call_cancel result is logged only: it never touches last_result (which keeps the call
+ * push's outcome for `sip show push`) and never purges, so a cancel can never cost a device
+ * its token; the next call push classifies the token as usual. */
+static void sofia_push_record_cancel(const char *peername, const char *device_id,
+	const char *callid, const char *reason, const char *out)
+{
+	char detail[160];
+
+	snprintf(detail, sizeof(detail), "%s %s", S_OR(reason, ""), S_OR(out, ""));
+	sofia_push_log_event(peername, device_id, callid, "cancel", detail);
+}
+
 /* Completion entry for the NATIVE sender lane (sofia_push_sender.c). Lives here, beside the
  * static consumers, so both lanes run the IDENTICAL record path: first-line truncate, redacted
- * verb line, push_log 'sent', last_result cache+DB, dead-token purge. Runs on the native sender
- * thread — the same safety class as the script lane's taskprocessor thread (leaf cache-entry
- * locks + pushdb queue only; never pvt/peer/channel). */
-void sofia_push_sender_complete(const char *peername, const char *device_id, const char *callid,
-	const char *sender_label, const char *token_redacted, const char *out_in, long ms)
+ * verb line, push_log 'sent', last_result cache+DB, dead-token purge (a call_cancel: push_log
+ * 'cancel' only). Runs on the native sender thread — the same safety class as the script lane's
+ * taskprocessor thread (leaf cache-entry locks + pushdb queue only; never pvt/peer/channel). */
+void sofia_push_sender_complete(enum sofia_push_purpose purpose, const char *peername,
+	const char *device_id, const char *callid, const char *reason, const char *sender_label,
+	const char *token_redacted, const char *out_in, long ms)
 {
 	char out[SOFIA_PUSH_RESULT_MAX];
 	char *nl;
@@ -657,6 +673,10 @@ void sofia_push_sender_complete(const char *peername, const char *device_id, con
 	}
 	ast_verb(2, "Sofia PUSH: sender %s dev=%s token=%s callid=%s result=%s (%ldms)\n",
 		sender_label, device_id, token_redacted, callid, out, ms);
+	if (purpose == SOFIA_PUSH_PURPOSE_CANCEL) {
+		sofia_push_record_cancel(peername, device_id, callid, reason, out);
+		return;
+	}
 	sofia_push_log_event(peername, device_id, callid, "sent", out);
 	sofia_push_record_result(peername, device_id, out);
 	if (sofia_push_result_is_dead_token(out)) {
@@ -678,7 +698,15 @@ static int sofia_push_send_exe(void *data)
 
 	if (access(j->script, X_OK)) {
 		ast_copy_string(out, "ERR:noexec", sizeof(out));
-		if (time(NULL) - last_exec_warn >= 60) {
+		if (j->cancel) {
+			/* A box without send_push_cancel.py still pushes calls: note it, nothing else. */
+			static time_t last_cancel_warn;
+			if (time(NULL) - last_cancel_warn >= 60) {
+				last_cancel_warn = time(NULL);
+				ast_log(LOG_NOTICE, "Sofia PUSH: cancel script '%s' missing/not executable - call_cancel pushes are not sent by the script sender\n",
+					j->script);
+			}
+		} else if (time(NULL) - last_exec_warn >= 60) {
 			last_exec_warn = time(NULL);
 			ast_log(LOG_WARNING, "Sofia PUSH: sender script '%s' missing/not executable - pushes are being dropped (calls still park + NOANSWER cleanly)\n",
 				j->script);
@@ -708,7 +736,8 @@ static int sofia_push_send_exe(void *data)
 		dup2(pfd[1], STDERR_FILENO);
 		ast_close_fds_above_n(STDERR_FILENO);
 		{
-			char *argv[] = { j->script, j->token, j->cid_num, j->cid_name, j->callid, NULL };
+			char *argv[] = { j->script, j->token, j->cid_num, j->cid_name, j->callid,
+				j->cancel ? j->reason : NULL, NULL };
 			execv(j->script, argv);
 		}
 		_exit(1);
@@ -760,10 +789,14 @@ record:
 	ast_verb(2, "Sofia PUSH: sender %s dev=%s token=%s callid=%s result=%s (%ldms)\n",
 		j->script, j->device_id, sofia_push_redact(j->token, redact, sizeof(redact)),
 		j->callid, out, (long) ast_tvdiff_ms(ast_tvnow(), t0));
-	sofia_push_log_event(j->peername, j->device_id, j->callid, "sent", out);
-	sofia_push_record_result(j->peername, j->device_id, out);
-	if (sofia_push_result_is_dead_token(out)) {
-		sofia_push_purge_device(j->peername, j->device_id, out);
+	if (j->cancel) {
+		sofia_push_record_cancel(j->peername, j->device_id, j->callid, j->reason, out);
+	} else {
+		sofia_push_log_event(j->peername, j->device_id, j->callid, "sent", out);
+		sofia_push_record_result(j->peername, j->device_id, out);
+		if (sofia_push_result_is_dead_token(out)) {
+			sofia_push_purge_device(j->peername, j->device_id, out);
+		}
 	}
 	ast_atomic_fetchadd_int(&sofia_pushdb_depth, -1);	/* shared best-effort budget */
 	ast_free(j);
@@ -800,6 +833,7 @@ struct sofia_push_park {
 	int collect_sched_id;		/* multi-ring collect window; -1 = none */
 	int collected;			/* a collect window already ran: stragglers resume immediately */
 	struct ast_sockaddr dialed[SOFIA_PUSH_MAX_DEVICES];	/* REGISTER source addrs already given a branch (late-append dedup; entry lock) */
+	char dialed_inst[SOFIA_PUSH_MAX_DEVICES][128];	/* +sip.instance of each dialed[] binding ("" = none): those devices got the INVITE, so no call_cancel */
 	int ndialed;
 	char live_inst[SOFIA_PUSH_MAX_DEVICES][128];	/* push-assist: +sip.instance of devices ALREADY ringing (a live binding) — their push is skipped, only the asleep devices are woken */
 	int n_live_inst;
@@ -811,6 +845,7 @@ struct sofia_push_park {
 	time_t parked_at;
 	int npushed;			/* devices actually notified */
 	char pushed_dev[SOFIA_PUSH_MAX_DEVICES][SOFIA_PUSH_DEVID_MAX];
+	int cancel_sent;		/* the call_cancel pushes went out (once per call; entry lock) */
 };
 
 #define SOFIA_PUSH_PARK_MAX_PER_PEER 4
@@ -892,12 +927,13 @@ static int sofia_push_notify_devices(struct sofia_push_park *entry, int *rate_li
 				continue;
 			}
 		}
-		if (sofia_cfg.push_min_interval > 0
+		if (sofia_cfg.push_min_interval > 0 && !e->dev[i].cancelled
 			&& e->dev[i].last_push_at > now - sofia_cfg.push_min_interval) {
 			(*rate_limited)++;
 			continue;
 		}
 		e->dev[i].last_push_at = now;	/* stamp NOW so a racing second park rate-limits */
+		e->dev[i].cancelled = 0;
 		snap[nsnap++] = e->dev[i];
 	}
 	ao2_unlock(e);
@@ -916,12 +952,14 @@ static int sofia_push_notify_devices(struct sofia_push_park *entry, int *rate_li
 		if (sofia_cfg.push_sender_native) {
 			int sr = sofia_push_sender_submit(SOFIA_PUSH_PURPOSE_CALL, snap[i].push_type,
 				snap[i].token, entry->cid_num, entry->cid_name, entry->callid,
-				entry->peername, snap[i].device_id);
+				entry->peername, snap[i].device_id, NULL);
 			if (sr == 0) {
+				ao2_lock(entry);	/* the entry is already linked: send_cancels reads these under it */
 				if (entry->npushed < SOFIA_PUSH_MAX_DEVICES) {
 					ast_copy_string(entry->pushed_dev[entry->npushed++], snap[i].device_id,
 						sizeof(entry->pushed_dev[0]));
 				}
+				ao2_unlock(entry);
 				queued++;
 				continue;
 			}
@@ -957,13 +995,151 @@ static int sofia_push_notify_devices(struct sofia_push_park *entry, int *rate_li
 			ast_free(j);
 			break;
 		}
+		ao2_lock(entry);
 		if (entry->npushed < SOFIA_PUSH_MAX_DEVICES) {
 			ast_copy_string(entry->pushed_dev[entry->npushed++], snap[i].device_id,
 				sizeof(entry->pushed_dev[0]));
 		}
+		ao2_unlock(entry);
 		queued++;
 	}
 	return queued;
+}
+
+/* +sip.instance of the binding the pvt's call is on ("" = none). ao2_lock(pvt) is a leaf. */
+static void sofia_push_pvt_instance(struct sofia_pvt *pvt, char *buf, size_t len)
+{
+	ao2_lock(pvt);
+	ast_copy_string(buf, pvt->dev_instance, len);
+	ao2_unlock(pvt);
+}
+
+/* call_cancel: the call announced by this entry's push will never reach these devices as an
+ * INVITE (the caller hung up, another destination or device answered, push_wait expired, or
+ * the call went to one device only), so nothing in SIP can stop the card the push put on
+ * screen. Send an FCM type=call_cancel with the same uuid to every pushed Android device
+ * (push_type fcm) that did not get an INVITE for this call: the dialed bindings, and keep_inst
+ * when the call went to one binding outside the fork ("" = that binding has no instance, so a
+ * device without one may be it and is skipped). iOS is never sent one: a VoIP push must
+ * report a call, and a woken iPhone gets the INVITE and the CANCEL. Once per entry. Both
+ * lanes, like the call push: native first, the script sender (send_push_cancel.py) when the
+ * native lane cannot serve it. Any thread holding no pvt/peer/entry lock (the channel lock
+ * may be held: only the cache entry lock, a leaf, and the sender queues are taken). */
+static void sofia_push_send_cancels(struct sofia_push_park *e, const char *reason, const char *keep_inst)
+{
+	char pushed[SOFIA_PUSH_MAX_DEVICES][SOFIA_PUSH_DEVID_MAX];
+	char joined[SOFIA_PUSH_MAX_DEVICES + 1][128];
+	char peername[128], callid[64], cid_num[80], cid_name[80];
+	struct sofia_push_tokens *te;
+	struct {
+		char device_id[SOFIA_PUSH_DEVID_MAX];
+		char token[SOFIA_PUSH_TOKEN_MAX];
+	} snap[SOFIA_PUSH_MAX_DEVICES];
+	int npushed, njoined = 0, any_joined, nsnap = 0, i, k, sent = 0;
+
+	ao2_lock(e);
+	if (e->cancel_sent || !e->npushed) {
+		ao2_unlock(e);
+		return;
+	}
+	e->cancel_sent = 1;
+	npushed = e->npushed;
+	memcpy(pushed, e->pushed_dev, sizeof(pushed));
+	for (i = 0; i < e->ndialed && i < SOFIA_PUSH_MAX_DEVICES; i++) {
+		ast_copy_string(joined[njoined++], e->dialed_inst[i], sizeof(joined[0]));
+	}
+	ast_copy_string(peername, e->peername, sizeof(peername));
+	ast_copy_string(callid, e->callid, sizeof(callid));
+	ast_copy_string(cid_num, e->cid_num, sizeof(cid_num));
+	ast_copy_string(cid_name, e->cid_name, sizeof(cid_name));
+	ao2_unlock(e);
+	if (keep_inst) {
+		ast_copy_string(joined[njoined++], keep_inst, sizeof(joined[0]));
+	}
+	any_joined = njoined > 0;
+
+	if (!(te = sofia_push_entry_get(peername, 0))) {
+		return;
+	}
+	ao2_lock(te);
+	for (i = 0; i < npushed; i++) {
+		struct sofia_push_device *d = NULL;
+		int got_invite = 0;
+		for (k = 0; k < te->ndev; k++) {
+			if (!strcasecmp(te->dev[k].device_id, pushed[i])) {
+				d = &te->dev[k];
+				break;
+			}
+		}
+		if (!d || !d->token[0] || strcasecmp(d->platform, "android") || strcasecmp(d->push_type, "fcm")) {
+			continue;
+		}
+		if (d->instance[0]) {
+			for (k = 0; k < njoined; k++) {
+				if (!strcasecmp(d->instance, joined[k])) {
+					got_invite = 1;
+					break;
+				}
+			}
+		} else {
+			got_invite = any_joined;	/* cannot tell it from the binding that got the INVITE */
+		}
+		if (got_invite) {
+			continue;
+		}
+		ast_copy_string(snap[nsnap].device_id, d->device_id, sizeof(snap[0].device_id));
+		ast_copy_string(snap[nsnap].token, d->token, sizeof(snap[0].token));
+		nsnap++;
+		d->cancelled = 1;	/* its card goes: a redial right now must push again */
+	}
+	ao2_unlock(te);
+	ao2_ref(te, -1);
+
+	for (i = 0; i < nsnap; i++) {
+		struct sofia_push_send_job *j;
+		if (sofia_cfg.push_sender_native) {
+			int sr = sofia_push_sender_submit(SOFIA_PUSH_PURPOSE_CANCEL, "fcm", snap[i].token,
+				cid_num, cid_name, callid, peername, snap[i].device_id, reason);
+			if (sr == 0) {
+				sent++;
+				continue;
+			}
+			if (sr < 0) {
+				continue;	/* native queue full: drop, as the call push does */
+			}
+		}
+		if (!sofia_push_tps) {
+			break;
+		}
+		/* Half the shared budget at most: call pushes and token writes keep their room. */
+		if (ast_atomic_fetchadd_int(&sofia_pushdb_depth, +1) >= SOFIA_PUSH_DBQ_MAX / 2) {
+			ast_atomic_fetchadd_int(&sofia_pushdb_depth, -1);
+			break;
+		}
+		if (!(j = ast_calloc(1, sizeof(*j)))) {
+			ast_atomic_fetchadd_int(&sofia_pushdb_depth, -1);
+			break;
+		}
+		snprintf(j->script, sizeof(j->script), "%s/send_push_cancel.py", sofia_cfg.push_scripts);
+		ast_copy_string(j->token, snap[i].token, sizeof(j->token));
+		ast_copy_string(j->cid_num, cid_num, sizeof(j->cid_num));
+		ast_copy_string(j->cid_name, cid_name, sizeof(j->cid_name));
+		ast_copy_string(j->callid, callid, sizeof(j->callid));
+		ast_copy_string(j->peername, peername, sizeof(j->peername));
+		ast_copy_string(j->device_id, snap[i].device_id, sizeof(j->device_id));
+		ast_copy_string(j->reason, reason, sizeof(j->reason));
+		j->cancel = 1;
+		if (ast_taskprocessor_push(sofia_push_tps, sofia_push_send_exe, j) < 0) {
+			ast_atomic_fetchadd_int(&sofia_pushdb_depth, -1);
+			ast_free(j);
+			break;
+		}
+		sent++;
+	}
+	if (nsnap) {
+		ast_verb(2, "Sofia PUSH: call_cancel %s peer='%s' reason=%s -> %d of %d Android device(s)\n",
+			callid, peername, reason, sent, nsnap);
+	}
 }
 
 /* push_wait fired (sched thread, sched lock NOT held). No nua call is made here, so no
@@ -996,6 +1172,7 @@ static int sofia_push_wait_cb(const void *data)
 	e->state = SOFIA_PUSH_DONE;
 	ao2_unlock(e);
 	sofia_push_collect_cancel_timer(e);	/* a pending multi-ring window loses to the deadline */
+	sofia_push_send_cancels(e, "timeout", NULL);
 
 	/* No wake REGISTER arrived: fail_count++ on every device we pushed (>=5 purges —
 	 * the uninstalled-without-logout phone). A REGISTER resets it (capture upserts 0). */
@@ -1311,10 +1488,14 @@ void sofia_push_guard_progress(struct sofia_pvt *pvt, int status)
 				}
 				ao2_unlock(e);
 				if (won) {
+					char a_inst[128];
 					sofia_push_park_cancel_timer(e);
 					ast_verb(2, "Sofia PUSH: unparked %s peer='%s' - the in-flight leg progressed (%d), old leg wins\n",
 						e->callid, e->peername, status);
 					sofia_push_log_event(e->peername, "", e->callid, "unparked", "");
+					/* The other pushed devices will get no INVITE for this call. */
+					sofia_push_pvt_instance(pvt, a_inst, sizeof(a_inst));
+					sofia_push_send_cancels(e, status < 300 ? "answered_elsewhere" : "cancelled", a_inst);
 					ao2_unlink(sofia_push_parked, e);
 				}
 			}
@@ -1421,7 +1602,7 @@ int sofia_push_park_and_notify(struct sofia_pvt *pvt, struct ast_channel *ast)
 
 /* Caller hangup / Dial-timeout reaping of a parked pvt. PBX thread, NO locks held (called
  * from sofia_hangup after pvt->lock is released; the caller still holds a pvt ref). */
-void sofia_push_on_pvt_hangup(struct sofia_pvt *pvt)
+void sofia_push_on_pvt_hangup(struct sofia_pvt *pvt, int answered_elsewhere)
 {
 	struct ao2_iterator it;
 	struct sofia_push_park *e;
@@ -1444,6 +1625,9 @@ void sofia_push_on_pvt_hangup(struct sofia_pvt *pvt)
 			if (won) {
 				sofia_push_park_cancel_timer(e);
 				sofia_push_collect_cancel_timer(e);
+				/* Parked: no device got the INVITE. Appending: those that never joined the
+				 * fork (no-op when an answer already sent them). */
+				sofia_push_send_cancels(e, answered_elsewhere ? "answered_elsewhere" : "cancelled", NULL);
 				if (was_appending) {
 					/* the call was DELIVERED (fork resume) and has now ended; this is
 					 * just the late-append window closing, not an abandoned park */
@@ -1457,6 +1641,34 @@ void sofia_push_on_pvt_hangup(struct sofia_pvt *pvt)
 				ao2_unlink(sofia_push_parked, e);
 			}
 			/* RESUMING/DONE: the owner of that transition cleans up; nothing here. */
+		}
+		ao2_ref(e, -1);
+	}
+	ao2_iterator_destroy(&it);
+}
+
+/* A fork branch answered on a master that a push resumed or assisted (sofia_thread, no locks
+ * held): the call is over for every pushed device that never joined, so they get their
+ * call_cancel now. The entry stays APPENDING; the master's hangup reaps it (and finds the
+ * cancels already sent). */
+void sofia_push_on_fork_answered(struct sofia_pvt *master)
+{
+	struct ao2_iterator it;
+	struct sofia_push_park *e;
+
+	if (!sofia_push_parked || !master) {
+		return;
+	}
+	it = ao2_iterator_init(sofia_push_parked, 0);
+	while ((e = ao2_iterator_next(&it))) {
+		int appending;
+		if (e->pvt == master) {
+			ao2_lock(e);
+			appending = (e->state == SOFIA_PUSH_APPENDING);
+			ao2_unlock(e);
+			if (appending) {
+				sofia_push_send_cancels(e, "answered_elsewhere", NULL);
+			}
 		}
 		ao2_ref(e, -1);
 	}
@@ -1481,6 +1693,8 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 	int peer_gruu = 0, rc = -1;
 	struct ast_sockaddr target;
 	time_t waited = time(NULL) - e->parked_at;
+	char bound_inst[128] = "";
+	int old_leg_lives = 0;	/* P2: the in-flight leg progressed while we claimed: it keeps the call */
 
 	/* The freshly bound contact FIRST (by the REGISTER's learned source, else the
 	 * single-live selector). No contact yet -> leave the entry PARKED: the push_wait
@@ -1520,6 +1734,10 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 		}
 		return;
 	}
+	/* Snapshot outside the entry lock (contact locks never nest under it). */
+	ao2_lock(c);
+	ast_copy_string(bound_inst, c->instance_id, sizeof(bound_inst));
+	ao2_unlock(c);
 
 	/* Claim. Multi-ring: the FIRST wake REGISTER of a plain parked call does not take
 	 * the call — it opens a short collect window (push_resume_window) so EVERY pushed
@@ -1540,7 +1758,7 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 		 * this fresh binding gets its own branch (same announced Call-ID - the phone is
 		 * already showing the card for that uuid). Only a binding identified by the
 		 * REGISTER source may append; a refresh of an already-dialed one dedups. */
-		int i, dup = 0, all_joined;
+		int i, dup = 0, all_joined, slot;
 		if (!c_from_update) {
 			ao2_unlock(e);
 			ao2_ref(c, -1);
@@ -1558,7 +1776,8 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 			return;
 		}
 		ast_sockaddr_copy(&e->dialed[e->ndialed], &update->new_src);
-		e->ndialed++;		/* reserve BEFORE posting: a racing re-REGISTER dedups here */
+		ast_copy_string(e->dialed_inst[e->ndialed], bound_inst, sizeof(e->dialed_inst[0]));
+		slot = e->ndialed++;	/* reserve BEFORE posting: a racing re-REGISTER dedups here */
 		/* Every pushed device has now joined: the fork no longer needs to be held open for a
 		 * woken device, so its own branches decide the outcome from here (released below). */
 		all_joined = (e->ndialed - e->n_live_inst) >= e->npushed;
@@ -1584,6 +1803,12 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 				if (all_joined) {
 					sofia_fork_push_hold_release(pvt);
 				}
+			} else {
+				/* No branch went out: this device got no INVITE, so it stays a cancel target
+				 * (dialed[] keeps the source for the dedup). */
+				ao2_lock(e);
+				e->dialed_inst[slot][0] = '\0';
+				ao2_unlock(e);
 			}
 		}
 		ao2_ref(c, -1);
@@ -1634,6 +1859,7 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 		 * normally guard_progress already unparked us; this is the race-safe recheck). */
 		nua_handle_t *old_nh;
 		if (pvt->owner != owner || !pvt->nh || pvt->got_provisional) {
+			old_leg_lives = (pvt->owner == owner && pvt->nh && pvt->got_provisional);
 			ast_mutex_unlock(&pvt->lock);
 			ast_channel_unlock(owner);
 			ast_channel_unref(owner);
@@ -1722,6 +1948,9 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 	ao2_lock(e);
 	e->state = SOFIA_PUSH_DONE;
 	ao2_unlock(e);
+	/* The call went to this one binding; the entry closes, so no later wake REGISTER gets a
+	 * branch: the other pushed devices' cards lead nowhere. */
+	sofia_push_send_cancels(e, "answered_elsewhere", bound_inst);
 	if (sofia_push_parked) {
 		ao2_unlink(sofia_push_parked, e);
 	}
@@ -1749,12 +1978,25 @@ fail_call:
 	ast_log(LOG_WARNING, "Sofia PUSH: resume of %s peer='%s' failed - call ends NOANSWER\n",
 		e->callid, e->peername);
 	sofia_push_log_event(e->peername, "", e->callid, "orphaned", "resume_failed");
+	sofia_push_send_cancels(e, "cancelled", NULL);
 	goto done;
 
 orphan:
+	if (old_leg_lives) {
+		/* Not orphaned: the old leg answered meanwhile and keeps ringing its device (the
+		 * guard's unpark saw RESUMING and left the entry to us). */
+		char a_inst[128];
+		sofia_push_pvt_instance(pvt, a_inst, sizeof(a_inst));
+		ast_verb(2, "Sofia PUSH: resume of %s peer='%s' dropped - the in-flight leg progressed, old leg wins\n",
+			e->callid, e->peername);
+		sofia_push_log_event(e->peername, "", e->callid, "unparked", "");
+		sofia_push_send_cancels(e, "answered_elsewhere", a_inst);
+		goto done;
+	}
 	ast_verb(2, "Sofia PUSH: resume of %s peer='%s' aborted - caller already gone\n",
 		e->callid, e->peername);
 	sofia_push_log_event(e->peername, "", e->callid, "orphaned", "caller_gone");
+	sofia_push_send_cancels(e, "cancelled", NULL);
 done:
 	if (c) {
 		ao2_ref(c, -1);
@@ -1897,6 +2139,7 @@ static int sofia_push_collect_cb(const void *data)
 	 * does not ring this call, exactly the pre-multi-ring behavior.) */
 	{
 		struct ast_sockaddr got[SOFIA_PUSH_MAX_DEVICES];
+		char got_inst[SOFIA_PUSH_MAX_DEVICES][128];
 		int ngot = 0, gi;
 		if (peer && peer->contacts) {
 			time_t now2 = time(NULL);
@@ -1908,6 +2151,7 @@ static int sofia_push_collect_cb(const void *data)
 				x2 = ct2->expires;
 				if (x2 > now2 && ngot < SOFIA_PUSH_MAX_DEVICES) {
 					ast_sockaddr_copy(&got[ngot], &ct2->src_addr);
+					ast_copy_string(got_inst[ngot], ct2->instance_id, sizeof(got_inst[0]));
 					ngot++;
 				}
 				ao2_unlock(ct2);
@@ -1918,6 +2162,7 @@ static int sofia_push_collect_cb(const void *data)
 		ao2_lock(e);
 		for (gi = 0; gi < ngot; gi++) {
 			ast_sockaddr_copy(&e->dialed[gi], &got[gi]);
+			ast_copy_string(e->dialed_inst[gi], got_inst[gi], sizeof(e->dialed_inst[0]));
 		}
 		e->ndialed = ngot;
 		e->state = SOFIA_PUSH_APPENDING;
@@ -1952,12 +2197,14 @@ fail_call:
 	ast_log(LOG_WARNING, "Sofia PUSH: multi-ring resume of %s peer='%s' failed - call ends NOANSWER\n",
 		e->callid, e->peername);
 	sofia_push_log_event(e->peername, "", e->callid, "orphaned", "resume_failed");
+	sofia_push_send_cancels(e, "cancelled", NULL);
 	goto cleanup;
 
 orphan:
 	ast_verb(2, "Sofia PUSH: multi-ring resume of %s peer='%s' aborted - caller already gone\n",
 		e->callid, e->peername);
 	sofia_push_log_event(e->peername, "", e->callid, "orphaned", "caller_gone");
+	sofia_push_send_cancels(e, "cancelled", NULL);
 cleanup:
 	ao2_lock(e);
 	e->state = SOFIA_PUSH_DONE;
@@ -2065,6 +2312,7 @@ int sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_channel *ast,
 	for (i = 0; i < n_live && i < SOFIA_PUSH_MAX_DEVICES; i++) {
 		ast_sockaddr_copy(&e->dialed[i], &live_srcs[i]);
 		ast_copy_string(e->live_inst[i], live_inst[i], sizeof(e->live_inst[i]));
+		ast_copy_string(e->dialed_inst[i], live_inst[i], sizeof(e->dialed_inst[i]));
 	}
 	e->ndialed = (n_live < SOFIA_PUSH_MAX_DEVICES) ? n_live : SOFIA_PUSH_MAX_DEVICES;
 	e->n_live_inst = e->ndialed;

@@ -2017,6 +2017,7 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	 * queue/setstate — never reach a fresh channel lock while holding master->lock
 	 * (canonical channel->pvt order vs sofia_hangup). */
 	struct ast_channel *m_owner = master->owner;
+	int push_appending = master->push_appending;
 	if (m_owner) {
 		ast_channel_ref(m_owner);
 	}
@@ -2084,6 +2085,11 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	 * answered call. master->lock is released here; the counter helper takes its own locks and
 	 * clears ring_inc_done so the catchall never double-decrements. */
 	sofia_update_call_counter(master, SOFIA_DEC_CALL_RINGING);
+
+	/* A push woke devices for this call: the ones that never joined get their call_cancel. */
+	if (push_appending) {
+		sofia_push_on_fork_answered(master);
+	}
 
 	/* Release the master lifetime ref taken under fork->lock above. */
 	ao2_ref(master, -1);
@@ -7110,7 +7116,7 @@ static int sofia_hangup(struct ast_channel *ast)
 		 * (we still hold this pvt ref; the entry holds its own). appending = a multi-ring
 		 * fork resume left the entry live for late appends; reap it the same way. */
 		if (was_parked || was_appending) {
-			sofia_push_on_pvt_hangup(pvt);
+			sofia_push_on_pvt_hangup(pvt, ae_reason != NULL);
 		}
 	}
 

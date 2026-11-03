@@ -117,6 +117,7 @@ struct nat_job {
 	char callid[64];
 	char peername[128];
 	char device_id[64];
+	char reason[24];		/* purpose=CANCEL only */
 	/* runtime (sender thread only) */
 	enum nat_stage stage;
 	struct timeval t0;
@@ -682,6 +683,9 @@ static const char *nat_job_label(const struct nat_job *j)
 	if (j->purpose == SOFIA_PUSH_PURPOSE_REREGISTER) {
 		return "native/fcm-rereg";
 	}
+	if (j->purpose == SOFIA_PUSH_PURPOSE_CANCEL) {
+		return "native/fcm-cancel";
+	}
 	return j->is_voip ? "native/apns-voip" : "native/fcm-call";
 }
 
@@ -690,8 +694,8 @@ static void nat_job_finish(struct nat_job *j, const char *out)
 	char redact[64];
 	long ms = (long) ast_tvdiff_ms(ast_tvnow(), j->t0);
 
-	sofia_push_sender_complete(j->peername, j->device_id, j->callid, nat_job_label(j),
-		sofia_push_redact(j->token, redact, sizeof(redact)), out, ms);
+	sofia_push_sender_complete(j->purpose, j->peername, j->device_id, j->callid, j->reason,
+		nat_job_label(j), sofia_push_redact(j->token, redact, sizeof(redact)), out, ms);
 	nat_job_free(j);
 }
 
@@ -764,7 +768,7 @@ static void nat_start_fcm_send(struct nat_job *j)
 		j->hdrs = NULL;
 	}
 	snprintf(j->url, sizeof(j->url), "https://fcm.googleapis.com/v1/projects/%s/messages:send", fcm.project);
-	/* payloads byte-identical to send_push.py / send_push_reregister.py json.dumps */
+	/* payloads byte-identical to send_push.py / send_push_reregister.py / send_push_cancel.py json.dumps */
 	if (j->purpose == SOFIA_PUSH_PURPOSE_REREGISTER) {
 		nat_json_escape(esc_a, sizeof(esc_a), j->cid_num);	/* username travels in cid_num */
 		snprintf(j->body, sizeof(j->body),
@@ -772,6 +776,16 @@ static void nat_start_fcm_send(struct nat_job *j)
 			"\"android\": {\"priority\": \"HIGH\", \"ttl\": \"120s\"}, "
 			"\"apns\": {\"headers\": {\"apns-priority\": \"5\", \"apns-push-type\": \"background\"}, \"payload\": {\"aps\": {\"content-available\": 1}}}}}",
 			j->token, esc_a);
+	} else if (j->purpose == SOFIA_PUSH_PURPOSE_CANCEL) {
+		/* Android only, no apns block. ttl 30 s, not the call's 0 s: a phone that drops off the
+		 * network for a moment after showing the card still gets it; caller/callerName repeat the
+		 * call push so the app can show the missed call even if that push never arrived. */
+		nat_json_escape(esc_a, sizeof(esc_a), j->cid_num);
+		nat_json_escape(esc_b, sizeof(esc_b), j->cid_name);
+		snprintf(j->body, sizeof(j->body),
+			"{\"message\": {\"token\": \"%s\", \"data\": {\"type\": \"call_cancel\", \"uuid\": \"%s\", \"reason\": \"%s\", \"caller\": \"%s\", \"callerName\": \"%s\"}, "
+			"\"android\": {\"priority\": \"HIGH\", \"ttl\": \"30s\"}}}",
+			j->token, j->callid, j->reason, esc_a, esc_b);
 	} else {
 		nat_json_escape(esc_a, sizeof(esc_a), j->cid_num);
 		nat_json_escape(esc_b, sizeof(esc_b), j->cid_name);
@@ -842,7 +856,7 @@ static void nat_job_route(struct nat_job *j)
 		nat_start_apns(j, 0);
 		return;
 	}
-	/* FCM-shaped (fcm call + every reregister) */
+	/* FCM-shaped (fcm call + every reregister + every cancel) */
 	if (nat_fcm_ready()) {
 		nat_fcm_sick_until = time(NULL) + NAT_HEALTH_RETRY_S;
 		nat_job_finish(j, "ERR:fcm-config");
@@ -1116,7 +1130,7 @@ int sofia_push_sender_natq_depth(void)
 
 int sofia_push_sender_submit(enum sofia_push_purpose purpose, const char *push_type,
 	const char *token, const char *cid_num, const char *cid_name, const char *callid,
-	const char *peername, const char *device_id)
+	const char *peername, const char *device_id, const char *reason)
 {
 	struct nat_job *j;
 	int is_voip = purpose == SOFIA_PUSH_PURPOSE_CALL
@@ -1133,7 +1147,8 @@ int sofia_push_sender_submit(enum sofia_push_purpose purpose, const char *push_t
 	if (!is_voip && nat_fcm_sick_until && time(NULL) < nat_fcm_sick_until) {
 		return 1;
 	}
-	if (ast_atomic_fetchadd_int(&nat_depth, +1) >= NATQ_MAX) {
+	/* A call_cancel may use half the queue at most, so call pushes always find room. */
+	if (ast_atomic_fetchadd_int(&nat_depth, +1) >= (purpose == SOFIA_PUSH_PURPOSE_CANCEL ? NATQ_MAX / 2 : NATQ_MAX)) {
 		ast_atomic_fetchadd_int(&nat_depth, -1);
 		return -1;	/* full: caller drops (bounded, never degrade a burst into fork/exec) */
 	}
@@ -1149,6 +1164,7 @@ int sofia_push_sender_submit(enum sofia_push_purpose purpose, const char *push_t
 	ast_copy_string(j->callid, S_OR(callid, ""), sizeof(j->callid));
 	ast_copy_string(j->peername, S_OR(peername, ""), sizeof(j->peername));
 	ast_copy_string(j->device_id, S_OR(device_id, ""), sizeof(j->device_id));
+	ast_copy_string(j->reason, S_OR(reason, ""), sizeof(j->reason));
 
 	AST_LIST_LOCK(&nat_inq);
 	if (!nat_up) {	/* re-check under the lock: stop() clears it under this same lock */
@@ -1184,7 +1200,7 @@ int sofia_push_sender_natq_depth(void)
 }
 int sofia_push_sender_submit(enum sofia_push_purpose purpose, const char *push_type,
 	const char *token, const char *cid_num, const char *cid_name, const char *callid,
-	const char *peername, const char *device_id)
+	const char *peername, const char *device_id, const char *reason)
 {
 	return 1;	/* always "use the script sender" */
 }
