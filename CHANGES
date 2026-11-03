@@ -1,3 +1,43 @@
+## 1.9.11 — binary packages for Debian, Ubuntu and RHEL 9, a voicemail overflow fixed, builds with GCC 11 to 14
+
+The first release with binary packages: `.deb` for Debian 12 and 13 and Ubuntu 22.04 and 24.04,
+`.rpm` for RHEL 9 and its rebuilds, each built and tested in its own distribution. Building there
+found two bugs, both fixed here: `app_voicemail` wrote one byte past a buffer for every mailbox
+(Ubuntu 24.04 caught it and aborted), and the bundled editline only built with GCC 14. Nothing
+changes in `chan_sofia` since 1.9.10.
+
+### Packages
+
+- **amd64 packages for five distributions,** attached to the release with `SHA256SUMS`:
+  `gabpbx_1.9.11-1~debian12_amd64.deb`, `~debian13`, `~ubuntu22.04`, `~ubuntu24.04`, and
+  `gabpbx-1.9.11-1.el9.x86_64.rpm` (tested on AlmaLinux 9 and Rocky Linux 9), plus a `.tar.gz` of
+  each tree. Install with `apt install ./gabpbx_…deb`, or `dnf install epel-release` and then
+  `dnf install ./gabpbx-…rpm` (some libraries come from EPEL).
+- **What they install:** GABPBX under `/usr`, its own build of Sofia-SIP 2.0.4 in
+  `/usr/lib/gabpbx/lib` (found through an rpath; the distribution's `libsofia-sip-ua` is never
+  used), the sample configuration in `/etc/gabpbx` (kept on upgrade), a `gabpbx` system user and
+  a `gabpbx.service` systemd unit, not enabled. Built for any CPU of the architecture
+  (`BUILD_NATIVE` off).
+- **`modules.conf` loads `chan_sofia` and not `chan_sip`:** both register the `SIP` channel type,
+  and with both loaded `chan_sip` fails and the start never completes. Swap the two `noload` lines
+  at the end of `modules.conf` to use `chan_sip`.
+- **No sound files:** install the prompts and music on hold of your choice under
+  `/var/lib/gabpbx`.
+
+### Fixes
+
+- **`app_voicemail` no longer writes one byte past a buffer for each mailbox.** Loading a mailbox
+  allocated room for the mailbox, the context and the terminating NUL, but not for the `@`
+  between them. Most builds overwrote that byte silently; with `_FORTIFY_SOURCE=3`, the default of
+  Ubuntu 24.04's compiler, the C library caught it and aborted the start as soon as a mailbox was
+  configured.
+- **The bundled editline builds with GCC older than 14.** Its configure got
+  `-Wno-error=return-mismatch`, an option only GCC 14 knows, which an older compiler refuses, so a
+  clean tree failed with "C compiler cannot create executables" on Debian 12, Ubuntu 22.04 and
+  24.04 and RHEL 9. It also got a fixed `-march=native`, which tied the binary to the build CPU
+  even with `BUILD_NATIVE` off. The option is now added only where the compiler accepts it, and
+  editline is built for the whole architecture.
+
 ## 1.9.10 — call pickup and channel names as `chan_sip`, the push shows the real caller, hidden numbers stay hidden
 
 A `chan_sip`-parity release for `chan_sofia`, driven by real calls. Directed pickup (`PickupChan`)
