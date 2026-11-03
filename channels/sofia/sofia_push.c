@@ -1092,7 +1092,9 @@ static void sofia_push_collect_cancel_timer(struct sofia_push_park *e)
  * carries it (sofia_resolve_identity). On an outbound leg Dial stores the dialled extension
  * in caller.id and the calling party in connected.id (Originate sets both), so caller.id
  * would show the callee its own number. A restricted presentation of the connected line
- * sends "anonymous", as the From does. Caller holds the channel lock. */
+ * sends "anonymous", as the From does. callerName carries the number as well: the phone draws
+ * its incoming-call screen from it, and the screen built from the INVITE shows the From user,
+ * which is the number, not the configured name. Caller holds the channel lock. */
 static void sofia_push_caller_id(struct ast_channel *ast,
 	char *num, size_t num_len, char *name, size_t name_len)
 {
@@ -1103,7 +1105,7 @@ static void sofia_push_caller_id(struct ast_channel *ast,
 	}
 	ast_copy_string(num, S_COR(ast->connected.id.number.valid, ast->connected.id.number.str, "unknown"),
 		num_len);
-	ast_copy_string(name, S_COR(ast->connected.id.name.valid, ast->connected.id.name.str, num), name_len);
+	ast_copy_string(name, num, name_len);
 }
 
 /* Core entry creation shared by the P1 park and the P2 inflight guard: alloc + link +
