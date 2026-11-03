@@ -1,3 +1,75 @@
+## 1.9.10 — call pickup and channel names as `chan_sip`, the push shows the real caller, hidden numbers stay hidden
+
+A `chan_sip`-parity release for `chan_sofia`, driven by real calls. Directed pickup (`PickupChan`)
+and group pickup through the `features.conf` `pickupexten` work on `chan_sofia` devices, whose
+channels are now named as `chan_sip` names them, `SIP/<device>-<8 hex>`. A phone woken by a push
+shows the caller's number instead of its own extension. A caller who hides their number stays
+hidden in the `From`, PAI/RPID, `Contact` and push, and the called peer's `callingpres=` never
+hides a visible caller. Voicemail NOTIFYs carry a `Contact` and a valid `Message-Account`, and
+realtime queue members announce themselves on the AMI. One restart.
+
+### Call pickup
+
+- **`PickupChan(SIP/<device>)` finds a ringing `chan_sofia` device.** It appended `-` and looked
+  for a `SIP/<device>-` prefix, so it never found a channel named after the device alone ("No
+  target channel found"). It now takes the channel named exactly as given first, then
+  `<name>-<suffix>` as before; a name is no longer used as a bare prefix, so `SIP/bob-2` does not
+  take `SIP/bob-20`. The `p` option keeps its prefix match. With `chan_sip` it behaves as before.
+- **The `features.conf` `pickupexten` picks up a call of the caller's pickup group**, as with
+  `chan_sip`: an INVITE to it runs the core group pickup (the caller's `pickupgroup` against the
+  ringing channel's `callgroup`) instead of the dialplan, where it got a `404`. A beginning of it
+  asks for more digits with `allowoverlap=yes`; a failed pickup ends with `403`.
+
+### Channel names
+
+- **Channels are named `SIP/<device>-<8 hex>`, as `chan_sip` names them:** the matched peer of an
+  incoming call (else the `From` domain) or the dialled peer of an outgoing one, plus a per-call
+  serial. Two calls of one device no longer share a name, and what cuts a channel name at its last
+  `-` to find the device (pickup, `SoftHangup`, the attended-transfer callback, the parking return,
+  device state) gets the right one, also for a peer whose name has a `-`.
+  `SIPCHANINFO(peername)` and the AMI `Peer` fields do not change. **Behaviour change:** a dialplan
+  or AMI client that matched the exact name `SIP/<peer>` of a `chan_sofia` call must allow the
+  suffix, as it had to with `chan_sip`.
+
+### Mobile push
+
+- **The push shows the caller, not the called extension.** The payload's `caller` and
+  `callerName` were read from the caller id of the outgoing leg, where `Dial` stores the dialled
+  extension, so a woken phone showed its own extension as the caller while the INVITE showed the
+  right one. Both now carry the calling party's number, the user the INVITE's `From` carries, on
+  every push path (no binding, the no-answer guard, devices woken while others ring), and
+  `anonymous` for a hidden caller.
+
+### Hidden numbers
+
+- **Caller-id restriction follows the caller's own presentation, as in `chan_sip`.** The `From`,
+  PAI/RPID and push took the presentation of our own channel's caller first: on an outgoing leg
+  the dialled party or the called peer's `callingpres=`, on an incoming one the remote caller. A
+  called peer with `callingpres=prohib` hid every caller of calls to it, a leg with an empty
+  caller id (Page, the attended-transfer callback) went out anonymous although the caller was
+  known, and a caller who hid their number got the callee's identity back as anonymous too. They
+  now use the connected line's presentation. **Behaviour change:** `callingpres=` applies to calls
+  *from* the peer, as in `chan_sip`, and no longer hides calls to it.
+- **A hidden caller's number no longer goes out in the `Contact`.** The `From` and PAI were
+  anonymous but the `Contact` user was still the number, fork branches included; it is now
+  `anonymous`, or the peer's `fromuser`, as `chan_sip` builds it.
+
+### Voicemail notification
+
+- **The message-summary NOTIFY carries a `Contact` and a valid `Message-Account`.** It went out
+  without a `Contact`, which RFC 3265 §7.1 makes mandatory (some devices answered `400 Missing
+  Contact header`), and `Message-Account` fell back to the digest realm, not a SIP URI when it
+  contains spaces (RFC 3842 §5.2). Both are built as `chan_sip` builds them, for each device:
+  `Contact: <sip:*@our-address:port>` and `Message-Account: sip:<vmexten>@<fromdomain, else our
+  address>`; `vmexten` defaults to `gabpbx`.
+
+### Queues
+
+- **Realtime queue members announce themselves on the AMI** as dynamic members do
+  (`QueueMemberAdded` with `Membership: realtime`, `QueueMemberRemoved`, `QueueMemberPaused`), so a
+  manager client no longer keeps a stale member list, and **`QueueStatus` lists every realtime
+  queue**, loading them first as `queue show` does.
+
 ## 1.9.9 — ringback on answered calls, fixed-host peers no longer register, forks keep ringing the live device
 
 A `chan_sip`-parity release for `chan_sofia`, driven by real calls. A caller the dialplan has
