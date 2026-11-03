@@ -105,8 +105,15 @@ endif
 .PHONY: CHECK_SUBDIR
 CHECK_SUBDIR:	# do nothing, just make sure that we recurse in the subdir/
 
+# GCC 14 makes implicit int, implicit declarations and return mismatches errors, and the bundled
+# editline still has them. -Wreturn-mismatch only exists from GCC 14 on, and an older compiler
+# refuses -Wno-error= for an option it does not know, so it is added only where it is known.
+# No -march=native: the library must run on any CPU of the architecture (BUILD_NATIVE in
+# menuselect decides that for the rest of the build).
+EDITLINE_CFLAGS=-Wno-error=implicit-int -Wno-error=implicit-function-declaration $(shell $(CC) -Werror -Wno-error=return-mismatch -E -x c /dev/null >/dev/null 2>&1 && echo -Wno-error=return-mismatch)
+
 editline/libedit.a: CHECK_SUBDIR
-	cd editline && test -f config.h || CFLAGS="$(PTHREAD_CFLAGS) -I../../include -g3 -O3 -march=native -Wno-error=implicit-int -Wno-error=implicit-function-declaration -Wno-error=return-mismatch" LDFLAGS="$(_ASTLDFLAGS) $(ASTLDFLAGS)" ./configure --build=$(BUILD_PLATFORM) --host=$(HOST_PLATFORM) --with-ncurses=$(NCURSES_DIR) --with-curses=$(CURSES_DIR) --with-termcap=$(TERMCAP_DIR) --with-tinfo=$(TINFO_DIR)
+	cd editline && test -f config.h || CFLAGS="$(PTHREAD_CFLAGS) -I../../include -g3 -O3 $(EDITLINE_CFLAGS)" LDFLAGS="$(_ASTLDFLAGS) $(ASTLDFLAGS)" ./configure --build=$(BUILD_PLATFORM) --host=$(HOST_PLATFORM) --with-ncurses=$(NCURSES_DIR) --with-curses=$(CURSES_DIR) --with-termcap=$(TERMCAP_DIR) --with-tinfo=$(TINFO_DIR)
 	$(MAKE) -C editline libedit.a
 
 db1-ast/libdb1.a: CHECK_SUBDIR
