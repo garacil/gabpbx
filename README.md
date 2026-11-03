@@ -219,6 +219,10 @@ GABPBX 1.2 is a security-hardening release for `chan_sofia`. Every hardening gat
 
 ---
 
+## Binary packages
+
+From 1.9.12 every release ships amd64 packages on its [GitHub release page](https://github.com/garacil/gabpbx/releases), with `SHA256SUMS`: `.deb` for Debian 12 and 13 and Ubuntu 22.04 and 24.04 (`apt install ./gabpbx_…deb`), and `.rpm` for RHEL 9 and its rebuilds (`dnf install epel-release && dnf install ./gabpbx-…rpm`). Each is built and tested in its own distribution and carries its own build of Sofia-SIP; `modules.conf` loads `chan_sofia` and not `chan_sip`, and `gabpbx.service` is installed but not enabled. Details on the wiki: **[Build and Installation](https://github.com/garacil/gabpbx/wiki/Build-and-Installation)**.
+
 ## Building from source
 
 GABPBX uses the standard Asterisk source workflow (`./configure && make menuselect && make && make install`). Beyond the usual Asterisk build dependencies, `chan_sofia` adds a few of its own.
