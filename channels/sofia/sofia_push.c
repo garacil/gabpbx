@@ -1395,17 +1395,36 @@ static int sofia_push_guard_cb(const void *data)
 	ast_mutex_unlock(&pvt->lock);
 
 	if (fire) {
+		int alive;
 		/* caller identity for the push payload: channel lock, nothing else held */
 		ast_channel_lock(owner);
 		sofia_push_caller_id(owner, cid_num, sizeof(cid_num), cid_name, sizeof(cid_name));
+		/* The hangup may have run while we waited for the channel lock (the core holds it
+		 * across sofia_hangup): never push for a call that is already gone or answered. */
+		ast_mutex_lock(&pvt->lock);
+		alive = (pvt->owner == owner && pvt->nh && !pvt->got_provisional);
+		ast_mutex_unlock(&pvt->lock);
 		ast_channel_unlock(owner);
 		ast_channel_unref(owner);
 
-		e = sofia_push_park_create(pvt, callid, cid_num, cid_name, 1 /* inflight */);
+		e = alive ? sofia_push_park_create(pvt, callid, cid_num, cid_name, 1 /* inflight */) : NULL;
 		if (e) {
+			int gone;
+			/* Mark the pvt so its hangup reaps the entry. sofia_hangup clears the owner and
+			 * reads the flag under this same lock: either it sees the flag, or we see it gone
+			 * and reap the entry ourselves. */
+			ast_mutex_lock(&pvt->lock);
+			gone = !pvt->owner;
+			if (!gone) {
+				pvt->push_inflight = 1;
+			}
+			ast_mutex_unlock(&pvt->lock);
 			ast_log(LOG_NOTICE, "Sofia PUSH: guard fired %s peer='%s' - no 1xx in %ds on a connection-oriented leg, pushed with the in-flight Call-ID\n",
 				e->callid, e->peername, sofia_cfg.push_noresponse);
 			sofia_push_log_event(e->peername, "", e->callid, "sent", "noresponse");
+			if (gone) {
+				sofia_push_on_pvt_hangup(pvt, 0);
+			}
 			ao2_ref(e, -1);
 		}
 	} else if (owner) {

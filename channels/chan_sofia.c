@@ -7105,8 +7105,10 @@ static int sofia_hangup(struct ast_channel *ast)
 	{
 		int was_parked = pvt->push_parked;
 		int was_appending = pvt->push_appending;
+		int was_inflight = pvt->push_inflight;
 		pvt->push_parked = 0;
 		pvt->push_appending = 0;
+		pvt->push_inflight = 0;
 
 		ast_mutex_unlock(&pvt->lock);
 
@@ -7114,8 +7116,9 @@ static int sofia_hangup(struct ast_channel *ast)
 		 * registry entry + cancel push_wait. AFTER pvt->lock (the entry lock is a leaf;
 		 * the hangup path must never nest it under pvt->lock), BEFORE the final unref
 		 * (we still hold this pvt ref; the entry holds its own). appending = a multi-ring
-		 * fork resume left the entry live for late appends; reap it the same way. */
-		if (was_parked || was_appending) {
+		 * fork resume left the entry live for late appends; reap it the same way. inflight =
+		 * the no-provisional guard parked the call with its INVITE on the wire. */
+		if (was_parked || was_appending || was_inflight) {
 			sofia_push_on_pvt_hangup(pvt, ae_reason != NULL);
 		}
 	}

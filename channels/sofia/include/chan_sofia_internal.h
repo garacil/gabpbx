@@ -84,8 +84,8 @@ int sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_channel *ast, struc
  * push_wait timer (+ sender jobs in a later stage). 0 = call parked (in progress); -1 =
  * fail-closed to today's failure (never park without an armed timer). */
 int sofia_push_park_and_notify(struct sofia_pvt *pvt, struct ast_channel *ast);
-/* Hangup notification for a pvt whose push_parked flag was set (called from sofia_hangup
- * AFTER pvt->lock is released, before the final unref): terminal-CAS + timer cancel, and the
+/* Hangup notification for a pvt whose push_parked, push_appending or push_inflight flag was set
+ * (called from sofia_hangup AFTER pvt->lock is released, before the final unref): terminal-CAS + timer cancel, and the
  * call_cancel push to the pushed devices that never got the INVITE (answered_elsewhere = the
  * leg ended because another destination of the Dial answered). */
 void sofia_push_on_pvt_hangup(struct sofia_pvt *pvt, int answered_elsewhere);
@@ -738,6 +738,7 @@ struct sofia_pvt {
 	 * uuid the push announces to the phone; distinct from pvt->callid (debug pointer hex). */
 	int push_parked;
 	int push_appending;		/* multi-ring fork resume posted; the parked-registry entry stays live for LATE APPENDS until answer/hangup - the hangup hook must run even though push_parked already dropped to 0 */
+	int push_inflight;		/* P2: the no-provisional guard parked this pvt with its INVITE on the wire; the hangup hook reaps that entry too */
 	char sip_callid[64];
 	/* P2 no-provisional guard: armed after the single-contact INVITE to a tokened peer on a
 	 * connection-oriented transport; a suspended phone's socket looks alive but swallows the
