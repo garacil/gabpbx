@@ -138,6 +138,8 @@ static int nochecksums;
 #endif
 static int strictrtp;			/*< Only accept RTP frames from a defined source. If we receive an indication of a changing source, enter learning mode. */
 static int learning_min_sequential;	/*< Number of sequential RTP frames needed from a single source during learning mode to accept new source. */
+#define DEFAULT_SRTP_REPLAY_PROTECTION 1
+static int srtp_replay_protection = DEFAULT_SRTP_REPLAY_PROTECTION;	/*< rtp.conf srtpreplayprotection: drop a replayed SRTP packet (RFC 3711 §3.3.2) instead of re-creating the SRTP session (which would reset the ROC and break the media). */
 
 enum strict_rtp_state {
 	STRICT_RTP_OPEN = 0, /*! No RTP packets should be dropped, all sources accepted */
@@ -2178,7 +2180,7 @@ read_again:
 				 * what would still be ciphertext (mirrors the TX guard). */
 				goto read_again;
 			}
-			if (res_srtp->unprotect(rtcp_srtp, buf, &rtcp_len, 1) < 0) {
+			if (res_srtp->unprotect(rtcp_srtp, buf, &rtcp_len, 1 | (srtp_replay_protection << 1)) < 0) {
 				/* SRTCP unprotect failed for this datagram (auth/replay) — drop it, keep the call. */
 				goto read_again;
 			}
@@ -2219,7 +2221,7 @@ read_again:
 	srtp = ast_rtp_instance_get_srtp(instance);
 #endif
 
-	if (res_srtp && srtp && res_srtp->unprotect(srtp, buf, &len, rtcp) < 0) {
+	if (res_srtp && srtp && res_srtp->unprotect(srtp, buf, &len, rtcp | (srtp_replay_protection << 1)) < 0) {
 #ifdef HAVE_OPENSSL
 		/* B3: SRTP unprotect failure on a WebRTC leg (wrong key / replay / forgery). Rate-limited. LOG ONLY;
 		 * the return -1 is unchanged. Distinguishes "DTLS up but media not decrypting" from "no media". */
@@ -5482,6 +5484,7 @@ static int rtp_reload(int reload)
 	dtmftimeout = DEFAULT_DTMF_TIMEOUT;
 	strictrtp = STRICT_RTP_OPEN;
 	learning_min_sequential = DEFAULT_LEARNING_MIN_SEQUENTIAL;
+	srtp_replay_protection = DEFAULT_SRTP_REPLAY_PROTECTION;
 	if (cfg) {
 		if ((s = ast_variable_retrieve(cfg, "general", "rtpstart"))) {
 			rtpstart = atoi(s);
@@ -5524,6 +5527,9 @@ static int rtp_reload(int reload)
 		}
 		if ((s = ast_variable_retrieve(cfg, "general", "strictrtp"))) {
 			strictrtp = ast_true(s);
+		}
+		if ((s = ast_variable_retrieve(cfg, "general", "srtpreplayprotection"))) {
+			srtp_replay_protection = ast_true(s);
 		}
 		if ((s = ast_variable_retrieve(cfg, "general", "probation"))) {
 			if ((sscanf(s, "%d", &learning_min_sequential) <= 0) || learning_min_sequential <= 0) {

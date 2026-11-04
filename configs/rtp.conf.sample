@@ -32,3 +32,10 @@ rtpend=20000
 ; if rtp packets are dropped from one or both ends after a call is
 ; connected. This option is set to 4 by default.
 ; probation=8
+;
+; Enable sRTP replay protection. Buggy UAs reset the RTP sequence number on a re-INVITE
+; (Session Timers, Hold/Resume) but keep the SSRC; a late packet from an old network path then
+; looks "too old". With replay protection on (the default, RFC 3711 section 3.3.2) that packet is
+; discarded; with it off the SRTP session is re-created, which resets the roll-over counter and can
+; break the audio one way or both. Turn it off only for a UA known to reset its sequence number.
+; srtpreplayprotection=yes

@@ -55,8 +55,11 @@ struct ast_srtp_res {
 	int (*change_source)(struct ast_srtp *srtp, unsigned int from_ssrc, unsigned int to_ssrc);
 	/* Set a callback function */
 	void (*set_cb)(struct ast_srtp *srtp, const struct ast_srtp_cb *cb, void *data);
-	/* Unprotect SRTP data */
-	int (*unprotect)(struct ast_srtp *srtp, void *buf, int *size, int rtcp);
+	/* Unprotect SRTP data. flags: bit 0 = this is SRTCP (not SRTP); bit 1 = replay protection,
+	 * i.e. discard a packet that fails the replay check instead of re-creating the session (Asterisk
+	 * 22 ast_srtp_unprotect parity; RFC 3711 §3.3.2). A plain 0/1 still means "RTP/SRTCP, no replay
+	 * protection", so old callers keep the re-create behaviour. */
+	int (*unprotect)(struct ast_srtp *srtp, void *buf, int *size, int flags);
 	/* Protect RTP data */
 	int (*protect)(struct ast_srtp *srtp, void **buf, int *size, int rtcp);
 	/* Obtain a random cryptographic key */

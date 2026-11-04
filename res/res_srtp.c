@@ -88,7 +88,7 @@ static void ast_srtp_destroy(struct ast_srtp *srtp);
 static int ast_srtp_add_stream(struct ast_srtp *srtp, struct ast_srtp_policy *policy);
 static int ast_srtp_change_source(struct ast_srtp *srtp, unsigned int from_ssrc, unsigned int to_ssrc);
 
-static int ast_srtp_unprotect(struct ast_srtp *srtp, void *buf, int *len, int rtcp);
+static int ast_srtp_unprotect(struct ast_srtp *srtp, void *buf, int *len, int flags);
 static int ast_srtp_protect(struct ast_srtp *srtp, void **buf, int *len, int rtcp);
 static void ast_srtp_set_cb(struct ast_srtp *srtp, const struct ast_srtp_cb *cb, void *data);
 static int ast_srtp_get_random(unsigned char *key, size_t len);
@@ -363,11 +363,17 @@ static void ast_srtp_set_cb(struct ast_srtp *srtp, const struct ast_srtp_cb *cb,
 }
 
 /* Vtable functions */
-static int ast_srtp_unprotect(struct ast_srtp *srtp, void *buf, int *len, int rtcp)
+static int ast_srtp_unprotect(struct ast_srtp *srtp, void *buf, int *len, int flags)
 {
 	int res = 0;
 	int i;
-	int retry = 0;
+	int rtcp = flags & 0x01;
+	/* Replay protection (RFC 3711 §3.3.2): when set, a packet that failed the replay check
+	 * (err_status_replay_old) is discarded like any other failure, not acted on. We reuse the
+	 * existing `retry` guard for that: pre-setting it to 1 skips the destroy-and-re-create branch
+	 * below, so the stale (rolled-back) stream is rejected instead of resetting our ROC. Asterisk
+	 * 22 ast_srtp_unprotect does exactly this (flags bit 1 = srtpreplayprotection, default on). */
+	int retry = (flags & 0x02) >> 1;
 	struct ast_rtp_instance_stats stats = {0,};
 
 tryagain:
