@@ -441,7 +441,17 @@ tryagain:
 		}
 	}
 
-	if (res != err_status_ok && res != err_status_replay_fail ) {
+	if (res == err_status_replay_fail) {
+		/* A replayed (duplicate) packet. libsrtp checks the replay database BEFORE decrypting, so the
+		 * payload is still ciphertext; discard it (RFC 3711 §3.3.2 — replayed packets are discarded)
+		 * rather than pass it up. Asterisk returns it as success, but the RTP layer has no duplicate
+		 * drop for audio, so the ciphertext would be decoded into a ~20 ms burst of noise. Silent: a
+		 * network duplicate is routine, not a fault to log. */
+		errno = EAGAIN;
+		return -1;
+	}
+
+	if (res != err_status_ok) {
 		if ((srtp->warned >= 10) && !((srtp->warned - 10) % 100)) {
 			ast_log(AST_LOG_WARNING, "SRTP unprotect failed with: %s %d\n", srtp_errstr(res), srtp->warned);
 			srtp->warned = 11;
