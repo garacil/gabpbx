@@ -187,6 +187,7 @@
 #include <sofia-sip/sip.h>
 #include <sofia-sip/sip_header.h>
 #include <sofia-sip/sip_status.h>
+#include <sofia-sip/sip_util.h>	/* sip_response_terminates_dialog: the stack's re-INVITE failure rule */
 #include <sofia-sip/url.h>
 #include <sofia-sip/nua_tag.h>
 #include <sofia-sip/sip_tag.h>
@@ -2134,8 +2135,9 @@ static int sofia_invite_failure_status(int status, sip_t const *sip)
  * - 487 hangs up with NORMAL_CLEARING;
  * - anything else hangs up with hangup_sip2cause() of the status, whose cause replaces the
  *   Reason one when the frame is read, as in chan_sip.
- * On a call already answered (the stack's own session-refresh re-INVITE failing) the call still
- * ends, with the status's cause: BUSY/CONGESTION are dropped by a reader outside a bridge.
+ * On a call already answered (a re-INVITE refused with a response that makes the stack end the
+ * session, sofia_reinvite_failure_ends_session) the call ends with the status's cause: BUSY/CONGESTION
+ * are dropped by a reader outside a bridge.
  * No pvt or peer lock may be held. */
 static void sofia_queue_invite_failure(struct ast_channel *owner, int status, int q850,
 	int overlap_yes, int answered)
@@ -2581,6 +2583,60 @@ static void sofia_alreadygone(struct sofia_pvt *pvt)
 	ast_debug(3, "Sofia: setting alreadygone on dialog %s\n",
 		pvt->callid ? pvt->callid : "(no-callid)");
 	pvt->alreadygone = 1;
+}
+
+/* Whether the stack ends an established session after a final response >= 300 to a re-INVITE, so the
+ * channel follows the stack's dialog. nua_client_response (nua_client.c) asks
+ * sip_response_terminates_dialog() (sip_util.c, the RFC 5057 dialog-usage rules) and, for a request that
+ * is not the initial one, turns a usage or dialog termination into a graceful one; a response >= 700 is
+ * graceful too. nua_invite_client_report (nua_session.c) then moves the established session to
+ * terminating and sends BYE. The session ends when the graceful flag comes out set; this mirrors that
+ * test for every final status (the only cases where the stack keeps a session this says ends are local
+ * stack errors, an init failure reported as neutral or an out-of-memory signal, and then the channel's
+ * own hangup sends the BYE). RFC 3261 §14.1 keeps the session on a non-2xx and §12.2.1.2 ends the
+ * dialog on 481/408 (and on no response); the table in sip_util.c also ends it on others (e.g. 404, 410,
+ * 480, 484, most 5xx and 6xx), and the channel goes with it rather than staying up on a dialog the stack
+ * has already closed. */
+static int sofia_reinvite_failure_ends_session(int status)
+{
+	int graceful = 1;
+
+	if (status >= 700) {
+		return 1;
+	}
+	if (sip_response_terminates_dialog(status, sip_method_invite, &graceful)) {
+		return 1;
+	}
+	return graceful;
+}
+
+/* A re-INVITE on an answered call was refused with a response that ends the session
+ * (sofia_reinvite_failure_ends_session): the stack sends BYE itself, so hang the channel up with the
+ * status's cause (the stack, already terminating, does not send a second BYE when the hangup asks for
+ * one). alreadygone makes a late 2xx take the orphan ACK+BYE path. sofia_thread only; no pvt, peer or
+ * channel lock may be held. */
+static void sofia_reinvite_failure_end_call(struct sofia_pvt *pvt, int status, sip_t const *sip)
+{
+	struct ast_channel *owner;
+	int overlap_mode;
+
+	ast_mutex_lock(&pvt->lock);
+	sofia_alreadygone(pvt);
+	owner = pvt->owner;
+	if (owner) {
+		ast_channel_ref(owner);
+	}
+	ast_mutex_unlock(&pvt->lock);
+	if (!owner) {
+		return;
+	}
+	ast_log(LOG_NOTICE, "Sofia: re-INVITE on '%s' answered %d — the session ends (BYE)\n",
+		pvt->callid ? pvt->callid : "(no-callid)", status);
+	overlap_mode = pvt->peer ? pvt->peer->allowoverlap_mode : sofia_cfg.default_allowoverlap_mode;
+	sofia_queue_invite_failure(owner, sofia_invite_failure_status(status, sip),
+		(sofia_cfg.use_q850_reason && sip) ? sofia_reason_parse_cause(sip->sip_reason) : 0,
+		overlap_mode == SOFIA_OVERLAP_YES, 1 /* answered */);
+	ast_channel_unref(owner);
 }
 
 /* Safety-net timer for REFER transferer-leg BYE deferral. After we send the
@@ -18176,8 +18232,20 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			}
 		}
 		if (pvt && pvt->is_fork_master) {
-			ast_log(LOG_WARNING, "Sofia: master pvt received nua_r_invite (should not happen)\n");
-			break;
+			int owns_dialog;
+
+			/* After the winner pick the master holds the winner's handle (sofia_fork_pick_winner sets
+			 * it UP), so the responses to re-INVITEs on that dialog (the stack's session refresh, our
+			 * hold/connected-line/directmedia re-INVITEs) arrive here and are handled below like a
+			 * single-contact call's (the 401/407 credential branch above stays single-contact only).
+			 * Before the pick the master never sent an INVITE. */
+			ast_mutex_lock(&pvt->lock);
+			owns_dialog = (pvt->state == SOFIA_DIALOG_STATE_UP);
+			ast_mutex_unlock(&pvt->lock);
+			if (!owns_dialog) {
+				ast_log(LOG_WARNING, "Sofia: master pvt received nua_r_invite (should not happen)\n");
+				break;
+			}
 		}
 		if (pvt && pvt->is_fork_child && pvt->fork) {
 			struct sofia_fork *fork = pvt->fork;
@@ -18312,6 +18380,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					ast_verbose("Sofia: local-hold re-INVITE accepted on '%s'\n",
 						pvt->callid ? pvt->callid : "(no-callid)");
 				}
+				if (rejected && sofia_reinvite_failure_ends_session(status)) {
+					sofia_reinvite_failure_end_call(pvt, status, sip);	/* the stack is sending BYE */
+				}
 				break;
 				}
 			if (reinvite_purpose == SOFIA_REINVITE_CONNECTED_LINE) {
@@ -18358,6 +18429,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					 * session itself is unaffected. */
 					ast_debug(1, "Sofia: connected-line re-INVITE rejected on '%s' (%d %s)\n",
 						pvt->callid ? pvt->callid : "(no-callid)", status, phrase ? phrase : "");
+				}
+				if (rejected && sofia_reinvite_failure_ends_session(status)) {
+					sofia_reinvite_failure_end_call(pvt, status, sip);	/* the stack is sending BYE */
 				}
 				break;
 			}
@@ -18440,6 +18514,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				ast_verbose("Sofia: directmedia re-INVITE accepted on '%s'\n",
 					pvt->callid ? pvt->callid : "(no-callid)");
 			}
+			if (rejected && sofia_reinvite_failure_ends_session(status)) {
+				sofia_reinvite_failure_end_call(pvt, status, sip);	/* the stack is sending BYE */
+			}
 			break;
 		}
 		if (pvt) {
@@ -18448,6 +18525,19 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			 * disarm the no-provisional guard and unpark a pending inflight entry
 			 * (the old leg lives; no swap will happen). sofia_thread, no locks held. */
 			sofia_push_guard_progress(pvt, status);
+			if (status > 100 && status < 200) {
+				int up;
+
+				/* A provisional response to a re-INVITE (the call is already answered) changes
+				 * nothing: the call stays UP, so the final response is read as a re-INVITE's
+				 * (RFC 3261 §14.1) and the caller does not hear ringing again mid-call. */
+				ast_mutex_lock(&pvt->lock);
+				up = (pvt->state == SOFIA_DIALOG_STATE_UP);
+				ast_mutex_unlock(&pvt->lock);
+				if (up) {
+					break;
+				}
+			}
 			if (status == 180) {
 				ast_mutex_lock(&pvt->lock);
 				pvt->state = SOFIA_DIALOG_STATE_RINGING;
@@ -18588,6 +18678,15 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 
 				ast_mutex_lock(&pvt->lock);
 				answered = (pvt->state == SOFIA_DIALOG_STATE_UP);
+				if (answered && !sofia_reinvite_failure_ends_session(status)) {
+					/* A re-INVITE on an answered call (the stack's own session refresh: our own
+					 * re-INVITEs are handled by purpose above) was refused with a response that keeps
+					 * the session: it stays as it was (RFC 3261 §14.1), and so does the stack's dialog. */
+					ast_mutex_unlock(&pvt->lock);
+					ast_log(LOG_NOTICE, "Sofia: re-INVITE on '%s' refused (%d %s) — session unchanged\n",
+						pvt->callid ? pvt->callid : "(no-callid)", status, phrase ? phrase : "");
+					break;
+				}
 				sofia_alreadygone(pvt);
 				owner = pvt->owner;
 				if (owner) ast_channel_ref(owner);
