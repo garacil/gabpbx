@@ -1836,6 +1836,11 @@ static void sofia_fork_try_early_media(struct sofia_fork *fork, struct sofia_pvt
 	ast_channel_unlock(m_owner);
 }
 
+/* RFC 4028 session refresh bookkeeping (defined with the re-INVITE senders below). */
+static void sofia_session_timer_store(struct sofia_pvt *pvt, sip_t const *sip);
+static void sofia_session_timer_plan(struct sofia_pvt *pvt, int uas);
+static void sofia_session_refresh_arm(struct sofia_pvt *pvt);
+
 static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *child, sip_t const *sip)
 {
 	struct sofia_pvt *master;
@@ -2023,6 +2028,17 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 		ast_channel_ref(m_owner);
 	}
 	master->state = SOFIA_DIALOG_STATE_UP;
+	/* The winner's 2xx negotiated the session timer on the handle the master now owns; the SDP
+	 * version bookkeeping follows the handle too. */
+	ast_free(master->last_sdp_body);
+	master->last_sdp_body = child->last_sdp_body;
+	child->last_sdp_body = NULL;
+	master->last_sdp_version = child->last_sdp_version;
+	if (sip) {
+		sofia_session_timer_store(master, sip);
+		sofia_session_timer_plan(master, 0);
+		sofia_session_refresh_arm(master);
+	}
 	ast_mutex_unlock(&master->lock);
 
 	if (m_owner) {
@@ -2585,8 +2601,8 @@ static void sofia_alreadygone(struct sofia_pvt *pvt)
 	pvt->alreadygone = 1;
 }
 
-/* Whether the stack ends an established session after a final response >= 300 to a re-INVITE, so the
- * channel follows the stack's dialog. nua_client_response (nua_client.c) asks
+/* Whether the stack ends an established session after a final response >= 300 to a re-INVITE (or an
+ * UPDATE), so the channel follows the stack's dialog. nua_client_response (nua_client.c) asks
  * sip_response_terminates_dialog() (sip_util.c, the RFC 5057 dialog-usage rules) and, for a request that
  * is not the initial one, turns a usage or dialog termination into a graceful one; a response >= 700 is
  * graceful too. nua_invite_client_report (nua_session.c) then moves the established session to
@@ -2597,14 +2613,14 @@ static void sofia_alreadygone(struct sofia_pvt *pvt)
  * dialog on 481/408 (and on no response); the table in sip_util.c also ends it on others (e.g. 404, 410,
  * 480, 484, most 5xx and 6xx), and the channel goes with it rather than staying up on a dialog the stack
  * has already closed. */
-static int sofia_reinvite_failure_ends_session(int status)
+static int sofia_reinvite_failure_ends_session(int status, sip_method_t method)
 {
 	int graceful = 1;
 
 	if (status >= 700) {
 		return 1;
 	}
-	if (sip_response_terminates_dialog(status, sip_method_invite, &graceful)) {
+	if (sip_response_terminates_dialog(status, method, &graceful)) {
 		return 1;
 	}
 	return graceful;
@@ -2615,7 +2631,7 @@ static int sofia_reinvite_failure_ends_session(int status)
  * status's cause (the stack, already terminating, does not send a second BYE when the hangup asks for
  * one). alreadygone makes a late 2xx take the orphan ACK+BYE path. sofia_thread only; no pvt, peer or
  * channel lock may be held. */
-static void sofia_reinvite_failure_end_call(struct sofia_pvt *pvt, int status, sip_t const *sip)
+static void sofia_reinvite_failure_end_call(struct sofia_pvt *pvt, int status, sip_t const *sip, const char *what)
 {
 	struct ast_channel *owner;
 	int overlap_mode;
@@ -2630,8 +2646,8 @@ static void sofia_reinvite_failure_end_call(struct sofia_pvt *pvt, int status, s
 	if (!owner) {
 		return;
 	}
-	ast_log(LOG_NOTICE, "Sofia: re-INVITE on '%s' answered %d — the session ends (BYE)\n",
-		pvt->callid ? pvt->callid : "(no-callid)", status);
+	ast_log(LOG_NOTICE, "Sofia: %s on '%s' answered %d — the session ends (BYE)\n",
+		what, pvt->callid ? pvt->callid : "(no-callid)", status);
 	overlap_mode = pvt->peer ? pvt->peer->allowoverlap_mode : sofia_cfg.default_allowoverlap_mode;
 	sofia_queue_invite_failure(owner, sofia_invite_failure_status(status, sip),
 		(sofia_cfg.use_q850_reason && sip) ? sofia_reason_parse_cause(sip->sip_reason) : 0,
@@ -3210,6 +3226,14 @@ static void sofia_pvt_destructor(void *obj)
 		}
 		pvt->push_guard_sched_id = -1;
 	}
+	if (pvt->session_refresh_sched_id != -1 && sofia_sched) {	/* same safety net for the refresh timer */
+		if (ast_sched_thread_del(sofia_sched, pvt->session_refresh_sched_id) == 0) {
+			ao2_ref(pvt, -1);
+		}
+		pvt->session_refresh_sched_id = -1;
+	}
+	ast_free(pvt->last_sdp_body);
+	pvt->last_sdp_body = NULL;
 	if (pvt->udptl) {
 		ast_udptl_destroy(pvt->udptl);
 		pvt->udptl = NULL;
@@ -3260,6 +3284,11 @@ static struct sofia_pvt *sofia_pvt_alloc(void)
 	pvt->t38id = -1;
 	pvt->defer_bye_sched_id = -1;
 	pvt->push_guard_sched_id = -1;	/* P2 no-provisional guard: same sentinel discipline */
+	pvt->session_refresh_sched_id = -1;	/* RFC 4028 refresh timer: same sentinel discipline */
+	pvt->st_remote_supported = pvt->st_remote_expires = pvt->st_remote_refresher = pvt->st_remote_min_se = 0;
+	pvt->st_remote_update = pvt->session_we_refresh = pvt->session_interval = pvt->session_update_refresh = 0;
+	pvt->session_update_refused = 0;
+	pvt->last_sdp_version = 0;
 
 	/* RFC 3264 answer-direction: -1 sentinel = "no offer staged" (sdp_inactive==0 would
 	 * otherwise mean an unset field emits a=inactive). Staged in sofia_parse_sdp. */
@@ -5706,6 +5735,7 @@ static const char *sofia_reinvite_purpose_str(int purpose)
 	case SOFIA_REINVITE_T38:            return "T.38";
 	case SOFIA_REINVITE_LOCAL_HOLD:     return "local-hold";
 	case SOFIA_REINVITE_CONNECTED_LINE: return "connected-line";
+	case SOFIA_REINVITE_SESSION_REFRESH: return "session-refresh";
 	default:                            return "in-dialog";
 	}
 }
@@ -5836,6 +5866,193 @@ static void sofia_hold_reinvite(struct sofia_pvt *pvt, int mode)
 		ast_mutex_unlock(&pvt->lock);
 		ao2_ref(pvt, -1);
 	}
+}
+
+
+/* RFC 4028 session refresh. The stack negotiates the session timer on every INVITE/UPDATE 2xx (nua_session.c:
+ * session_timer_preferences + session_timer_store + session_timer_negotiate + session_timer_set) and, when it made us
+ * the refresher, refreshes at interval/2 (+-5 s) by resending the last INVITE it sent on the dialog, with that
+ * INVITE's SDP (nua_client_resend_request), or, on a dialog where we never sent one (an inbound call), with an INVITE
+ * carrying no offer at all. Both are wrong once the session was renegotiated (RFC 4028 §7.4: the refresh offer must
+ * be the current one, unchanged; RFC 3264 §8: its o= version must not go back), and the offer-less one gets a 2xx with
+ * an offer that our ACK does not answer (RFC 3261 §13.2.1). So the same negotiation is mirrored here from the same
+ * inputs; when the peer allows UPDATE the stack is told to refresh with UPDATE and no SDP (NUTAG_UPDATE_REFRESH,
+ * RFC 4028 §7.4 recommends it), otherwise chan_sofia sends the refresh itself, a re-INVITE with the current SDP,
+ * 10 s before the stack's nominal time (5 s before its earliest), which the stack then re-arms from that 2xx. */
+static void sofia_session_refresh_root(void *data);
+static int sofia_session_refresh_cb(const void *data);
+
+/* Cancel our refresh timer. pvt->lock held; the caller holds a reference of its own. */
+static void sofia_session_refresh_cancel_locked(struct sofia_pvt *pvt)
+{
+	if (pvt->session_refresh_sched_id != -1 && sofia_sched) {
+		if (ast_sched_thread_del(sofia_sched, pvt->session_refresh_sched_id) == 0) {
+			ao2_ref(pvt, -1);	/* the timer never ran: drop its reference */
+		}
+		pvt->session_refresh_sched_id = -1;
+	}
+}
+
+/* What the peer's last request (we are its UAS) or response (we are the UAC) said about the session timer and
+ * about UPDATE, as the stack's session_timer_store reads it. pvt->lock held. */
+static void sofia_session_timer_store(struct sofia_pvt *pvt, sip_t const *sip)
+{
+	int uas = sip->sip_request != NULL;
+	const char *r;
+
+	if (sip->sip_supported && sip_has_feature(sip->sip_supported, "timer")) {
+		pvt->st_remote_supported = 1;
+	}
+	pvt->st_remote_expires = 0;
+	pvt->st_remote_refresher = 0;
+	pvt->st_remote_min_se = 0;
+	if (sip->sip_session_expires) {
+		pvt->st_remote_expires = sip->sip_session_expires->x_delta;
+		r = sip->sip_session_expires->x_refresher;
+		if (r && !strncasecmp(r, "uac", 3)) {
+			pvt->st_remote_refresher = uas ? 2 : 1;
+		} else if (r && !strncasecmp(r, "uas", 3)) {
+			pvt->st_remote_refresher = uas ? 1 : 2;
+		} else if (sip->sip_require && sip_has_feature(sip->sip_require, "timer")) {
+			pvt->st_remote_refresher = 1;
+		}
+	}
+	if (sip->sip_min_se) {
+		pvt->st_remote_min_se = sip->sip_min_se->min_delta;
+	}
+	if (sip->sip_allow) {
+		pvt->st_remote_update = sip_is_allowed(sip->sip_allow, sip_method_update, NULL) ? 1 : 0;
+	}
+}
+
+/* The stack's session_timer_negotiate for this leg: our preferences are the NUTAG values the last nua_invite /
+ * nua_respond of this leg carried (sofia_session_timer_values for the leg's direction), else the stack's defaults
+ * (session timer 1800 s as a cap, Min-SE 120 s); "timer" is always in our Supported. uas: 1 when the transaction
+ * was the peer's request that we answered 2xx, 0 when it was our INVITE answered 2xx. pvt->lock held. */
+static void sofia_session_timer_plan(struct sofia_pvt *pvt, int uas)
+{
+	int st_seconds, st_min_se, st_refresher;
+	int local_expires = 0, local_defaults = 0, local_min_se, interval;
+	enum nua_session_refresher refresher;
+
+	sofia_session_timer_values(pvt->peer, pvt->outgoing, &st_seconds, &st_min_se, &st_refresher);
+	if (st_seconds >= 0 || st_refresher >= 0) {
+		local_expires = st_seconds >= 0 ? st_seconds : 1800;
+	} else {
+		local_defaults = 1800;
+	}
+	local_min_se = st_min_se > 0 ? st_min_se : 120;
+
+	if (!pvt->st_remote_supported) {
+		refresher = nua_local_refresher;
+	} else if (pvt->st_remote_refresher == 1) {
+		refresher = nua_local_refresher;
+	} else if (pvt->st_remote_refresher == 2) {
+		refresher = nua_remote_refresher;
+	} else if (uas) {
+		refresher = nua_remote_refresher;
+	} else {
+		refresher = nua_local_refresher;
+	}
+	interval = pvt->st_remote_expires;
+	if (interval == 0) {
+		interval = local_expires;
+	}
+	if (local_expires != 0 && interval > local_expires) {
+		interval = local_expires;
+	}
+	if (local_defaults != 0 && interval > local_defaults) {
+		interval = local_defaults;
+	}
+	if (interval != 0) {
+		if (interval < local_min_se) {
+			interval = local_min_se;
+		}
+		if (interval < pvt->st_remote_min_se) {
+			interval = pvt->st_remote_min_se;
+		}
+	}
+	if (interval == 0) {
+		refresher = nua_no_refresher;
+	}
+	pvt->session_we_refresh = (refresher == nua_local_refresher);
+	pvt->session_interval = interval;
+}
+
+/* (Re)arm the refresh after a negotiation. pvt->lock held. */
+static void sofia_session_refresh_arm(struct sofia_pvt *pvt)
+{
+	int delay;
+
+	sofia_session_refresh_cancel_locked(pvt);
+	if (!pvt->session_we_refresh || pvt->session_interval <= 0 || !pvt->nh || pvt->alreadygone) {
+		return;
+	}
+	if (pvt->st_remote_update && !pvt->session_update_refused) {
+		/* The stack refreshes with UPDATE carrying no SDP and the session timer headers. */
+		if (!pvt->session_update_refresh) {
+			pvt->session_update_refresh = 1;
+			nua_set_hparams(pvt->nh, NUTAG_UPDATE_REFRESH(1), TAG_END());
+		}
+		return;
+	}
+	delay = pvt->session_interval / 2 - 10;
+	if (delay < 5) {
+		delay = 5;
+	}
+	ao2_ref(pvt, +1);
+	pvt->session_refresh_sched_id = ast_sched_thread_add(sofia_sched, delay * 1000, sofia_session_refresh_cb, pvt);
+	if (pvt->session_refresh_sched_id < 0) {
+		pvt->session_refresh_sched_id = -1;
+		ao2_ref(pvt, -1);	/* not armed: the stack's own refresh remains */
+	}
+}
+
+/* Scheduler thread: hand the reference to sofia_thread, where the re-INVITE is sent. */
+static int sofia_session_refresh_cb(const void *data)
+{
+	struct sofia_pvt *pvt = (struct sofia_pvt *) data;
+
+	ast_mutex_lock(&pvt->lock);
+	pvt->session_refresh_sched_id = -1;
+	ast_mutex_unlock(&pvt->lock);
+	if (sofia_dispatch_to_root_thread(sofia_session_refresh_root, pvt) < 0) {
+		ao2_ref(pvt, -1);
+	}
+	return 0;
+}
+
+/* Send the refresh re-INVITE with the current SDP now, or in 2 s when another re-INVITE of ours is in flight.
+ * sofia_thread, pvt->lock held, call UP. Its 2xx is handled by the SESSION_REFRESH purpose path, and the
+ * negotiation on that 2xx re-arms the timer. */
+static void sofia_session_refresh_send_locked(struct sofia_pvt *pvt)
+{
+	if (pvt->reinvite_pending) {
+		if (pvt->session_refresh_sched_id == -1) {
+			ao2_ref(pvt, +1);
+			pvt->session_refresh_sched_id = ast_sched_thread_add(sofia_sched, 2000, sofia_session_refresh_cb, pvt);
+			if (pvt->session_refresh_sched_id < 0) {
+				pvt->session_refresh_sched_id = -1;
+				ao2_ref(pvt, -1);
+			}
+		}
+		return;
+	}
+	pvt->reinvite_purpose = SOFIA_REINVITE_SESSION_REFRESH;
+	sofia_send_reinvite(pvt);
+}
+
+/* sofia_thread: the refresh timer fired. */
+static void sofia_session_refresh_root(void *data)
+{
+	struct sofia_pvt *pvt = data;
+
+	ast_mutex_lock(&pvt->lock);
+	if (!pvt->alreadygone && pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh && pvt->session_we_refresh) {
+		sofia_session_refresh_send_locked(pvt);
+	}
+	ast_mutex_unlock(&pvt->lock);
+	ao2_ref(pvt, -1);
 }
 
 static int sofia_set_rtp_peer(struct ast_channel *chan, struct ast_rtp_instance *instance,
@@ -7059,6 +7276,7 @@ static int sofia_hangup(struct ast_channel *ast)
 	sofia_update_call_counter(pvt, SOFIA_DEC_CALL_LIMIT);
 
 	ast_mutex_lock(&pvt->lock);
+	sofia_session_refresh_cancel_locked(pvt);	/* no refresh after the channel is gone */
 
 	/* Fork master hangup — CANCEL all children if no winner yet */
 	if (pvt->is_fork_master && pvt->fork) {
@@ -7229,6 +7447,13 @@ static int sofia_answer(struct ast_channel *ast)
 				TAG_END());
 		}
 	}
+
+	/* The stack negotiates the session timer on this 200 (session_timer_set(ss, 1)): mirror it and
+	 * arm our refresh when it made us the refresher. */
+	ast_mutex_lock(&pvt->lock);
+	sofia_session_timer_plan(pvt, 1);
+	sofia_session_refresh_arm(pvt);
+	ast_mutex_unlock(&pvt->lock);
 
 	/* Activate the RTP instance AFTER the 200 OK is dispatched (the browser
 	 * starts ICE only once it has our answer). For a WebRTC leg this arms the
@@ -8622,6 +8847,13 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 		if (pvt->is_webrtc && pvt->webrtc_video_accepted && pvt->vrtp) {
 			ast_rtp_instance_activate(pvt->vrtp);
 		}
+		/* Every 2xx we send to a re-INVITE re-negotiates the session timer in the stack (re-armed at
+		 * the ACK): mirror it. */
+		ast_mutex_lock(&pvt->lock);
+		sofia_session_timer_store(pvt, sip);
+		sofia_session_timer_plan(pvt, 1);
+		sofia_session_refresh_arm(pvt);
+		ast_mutex_unlock(&pvt->lock);
 	} else {
 		nua_respond(nh, SIP_500_INTERNAL_SERVER_ERROR, TAG_END());
 	}
@@ -8852,6 +9084,21 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 		}
 	}
 
+	/* A 2xx we send to an UPDATE that carries Session-Expires re-negotiates the session timer in the
+	 * stack (an UPDATE without it changes nothing there), and the stack leaves its timer alone while an
+	 * INVITE of ours is in flight. The peer's Allow is noted either way. */
+	if (sip && (!has_offer || sdp_ok)) {
+		ast_mutex_lock(&pvt->lock);
+		if (sip->sip_allow) {
+			pvt->st_remote_update = sip_is_allowed(sip->sip_allow, sip_method_update, NULL) ? 1 : 0;
+		}
+		if (sip->sip_session_expires && !pvt->reinvite_pending) {
+			sofia_session_timer_store(pvt, sip);
+			sofia_session_timer_plan(pvt, 1);
+			sofia_session_refresh_arm(pvt);
+		}
+		ast_mutex_unlock(&pvt->lock);
+	}
 	/* SessionTimerRefresh AMI for a uas-side refresh fire via UPDATE (mirrors the re-INVITE path).
 	 * Gated on a 2xx: a non-2xx UPDATE leaves session parameters unchanged (RFC 3311 §5.3), so an
 	 * offer that failed to answer (500) must NOT bump the negotiated session timer. */
@@ -8982,6 +9229,12 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		/* session-timer field write under pvt->lock (CLI reader holds it). */
 		ast_mutex_lock(&pvt->lock);
 		pvt->session_negotiated_expires = sip->sip_session_expires->x_delta;
+		ast_mutex_unlock(&pvt->lock);
+	}
+	if (sip) {
+		/* What the caller said about the session timer and UPDATE: the plan is made when we answer. */
+		ast_mutex_lock(&pvt->lock);
+		sofia_session_timer_store(pvt, sip);
 		ast_mutex_unlock(&pvt->lock);
 	}
 
@@ -17850,6 +18103,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	case nua_i_message:
 	case nua_i_error:
 	case nua_r_invite:
+	case nua_r_update:
 	case nua_r_bye:
 	case nua_r_cancel:
 		dialog_pvt = sofia_pvt_ref_if_linked(hmagic);
@@ -18200,6 +18454,16 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				"Sofia: outbound INVITE challenged (%d) but no usable cleartext credential — call will fail\n",
 				status);
 		}
+		if (pvt && status >= 200 && status < 300 && sip && !pvt->is_fork_child) {
+			/* The stack re-negotiates the session timer on every 2xx to one of our INVITEs
+			 * (nua_invite_client_response): mirror it and (re)arm our refresh. A fork child's 2xx
+			 * is handled when the winner is picked (its handle moves to the master). */
+			ast_mutex_lock(&pvt->lock);
+			sofia_session_timer_store(pvt, sip);
+			sofia_session_timer_plan(pvt, 0);
+			sofia_session_refresh_arm(pvt);
+			ast_mutex_unlock(&pvt->lock);
+		}
 		/* Session timers (RFC 4028): capture negotiated Session-Expires on every 200 OK.
 		 * The SessionTimerRefresh AMI event fires only on REFRESH (dialog already UP). */
 		if (pvt && status == 200 && sip && sip->sip_session_expires) {
@@ -18398,11 +18662,63 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					ast_verbose("Sofia: local-hold re-INVITE accepted on '%s'\n",
 						pvt->callid ? pvt->callid : "(no-callid)");
 				}
-				if (rejected && sofia_reinvite_failure_ends_session(status)) {
-					sofia_reinvite_failure_end_call(pvt, status, sip);	/* the stack is sending BYE */
+				if (rejected && sofia_reinvite_failure_ends_session(status, sip_method_invite)) {
+					sofia_reinvite_failure_end_call(pvt, status, sip, "re-INVITE");	/* the stack is sending BYE */
 				}
 				break;
 				}
+			if (reinvite_purpose == SOFIA_REINVITE_SESSION_REFRESH) {
+				/* Our session-refresh re-INVITE was answered. Its offer was the current session,
+				 * unchanged, so a 2xx only brings the peer's answer to apply; the session timer was
+				 * re-negotiated and our timer re-armed above (the 2xx block before the purposes).
+				 * A refusal keeps the session, as any re-INVITE's does (RFC 3261 §14.1), unless the
+				 * stack ends it; the stack arms no further refresh after a refused one, and the peer
+				 * may end the session when it expires (RFC 4028 §10). */
+				int rejected = (status >= 300);
+				int has_sdp = (!rejected && sip && sip->sip_payload && sip->sip_payload->pl_data);
+				struct ast_channel *owner = NULL;
+
+				ast_mutex_lock(&pvt->lock);
+				for (;;) {	/* re-acquire channel->pvt order for a safe sofia_parse_sdp (set_format) */
+					owner = pvt->owner;
+					if (!owner) {
+						break;
+					}
+					ast_channel_ref(owner);
+					ast_mutex_unlock(&pvt->lock);
+					ast_channel_lock(owner);
+					ast_mutex_lock(&pvt->lock);
+					if (pvt->owner == owner) {
+						break;
+					}
+					ast_channel_unlock(owner);
+					ast_channel_unref(owner);
+					owner = NULL;
+				}
+				pvt->reinvite_pending = 0;
+				pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
+				if (has_sdp) {
+					sofia_parse_sdp(pvt, sip, 0 /* answer: session-refresh re-INVITE 2xx */);
+				}
+				if (owner) {
+					ast_channel_unlock(owner);
+				}
+				ast_mutex_unlock(&pvt->lock);
+				if (owner) {
+					ast_channel_unref(owner);
+				}
+				if (rejected) {
+					ast_log(LOG_NOTICE, "Sofia: session-refresh re-INVITE on '%s' refused (%d %s)\n",
+						pvt->callid ? pvt->callid : "(no-callid)", status, phrase ? phrase : "");
+				} else if (sofia_debug) {
+					ast_verbose("Sofia: session-refresh re-INVITE accepted on '%s'\n",
+						pvt->callid ? pvt->callid : "(no-callid)");
+				}
+				if (rejected && sofia_reinvite_failure_ends_session(status, sip_method_invite)) {
+					sofia_reinvite_failure_end_call(pvt, status, sip, "re-INVITE");	/* the stack is sending BYE */
+				}
+				break;
+			}
 			if (reinvite_purpose == SOFIA_REINVITE_CONNECTED_LINE) {
 				/* Connected-line re-INVITE response. This purpose carries no media or
 				 * state change of its own — the offer was a plain re-offer of the current
@@ -18448,8 +18764,8 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					ast_debug(1, "Sofia: connected-line re-INVITE rejected on '%s' (%d %s)\n",
 						pvt->callid ? pvt->callid : "(no-callid)", status, phrase ? phrase : "");
 				}
-				if (rejected && sofia_reinvite_failure_ends_session(status)) {
-					sofia_reinvite_failure_end_call(pvt, status, sip);	/* the stack is sending BYE */
+				if (rejected && sofia_reinvite_failure_ends_session(status, sip_method_invite)) {
+					sofia_reinvite_failure_end_call(pvt, status, sip, "re-INVITE");	/* the stack is sending BYE */
 				}
 				break;
 			}
@@ -18532,8 +18848,8 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				ast_verbose("Sofia: directmedia re-INVITE accepted on '%s'\n",
 					pvt->callid ? pvt->callid : "(no-callid)");
 			}
-			if (rejected && sofia_reinvite_failure_ends_session(status)) {
-				sofia_reinvite_failure_end_call(pvt, status, sip);	/* the stack is sending BYE */
+			if (rejected && sofia_reinvite_failure_ends_session(status, sip_method_invite)) {
+				sofia_reinvite_failure_end_call(pvt, status, sip, "re-INVITE");	/* the stack is sending BYE */
 			}
 			break;
 		}
@@ -18696,7 +19012,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 
 				ast_mutex_lock(&pvt->lock);
 				answered = (pvt->state == SOFIA_DIALOG_STATE_UP);
-				if (answered && !sofia_reinvite_failure_ends_session(status)) {
+				if (answered && !sofia_reinvite_failure_ends_session(status, sip_method_invite)) {
 					/* A re-INVITE on an answered call (the stack's own session refresh: our own
 					 * re-INVITEs are handled by purpose above) was refused with a response that keeps
 					 * the session: it stays as it was (RFC 3261 §14.1), and so does the stack's dialog. */
@@ -18721,6 +19037,60 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					ast_channel_unref(owner);
 					owner = NULL;
 				}
+			}
+		}
+		break;
+	case nua_r_update:
+		/* The stack's own UPDATE (its session refresh when the peer allows UPDATE). On a 2xx the stack
+		 * stores the session timer and re-arms; the channel only records the refresh as it does for a
+		 * re-INVITE's. A refusal keeps the session (RFC 4028 §10) unless the stack ends it, but the stack
+		 * would then send the UPDATE again every second (nothing moves its refresh time forward until an
+		 * INVITE of ours does), so UPDATE is dropped for this call and the refresh goes out now as our
+		 * re-INVITE with the current SDP. */
+		if (sofia_debug)
+			ast_verbose("Sofia: UPDATE response %d %s\n", status, phrase);
+		if (pvt && status >= 200 && status < 300 && sip && sip->sip_session_expires) {
+			char own_name[80] = "";
+			char own_uniqueid[150] = "";
+
+			ast_mutex_lock(&pvt->lock);
+			pvt->session_negotiated_expires = sip->sip_session_expires->x_delta;
+			pvt->session_last_refresh_at = time(NULL);
+			ast_mutex_unlock(&pvt->lock);
+			sofia_snapshot_owner_id(pvt, own_name, sizeof(own_name), own_uniqueid, sizeof(own_uniqueid));
+			manager_event(EVENT_FLAG_CALL, "SessionTimerRefresh",
+				"Channel: %s\r\n"
+				"Uniqueid: %s\r\n"
+				"Peer: Sofia/%s\r\n"
+				"SessionExpires: %d\r\n"
+				"Refresher: %s\r\n"
+				"Direction: uac\r\n",
+				own_name, own_uniqueid, pvt->peername,
+				(int)sip->sip_session_expires->x_delta,
+				sip->sip_session_expires->x_refresher ? sip->sip_session_expires->x_refresher : "auto");
+		}
+		if (pvt && status >= 300) {
+			int up, ends, fallback = 0;
+
+			ends = sofia_reinvite_failure_ends_session(status, sip_method_update);
+			ast_mutex_lock(&pvt->lock);
+			up = (pvt->state == SOFIA_DIALOG_STATE_UP);
+			if (up && !ends && pvt->session_update_refresh) {
+				pvt->session_update_refresh = 0;
+				pvt->session_update_refused = 1;	/* for the rest of the call, whatever its Allow says */
+				nua_set_hparams(pvt->nh, NUTAG_UPDATE_REFRESH(0), TAG_END());
+				if (pvt->session_we_refresh && !pvt->alreadygone && pvt->nh) {
+					sofia_session_refresh_send_locked(pvt);
+				}
+				fallback = 1;
+			}
+			ast_mutex_unlock(&pvt->lock);
+			if (up && ends) {
+				sofia_reinvite_failure_end_call(pvt, status, sip, "UPDATE");
+			} else if (up) {
+				ast_log(LOG_NOTICE, "Sofia: UPDATE on '%s' refused (%d %s) — %s\n",
+					pvt->callid ? pvt->callid : "(no-callid)", status, phrase ? phrase : "",
+					fallback ? "refreshing with a re-INVITE from now on" : "session unchanged");
 			}
 		}
 		break;

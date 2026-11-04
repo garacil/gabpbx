@@ -654,6 +654,48 @@ static const char *sofia_answer_dir_attr(int is_answer, int offered_mode, int lo
 	}
 }
 
+
+/* RFC 3264 §8 / RFC 4028 §7.4: an SDP that does not change the session goes out with the same o= version as the last
+ * one we sent (a session refresh "MUST indicate that it has not changed"), a changed one with the next version.
+ * sofia_generate_sdp bumps sess_version before building; when the body after the o= line is identical to the previous
+ * one this puts the previous version back into the o= line, and it remembers the body for the next comparison. */
+static void sofia_sdp_keep_version(struct sofia_pvt *pvt, char *buf, size_t len)
+{
+	char *body = strstr(buf, "\r\ns=");	/* everything after the o= line */
+	char *o, *rest;
+	char head[64];
+	int hl;
+	size_t rest_len;
+
+	if (!body) {
+		return;
+	}
+	if (!pvt->last_sdp_body || strcmp(body, pvt->last_sdp_body)) {
+		char *copy = ast_strdup(body);
+		if (copy) {
+			ast_free(pvt->last_sdp_body);
+			pvt->last_sdp_body = copy;
+		}
+		pvt->last_sdp_version = pvt->sess_version;
+		return;
+	}
+	/* unchanged: "o=- <id> <version>" takes the previous version again */
+	o = strstr(buf, "\r\no=- ");
+	rest = o ? strchr(o + 6, ' ') : NULL;		/* after the id */
+	rest = rest ? strchr(rest + 1, ' ') : NULL;	/* after the version: " IN ..." */
+	if (!rest) {
+		return;
+	}
+	pvt->sess_version = pvt->last_sdp_version;
+	hl = snprintf(head, sizeof(head), "\r\no=- %lu %lu", pvt->sess_id, pvt->sess_version);
+	rest_len = strlen(rest) + 1;
+	if (hl < 0 || (size_t)(o - buf) + hl + rest_len > len) {
+		return;
+	}
+	memmove(o + hl, rest, rest_len);
+	memcpy(o, head, hl);
+}
+
 char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_answer)
 {
 	const char *audio_dir = sofia_answer_dir_attr(is_answer, pvt->offered_audio_mode, pvt->local_hold_mode);
@@ -1511,6 +1553,7 @@ webrtc_m_lines_done:
 		return NULL;
 	}
 
+	sofia_sdp_keep_version(pvt, buf, len);
 	return buf;
 }
 

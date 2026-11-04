@@ -568,6 +568,7 @@ enum sofia_reinvite_purpose {
 	SOFIA_REINVITE_T38,
 	SOFIA_REINVITE_LOCAL_HOLD,
 	SOFIA_REINVITE_CONNECTED_LINE,
+	SOFIA_REINVITE_SESSION_REFRESH,	/* RFC 4028 session refresh sent by chan_sofia with the current SDP */
 };
 
 /* The per-call/dialog object — the central media/signaling state. Shared so the SDP, T.38, register
@@ -657,6 +658,8 @@ struct sofia_pvt {
 	int outbound_invite_auth_attempts; /* 401/407 answered on this outbound INVITE; bounded vs bad-creds loop */
 	unsigned long sess_id;           /* SDP o= session-id, set ONCE per dialog (RFC 4566 §5.2 / RFC 3264 §8: constant across offers/answers) */
 	unsigned long sess_version;      /* SDP o= session-version, bumped per generated SDP */
+	char *last_sdp_body;             /* the last SDP we sent, after its o= line (RFC 3264 §8: an unchanged body keeps its version) */
+	unsigned long last_sdp_version;  /* the o= version that body went out with */
 	int hold_state;                  /* 1 = peer holding us (a=sendonly/inactive) */
 	/* Self-call device exclusion: when a device dials its OWN extension, the calling
 	 * binding is excluded from ring/fork/park (its INVITE transport source, captured
@@ -724,6 +727,20 @@ struct sofia_pvt {
 	 * SessionTimerRefresh); populated at refresh-fire. zero = none yet. */
 	int session_negotiated_expires; /* negotiated Session-Expires (s); 0 = no timer */
 	time_t session_last_refresh_at; /* most recent refresh; 0 = never */
+	/* RFC 4028 refresh, mirrored from the stack's negotiation (sofia_session_timer_plan): what the peer's last
+	 * request/response said, and the result. The stack refreshes with its last INVITE or with no offer at all
+	 * (see sofia_session_refresh_arm), so chan_sofia refreshes with a re-INVITE carrying the current SDP, or
+	 * has the stack use UPDATE when the peer allows it. All under pvt->lock. */
+	int st_remote_supported;        /* the peer's Supported had "timer" (sticky, as in the stack) */
+	int st_remote_expires;          /* the peer's Session-Expires delta, 0 = none */
+	int st_remote_refresher;        /* 0 any / 1 us / 2 the peer, from its refresher parameter (or Require: timer) */
+	int st_remote_min_se;           /* the peer's Min-SE, 0 = none */
+	int st_remote_update;           /* the peer's Allow lists UPDATE (set once an Allow was seen) */
+	int session_we_refresh;         /* the stack made us the refresher */
+	int session_interval;           /* the negotiated session interval (s), 0 = no timer */
+	int session_update_refresh;     /* NUTAG_UPDATE_REFRESH(1) applied on the handle: the stack refreshes with UPDATE */
+	int session_update_refused;     /* the peer refused an UPDATE refresh: re-INVITE for the rest of the call */
+	int session_refresh_sched_id;   /* -1 = none; our re-INVITE refresh timer (del-or-fire idiom) */
 	int allowtransfer; /* per-call REFER policy; inherits peer->allowtransfer; gated at sofia_process_refer */
 	/* Blind/attended-transfer BYE deferral (RFC 5589 §6.1): we must not race the
 	 * transferer's UA BYE with our own nua_bye, or sofia-sip drops the pending
