@@ -18323,9 +18323,27 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		}
 		if (pvt && pvt->reinvite_pending && status >= 200) {
 			int reinvite_purpose;
+			char leg_proxy[128] = "";
 			ast_mutex_lock(&pvt->lock);
 			reinvite_purpose = pvt->reinvite_purpose;
+			ast_copy_string(leg_proxy, S_OR(pvt->outbound_proxy, ""), sizeof(leg_proxy));
 			ast_mutex_unlock(&pvt->lock);
+			if (status < 300) {
+				/* Our own re-INVITE was answered: ACK the 2xx like the initial INVITE's. For a NAT or
+				 * WebSocket peer the INVITE went out with NUTAG_AUTOACK(0), so the stack waits for
+				 * this ACK; without it the transaction stays open, later re-INVITEs wait behind it,
+				 * and the peer ends the call when its 2xx is never acknowledged (RFC 3261 §13.3.1.4).
+				 * The ACK goes to this leg's learned public source (outbound_proxy, the device that
+				 * answered: a peer may have several), else to the peer's registered source. On a
+				 * handle whose INVITE auto-ACKs (a fork winner) the stack has already sent the ACK
+				 * and reports this one as a 900 error that nothing acts on. */
+				char nat_proxy_url[128];
+				if (leg_proxy[0]) {
+					nua_ack(nh, NUTAG_PROXY(leg_proxy), TAG_END());
+				} else if (sofia_build_nat_proxy_url_from_peer(pvt->peer, nat_proxy_url, sizeof(nat_proxy_url))) {
+					nua_ack(nh, NUTAG_PROXY(nat_proxy_url), TAG_END());
+				}
+			}
 			if (reinvite_purpose == SOFIA_REINVITE_LOCAL_HOLD) {
 				/* Local hold/unhold re-INVITE response. Unlike directmedia/T.38 this must NOT clear
 				 * redirip, touch T.38 state, or revert to relay — it only applies the peer's answer
