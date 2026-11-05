@@ -39,9 +39,14 @@
 
 struct sofia_pvt;  /* full definition below */
 struct sofia_contact;  /* full definition below */
+struct sofia_peer;  /* full definition below */
 
 /* Cross-module helpers defined in chan_sofia.c, used by the split-out modules. */
 void sofia_get_source_addr(sip_t const *sip, struct ast_sockaddr *addr);
+int sofia_subscription_contact(const char *target_uri, const struct ast_sockaddr *hint, const char *user,
+	char *buf, size_t len);
+int sofia_peer_subscription_contact(struct sofia_peer *peer, const char *target, const char *route,
+	char *buf, size_t len);
 int sofia_dispatch_to_root_thread(void (*callback)(void *), void *data);
 /* Post the outbound INVITE for a single-contact call (extracted from sofia_call; the push
  * wake-up resume sends its deferred INVITE through it). Caller holds the CHANNEL lock,
@@ -495,6 +500,8 @@ struct sofia_presence_sub {
 	char nat_proxy[128];			/* NUTAG_PROXY target for NAT watchers — routes NOTIFY to
 						 * the public source not the private Contact (else 408s).
 						 * Empty for non-NAT peers. */
+	char contact[300];			/* Contact of our NOTIFYs: <sip:exten@our address as the
+						 * watcher's source sees it>; "" = none known */
 	char event[16];				/* "dialog" or "presence" (NOTIFY Event hdr) */
 	enum sofia_sub_format format;		/* negotiated body type */
 	int stateid;				/* ast_extension_state_add_destroy id (-1 = none) */

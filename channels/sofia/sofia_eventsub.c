@@ -72,6 +72,7 @@ struct sofia_evsub {
 	char target[256];		/* Request-URI/To we SUBSCRIBE (peer AOR at the trunk) */
 	char from[256];			/* From identity (the peer's register identity) */
 	char route[256];		/* outboundproxy initial Route (empty = none) */
+	char contact[300];		/* our Contact (RFC 3265 §7.1; the stack adds none): "" = not known */
 	char spec[200];			/* raw peer->subscribe_event value at create time (reload diff key) */
 	int auth_tries;			/* reactive-auth attempt guard */
 	int established;		/* 1 once a 2xx SUBSCRIBE arrived (nua then owns refresh) */
@@ -256,6 +257,8 @@ static int evsub_send_subscribe(struct sofia_evsub *sub)
 		TAG_IF(!ast_strlen_zero(sub->accept), SIPTAG_ACCEPT_STR(sub->accept)),
 		SIPTAG_EXPIRES_STR(exp),
 		TAG_IF(!ast_strlen_zero(sub->from), SIPTAG_FROM_STR(sub->from)),
+		/* also the dialog's local target: the refreshes and the un-SUBSCRIBE the stack sends carry it */
+		TAG_IF(sub->contact[0], SIPTAG_CONTACT_STR(sub->contact)),
 		TAG_END());
 	return 0;
 }
@@ -372,6 +375,7 @@ static void evsub_start_one(struct sofia_peer *peer)
 	ast_copy_string(sub->target, target, sizeof(sub->target));
 	ast_copy_string(sub->from, from, sizeof(sub->from));
 	ast_copy_string(sub->route, route, sizeof(sub->route));
+	sofia_peer_subscription_contact(peer, sub->target, sub->route, sub->contact, sizeof(sub->contact));
 	ast_copy_string(sub->spec, spec, sizeof(sub->spec));
 	sub->established = sub->in_flight = 0;
 	sub->next_send = 0;
@@ -507,6 +511,7 @@ static void evsub_retry_sweep(su_root_magic_t *magic, su_timer_t *t, su_timer_ar
 					ast_copy_string(sub->target, cur_target, sizeof(sub->target));
 					ast_copy_string(sub->from, cur_target, sizeof(sub->from));
 					ast_copy_string(sub->route, cur_route, sizeof(sub->route));
+					sofia_peer_subscription_contact(p, sub->target, sub->route, sub->contact, sizeof(sub->contact));
 				} else {
 					wanted = 0;
 				}

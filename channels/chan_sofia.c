@@ -791,6 +791,40 @@ const char *sofia_transport_name(int transport)
 	}
 }
 
+/* The source a request came from, as the URI of the next hop back to it: sip:<address>:<port> with the
+ * ;transport= it arrived on (the delivering tport, else ws/wss from the top Via, else the Via sent-protocol,
+ * RFC 3261 §18.2.2). src gets the address (null when unknown, and buf is then ""). Inside a nua event
+ * callback only (sofia_incoming_transport). */
+static void sofia_request_source_uri(nua_t *nua, sip_t const *sip, struct ast_sockaddr *src, char *buf, size_t len)
+{
+	char tbuf[8] = "";
+	char hbuf[80];
+
+	buf[0] = '\0';
+	sofia_get_source_addr(sip, src);
+	sofia_incoming_transport(nua, tbuf, sizeof(tbuf));	/* the tport it was delivered on */
+	if (!tbuf[0] && sip) {
+		sofia_register_transport_from_via(sip->sip_via, tbuf, sizeof(tbuf));	/* ws/wss from Via */
+	}
+	if (!tbuf[0] && sip && sip->sip_via && sip->sip_via->v_protocol) {
+		/* "SIP/2.0/TCP" -> "tcp" (RFC 3261 §18.2.2: the transport the request came in on). */
+		const char *slash = strrchr(sip->sip_via->v_protocol, '/');
+		if (slash && *(slash + 1)) {
+			int i;
+			ast_copy_string(tbuf, slash + 1, sizeof(tbuf));
+			for (i = 0; tbuf[i]; i++) {
+				tbuf[i] = tolower((unsigned char) tbuf[i]);
+			}
+		}
+	}
+	if (!ast_sockaddr_isnull(src)) {
+		snprintf(buf, len, "sip:%s:%d",
+			sofia_uri_format_host(ast_sockaddr_stringify_host(src), hbuf, sizeof(hbuf)),
+			ast_sockaddr_port(src));
+		sofia_uri_append_transport(buf, len, tbuf);
+	}
+}
+
 /* Outbound REGISTER (register => trunk) addressing — chan_sip transmit_register and RFC 3261 §10.2.
  * The Request-URI names the registration domain only: "The "userinfo" and "@" components of the SIP
  * URI MUST NOT be present" (§10.2). It is sip:<regdomain>[:<regdomainport>] when the line names a
@@ -14848,6 +14882,7 @@ struct sofia_mwi_local {
 	int port;
 	char transport[8];	/* lowercase token; "udp" when the target URI names none */
 	int known;		/* 1 = a concrete address (routed or externaddr), 0 = only the bind fallback */
+	int sips;		/* the target is a SIPS URI: our Contact must be one too (RFC 3261 §8.1.1.8) */
 };
 
 /* Read a peer's message counts for an RFC 3842 simple-message-summary body. Snapshots the mailbox specs +
@@ -14907,6 +14942,7 @@ static void sofia_mwi_local_addr(const char *target_uri, const struct ast_sockad
 	ast_sockaddr_setnull(&ours);
 	ast_copy_string(loc->transport, "udp", sizeof(loc->transport));
 	loc->known = 0;
+	loc->sips = 0;
 	url = !ast_strlen_zero(target_uri) ? url_make(home, target_uri) : NULL;
 	if (url && url->url_host) {
 		char hostport[160];
@@ -14919,6 +14955,7 @@ static void sofia_mwi_local_addr(const char *target_uri, const struct ast_sockad
 			}
 		}
 		sofia_contact_transport_from_url(url, loc->transport, sizeof(loc->transport));
+		loc->sips = url->url_scheme && !strcasecmp(url->url_scheme, "sips");
 	}
 	su_home_deinit(home);
 
@@ -14959,19 +14996,71 @@ static void sofia_mwi_local_addr(const char *target_uri, const struct ast_sockad
 		loc->host, sizeof(loc->host));
 }
 
-/* Contact of an MWI NOTIFY (RFC 3265 §7.1: mandatory in a NOTIFY request; the stack adds none to a
- * client request), built like chan_sip initreqprep + build_contact: the From user at our address and
- * port, with ;transport= when the transport is not udp. The user is the stack default "*"
- * (NUTAG_M_USERNAME), the From user of the unsolicited NOTIFY and the Contact user of the 200 to an MWI
- * SUBSCRIBE. Callers leave the Contact out when loc->known is 0 rather than advertise the wildcard
- * address: inside a subscription the dialog then keeps its earlier target. */
-static void sofia_mwi_contact(const struct sofia_mwi_local *loc, char *buf, size_t len)
+/* Contact of a request we send inside a subscription (RFC 3265 §7.1: mandatory in SUBSCRIBE and NOTIFY;
+ * this stack adds none to a client request, nua_client.c FS-4102), built like chan_sip initreqprep +
+ * build_contact: user at our address and port, with ;transport= when the transport is not udp; a sips: URI
+ * (no ;transport=tls) when the target is one (RFC 3261 §8.1.1.8). The user is %-escaped (RFC 3261 §25.1);
+ * for an MWI NOTIFY it is the stack default "*" (NUTAG_M_USERNAME), the From user of the unsolicited NOTIFY
+ * and the Contact user of the 200 to an MWI SUBSCRIBE. Returns -1 with buf empty when it does not fit: a
+ * cut Contact would make the stack refuse the whole request. Callers leave the Contact out when buf is
+ * empty or loc->known is 0 rather than advertise the wildcard address: inside a subscription the dialog
+ * then keeps its earlier target. */
+static int sofia_mwi_contact(const struct sofia_mwi_local *loc, const char *user, char *buf, size_t len)
 {
-	char uri[160];
+	char euser[3 * AST_MAX_EXTENSION];
+	char uri[400];
+	int n;
 
-	snprintf(uri, sizeof(uri), "sip:*@%s:%d", loc->host, loc->port);
-	sofia_uri_append_transport(uri, sizeof(uri), loc->transport);
-	snprintf(buf, len, "<%s>", uri);
+	ast_uri_encode(user, euser, sizeof(euser), 1);
+	n = snprintf(uri, sizeof(uri), "%s:%s@%s:%d", loc->sips ? "sips" : "sip", euser, loc->host, loc->port);
+	if (!loc->sips || strcmp(loc->transport, "tls")) {
+		sofia_uri_append_transport(uri, sizeof(uri), loc->transport);
+	}
+	if (n < 0 || n >= (int) sizeof(uri) || strlen(uri) >= sizeof(uri) - 1
+			|| snprintf(buf, len, "<%s>", uri) >= (int) len) {
+		buf[0] = '\0';
+		return -1;
+	}
+	return 0;
+}
+
+/* The Contact for a SUBSCRIBE or NOTIFY sent to target_uri (or through it, when it is the outbound proxy):
+ * <sip:user@our address:port[;transport=]>, our address and port as target_uri sees them
+ * (sofia_mwi_local_addr; hint = the resolved address when the URI names a host). Returns 0 with buf empty
+ * when only the wildcard bind address is known: the caller then sends none. Passed once in a dialog, the
+ * stack keeps it as the local target of the requests it later sends there by itself (nua_client.c:873-881:
+ * refreshes, un-SUBSCRIBE, the NOTIFY of an expiring subscription). sofia_thread only. */
+int sofia_subscription_contact(const char *target_uri, const struct ast_sockaddr *hint, const char *user,
+	char *buf, size_t len)
+{
+	struct sofia_mwi_local loc;
+
+	buf[0] = '\0';
+	sofia_mwi_local_addr(target_uri, hint, &loc);
+	if (!loc.known || sofia_mwi_contact(&loc, S_OR(user, "*"), buf, len)) {
+		buf[0] = '\0';
+		return 0;
+	}
+	return 1;
+}
+
+/* The Contact of a SUBSCRIBE we send to peer (mwi_subscribe=, subscribe_event=): its From user, the peer's
+ * defaultuser else its name, at our address as the request's first hop sees it: route (its outbound proxy)
+ * when set, else target, which routes to the peer's resolved address when it names a host. An outbound
+ * proxy given by name cannot be routed here (no DNS on sofia_thread): our address is then the bind or
+ * externaddr fallback, and no Contact when that is the wildcard. Caller holds a reference on peer, not its
+ * lock. sofia_thread only. */
+int sofia_peer_subscription_contact(struct sofia_peer *peer, const char *target, const char *route,
+	char *buf, size_t len)
+{
+	struct ast_sockaddr hint;
+	char user[256];
+
+	ast_mutex_lock(&peer->lock);
+	ast_sockaddr_copy(&hint, &peer->src_addr);
+	ast_copy_string(user, S_OR(peer->defaultuser, peer->name), sizeof(user));
+	ast_mutex_unlock(&peer->lock);
+	return sofia_subscription_contact(S_OR(route, target), ast_strlen_zero(route) ? &hint : NULL, user, buf, len);
 }
 
 /* Build the RFC 3842 simple-message-summary body for one target. Message-Account as chan_sip
@@ -15157,7 +15246,7 @@ static void sofia_mwi_notify_on_handle(struct sofia_peer *peer, nua_handle_t *nh
 	if (!(body = sofia_mwi_body(&sum, &loc))) {
 		return;
 	}
-	sofia_mwi_contact(&loc, contact, sizeof(contact));
+	sofia_mwi_contact(&loc, "*", contact, sizeof(contact));
 	notifymime = !ast_strlen_zero(sofia_cfg.notifymime) ? sofia_cfg.notifymime
 		: "application/simple-message-summary";
 	if (terminate) {
@@ -15169,7 +15258,7 @@ static void sofia_mwi_notify_on_handle(struct sofia_peer *peer, nua_handle_t *nh
 		SIPTAG_EVENT_STR("message-summary"),
 		NUTAG_SUBSTATE(terminate ? nua_substate_terminated : nua_substate_active),
 		SIPTAG_SUBSCRIPTION_STATE_STR(ss),
-		TAG_IF(loc.known, SIPTAG_CONTACT_STR(contact)),
+		TAG_IF(loc.known && contact[0], SIPTAG_CONTACT_STR(contact)),
 		SIPTAG_CONTENT_TYPE_STR(notifymime),
 		SIPTAG_PAYLOAD_STR(ast_str_buffer(body)),
 		TAG_IF(!ast_strlen_zero(proxy), NUTAG_PROXY(proxy)),
@@ -15237,7 +15326,7 @@ static void sofia_send_unsolicited_mwi(struct sofia_peer *peer, const char *targ
 	if (!(body = sofia_mwi_body(sum, &loc))) {
 		return;
 	}
-	sofia_mwi_contact(&loc, contact, sizeof(contact));
+	sofia_mwi_contact(&loc, "*", contact, sizeof(contact));
 	notifymime = !ast_strlen_zero(sofia_cfg.notifymime) ? sofia_cfg.notifymime
 		: "application/simple-message-summary";
 
@@ -15247,7 +15336,7 @@ static void sofia_send_unsolicited_mwi(struct sofia_peer *peer, const char *targ
 			NUTAG_METHOD("NOTIFY"),
 			SIPTAG_EVENT_STR("message-summary"),
 			SIPTAG_SUBSCRIPTION_STATE_STR("active"),
-			TAG_IF(loc.known, SIPTAG_CONTACT_STR(contact)),
+			TAG_IF(loc.known && contact[0], SIPTAG_CONTACT_STR(contact)),
 			SIPTAG_CONTENT_TYPE_STR(notifymime),
 			SIPTAG_PAYLOAD_STR(ast_str_buffer(body)),
 			TAG_IF(!ast_strlen_zero(route), NUTAG_INITIAL_ROUTE_STR(route)),
@@ -15563,8 +15652,6 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 	 * (terminated;reason=timeout) by itself; we only stop treating the dialog as a subscriber. */
 	{
 		int cfg_expiry = sofia_cfg.mwi_expiry > 0 ? sofia_cfg.mwi_expiry : 3600;
-		char tbuf[8] = "";
-		char hbuf[80];
 		requested = cfg_expiry;
 		if (sip->sip_expires) {
 			requested = sip->sip_expires->ex_delta > (unsigned long) INT_MAX
@@ -15579,28 +15666,7 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 		/* Next hop of every in-dialog NOTIFY: the source this SUBSCRIBE arrived from, over the
 		 * transport it arrived on (presence engine idiom; a NAT device or a WebSocket client is
 		 * reachable only there, never at the Contact it advertised). */
-		sofia_get_source_addr(sip, &sub_src);
-		sofia_incoming_transport(nua, tbuf, sizeof(tbuf));	/* the tport it was delivered on */
-		if (!tbuf[0]) {
-			sofia_register_transport_from_via(sip->sip_via, tbuf, sizeof(tbuf));	/* ws/wss from Via */
-		}
-		if (!tbuf[0] && sip->sip_via && sip->sip_via->v_protocol) {
-			/* "SIP/2.0/TCP" -> "tcp" (RFC 3261 §18.2.2: the transport the request came in on). */
-			const char *slash = strrchr(sip->sip_via->v_protocol, '/');
-			if (slash && *(slash + 1)) {
-				int i;
-				ast_copy_string(tbuf, slash + 1, sizeof(tbuf));
-				for (i = 0; tbuf[i]; i++) {
-					tbuf[i] = tolower((unsigned char) tbuf[i]);
-				}
-			}
-		}
-		if (!ast_sockaddr_isnull(&sub_src)) {
-			snprintf(sub_proxy, sizeof(sub_proxy), "sip:%s:%d",
-				sofia_uri_format_host(ast_sockaddr_stringify_host(&sub_src), hbuf, sizeof(hbuf)),
-				ast_sockaddr_port(&sub_src));
-			sofia_uri_append_transport(sub_proxy, sizeof(sub_proxy), tbuf);
-		}
+		sofia_request_source_uri(nua, sip, &sub_src, sub_proxy, sizeof(sub_proxy));
 	}
 
 	/* An in-dialog refresh or unsubscribe does not reliably arrive on the dialog's handle: this stack
@@ -15766,6 +15832,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	char l_context[AST_MAX_CONTEXT];
 	char l_peername[80];
 	char l_proxy[128] = "";			/* NAT proxy target for the NOTIFY (empty = none) */
+	char l_contact[300] = "";		/* Contact of our NOTIFYs (empty = our address is not known) */
 	char l_exten[AST_MAX_EXTENSION];	/* bounded copy of the watched user — keeps subkey consistent with sub->exten */
 	char subkey[200];
 	char hint[AST_MAX_EXTENSION];
@@ -15921,6 +15988,25 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	 * sofia-sip does not reliably reuse. */
 	ast_copy_string(l_exten, watched, sizeof(l_exten));
 	snprintf(subkey, sizeof(subkey), "%s|%s|%s", l_peername, l_exten, l_context);
+	/* Contact of our 2xx and of every NOTIFY of this subscription (RFC 3265 §7.1; RFC 6665 §3.1/§3.2,
+	 * SUBSCRIBE and NOTIFY are target refresh requests): the watched extension at our address as the
+	 * watcher's source sees it, over the transport the SUBSCRIBE came in on, a sips: URI when the SUBSCRIBE
+	 * or the watcher's Contact (the Request-URI of our NOTIFYs) is one (RFC 3261 §8.1.1.8, §12.1.1).
+	 * Given in the 2xx, it is also the dialog's local target, so the 2xx and the NOTIFYs agree.
+	 * NUTAG_M_USERNAME only names the user of a Contact the stack builds itself (when ours is unknown);
+	 * this stack puts none in a NOTIFY (nua_client.c FS-4102). */
+	{
+		char l_source[160];
+		char l_target[168];
+		int secure = (sip->sip_request && sip->sip_request->rq_url
+				&& sip->sip_request->rq_url->url_type == url_sips)
+			|| (sip->sip_contact && sip->sip_contact->m_url && sip->sip_contact->m_url->url_type == url_sips);
+
+		sofia_request_source_uri(nua, sip, &src, l_source, sizeof(l_source));
+		snprintf(l_target, sizeof(l_target), "%s%s", secure && !strncmp(l_source, "sip:", 4) ? "sips:" : "",
+			secure && !strncmp(l_source, "sip:", 4) ? l_source + 4 : l_source);
+		sofia_subscription_contact(l_target, NULL, l_exten, l_contact, sizeof(l_contact));
+	}
 	/* Clamp ex_delta before the int cast: > INT_MAX wraps negative and would read as
 	 * an unsubscribe (expires <= 0). */
 	if (!sip || !sip->sip_expires) {
@@ -15970,9 +16056,11 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 			/* routable Contact user = watched exten (see the initial-accept note below). */
 			nua_respond(nh, SIP_200_OK, NUTAG_WITH_THIS(nua),
 				NUTAG_M_USERNAME(l_exten),
+				TAG_IF(l_contact[0], SIPTAG_CONTACT_STR(l_contact)),
 				SIPTAG_EXPIRES_STR("0"), TAG_END());
 			nua_notify(nh,
 				NUTAG_M_USERNAME(l_exten),
+				TAG_IF(l_contact[0], SIPTAG_CONTACT_STR(l_contact)),
 				SIPTAG_EVENT_STR(norm),
 				NUTAG_SUBSTATE(nua_substate_terminated),
 				SIPTAG_SUBSCRIPTION_STATE_STR("terminated;reason=timeout"),
@@ -16003,10 +16091,14 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 				old->expires = expires;
 				old->expires_at = time(NULL) + expires;
 				ast_copy_string(old->nat_proxy, l_proxy, sizeof(old->nat_proxy));	/* source may have moved */
+				if (l_contact[0]) {
+					ast_copy_string(old->contact, l_contact, sizeof(old->contact));
+				}
 				snprintf(eb, sizeof(eb), "%d", expires);
 				/* routable Contact user = watched exten (see the initial-accept note below). */
 				nua_respond(nh, SIP_202_ACCEPTED, NUTAG_WITH_THIS(nua),
 					NUTAG_M_USERNAME(old->exten),
+					TAG_IF(old->contact[0], SIPTAG_CONTACT_STR(old->contact)),
 					SIPTAG_EXPIRES_STR(eb), TAG_END());
 				st = ast_extension_state(NULL, old->context, old->exten);
 				sofia_presence_emit_notify(old, st, 0);
@@ -16038,6 +16130,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	ast_copy_string(sub->context, l_context, sizeof(sub->context));
 	ast_copy_string(sub->peername, l_peername, sizeof(sub->peername));
 	ast_copy_string(sub->nat_proxy, l_proxy, sizeof(sub->nat_proxy));
+	ast_copy_string(sub->contact, l_contact, sizeof(sub->contact));
 	snprintf(sub->entity, sizeof(sub->entity), "sip:%s@%s", to_user,
 		!ast_strlen_zero(to_host) ? to_host : (!ast_strlen_zero(sofia_cfg.realm) ? sofia_cfg.realm : "localhost"));
 	sofia_get_source_addr(sip, &src);
@@ -16108,6 +16201,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		 * Contact generation (nua_server.c:455/584); keep the correct host:port it fills. */
 		nua_respond(nh, SIP_202_ACCEPTED, NUTAG_WITH_THIS(nua),
 			NUTAG_M_USERNAME(l_exten),
+			TAG_IF(l_contact[0], SIPTAG_CONTACT_STR(l_contact)),
 			SIPTAG_EXPIRES_STR(expires_buf), TAG_END());
 	}
 

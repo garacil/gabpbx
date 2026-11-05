@@ -660,6 +660,9 @@ static void sipnotify_callback(void *data)
 	struct sipnotify_data *d = data;
 	nua_handle_t *nh;
 	struct ast_str *header_buf = NULL;
+	struct ast_sockaddr hint;
+	char contact[300] = "";
+	int caller_contact = 0;
 	int i;
 
 	if (!d) {
@@ -677,8 +680,27 @@ static void sipnotify_callback(void *data)
 			for (i = 0; i < d->header_count; i++) {
 				ast_str_append(&header_buf, 0, "%s: %s\r\n",
 					d->headers[i].name, d->headers[i].value);
+				if (!strcasecmp(d->headers[i].name, "Contact") || !strcasecmp(d->headers[i].name, "m")) {
+					caller_contact = 1;
+				}
 			}
 		}
+	}
+
+	/* Contact (RFC 3265 §7.1: mandatory in NOTIFY; the stack adds none to a client request), unless the
+	 * caller gave one: our address as the target sees it, as the unsolicited MWI NOTIFY. A target URI that
+	 * names a host routes to the source of the contact it came from, else to the peer's address. */
+	if (!caller_contact && d->peer) {
+		if (d->contact) {
+			ao2_lock(d->contact);
+			ast_sockaddr_copy(&hint, &d->contact->src_addr);
+			ao2_unlock(d->contact);
+		} else {
+			ast_mutex_lock(&d->peer->lock);
+			ast_sockaddr_copy(&hint, &d->peer->src_addr);
+			ast_mutex_unlock(&d->peer->lock);
+		}
+		sofia_subscription_contact(d->target_uri, &hint, "*", contact, sizeof(contact));
 	}
 
 	/* Bind the SIPnotify sentinel hmagic so sofia_event_callback can destroy this app-owned one-shot
@@ -695,6 +717,7 @@ static void sipnotify_callback(void *data)
 		nua_method(nh,
 			NUTAG_METHOD("NOTIFY"),
 			SIPTAG_EVENT_STR(d->event),
+			TAG_IF(contact[0], SIPTAG_CONTACT_STR(contact)),
 			TAG_IF(header_buf, SIPTAG_HEADER_STR(header_buf ? ast_str_buffer(header_buf) : "")),
 			TAG_IF(!ast_strlen_zero(d->content), SIPTAG_PAYLOAD_STR(d->content)),
 			TAG_END());

@@ -79,6 +79,7 @@ struct sofia_mwisub {
 	char target[256];		/* Request-URI/To we SUBSCRIBE (peer AOR at the trunk) */
 	char from[256];			/* From identity (the peer's register identity) */
 	char route[256];		/* F2: outboundproxy initial Route (empty = none) */
+	char contact[300];		/* our Contact (RFC 3265 §7.1; the stack adds none): "" = not known */
 	char spec[160];			/* raw peer->mwi_subscribe value at create time (reload diff key) */
 	int auth_tries;			/* reactive-auth attempt guard (cap at SOFIA_MWISUB_MAX_AUTH) */
 	int established;		/* F1b: 1 once a 2xx SUBSCRIBE response arrived (nua then owns refresh) */
@@ -256,6 +257,8 @@ static int mwisub_send_subscribe(struct sofia_mwisub *sub)
 		SIPTAG_ACCEPT_STR("application/simple-message-summary"),
 		SIPTAG_EXPIRES_STR(exp),
 		TAG_IF(!ast_strlen_zero(sub->from), SIPTAG_FROM_STR(sub->from)),
+		/* also the dialog's local target: the refreshes and the un-SUBSCRIBE the stack sends carry it */
+		TAG_IF(sub->contact[0], SIPTAG_CONTACT_STR(sub->contact)),
 		TAG_END());
 	return 0;
 }
@@ -329,6 +332,7 @@ static void mwisub_start_one(struct sofia_peer *peer)
 	ast_copy_string(sub->target, target, sizeof(sub->target));
 	ast_copy_string(sub->from, from, sizeof(sub->from));
 	ast_copy_string(sub->route, route, sizeof(sub->route));
+	sofia_peer_subscription_contact(peer, sub->target, sub->route, sub->contact, sizeof(sub->contact));
 	ast_copy_string(sub->spec, spec, sizeof(sub->spec));	/* reload diff key */
 	sub->established = 0;
 	sub->in_flight = 0;
@@ -492,6 +496,7 @@ static void mwisub_retry_sweep(su_root_magic_t *magic, su_timer_t *t, su_timer_a
 					ast_copy_string(sub->target, cur_target, sizeof(sub->target));
 					ast_copy_string(sub->from, cur_target, sizeof(sub->from));
 					ast_copy_string(sub->route, cur_route, sizeof(sub->route));
+					sofia_peer_subscription_contact(p, sub->target, sub->route, sub->contact, sizeof(sub->contact));
 				} else {
 					wanted = 0;	/* target build failed — treat as gone for this tick */
 				}
