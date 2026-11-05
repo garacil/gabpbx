@@ -2655,6 +2655,38 @@ static void sofia_reinvite_failure_end_call(struct sofia_pvt *pvt, int status, s
 	ast_channel_unref(owner);
 }
 
+/* The stack ended an established session on its own, with a BYE chan_sofia did not ask for: the 2xx to an
+ * INVITE was never ACKed (RFC 3261 §13.3.1.4: BYE "ACK Timeout" after 64*T1, nua_session.c process_timeout), or
+ * the peer, the session refresher, never refreshed (RFC 4028 §10: BYE "Session timeout", sent from the refresh
+ * timer without any state event). Nothing else tells the channel, so it stayed up until the dialplan ended it.
+ * Hang it up now when it was answered and nothing has let it go yet: chan_sofia's own hangup detaches the owner
+ * before its BYE is answered, and every other path of ours that ends the session (a refused re-INVITE or UPDATE,
+ * an answer refused for encryption) marks alreadygone first. status maps to the hangup cause, as the Reason of
+ * the stack's BYE does (RFC 3326): 408 (both the ACK timeout and the session expiry) = 18, no user response;
+ * 0 = a plain hangup. */
+static void sofia_stack_ended_session(struct sofia_pvt *pvt, int status, const char *why)
+{
+	struct ast_channel *owner;
+
+	ast_mutex_lock(&pvt->lock);
+	owner = pvt->alreadygone ? NULL : pvt->owner;
+	if (!owner || owner->_state != AST_STATE_UP) {
+		ast_mutex_unlock(&pvt->lock);
+		return;
+	}
+	sofia_alreadygone(pvt);	/* the stack's BYE ends the dialog */
+	ast_channel_ref(owner);
+	ast_mutex_unlock(&pvt->lock);
+	ast_log(LOG_NOTICE, "Sofia: the stack ended the session on '%s' (%s) — hanging up the channel\n",
+		pvt->callid ? pvt->callid : "(no-callid)", why);
+	if (status) {
+		sofia_queue_invite_failure(owner, status, 0, 0, 1 /* answered */);
+	} else {
+		ast_queue_hangup(owner);
+	}
+	ast_channel_unref(owner);
+}
+
 /* Safety-net timer for REFER transferer-leg BYE deferral. After we send the
  * terminal NOTIFY 200 OK for a transfer, sofia_hangup leaves the SIP dialog
  * alive so the transferer's UA can BYE per RFC 5589 §6.1. If no BYE arrives
@@ -18097,6 +18129,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 	case nua_i_refer:
 	case nua_i_info:
 	case nua_i_ack:
+	case nua_i_state:
 	case nua_i_terminated:
 	case nua_i_bye:
 	case nua_i_cancel:
@@ -18960,6 +18993,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					/* The answer failed encryption policy — tear down (BYE + HANGUP). */
 					ast_log(LOG_NOTICE, "Sofia: outbound 200 OK rejected — encryption mismatch in answer (peer=%s)\n",
 						pvt->peer ? pvt->peer->name : "<unknown>");
+					ast_mutex_lock(&pvt->lock);
+					sofia_alreadygone(pvt);	/* our BYE below: its response must not look like the stack's */
+					ast_mutex_unlock(&pvt->lock);
 					nua_bye(nh, TAG_END());
 					ast_queue_control(owner, AST_CONTROL_HANGUP);
 					ast_channel_unref(owner);
@@ -19100,6 +19136,12 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		/* nua_r_bye DEC site (defensive; flag-gated idempotency makes it multi-site safe). */
 		if (pvt) {
 			sofia_update_call_counter(pvt, SOFIA_DEC_CALL_LIMIT);
+			/* A BYE the stack sent by itself with no state event before it: the session expired because
+			 * the peer, the refresher, never refreshed (nua_session.c refresh timer -> nua_stack_bye). Our
+			 * own BYEs are answered with the owner already detached or alreadygone set. With a dead peer this
+			 * is the BYE's own timeout (32 s later). That BYE carries Reason: SIP;cause=408 "Session timeout"
+			 * (RFC 3326), so the channel ends with the same cause as the ACK timeout (18), not with none. */
+			sofia_stack_ended_session(pvt, 408, "session expired, BYE sent by the stack");
 		}
 		break;
 	case nua_r_cancel:
@@ -19291,6 +19333,22 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		ast_verbose("Sofia: Shutdown response %d %s\n", status, phrase);
 		break;
 	case nua_i_state:
+		/* The stack moving an established session to "terminating" by itself: its 2xx was never ACKed
+		 * (process_timeout: "ACK Timeout" / "PRACK Timeout", status 0) or our nua_ack failed (500). Our own
+		 * hangup detaches the owner first, and a refused re-INVITE or UPDATE that ends the session was handled
+		 * at nua_r_invite / nua_r_update, which the stack reports before this state change. */
+		if (pvt) {
+			int callstate = -1;
+
+			tl_gets(tags, NUTAG_CALLSTATE_REF(callstate), TAG_END());
+			if (callstate == nua_callstate_terminating) {
+				int st = status >= 300 ? status
+					: (phrase && !strcmp(phrase, "ACK Timeout")) ? 408
+					: (phrase && !strcmp(phrase, "PRACK Timeout")) ? 504 : 0;
+
+				sofia_stack_ended_session(pvt, st, phrase ? phrase : "terminating");
+			}
+		}
 		break;
 	case nua_i_error:
 		if (sofia_debug)
