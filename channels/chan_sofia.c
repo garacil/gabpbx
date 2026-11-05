@@ -19386,6 +19386,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 
 /* feature #6: forward decl — defined near the config parser, used at nua_create below. */
 static unsigned sofia_tls_min_version_mask(const char *v);
+static void sofia_apply_stack_min_se(void);	/* defined with the config parser */
 
 /* One-shot: apply the SIP-capture config (HEP stream + file dump) once the su_root event loop is RUNNING.
  * Applying it synchronously right after nua_create (before su_root_run) sets the TPTAG_CAPT/DUMP param but the
@@ -19716,6 +19717,7 @@ static void *sofia_thread_func(void *data)
 		NUTAG_ENABLEMESSAGE(1),
 		NUTAG_ALLOW("INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, REFER, MESSAGE, INFO, PRACK, UPDATE"),
 		TAG_END());
+	sofia_apply_stack_min_se();
 
 	/* Add methods to appl_method one at a time */
 	nua_set_params(sofia_nua, NUTAG_APPL_METHOD("REGISTER"), TAG_END());
@@ -20473,6 +20475,19 @@ static unsigned sofia_tls_min_version_mask(const char *v)
 	}
 	/* "1.0" (and defensively anything else) -> TLS1.0/1.1/1.2 all enabled. */
 	return TPTLS_VERSION_TLSv1 | TPTLS_VERSION_TLSv1_1 | TPTLS_VERSION_TLSv1_2;
+}
+
+/* RFC 4028 Min-SE for the stack. sofia-sip checks Session-Expires against its own Min-SE on the FIRST INVITE, while
+ * the request still belongs to the default handle and before chan_sofia sees it (nua_session.c
+ * session_timer_check_min_se from nua_session_server_init), and answers 422 itself; the per-call NUTAG_MIN_SE on
+ * nua_respond only governs later in-dialog requests. Without this the stack kept its default 120 and refused any
+ * session interval below it whatever [general] session-minse said. Startup (after nua_create) and every reload;
+ * a no-op before the stack exists. nua_set_params is a message to the stack thread. */
+static void sofia_apply_stack_min_se(void)
+{
+	if (sofia_nua) {
+		nua_set_params(sofia_nua, NUTAG_MIN_SE(sofia_cfg.default_session_minse), TAG_END());
+	}
 }
 
 static void sofia_parse_general_config(struct ast_config *cfg)
@@ -22325,6 +22340,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	ast_rwlock_unlock(&sofia_localha_lock);
 
 	sofia_parse_general_config(cfg);
+	sofia_apply_stack_min_se();	/* a changed [general] session-minse reaches the stack's 422 check */
 
 	/* Push the (possibly changed) SIP-capture config onto the tport layer. No-op on the initial load
 	 * (sofia_nua not yet created — the startup path applies it after nua_create); on `sip reload` this
