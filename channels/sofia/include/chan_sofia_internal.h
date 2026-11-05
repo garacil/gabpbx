@@ -274,7 +274,7 @@ struct sofia_contact {
 	char instance_id[128];     /* RFC 5626 +sip.instance (normalized urn:..., quotes + <> stripped). Stable across reboots. */
 	int  reg_id;               /* RFC 5626 reg-id (1..INT_MAX, 0 = absent/invalid). Distinct flows of one instance. */
 	char call_id[128];         /* REGISTER Call-ID (RFC 3261 10.2: stable per UA boot). Universal rotation key. */
-	time_t last_register;      /* wall-clock of the last REGISTER (re)bind for THIS contact; distinct from expires. Diagnostic only ("Last-REGISTER Ns ago" in sip show peer). 0 = never stamped. */
+	time_t last_register;      /* wall-clock of the last REGISTER (re)bind for THIS contact; distinct from expires. "Last-REGISTER Ns ago" in sip show peer, and sofia_qualify_refuses: a REGISTER after an unanswered qualify lifts the refusal. 0 = never stamped. */
 	nua_handle_t *reg_nh;      /* RFC 5626 flow-close: retained REGISTER handle whose sofia built-in registrar watch fires nua_i_media_error when this connection-oriented binding's flow closes. NULL = unwatched (udp / multi-Contact / link-failed). Contact is the SOLE dropper (sofia_contact_destructor); r/w under peer->lock while linked. */
 };
 
@@ -1005,6 +1005,9 @@ struct sofia_peer {
 	struct timeval qualify_sent;
 	struct timeval last_qualify;
 	nua_handle_t *qualify_nh;
+	struct ast_sockaddr qualify_addr;	/* where the qualify in flight was sent (peer->src_addr then) */
+	struct ast_sockaddr qualify_failed_addr;	/* where the last unanswered qualify went */
+	time_t qualify_failed_at;	/* when that unanswered qualify was sent (0 = none) */
 	int is_realtime;
 		int is_register_line;
 	/* Transient flag used only by sofia_reload_worker for mark-and-sweep

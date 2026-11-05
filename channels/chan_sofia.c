@@ -8428,6 +8428,46 @@ static const char *sofia_get_callid(struct ast_channel *ast)
 	return pvt ? pvt->callid : "";
 }
 
+/* Whether a call to peer's one live binding single is refused because its qualify found it unreachable
+ * (chan_sip create_addr_from_peer: maxms set and lastms out of range -> AST_CAUSE_UNREGISTERED). Only where
+ * the unanswered probe speaks for this call: qualify on and UNREACHABLE (no final answer, or the stack's own
+ * 408/503); the probe went to single's source address and was sent after single last registered (a REGISTER
+ * since then proves the device is there; the next probe settles it); the INVITE goes to that same address (a
+ * NAT or WebSocket binding, or a Contact equal to its source: with nat=no the INVITE goes to the Contact,
+ * which the probe did not test); and the peer cannot be woken by push (a sleeping app answers no OPTIONS; the
+ * push path wakes it). A LAGGED peer did answer and is not refused, unlike chan_sip beyond maxms: a slow
+ * answer is still an answer. Caller holds a reference on peer and on single, and no lock. */
+static int sofia_qualify_refuses(struct sofia_peer *peer, struct sofia_contact *single)
+{
+	struct ast_sockaddr failed_addr, src;
+	char chost[80], proxy[160];
+	time_t failed_at, last_register;
+	int unreachable, cport;
+
+	ast_mutex_lock(&peer->lock);
+	unreachable = peer->qualify && peer->peer_status == PEER_UNREACHABLE;
+	ast_sockaddr_copy(&failed_addr, &peer->qualify_failed_addr);
+	failed_at = peer->qualify_failed_at;
+	ast_mutex_unlock(&peer->lock);
+	if (!unreachable || !failed_at || ast_sockaddr_isnull(&failed_addr)) {
+		return 0;
+	}
+	ao2_lock(single);
+	ast_sockaddr_copy(&src, &single->src_addr);
+	last_register = single->last_register;
+	ast_copy_string(chost, single->host, sizeof(chost));
+	cport = single->port;
+	ao2_unlock(single);
+	if (ast_sockaddr_cmp(&failed_addr, &src) || last_register > failed_at) {	/* same second: probe after */
+		return 0;
+	}
+	if (!sofia_build_contact_proxy_url(peer, single, proxy, sizeof(proxy))
+			&& !(cport == ast_sockaddr_port(&src) && !strcasecmp(chost, ast_sockaddr_stringify_host(&src)))) {
+		return 0;
+	}
+	return !sofia_push_peer_pushable(peer);
+}
+
 static struct ast_channel *sofia_request_call(const char *type, format_t format, const struct ast_channel *requestor, void *data, int *cause)
 {
 	char *dest = (char *)data;
@@ -8676,6 +8716,18 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 				single = sofia_peer_select_single_live_contact(peer, &n_unexpired, &n_total,
 					pvt->fork_exclude_valid ? &pvt->fork_exclude_src : NULL,
 					pvt->fork_exclude_valid ? pvt->push_exclude_instance : NULL);
+				if (single && sofia_qualify_refuses(peer, single)) {
+					/* chan_sip parity (create_addr_from_peer refuses a peer its qualify found unreachable,
+					 * sip_request_call returns AST_CAUSE_UNREGISTERED): the INVITE would only time out at a
+					 * device that does not answer. Same cleanup as the expired-registration refusal below. */
+					ast_log(LOG_NOTICE, "Sofia: peer '%s' is UNREACHABLE (no answer to its qualify) - refusing the call (CHANUNAVAIL)\n",
+						peername);
+					ao2_ref(single, -1);
+					ao2_ref(peer, -1);
+					ao2_ref(pvt, -1);
+					*cause = AST_CAUSE_UNREGISTERED;
+					return NULL;
+				}
 				if (single) {
 					sofia_build_contact_ruri(single, exten, url, sizeof(url),
 						peer->path_support, path_buf, sizeof(path_buf));
@@ -11194,6 +11246,22 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 	if (ao2_container_count(peer->contacts) > 0) {
 		peer->registered = 1;
 		peer->expire = expires;
+		/* A REGISTER from a peer its qualify left UNREACHABLE, or from a new source: qualify it at the next
+		 * tick, as chan_sip pokes a peer as soon as it registers, and drop a probe still in flight (its late
+		 * 408 is about the old address). The status changes only with the answer to that probe (no event
+		 * per REGISTER); meanwhile sofia_qualify_refuses does not refuse a binding registered after the
+		 * unanswered probe was sent. Only for a REGISTER that bound, refreshed or moved a binding: one that
+		 * only removed a device (Contact;expires=0 while another stays) proves nothing about the others. */
+		if (peer->qualify && (!update || update->contacts_added + update->contacts_refreshed + update->contacts_moved > 0)
+				&& (peer->peer_status == PEER_UNREACHABLE || ast_sockaddr_cmp(&peer->src_addr, &src))) {
+			memset(&peer->last_qualify, 0, sizeof(peer->last_qualify));
+			if (peer->qualify_nh) {
+				nua_handle_t *qnh = peer->qualify_nh;
+				peer->qualify_nh = NULL;
+				nua_handle_bind(qnh, NULL);
+				sofia_nh_destroy_async(qnh);
+			}
+		}
 		memcpy(&peer->src_addr, &src, sizeof(peer->src_addr));
 		/* Snapshot transport beside src_addr so NAT-proxy resolution routes a
 		 * TCP/TLS phone instead of defaulting to UDP. */
@@ -17773,7 +17841,9 @@ void sofia_qualify_peer(struct sofia_peer *peer)
 
 	sofia_resolve_peer_target(peer, peer->defaultuser, url, sizeof(url));
 
-	nh = nua_handle(sofia_nua, peer, NUTAG_URL(url), TAG_END());
+	/* No Retry-After restarts (nua's default): a 503 Retry-After would hold this probe, and the status,
+	 * for up to an hour (FreeSWITCH turns them off too). */
+	nh = nua_handle(sofia_nua, peer, NUTAG_URL(url), NUTAG_RETRY_AFTER_ENABLE(0), TAG_END());
 	if (!nh) {
 		ast_mutex_unlock(&peer->lock);
 		return;
@@ -17781,6 +17851,7 @@ void sofia_qualify_peer(struct sofia_peer *peer)
 
 	peer->qualify_nh = nh;
 	peer->qualify_sent = ast_tvnow();
+	ast_sockaddr_copy(&peer->qualify_addr, &peer->src_addr);
 	if (sofia_debug)
 			ast_verbose("Sofia: Sending OPTIONS qualify to %s (url=%s, hmagic=%p)\n",
 			peer->name, url, (void *)peer);
@@ -19303,8 +19374,14 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			/* Revalidate+pin the peer (ref-if-linked) before any deref — `sip prune
 			 * realtime` can free it while the OPTIONS response is in flight. NULL ->
 			 * drop the stale response. Ref released before the case breaks. */
-			struct sofia_peer *peer = sofia_peer_ref_if_linked((struct sofia_peer *)hmagic);
+			struct sofia_peer *peer;
 			int pingtime;
+			if (status < 200) {
+				/* A provisional answer (a proxy's 100 Trying): this stack reports it too (nua_client.c,
+				 * no crm_preliminary for OPTIONS). The final response is still to come, on this handle. */
+				break;
+			}
+			peer = sofia_peer_ref_if_linked((struct sofia_peer *)hmagic);
 			if (!peer) {
 				if (sofia_debug)
 					ast_verbose("Sofia: OPTIONS response for a pruned/freed peer (hmagic=%p) — dropped\n",
@@ -19330,7 +19407,13 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			ast_mutex_lock(&peer->lock);
 			{
 				enum sofia_peer_status old_status = peer->peer_status;
-				if (status == 200) {
+				/* Any final response proves the device is there: a 405, 401 or 501 to OPTIONS too. Only
+				 * the 408 and 503 this stack reports for a timeout or a transport/DNS error (and the same
+				 * codes from the device, which say it cannot serve), and the stack's own 7xx-9xx, mean
+				 * unreachable. Asterisk 22 (res_pjsip qualify_contact_cb) takes any received response;
+				 * FreeSWITCH, on this same stack, 200-599 but 408 and 503 for its gateway pings (a 6xx is
+				 * an answer here too: the device is there). */
+				if (status < 700 && status != 408 && status != 503) {
 					int timeout = peer->qualifytimeout * 1000;
 					if (timeout <= 0)
 						timeout = DEFAULT_QUALIFYTIMEOUT * 1000;
@@ -19340,6 +19423,8 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				} else {
 					peer->peer_status = PEER_UNREACHABLE;
 					peer->lastms = -1;
+					peer->qualify_failed_at = peer->qualify_sent.tv_sec;
+					ast_sockaddr_copy(&peer->qualify_failed_addr, &peer->qualify_addr);
 				}
 				if (old_status != peer->peer_status) {
 					transitioned = 1;
