@@ -1,3 +1,53 @@
+## 1.9.16 — the re-register push goes when each phone's registration is due, and survives a restart
+
+A feature and fix release for `chan_sofia`. Push phones get a silent re-register push before their registration ends,
+scheduled from the stored tokens so a restart loses none, and a parked push call cut by a crash or a killed stop is
+cancelled on the phones at the next start. MD5 is the only digest algorithm offered by default again, and a few
+presence, registration and RTCP corner cases follow the RFCs. Only `chan_sofia.so` changes.
+
+### Added
+
+- **A silent re-register push when each phone's registration is due** (`push_reregister=yes`,
+  `push_reregister_lead=120`). A phone app that the system stopped keeps no connection, so its registration lapses
+  unless something wakes it. Every device whose stored push token is an FCM one now gets one `type=reregister` data
+  push about two minutes (plus a fixed 0-59 s per device) before its registration ends. The schedule is the stored
+  token rows (`reg_expires` on every `REGISTER`, `last_push_at` after every push), read back at load: a restart loses
+  no scheduled push, those that fell due while gabpbx was down go out within two minutes of the start, spread per
+  device, and a `REGISTER` that comes earlier moves the next one. Never sent to an APNs VoIP token (a VoIP push must
+  report a call to CallKit); always through the native sender, with at most a quarter of its queue so a call push
+  always finds room; none for a registration shorter than 2 x (lead + 60) seconds or one that ended more than 30
+  minutes ago. `sip show push` shows the state and a `ReReg` column with the seconds left per device.
+- **A parked push call cut by a restart is cancelled on the phones.** A clean stop hangs a parked call up and sends its
+  `call_cancel`; a gabpbx that dies without its shutdown (killed after a stop that hung, or crashed) cannot. At load the
+  driver reads the push journal of the previous run: a call that was parked or pushed and never ended gets the
+  `call_cancel` it would have sent to each Android device still showing its card, and is closed (`orphaned`/`restart`)
+  so a second restart does not repeat it.
+
+### Changed
+
+- **`auth_algorithms` defaults to `md5`** (it offered MD5 and SHA-256). Many phones support no other algorithm,
+  `chan_sip` offers MD5 only, and with both an `md5secret` account answered a SHA-256 digest differently from every
+  other name, which told a scanner which names are such accounts. An explicit `both` behaves as before;
+  `sip show settings` now prints the algorithms actually offered.
+
+### Fixes
+
+- **A peer's address follows a device that stays when another one leaves.** After one device of an account
+  unregisters (or lapses, or its connection closes), the address used for the qualify, NAT next hops, presence
+  `NOTIFY`s and the realtime row stays on a remaining binding instead of pointing at the device that left, so the
+  account no longer shows `UNREACHABLE` until the other device refreshes.
+- **Presence `NOTIFY`s go to the source of their `SUBSCRIBE`** (RFC 3261 section 18.2.2, RFC 5626 section 5.3, RFC
+  7118), not to the account's last registration: with two devices on one account each gets its own, and a browser
+  subscribing over a WebSocket gets them on that WebSocket. The terminated `NOTIFY` of an unsubscribe too.
+- **A `SUBSCRIBE` inside a call's dialog gets `403 Dialog sharing not supported`** (RFC 6665 section 4.5.2) instead
+  of creating a second dialog with the call's identifiers, which could swallow the call's `BYE` (`481`, channel left
+  up).
+- **A registration seeded from the realtime row lapses** at the end of its window like any binding, and a call to it
+  is refused with cause 20 when its qualify found that address unreachable.
+- **No RTCP while a leg's media go direct or during T.38 without audio**, as `chan_sip`: paused when the bridge sends
+  the media between the endpoints or the fax starts, and resumed, with its destination set again, when the audio
+  returns to the PBX or the T.38 session is refused or ends.
+
 ## 1.9.15 — one answer for every request that cannot authenticate, and a phone that does not answer is not rung
 
 A fix release for `chan_sofia`. A request that cannot authenticate now gets the answers of a wrong password
