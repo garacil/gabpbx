@@ -387,6 +387,8 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 static const char *sofia_get_realm_for_dialog(sip_t const *sip, char *buf, size_t buflen);
 
 static void sofia_emit_timing_equalized_reject(void);
+static void sofia_reject_as_unknown(nua_t *nua, nua_handle_t *nh, sip_t const *sip, const char *method,
+	const char *realm, int blacklist);
 static void sofia_send_auth_challenge(nua_t *nua, nua_handle_t *nh, sip_t const *sip,
 		const char *realm, const char *method, const char *reason,
 		struct sofia_pvt *pvt_ref, int reap_handle_on_fire);
@@ -9542,24 +9544,10 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 				if (ast_apply_ha(caller_peer->ha, &src) != AST_SENSE_ALLOW) {
 					ast_log(LOG_NOTICE, "Sofia: INVITE from %s rejected by peer '%s' ACL\n",
 						ast_sockaddr_stringify(&src), caller_peer->name);
-					/* Timing-equalize the ACL-deny vs auth-401-slow path, else
-					 * ACL-403-fast is a peer-existence oracle defeating
-					 * alwaysauthreject. The cheap dummy HMAC runs INLINE; the 403
-					 * itself is deferred 10-50ms ASYNCHRONOUSLY (NON-blocking — the
-					 * dispatcher is not parked). We snapshot nh/nua and pin the handle
-					 * inside the scheduler, so we can drop OUR caller_peer/pvt refs and
-					 * return immediately; the timer sends the 403 on sofia_thread.
-					 *
-					 * RESIDUAL-RACE FENCE: nua_handle_ref pins the handle MEMORY but not
-					 * its NTA server request, so our ao2_ref(pvt,-1) below would run the
-					 * destructor -> nua_handle_destroy -> nta_incoming_destroy auto-500,
-					 * racing ahead of our timer. Pass `pvt` as pvt_ref so the scheduler
-					 * takes an ADDITIONAL ao2 ref keeping the pvt (and thus the bound
-					 * handle + its server request) alive until the 403 is queued; that
-					 * extra ref is dropped at fire/immediate/failure/unload. */
-					sofia_emit_timing_equalized_reject();
-					sofia_delay_reject_schedule(SOFIA_DELAY_REJECT_403_FORBIDDEN,
-						nua, nh, NULL, NULL, NULL, NULL, &src, pvt, 0);
+					/* The answers a name that is not an account gets (401, then 403), with the same work: a
+					 * 403 here told a denied address the account exists. Synchronous like the unknown-peer
+					 * path below, so the response is queued before the pvt ref goes. */
+					sofia_reject_as_unknown(nua, nh, sip, "INVITE", NULL, 1);
 					ao2_ref(caller_peer, -1);
 					ao2_ref(pvt, -1);
 					return;
@@ -12236,6 +12224,30 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 	return sofia_verify_digest_auth_ex(peer, nua, nh, sip, au, method, realm, 1);
 }
 
+/* The answer to a request that cannot authenticate as an account — a name that is not one, an address the
+ * account's ACL denies, a REGISTER for an account that is not host=dynamic: the verifier against the bogus
+ * peer, so it is exactly what a real account with a wrong password gets, whatever the name (RFC 3261 §22.2:
+ * 401 with a challenge when no credentials came; §22.1: 403 when the credentials are not accepted; 401 stale
+ * for an expired nonce), with the same work and timing. chan_sip does it only with alwaysauthreject=yes; here
+ * it is the only behaviour (alwaysauthreject is always on). Synchronous: the response is queued on return.
+ * realm NULL = the dialog's. sofia_thread. */
+static void sofia_reject_as_unknown(nua_t *nua, nua_handle_t *nh, sip_t const *sip, const char *method,
+	const char *realm, int blacklist)
+{
+	char realm_buf[MAXHOSTNAMELEN];
+	/* The credentials the account's own path reads: Authorization, and Proxy-Authorization too for INVITE and
+	 * MESSAGE. Reading more here than there would answer 403 where an account answers a fresh 401. */
+	sip_authorization_t const *au = sip->sip_authorization;
+
+	if (!au && (!strcmp(method, "INVITE") || !strcmp(method, "MESSAGE"))) {
+		au = (sip_authorization_t const *)sip->sip_proxy_authorization;
+	}
+	if (!realm) {
+		realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
+	}
+	sofia_verify_digest_auth_ex(sofia_bogus_peer, nua, nh, sip, au, method, realm, blacklist);
+}
+
 /* Out-of-dialog MESSAGE digest gate (RFC 3428): a MESSAGE from a configured, credentialed
  * peer must pass the SAME challenge/verify as INVITE before reaching the dialplan — otherwise
  * the From-user is trusted unauthenticated. Exported for sofia_message.c (the static verifier
@@ -12310,14 +12322,15 @@ struct sofia_peer *sofia_message_authenticate_sender(nua_t *nua, nua_handle_t *n
 		struct ast_sockaddr src;
 		sofia_get_source_addr(sip, &src);
 		if (ast_apply_ha(peer->ha, &src) != AST_SENSE_ALLOW) {
-			char realm_buf[MAXHOSTNAMELEN];
-			const char *realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
 			ast_log(LOG_NOTICE, "Sofia: MESSAGE from %s rejected by peer '%s' ACL\n",
 				ast_sockaddr_stringify(&src), peer->name);
 			ao2_ref(peer, -1);
-			/* TERMINAL: challenge (401, anti-enumeration) and stop — never fall through to the guest
-			 * message_context path, else a denied peer could inject under allowguest=yes. */
-			sofia_send_auth_challenge(nua, nh, sip, realm, "MESSAGE", "ACLDenied", NULL, 1);
+			/* TERMINAL: the answers a name that is not an account gets (401, then 403), as the unknown
+			 * sender below, then the same reap — never fall through to the guest message_context path. */
+			sofia_reject_as_unknown(nua, nh, sip, "MESSAGE", NULL, 1);
+			if (nua_handle_magic(nh) == NULL) {
+				nua_handle_destroy(nh);
+			}
 			if (challenged) {
 				*challenged = 1;
 			}
@@ -13164,6 +13177,23 @@ static void sofia_log_register_outcome(const char *result, const char *aor, sip_
 	sofia_log_register_outcome_lvl(result, aor, sip, 1);
 }
 
+/* Path (RFC 3327 §5.3): a path=yes peer whose REGISTER carries a Path but did NOT advertise Supported: path means an
+ * intermediary inserted the Path without UA support -> 420 Bad Extension + Unsupported: path (RFC 3327 §7
+ * interception-risk posture). Checked once the sender authenticated (or for an account without credentials): before
+ * that, a 420 told an unauthenticated sender the account exists. Returns 1 when it answered. */
+static int sofia_register_path_refused(nua_t *nua, nua_handle_t *nh, sip_t const *sip, struct sofia_peer *peer)
+{
+	if (!peer->path_support || !sip->sip_path || sip_has_feature(sip->sip_supported, "path")) {
+		return 0;
+	}
+	sofia_log_register_outcome("REJECT (Path without Supported)", peer->name, sip);
+	nua_respond(nh, 420, "Bad Extension",
+		NUTAG_WITH_THIS(nua),
+		SIPTAG_UNSUPPORTED_STR("path"),
+		TAG_END());
+	return 1;
+}
+
 /* True when a SUCCESSFUL REGISTER is worth telling a human about: the first one this peer
  * completes, or one whose source IP or User-Agent differs from the one last announced.
  *
@@ -13364,21 +13394,12 @@ static enum sofia_register_nh_fate sofia_process_register_impl(nua_t *nua, nua_h
 
 	peer = sofia_find_peer(user);
 	if (!peer) {
-		if (sofia_cfg.alwaysauthreject) {
-			/* Unknown peer: SAME verifier vs the static bogus peer (synchronous) — a no-auth REGISTER
-			 * is challenged 401 and a credentialed retry gets the IDENTICAL 400/401-stale/403 (and
-			 * timing) a known peer with a bad password would, closing the enumeration oracle. */
-			sip_authorization_t const *au = sip->sip_authorization
-				? sip->sip_authorization
-				: (sip_authorization_t const *)sip->sip_proxy_authorization;
-			sofia_verify_digest_auth(sofia_bogus_peer, nua, nh, sip, au, "REGISTER", realm);
-			ast_verbose("Sofia: REGISTER from unknown peer '%s' — bogus-peer verify (alwaysauthreject)\n", user);
-		} else {
-			nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
-			ast_verbose("Sofia: Registration rejected for unknown peer '%s'\n", user);
-		}
+		/* Unknown peer: the answers, the work and the blacklist count of a real account with a wrong
+		 * password (the verifier counts a bad digest for every name; an extra count here would let a
+		 * series of requests tell an unknown name from an account). */
+		sofia_reject_as_unknown(nua, nh, sip, "REGISTER", realm, 1);
+		ast_verbose("Sofia: REGISTER from unknown peer '%s' — bogus-peer verify\n", user);
 		sofia_log_register_outcome("REJECT (unknown peer)", user, sip);
-		sofia_blacklist_add_sip(sip, "REGISTER unknown peer");
 		return SOFIA_REG_NH_ANSWERED;
 	}
 
@@ -13388,9 +13409,9 @@ static enum sofia_register_nh_fate sofia_process_register_impl(nua_t *nua, nua_h
 		sofia_get_source_addr(sip, &src);
 		if (ast_apply_ha(peer->ha, &src) != AST_SENSE_ALLOW) {
 			sofia_log_register_outcome("REJECT (ACL)", peer->name, sip);
-			nua_respond(nh, SIP_403_FORBIDDEN,
-				NUTAG_WITH_THIS(nua), TAG_END());
-			sofia_blacklist_add_sip(sip, "REGISTER peer ACL reject");
+			/* The answers and the blacklist count any name that is not an account gets, as chan_sip sends
+			 * its fake 401 for AUTH_ACL_FAILED: a 403 here told a denied address the account exists. */
+			sofia_reject_as_unknown(nua, nh, sip, "REGISTER", realm, 1);
 			ao2_ref(peer, -1);
 			return SOFIA_REG_NH_ANSWERED;
 		}
@@ -13412,35 +13433,22 @@ static enum sofia_register_nh_fate sofia_process_register_impl(nua_t *nua, nua_h
 		if (not_dynamic) {
 			ast_log(LOG_ERROR, "Peer '%s' is trying to register, but not configured as host=dynamic\n", peer->name);
 			sofia_log_register_outcome("REJECT (not host=dynamic)", peer->name, sip);
-			if (sofia_cfg.alwaysauthreject) {
-				sip_authorization_t const *au = sip->sip_authorization
-					? sip->sip_authorization
-					: (sip_authorization_t const *)sip->sip_proxy_authorization;
-				sofia_verify_digest_auth_ex(sofia_bogus_peer, nua, nh, sip, au, "REGISTER", realm, 0);
-			} else {
-				nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
-			}
+			/* The answers any name that cannot authenticate gets; with blacklisting off, so a REGISTER
+			 * refused here never bans an address that also carries a trunk (unlike a wrong password,
+			 * which counts: after enough credentialed tries a static account can be told apart). */
+			sofia_reject_as_unknown(nua, nh, sip, "REGISTER", realm, 0);
 			ao2_ref(peer, -1);
 			return SOFIA_REG_NH_ANSWERED;
 		}
 	}
 
-	/* Path (RFC 3327 §5.3): a path=yes peer whose REGISTER carries a Path but did NOT advertise
-	 * Supported: path means an intermediary inserted the Path without UA support -> reject with 420
-	 * Bad Extension + Unsupported: path (RFC 3327 §7 interception-risk posture). Gated on path=yes. */
-	if (peer->path_support && sip->sip_path && !sip_has_feature(sip->sip_supported, "path")) {
-		sofia_log_register_outcome("REJECT (Path without Supported)", peer->name, sip);
-		nua_respond(nh, 420, "Bad Extension",
-			NUTAG_WITH_THIS(nua),
-			SIPTAG_UNSUPPORTED_STR("path"),
-			TAG_END());
-		ao2_ref(peer, -1);
-		return SOFIA_REG_NH_ANSWERED;
-	}
-
 	/* No credential at all (neither secret nor md5secret) -> accept without auth.
 	 * md5secret IS a credential, so a md5secret-only peer MUST take the auth path below. */
 	if (ast_strlen_zero(peer->secret) && ast_strlen_zero(peer->md5secret)) {
+		if (sofia_register_path_refused(nua, nh, sip, peer)) {
+			ao2_ref(peer, -1);
+			return SOFIA_REG_NH_ANSWERED;
+		}
 		/* Contact-less REGISTER = binding QUERY, no state side-effects. */
 		if (!sip->sip_contact) {
 			sofia_respond_register_query(nua, nh, peer);
@@ -13574,6 +13582,10 @@ static enum sofia_register_nh_fate sofia_process_register_impl(nua_t *nua, nua_h
 			ao2_ref(peer, -1);
 			return SOFIA_REG_NH_ANSWERED;
 		}
+	}
+	if (sofia_register_path_refused(nua, nh, sip, peer)) {
+		ao2_ref(peer, -1);
+		return SOFIA_REG_NH_ANSWERED;
 	}
 
 	/* Captured out here so the 200 OK below the block can echo it. */
@@ -15594,9 +15606,17 @@ static void sofia_register_initial_mwi(struct sofia_peer *peer)
  * fresh). Accept paths (nua_notifier) own the handle and must NOT call this. */
 static void sofia_subscribe_reject_reap(nua_handle_t *nh)
 {
+	struct sofia_presence_sub *owner;
+
 	/* Reap ONLY a fresh, UNBOUND handle. A BOUND handle (hmagic != NULL) is owned by
 	 * its sofia_pvt / presence / MWI sub — destroying it here would UAF that object. */
 	if (!nh || nua_handle_magic(nh) != NULL) {
+		return;
+	}
+	/* A presence subscription's handle is never bound: an in-dialog refresh or unsubscribe rejected on it
+	 * (a stale nonce, a failed digest) must not destroy it under the live sub->nh. */
+	if ((owner = sofia_presence_find_by_nh(nh))) {
+		ao2_ref(owner, -1);
 		return;
 	}
 	nua_handle_destroy(nh);
@@ -15644,16 +15664,11 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 	peer = sofia_find_peer(to_user);
 	if (!peer) {
 		if (sofia_cfg.alwaysauthreject) {
-			/* sofia_get_realm_for_dialog (chan_sip get_realm parity). */
-			char realm_buf[MAXHOSTNAMELEN];
-			const char *realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
-			ast_log(LOG_NOTICE, "Sofia MWI: SUBSCRIBE for unknown peer '%s' — 401 challenge (alwaysauthreject)\n", to_user);
-			/* RESIDUAL-RACE FENCE: nh is UNBOUND (no pvt). Reaping it NOW (the old code)
-			 * dispatches nua_handle_destroy -> nta_incoming_destroy auto-500, racing ahead of
-			 * the deferred 401 timer. Defer the reap: pass reap_handle_on_fire=1 so the timer
-			 * emits the 401 FIRST, then reaps. The immediate reap below is taken ONLY on the
-			 * 404 branch. */
-			sofia_send_auth_challenge(nua, nh, sip, realm, "SUBSCRIBE", "UnknownPeer", NULL, 1);
+			ast_log(LOG_NOTICE, "Sofia MWI: SUBSCRIBE for unknown peer '%s' — answered as a wrong password\n", to_user);
+			/* The answers a real account with a wrong password gets (401, then 403 for credentials, not a
+			 * second 401), synchronously like the credentialed-peer path, which reaps the same way. */
+			sofia_reject_as_unknown(nua, nh, sip, "SUBSCRIBE", NULL, 1);
+			sofia_mwi_reject_reap(nh);
 		} else {
 			ast_log(LOG_NOTICE, "Sofia MWI: SUBSCRIBE for unknown peer '%s' — 404\n", to_user);
 			nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
@@ -15672,26 +15687,13 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 		if (ast_apply_ha(peer->ha, &src) != AST_SENSE_ALLOW) {
 			ast_log(LOG_NOTICE, "Sofia MWI: SUBSCRIBE for peer '%s' rejected by peer ACL\n",
 				peer->name);
-			nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
 			ao2_ref(peer, -1);
-			sofia_mwi_reject_reap(nh);	/* reap the challenge handle */
+			/* The answers a name that is not an account gets: a 403 told a denied address the account
+			 * exists (stricter than chan_sip, which answers 403 here and fakes a 401 for REGISTER only). */
+			sofia_reject_as_unknown(nua, nh, sip, "SUBSCRIBE", NULL, 1);
+			sofia_mwi_reject_reap(nh);
 			return;
 		}
-	}
-
-	/* allowsubscribe=no gate (chan_sip parity). The "403 Forbidden (policy)" string is
-	 * verbatim — operator scripts pattern-match the exact text. */
-	if (!peer->allowsubscribe) {
-		ast_log(LOG_NOTICE,
-			"Sofia MWI: SUBSCRIBE for peer '%s' rejected by allowsubscribe=no — 403\n",
-			peer->name);
-		nua_respond(nh, 403, "Forbidden (policy)",
-			NUTAG_WITH_THIS(nua), TAG_END());
-		sofia_emit_subscribe_rejected(sip, peer->name, "message-summary",
-			"AllowSubscribeClosed");
-		ao2_ref(peer, -1);
-		sofia_mwi_reject_reap(nh);	/* reap the challenge handle */
-		return;
 	}
 
 	/* Digest-auth a credentialed peer's MWI SUBSCRIBE (else anyone could subscribe its
@@ -15706,6 +15708,22 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 			sofia_mwi_reject_reap(nh);	/* reap the 401/4xx challenge handle */
 			return;
 		}
+	}
+
+	/* allowsubscribe=no gate, after the digest as in chan_sip (handle_request_subscribe: check_user_full,
+	 * then allowsubscribe): before it, its 403 told an unauthenticated sender the account exists. The
+	 * "403 Forbidden (policy)" string is verbatim — operator scripts pattern-match the exact text. */
+	if (!peer->allowsubscribe) {
+		ast_log(LOG_NOTICE,
+			"Sofia MWI: SUBSCRIBE for peer '%s' rejected by allowsubscribe=no — 403\n",
+			peer->name);
+		nua_respond(nh, 403, "Forbidden (policy)",
+			NUTAG_WITH_THIS(nua), TAG_END());
+		sofia_emit_subscribe_rejected(sip, peer->name, "message-summary",
+			"AllowSubscribeClosed");
+		ao2_ref(peer, -1);
+		sofia_mwi_reject_reap(nh);	/* reap the challenge handle */
+		return;
 	}
 
 	ast_mutex_lock(&peer->lock);
@@ -15945,13 +15963,10 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	peer = sofia_find_peer(from_user);
 	if (!peer) {
 		if (sofia_cfg.alwaysauthreject) {
-			char realm_buf[MAXHOSTNAMELEN];
-			const char *realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
-			/* RESIDUAL-RACE FENCE: nh is UNBOUND. Defer the reap (reap_handle_on_fire=1) so the
-			 * timer emits the 401 FIRST, then reaps — else an immediate reap dispatches
-			 * nta_incoming_destroy's auto-500 ahead of our deferred 401. The immediate reap below
-			 * is taken ONLY on the 404 branch. */
-			sofia_send_auth_challenge(nua, nh, sip, realm, "SUBSCRIBE", "UnknownPeer", NULL, 1);
+			/* The answers a real account with a wrong password gets (401, then 403 for credentials, not a
+			 * second 401), synchronously like the credentialed-peer path, which reaps the same way. */
+			sofia_reject_as_unknown(nua, nh, sip, "SUBSCRIBE", NULL, 1);
+			sofia_subscribe_reject_reap(nh);
 		} else {
 			ast_log(LOG_NOTICE, "Sofia presence: SUBSCRIBE from unknown peer '%s' — 404\n", from_user);
 			nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
@@ -15970,22 +15985,13 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		if (ast_apply_ha(peer->ha, &ha_src) != AST_SENSE_ALLOW) {
 			ast_log(LOG_NOTICE, "Sofia presence: SUBSCRIBE from peer '%s' rejected by peer ACL\n",
 				peer->name);
-			nua_respond(nh, SIP_403_FORBIDDEN, NUTAG_WITH_THIS(nua), TAG_END());
 			ao2_ref(peer, -1);
-			sofia_subscribe_reject_reap(nh);	/* reap the challenge handle */
+			/* The answers a name that is not an account gets: a 403 told a denied address the account
+			 * exists (stricter than chan_sip, which answers 403 here and fakes a 401 for REGISTER only). */
+			sofia_reject_as_unknown(nua, nh, sip, "SUBSCRIBE", NULL, 1);
+			sofia_subscribe_reject_reap(nh);
 			return;
 		}
-	}
-
-	if (!peer->allowsubscribe) {
-		ast_log(LOG_NOTICE,
-			"Sofia presence: SUBSCRIBE from peer '%s' rejected by allowsubscribe=no — 403\n",
-			peer->name);
-		nua_respond(nh, 403, "Forbidden (policy)", NUTAG_WITH_THIS(nua), TAG_END());
-		sofia_emit_subscribe_rejected(sip, peer->name, event, "AllowSubscribeClosed");
-		ao2_ref(peer, -1);
-		sofia_subscribe_reject_reap(nh);	/* reap the challenge handle */
-		return;
 	}
 
 	/* Digest-authenticate the SUBSCRIBE for a credentialed peer (MWI-path rationale):
@@ -16000,6 +16006,19 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 			sofia_subscribe_reject_reap(nh);	/* reap the 401/4xx challenge handle */
 			return;
 		}
+	}
+
+	/* allowsubscribe=no gate, after the digest as in chan_sip: before it, its 403 told an unauthenticated
+	 * sender the account exists. */
+	if (!peer->allowsubscribe) {
+		ast_log(LOG_NOTICE,
+			"Sofia presence: SUBSCRIBE from peer '%s' rejected by allowsubscribe=no — 403\n",
+			peer->name);
+		nua_respond(nh, 403, "Forbidden (policy)", NUTAG_WITH_THIS(nua), TAG_END());
+		sofia_emit_subscribe_rejected(sip, peer->name, event, "AllowSubscribeClosed");
+		ao2_ref(peer, -1);
+		sofia_subscribe_reject_reap(nh);	/* reap the challenge handle */
+		return;
 	}
 
 	/* Resolve hint context + snapshot peer name: peer subscribecontext > peer
@@ -21088,10 +21107,14 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			/* parse-compatibility only (default DISABLED): early-RTP-bridge not implemented. */
 			sofia_cfg.directrtpsetup = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "alwaysauthreject")) {
-			/* Security-critical RFC 3261 §22.4 username-enumeration prevention —
-			 * drives REGISTER unknown-peer + MWI SUBSCRIBE unknown-mailbox to emit
-			 * 401 challenge instead of 403/404 disclosure. Default TRUE (chan_sip parity). */
-			sofia_cfg.alwaysauthreject = ast_true(v->value);
+			/* Always the default (yes): a name that is not an account, an address an account's ACL denies
+			 * and a wrong password get the same answers (RFC 3261 §22.1/§22.2: 401, then 403), whatever
+			 * the name, so a scan learns nothing. "no" is still read, and ignored. */
+			if (!ast_true(v->value)) {
+				ast_log(LOG_NOTICE, "Sofia: alwaysauthreject=%s ignored (line %d): requests that cannot "
+					"authenticate always get the answers of a wrong password\n", v->value, v->lineno);
+			}
+			sofia_cfg.alwaysauthreject = 1;
 		} else if (!strcasecmp(v->name, "compactheaders")) {
 			/* parse-compatibility only: sofia-sip native compact-emit gate ABSENT; effect deferred. */
 			sofia_cfg.compactheaders = ast_true(v->value);

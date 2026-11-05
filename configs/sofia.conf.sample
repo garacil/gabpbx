@@ -151,19 +151,21 @@ auth_algorithms = md5
 ;auth_qop = yes     ; RFC 2617/7616 qop="auth" (replay-protected) — needs handset support
 
 ;
-; Allow guest calls (calls from unknown peers)
-; Default: yes
+; allowguest: kept for old configs, with no effect on a request from a name that is not an
+; account: it always gets the answers of a wrong password (see alwaysauthreject), so a guest call
+; or MESSAGE is never accepted. A device or trunk trusted by its address (host=<ip> with
+; insecure=invite) is a matched peer, not a guest.
 ;
-allowguest=yes
+allowguest=no
 
 ;
 ; Local anti-abuse blacklist (fail2ban-style). Repeated authentication / registration / routing
 ; failures from the same source IP are counted; once the threshold is reached the IP is blocked at
 ; the gate. Inspect/manage it with the `sip show blacklist` / `sip blacklist ...` CLI.
-; The routing failure counted is a guest INVITE (no peer matched) to an extension that does not exist
-; in the default context, which is how a scanner probes extensions. A call from a matched peer (it
-; passed its ACL and digest auth, or is trusted by address with insecure=invite) is never counted,
-; so a trunk calling a missing extension gets its 404 without banning its own address.
+; A call reaches the dialplan only from a matched peer (it passed its ACL and digest auth, or is
+; trusted by address with insecure=invite): a name that is not an account is challenged like a wrong
+; password. A call from a matched peer to a missing extension is never counted, so a trunk gets its
+; 404 without banning its own address.
 ; A blocked address is not silent-dropped: its new requests never reach authentication, routing or
 ; the dialplan, but the SIP stack still closes the transaction it opened for each one - an INVITE
 ; gets 100 Trying and 480 Temporarily Unavailable, REGISTER/SUBSCRIBE/NOTIFY/MESSAGE/INFO get 500,
@@ -705,8 +707,8 @@ srvlookup=yes
 ;
 ; Only a host=dynamic peer may REGISTER, as in chan_sip: a peer with a fixed host= takes
 ; its address from it and its REGISTER is refused ("Peer '<name>' is trying to register, but
-; not configured as host=dynamic"; with alwaysauthreject=yes the answers of an unknown peer,
-; otherwise 403). Unlike chan_sip the refusal never counts toward the blacklist.
+; not configured as host=dynamic"; the answers of a wrong password, as for any name that cannot
+; authenticate, see alwaysauthreject). Unlike chan_sip the refusal never counts toward the blacklist.
 
 ;
 ; --- rel100 (RFC 3262 reliable provisional responses / PRACK — per-peer) ---
@@ -844,9 +846,9 @@ srvlookup=yes
 ; MESSAGE always reaches the channel as a TEXT frame regardless of this setting.
 ; The launched dialplan extension can read these channel variables:
 ;   SIPMESSAGE_FROM, SIPMESSAGE_FROM_DISPLAY, SIPMESSAGE_TO, SIPMESSAGE_RURI,
-;   SIPMESSAGE_PEER (matched local peer, empty if guest), SIPMESSAGE_CONTENT_TYPE,
+;   SIPMESSAGE_PEER (the matched local peer), SIPMESSAGE_CONTENT_TYPE,
 ;   SIPMESSAGE_BODY (the message text).
-; Unknown senders are accepted only when allowguest=yes; otherwise 403.
+; A sender that is not an account gets the answers of a wrong password (401, then 403).
 ;message_context = sipmessages          ; [general] default context for inbound MESSAGE
 ;message_context = sipmessages          ; per-peer override (in [peer] section)
 ;
@@ -1028,23 +1030,18 @@ maxexpiry      = 3600      ; maximum REGISTER expires (seconds); over-max silent
 ;directrtpsetup = no    ; default; experimental — PARSE-COMPAT-ONLY today (effect-deferred)
 
 ;
-; --- alwaysauthreject (chan_sip parity, security-critical) ---
-; When yes (default), REGISTER from an unknown peer + MWI SUBSCRIBE for an
-; unknown mailbox both return 401 Unauthorized with a bogus digest challenge
-; instead of 403/404. RFC 3261 §22.4 username-enumeration prevention: an
-; attacker probing for valid SIP accounts cannot distinguish "peer exists with
-; bad password" from "peer does not exist". Default is yes per chan_sip
-; sip.h:213 DEFAULT_ALWAYSAUTHREJECT=TRUE — drop-in security baseline; chan_sip
-; operator scripts containing alwaysauthreject=yes/no migrate verbatim.
-; chan_sofia extension: every triggered 401 also emits an AMI AuthFailure event
-; (Peer:UNKNOWN + Method + Reason + RemoteAddr) so an NMS can detect
-; brute-force probing in real time (chan_sip is silent on the same paths —
-; operators must grep authpedantic LOG_NOTICE). Note: GabPBX has no
-; EVENT_FLAG_SECURITY class, so the event ships under EVENT_FLAG_SYSTEM
-; matching existing chan_sofia AMI events; subscribe via system permission.
-; chan_sip parity: chan_sip.c:29699-29700 ([general] parser) + sip.h:213.
+; --- alwaysauthreject (always on) ---
+; A request that cannot authenticate as an account gets the answers of a real account with a wrong
+; password, whatever the name: 401 with a challenge when it carries no credentials (RFC 3261
+; section 22.2), 403 when they are not accepted (section 22.1), 401 stale for an expired nonce. That
+; covers a name that is not an account, an address the account's deny/permit refuses and a REGISTER
+; for an account that is not host=dynamic, for REGISTER, INVITE, SUBSCRIBE and MESSAGE alike, so a
+; scan cannot tell which accounts exist. chan_sip does this only with alwaysauthreject=yes; here the
+; option always takes its default: "no" is read and ignored (a NOTICE says so). The AMI AuthFailure
+; event (Peer: SIP/UNKNOWN, Method, Reason, RemoteAddr) is sent for the 401 of the User-Agent
+; allowlist (lockuseragent); these answers send none.
 ;
-;alwaysauthreject = yes    ; default; RFC 3261 §22.4 username-enumeration prevention
+;alwaysauthreject = yes    ; always; "no" is ignored
 
 ;
 ; --- compactheaders (chan_sip parity, PARSE-COMPAT-ONLY) ---
@@ -2806,9 +2803,10 @@ tos_video = af41
 ;   8. uri= required (rejects 400 if absent per RFC 2617 §3.2.2)
 ;   9. md5secret support (chan_sip parity fix; pre-hashed digest secret)
 ;  10. Algorithm strict-parse (case-insensitive enum; reject unknown 400)
-;  11. Timing-equalization helper-level (sofia_emit_timing_equalized_reject
-;      helper: dummy 3× SHA-256 + 10-50ms jitter; covers REGISTER +
-;      SUBSCRIBE + INVITE + ACL-deny + alwaysauthreject all paths)
+;  11. Same answers and work for every request that cannot authenticate: an
+;      unknown name, an ACL-denied address and a wrong password all go through
+;      the digest verifier (the unknown ones against a bogus peer), for
+;      REGISTER, INVITE, SUBSCRIBE and MESSAGE (alwaysauthreject, always on)
 ;  12. Per-peer algorithm offer (md5secret-only-no-secret peer offered MD5
 ;      only; closes silent-403 fail-forever case)
 ;  13. WWW-Authenticate header validation (defense-in-depth charset check)
@@ -2939,9 +2937,9 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ; none, as in chan_sip: the Request-URI names what the request is for, while the To names the
 ; original recipient, which is somebody else on a forwarded call (RFC 3261 section 8.2.2.1). A
 ; %-escaped user that does not match as sent is tried decoded. The extension decides the 404 Not Found
-; (unknown extension) and the 484 Address Incomplete (allowoverlap=yes). The 404 of a guest call (no
-; peer matched) in the default context counts toward the blacklist (blacklist_ban); a call from a
-; matched peer never does. The host of the Request-URI, without its port, is set on the channel as
+; (unknown extension) and the 484 Address Incomplete (allowoverlap=yes). Only a matched peer's call
+; reaches the dialplan (a name that is not an account is challenged), and its 404 never counts
+; toward the blacklist. The host of the Request-URI, without its port, is set on the channel as
 ; ${SIPDOMAIN}, as in chan_sip (empty on outbound calls), e.g. to tell calls addressed to a private
 ; address: ${REGEX("^10\." ${SIPDOMAIN})}.
 ;

@@ -1204,7 +1204,7 @@ struct sofia_config {
 	int register_timeout;  /* seconds between retry attempts; default 20s */
 	int register_attempts; /* max scheduled-retry count; 0 = unlimited */
 	int directrtpsetup;        /* parse-compatibility only (early-RTP-bridge not implemented); chan_sip itself defaults DISABLED */
-	int alwaysauthreject;      /* 1 = unknown REGISTER / unknown-mailbox MWI SUBSCRIBE return 401 (bogus challenge) not 403/404 — anti-enumeration (RFC 3261 §22.4); default TRUE (chan_sip). Each 401 emits AMI AuthFailure (EVENT_FLAG_SYSTEM). */
+	int alwaysauthreject;      /* always 1 (a configured "no" is ignored): every request that cannot authenticate (unknown name, ACL-denied address, non-dynamic REGISTER) gets the answers of a wrong password via sofia_reject_as_unknown (RFC 3261 §22.1/§22.2). */
 	int compactheaders;        /* parse-compatibility only: sofia-sip has no native compact-emit gate. Default 0 (chan_sip). */
 	char disallowed_methods[128]; /* parse-compatibility only string-storage; default empty (sofia-sip NUTAG_APPL_METHOD gates unknown methods natively) */
 	struct ast_ha *contact_ha; /* contactpermit/contactdeny; inherited by peers via ast_duplicate_ha_list when peer omits the key */
