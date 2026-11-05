@@ -21744,6 +21744,16 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 				g = g < 0 ? 0 : 5;
 			}
 			sofia_cfg.push_resume_window = g;
+		} else if (!strcasecmp(v->name, "push_reregister")) {
+			sofia_cfg.push_reregister = ast_true(v->value) ? 1 : 0;
+		} else if (!strcasecmp(v->name, "push_reregister_lead")) {
+			/* seconds before the registration ends; the phone expects about 2 min */
+			int l = atoi(v->value);
+			if (l < 30 || l > 600) {
+				ast_log(LOG_WARNING, "Sofia PUSH: push_reregister_lead=%d out of range (30..600) - clamping\n", l);
+				l = l < 30 ? 30 : 600;
+			}
+			sofia_cfg.push_reregister_lead = l;
 		} else if (!strcasecmp(v->name, "push_sender")) {
 			/* Transport for the wake-up notifications: native = in-process libcurl HTTP/2
 			 * lane (persistent connections, cached credentials); script = fork/exec the
@@ -22977,6 +22987,8 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.push_noresponse = 4;	/* P2 guard; 0 disables */
 	sofia_cfg.push_resume_window = 2;	/* multi-ring collect window; 0 = first-registrant-wins */
 	sofia_cfg.push_sender_native = 1;	/* native in-process sender by default; script = fallback */
+	sofia_cfg.push_reregister = 1;	/* silent re-register push before a registration ends (native only) */
+	sofia_cfg.push_reregister_lead = 120;
 	/* Register pool: default OFF + auto lane count. */
 	sofia_cfg.register_pool = 0;
 	sofia_cfg.register_pool_workers = 0;
@@ -24193,6 +24205,8 @@ static int load_module(void)
 		if (sofia_rtp_sweep_id < 0) {
 			ast_log(LOG_WARNING, "Sofia: could not arm the RTP-inactivity sweep — rtptimeout/rtpkeepalive disabled\n");
 		}
+		/* Silent re-register pushes, rebuilt from the stored token rows (sofia_push.c). */
+		sofia_push_rereg_start();
 	}
 
 	ast_register_application_xml(app_dtmfmode, sofia_app_dtmfmode);

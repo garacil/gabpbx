@@ -86,6 +86,7 @@ struct sofia_push_device {
 	int fail_count;
 	char last_result[121];
 	int cancelled;			/* a call_cancel went out after the last push: its card is gone, so the next call pushes even inside push_min_interval (cache only) */
+	time_t rereg_for;		/* the reg_expires a re-register push was queued for in this run (cache only; after a restart last_push_at says it went) */
 };
 
 /* One cache entry per peer name; devices mutated ONLY under ao2_lock(entry).
@@ -191,6 +192,8 @@ enum sofia_pushdb_kind {
 	PUSHDB_DELETE,
 	PUSHDB_LOG,
 	PUSHDB_FIELDS,		/* partial device update: last_push_at / last_result / fail_count */
+	PUSHDB_LASTPUSH,	/* last_push_at only (a re-register push: nothing else of the row is touched) */
+	PUSHDB_FAILCOUNT,	/* fail_count only (a push_wait timeout) */
 };
 
 struct sofia_pushdb_job {
@@ -243,6 +246,18 @@ static int sofia_pushdb_exe(void *data)
 			"peer", j->peer, "device_id", j->device_id, SENTINEL,
 			"last_push_at", lpush_s, "last_result", j->last_result, "fail_count", fc_s,
 			SENTINEL);
+		break;
+	case PUSHDB_LASTPUSH:
+		snprintf(lpush_s, sizeof(lpush_s), "%ld", (long) j->last_push_at);
+		ast_update2_realtime("pushtokens",
+			"peer", j->peer, "device_id", j->device_id, SENTINEL,
+			"last_push_at", lpush_s, SENTINEL);
+		break;
+	case PUSHDB_FAILCOUNT:
+		snprintf(fc_s, sizeof(fc_s), "%d", j->fail_count);
+		ast_update2_realtime("pushtokens",
+			"peer", j->peer, "device_id", j->device_id, SENTINEL,
+			"fail_count", fc_s, SENTINEL);
 		break;
 	case PUSHDB_LOG:
 		snprintf(ts_s, sizeof(ts_s), "%ld", (long) time(NULL));
@@ -643,6 +658,24 @@ static void sofia_push_record_result(const char *peername, const char *device_id
 	sofia_pushdb_queue(&fj);
 }
 
+/* A re-register result: last_push_at goes to the DATABASE only (it is what tells the next load that this
+ * registration was pushed), while the cache keeps the call push's last_push_at and last_result, so
+ * push_min_interval never holds back a call push behind a re-register push. The token is dropped only when FCM
+ * says it no longer exists (404 UNREGISTERED), not on a 400: a 400 could also be FCM refusing the message
+ * itself, and that must not cost every device its token. */
+static void sofia_push_record_rereg(const char *peername, const char *device_id, const char *result)
+{
+	struct sofia_pushdb_job fj = { .kind = PUSHDB_LASTPUSH };
+
+	ast_copy_string(fj.peer, peername, sizeof(fj.peer));
+	ast_copy_string(fj.device_id, device_id, sizeof(fj.device_id));
+	fj.last_push_at = time(NULL);
+	sofia_pushdb_queue(&fj);
+	if (result && !strcmp(result, "ERR:404")) {
+		sofia_push_purge_device(peername, device_id, result);
+	}
+}
+
 /* A call_cancel result is logged only: it never touches last_result (which keeps the call
  * push's outcome for `sip show push`) and never purges, so a cancel can never cost a device
  * its token; the next call push classifies the token as usual. */
@@ -675,6 +708,11 @@ void sofia_push_sender_complete(enum sofia_push_purpose purpose, const char *pee
 		sender_label, device_id, token_redacted, callid, out, ms);
 	if (purpose == SOFIA_PUSH_PURPOSE_CANCEL) {
 		sofia_push_record_cancel(peername, device_id, callid, reason, out);
+		return;
+	}
+	if (purpose == SOFIA_PUSH_PURPOSE_REREGISTER) {
+		sofia_push_log_event(peername, device_id, callid, "sent", out);
+		sofia_push_record_rereg(peername, device_id, out);
 		return;
 	}
 	sofia_push_log_event(peername, device_id, callid, "sent", out);
@@ -1240,16 +1278,12 @@ static int sofia_push_wait_cb(const void *data)
 		int i;
 		if (te) {
 			for (i = 0; i < e->npushed; i++) {
-				struct sofia_pushdb_job fj = { .kind = PUSHDB_FIELDS };
+				struct sofia_pushdb_job fj = { .kind = PUSHDB_FAILCOUNT };	/* fail_count only: never lowers a stored last_push_at */
 				int fc = 0, k;
-				time_t lp = 0;
-				char lr[121] = "";
 				ao2_lock(te);
 				for (k = 0; k < te->ndev; k++) {
 					if (!strcasecmp(te->dev[k].device_id, e->pushed_dev[i])) {
 						fc = ++te->dev[k].fail_count;
-						lp = te->dev[k].last_push_at;
-						ast_copy_string(lr, te->dev[k].last_result, sizeof(lr));
 						break;
 					}
 				}
@@ -1260,8 +1294,6 @@ static int sofia_push_wait_cb(const void *data)
 					ast_copy_string(fj.peer, e->peername, sizeof(fj.peer));
 					ast_copy_string(fj.device_id, e->pushed_dev[i], sizeof(fj.device_id));
 					fj.fail_count = fc;
-					fj.last_push_at = lp;
-					ast_copy_string(fj.last_result, lr, sizeof(fj.last_result));
 					sofia_pushdb_queue(&fj);
 				}
 			}
@@ -1711,6 +1743,7 @@ void sofia_push_on_pvt_hangup(struct sofia_pvt *pvt, int answered_elsewhere)
 					 * just the late-append window closing, not an abandoned park */
 					ast_debug(1, "Sofia PUSH: %s peer='%s' - late-append window closed (call ended)\n",
 						e->callid, e->peername);
+					sofia_push_log_event(e->peername, "", e->callid, "unparked", "ended");	/* closes it for the restart reader */
 				} else {
 					ast_verb(2, "Sofia PUSH: cancelled %s peer='%s' (caller hangup)\n",
 						e->callid, e->peername);
@@ -2633,6 +2666,426 @@ void sofia_push_on_register(struct sofia_peer *peer, sip_t const *sip,
 	}
 }
 
+/* ---------- silent re-register before a registration ends (P3; scheduled, survives a restart) ----------
+ *
+ * Every device whose stored token is an FCM one gets ONE `type=reregister` push (the phone contract: "server
+ * sends this ~2 min before SIP registration expires") at reg_expires - push_reregister_lead. The schedule is
+ * kept nowhere else than in the token rows: reg_expires is written on every REGISTER and last_push_at after
+ * every push, both in push_tokens (the local SQLite), and the whole table is read back at load
+ * (sofia_push_init). So a restart loses no scheduled push: after the load every due time is computed again
+ * from what the database holds. A push that fell due while gabpbx was down goes out within
+ * SOFIA_PUSH_REREG_SPREAD seconds of the first tick, at a fixed per-device offset, never all together; a
+ * registration that ended more than SOFIA_PUSH_REREG_LATE_MAX seconds ago is not chased (the call push still
+ * wakes that phone), and neither is one shorter than 2 * (lead + SOFIA_PUSH_REREG_JITTER) (the live app refreshes
+ * it itself, and a push per half-life would never stop). Each device also goes 0..SOFIA_PUSH_REREG_JITTER-1 s earlier (fixed per device), so phones
+ * that registered together (every phone right after a restart) do not stay due together. A tick sends at most
+ * SOFIA_PUSH_REREG_PER_TICK pushes and none while the token database queue is loaded; the native lane gives these
+ * pushes a quarter of its queue, so a call push always finds room. The rest wait for the next tick.
+ *
+ * NATIVE sender only and FCM-shaped only, whatever push_sender says (the servers run no external sender for
+ * these): never the script lane, and never an APNs VoIP push (Apple, PushKit:
+ * a VoIP push must report a call to CallKit or iOS terminates the app), so a VoIP-token device gets none.
+ * Runs on sofia_sched; takes only the cache entry locks (leaf) and queues on the native lane. */
+#define SOFIA_PUSH_REREG_TICK_MS 5000
+#define SOFIA_PUSH_REREG_PER_TICK 20
+#define SOFIA_PUSH_REREG_SPREAD 120
+#define SOFIA_PUSH_REREG_JITTER 60
+#define SOFIA_PUSH_REREG_LATE_MAX 1800
+
+struct sofia_push_rereg_job {
+	char peer[128];
+	char device_id[SOFIA_PUSH_DEVID_MAX];
+	char token[SOFIA_PUSH_TOKEN_MAX];
+	time_t reg_expires;
+};
+
+static int sofia_push_rereg_sched_id = -1;
+static time_t sofia_push_rereg_t0;	/* when the schedule became active (load, or push turned back on): pushes due before it are spread */
+static int sofia_push_rereg_active;	/* the previous tick passed the gates */
+static time_t sofia_push_load_time;	/* sofia_push_init: rows older than this were written by the previous run */
+static int sofia_push_restart_done;	/* the restart call_cancel check was queued for this load */
+static volatile int sofia_push_restart_finished;	/* ... and has run: re-register pushes wait for it (the cancels get the lane first) */
+static int sofia_push_restart_exe(void *data);
+
+/* Fixed offset in [0, SOFIA_PUSH_REREG_SPREAD) for a push that fell due before the first tick. */
+static int sofia_push_rereg_offset(const char *peer, const char *device_id)
+{
+	unsigned int h = 5381;
+	const char *p;
+
+	for (p = peer; *p; p++) {
+		h = h * 33 + (unsigned char) ((*p >= 'A' && *p <= 'Z') ? *p + 32 : *p);
+	}
+	for (p = device_id; *p; p++) {
+		h = h * 33 + (unsigned char) ((*p >= 'A' && *p <= 'Z') ? *p + 32 : *p);
+	}
+	return (int) (h % SOFIA_PUSH_REREG_SPREAD);
+}
+
+/* When the device's re-register push is due; 0 = none for it now (not an FCM token, stale token, no stored
+ * expiry, a registration that ended too long ago, or already pushed for this registration). Entry lock held. */
+static time_t sofia_push_rereg_due(const char *peername, const struct sofia_push_device *d, time_t now)
+{
+	time_t due;
+
+	if (strcasecmp(d->push_type, "fcm") || !d->token[0] || d->reg_expires <= 0) {
+		return 0;
+	}
+	if (sofia_push_device_stale(d, now) || d->reg_expires < now - SOFIA_PUSH_REREG_LATE_MAX) {
+		return 0;
+	}
+	if (d->updated_at > 0 && d->reg_expires - d->updated_at < 2 * (sofia_cfg.push_reregister_lead + SOFIA_PUSH_REREG_JITTER)) {
+		return 0;	/* a short registration: the live app refreshes it itself, and a push per half-life would never stop */
+	}
+	due = d->reg_expires - sofia_cfg.push_reregister_lead - sofia_push_rereg_offset(peername, d->device_id) % SOFIA_PUSH_REREG_JITTER;
+	if (d->updated_at > 0 && d->updated_at < d->reg_expires && due < d->updated_at + (d->reg_expires - d->updated_at) / 2) {
+		due = d->updated_at + (d->reg_expires - d->updated_at) / 2;	/* a short registration: never before its half, so a push never follows its own REGISTER */
+	}
+	if (d->rereg_for == d->reg_expires || d->last_push_at >= due) {
+		return 0;	/* queued in this run, or pushed (before a restart too: last_push_at is stored) */
+	}
+	if (sofia_push_rereg_t0 && due < sofia_push_rereg_t0) {
+		due = sofia_push_rereg_t0 + sofia_push_rereg_offset(peername, d->device_id);	/* fell due while down */
+	}
+	return due;
+}
+
+/* A job the native lane did not take: forget the mark so a later tick tries again. */
+static void sofia_push_rereg_unmark(const struct sofia_push_rereg_job *j)
+{
+	struct sofia_push_tokens *e = sofia_push_entry_get(j->peer, 0);
+	int i;
+
+	if (!e) {
+		return;
+	}
+	ao2_lock(e);
+	for (i = 0; i < e->ndev; i++) {
+		if (!strcasecmp(e->dev[i].device_id, j->device_id) && e->dev[i].rereg_for == j->reg_expires) {
+			e->dev[i].rereg_for = 0;
+			break;
+		}
+	}
+	ao2_unlock(e);
+	ao2_ref(e, -1);
+}
+
+static int sofia_push_rereg_tick(const void *data)
+{
+	struct sofia_push_rereg_job *jobs;
+	struct ao2_iterator it;
+	struct sofia_push_tokens *te;
+	time_t now = time(NULL), next = 0;
+	int n = 0, planned = 0, first = 0, i;
+
+	if (!sofia_cfg.push_enabled || !sofia_push_cache || !sofia_push_cache_complete || !sofia_push_sender_available()) {
+		sofia_push_rereg_active = 0;	/* native only: a later tick retries, never the scripts */
+		return SOFIA_PUSH_REREG_TICK_MS;
+	}
+	if (!sofia_push_restart_done) {
+		/* once per load, on the database lane (it reads push_log): the parked calls the restart cut */
+		sofia_push_restart_done = 1;
+		if (!sofia_pushdb_tps || ast_taskprocessor_push(sofia_pushdb_tps, sofia_push_restart_exe, NULL)) {
+			ast_log(LOG_WARNING, "Sofia PUSH: could not queue the restart call_cancel check\n");
+			sofia_push_restart_finished = 1;
+		}
+	}
+	if (!sofia_push_restart_finished) {
+		return SOFIA_PUSH_REREG_TICK_MS;	/* the restart cancels take the native lane first */
+	}
+	if (!sofia_cfg.push_reregister) {
+		sofia_push_rereg_active = 0;
+		return SOFIA_PUSH_REREG_TICK_MS;
+	}
+	if (sofia_pushdb_depth > SOFIA_PUSH_DBQ_MAX / 4) {
+		return SOFIA_PUSH_REREG_TICK_MS;	/* the token database is behind: its writes (the schedule itself) come first */
+	}
+	if (!sofia_push_rereg_active) {
+		sofia_push_rereg_active = 1;	/* loaded, or turned back on: rebuild and spread what is overdue */
+		sofia_push_rereg_t0 = now;
+		first = 1;
+	}
+	if (!(jobs = ast_calloc(SOFIA_PUSH_REREG_PER_TICK, sizeof(*jobs)))) {
+		return SOFIA_PUSH_REREG_TICK_MS;
+	}
+	it = ao2_iterator_init(sofia_push_cache, 0);
+	while ((te = ao2_iterator_next(&it))) {
+		ao2_lock(te);
+		for (i = 0; i < te->ndev; i++) {
+			struct sofia_push_device *d = &te->dev[i];
+			time_t due = sofia_push_rereg_due(te->peername, d, now);
+
+			if (!due) {
+				continue;
+			}
+			if (due > now || n >= SOFIA_PUSH_REREG_PER_TICK) {
+				planned++;
+				if (!next || due < next) {
+					next = due;
+				}
+				continue;
+			}
+			d->rereg_for = d->reg_expires;
+			ast_copy_string(jobs[n].peer, te->peername, sizeof(jobs[n].peer));
+			ast_copy_string(jobs[n].device_id, d->device_id, sizeof(jobs[n].device_id));
+			ast_copy_string(jobs[n].token, d->token, sizeof(jobs[n].token));
+			jobs[n].reg_expires = d->reg_expires;
+			n++;
+		}
+		ao2_unlock(te);
+		ao2_ref(te, -1);
+	}
+	ao2_iterator_destroy(&it);
+
+	if (first) {
+		char nexts[32] = "";
+		if (next) {
+			snprintf(nexts, sizeof(nexts), ", next in %lds", (long) (next > now ? next - now : 0));
+		}
+		ast_verb(2, "Sofia PUSH: re-register schedule rebuilt from the database: %d push(es) due now, %d planned%s\n",
+			n, planned, nexts);
+	}
+	for (i = 0; i < n; i++) {
+		char red[64];
+		int rc = sofia_push_sender_submit(SOFIA_PUSH_PURPOSE_REREGISTER, "fcm", jobs[i].token, jobs[i].peer, "",
+			"reregister", jobs[i].peer, jobs[i].device_id, NULL);
+
+		if (rc) {
+			int k;
+			for (k = i; k < n; k++) {
+				sofia_push_rereg_unmark(&jobs[k]);	/* this one and the rest: a later tick */
+			}
+			ast_debug(1, "Sofia PUSH: re-register push for peer '%s' dev '%s' not queued (%s) - next tick\n",
+				jobs[i].peer, jobs[i].device_id, rc > 0 ? "native lane cannot serve" : "native queue share full");
+			break;
+		}
+		ast_verb(3, "Sofia PUSH: re-register push queued peer='%s' dev='%s' token=%s registration ends in %lds\n",
+			jobs[i].peer, jobs[i].device_id, sofia_push_redact(jobs[i].token, red, sizeof(red)),
+			(long) (jobs[i].reg_expires - now));
+	}
+	ast_free(jobs);
+	return SOFIA_PUSH_REREG_TICK_MS;
+}
+
+/* ---------- parked calls a restart cut: their call_cancel, from push_log ----------
+ *
+ * A parked call lives in RAM only (sofia_push_parked, its timers on sofia_sched, the native queue): a restart
+ * ends the call, and nothing would tell the Android phones that showed its card. push_log (the local SQLite)
+ * holds every step: "parked" (or a "sent" with no device for an assist / no-response / renotify push), a "sent"
+ * per pushed device, a "cancel" per cancelled device, and the end ("resumed", "timeout", "caller_hangup",
+ * "orphaned", "unparked"). So once per load, on the database lane, the rows the PREVIOUS run wrote in its last
+ * push_wait + SOFIA_PUSH_RESTART_LOOKBACK seconds (ts before sofia_push_load_time) are read: a call with no end
+ * row was cut, and every Android device pushed for it and not cancelled yet gets the call_cancel the call would
+ * have sent (reason=cancelled). An iPhone gets nothing (never an APNs push that is not a call). Each such call is
+ * then closed with "orphaned"/"restart", so a second restart does not cancel it again. Native sender only. The
+ * ended calls are collected first, so a busy window cannot crowd the cut ones out of the bounded arrays. */
+#define SOFIA_PUSH_RESTART_LOOKBACK 180
+#define SOFIA_PUSH_RESTART_MAX_CALLS 256
+#define SOFIA_PUSH_RESTART_MAX_ENDED 1024
+#define SOFIA_PUSH_RESTART_MAX_DEVS SOFIA_PUSH_MAX_DEVICES
+
+struct sofia_push_cut_call {
+	char peer[128];
+	char callid[64];
+	char cid_num[80];
+	int ndev;
+	char dev[SOFIA_PUSH_RESTART_MAX_DEVS][SOFIA_PUSH_DEVID_MAX];
+	int devcancelled[SOFIA_PUSH_RESTART_MAX_DEVS];
+};
+
+struct sofia_push_log_row {
+	const char *peer, *dev, *callid, *event, *detail;
+};
+
+static void sofia_push_log_row_read(struct ast_config *cfg, const char *cat, struct sofia_push_log_row *r)
+{
+	const struct ast_variable *v;
+
+	r->peer = r->dev = r->callid = r->event = r->detail = "";
+	for (v = ast_variable_browse(cfg, cat); v; v = v->next) {
+		if (!strcasecmp(v->name, "peer")) {
+			r->peer = v->value;
+		} else if (!strcasecmp(v->name, "device_id")) {
+			r->dev = v->value;
+		} else if (!strcasecmp(v->name, "callid")) {
+			r->callid = v->value;
+		} else if (!strcasecmp(v->name, "event")) {
+			r->event = v->value;
+		} else if (!strcasecmp(v->name, "detail")) {
+			r->detail = v->value;
+		}
+	}
+}
+
+static int sofia_push_log_row_is_end(const struct sofia_push_log_row *r)
+{
+	return !strcmp(r->event, "resumed") || !strcmp(r->event, "timeout") || !strcmp(r->event, "caller_hangup")
+		|| !strcmp(r->event, "orphaned") || !strcmp(r->event, "unparked");
+}
+
+static int sofia_push_restart_exe(void *data)
+{
+	struct sofia_push_cut_call *calls;
+	char (*ended)[64];
+	struct ast_config *cfg;
+	char since[24], until[24], *cat;
+	int ncalls = 0, nended = 0, i, k, ncut = 0, nsent = 0;
+
+	if (!ast_check_realtime("pushlog")) {
+		sofia_push_restart_finished = 1;
+		return 0;
+	}
+	snprintf(since, sizeof(since), "%ld",
+		(long) (sofia_push_load_time - sofia_cfg.push_wait - SOFIA_PUSH_RESTART_LOOKBACK));
+	snprintf(until, sizeof(until), "%ld", (long) sofia_push_load_time);
+	if (!(cfg = ast_load_realtime_multientry("pushlog", "ts >=", since, "ts <", until, SENTINEL))) {
+		sofia_push_restart_finished = 1;
+		return 0;	/* no rows in the window, or no table: nothing was cut */
+	}
+	calls = ast_calloc(SOFIA_PUSH_RESTART_MAX_CALLS, sizeof(*calls));
+	ended = ast_calloc(SOFIA_PUSH_RESTART_MAX_ENDED, sizeof(*ended));
+	if (!calls || !ended) {
+		ast_free(calls);
+		ast_free(ended);
+		ast_config_destroy(cfg);
+		sofia_push_restart_finished = 1;
+		return 0;
+	}
+	/* pass 1: the ended calls */
+	for (cat = NULL; (cat = ast_category_browse(cfg, cat)); ) {
+		struct sofia_push_log_row r;
+		sofia_push_log_row_read(cfg, cat, &r);
+		if (r.callid[0] && sofia_push_log_row_is_end(&r) && nended < SOFIA_PUSH_RESTART_MAX_ENDED) {
+			ast_copy_string(ended[nended++], r.callid, sizeof(ended[0]));
+		}
+	}
+	/* pass 2: the opened calls that did not end */
+	for (cat = NULL; (cat = ast_category_browse(cfg, cat)); ) {
+		struct sofia_push_log_row r;
+		struct sofia_push_cut_call *c = NULL;
+		sofia_push_log_row_read(cfg, cat, &r);
+		if (!r.callid[0] || !strcmp(r.callid, "reregister")
+				|| !(!strcmp(r.event, "parked") || (!strcmp(r.event, "sent") && !r.dev[0]))) {
+			continue;
+		}
+		for (i = 0; i < nended && strcmp(ended[i], r.callid); i++) {
+		}
+		if (i < nended) {
+			continue;
+		}
+		for (i = 0; i < ncalls && strcmp(calls[i].callid, r.callid); i++) {
+		}
+		if (i < ncalls) {
+			c = &calls[i];
+		} else if (ncalls < SOFIA_PUSH_RESTART_MAX_CALLS) {
+			c = &calls[ncalls++];
+			ast_copy_string(c->peer, r.peer, sizeof(c->peer));
+			ast_copy_string(c->callid, r.callid, sizeof(c->callid));
+		}
+		if (c && !strcmp(r.event, "parked")) {
+			ast_copy_string(c->cid_num, r.detail, sizeof(c->cid_num));
+		}
+	}
+	/* pass 3: the devices pushed for them, and those already cancelled */
+	for (cat = NULL; ncalls && (cat = ast_category_browse(cfg, cat)); ) {
+		struct sofia_push_log_row r;
+		struct sofia_push_cut_call *c;
+		sofia_push_log_row_read(cfg, cat, &r);
+		if (!r.dev[0] || (strcmp(r.event, "sent") && strcmp(r.event, "cancel"))) {
+			continue;
+		}
+		for (k = 0; k < ncalls && strcmp(calls[k].callid, r.callid); k++) {
+		}
+		if (k == ncalls) {
+			continue;
+		}
+		c = &calls[k];
+		for (i = 0; i < c->ndev && strcasecmp(c->dev[i], r.dev); i++) {
+		}
+		if (i == c->ndev) {
+			if (c->ndev >= SOFIA_PUSH_RESTART_MAX_DEVS) {
+				continue;
+			}
+			ast_copy_string(c->dev[i], r.dev, sizeof(c->dev[i]));
+			c->ndev++;
+		}
+		if (!strcmp(r.event, "cancel")) {
+			c->devcancelled[i] = 1;
+		}
+	}
+	ast_config_destroy(cfg);
+
+	for (k = 0; k < ncalls; k++) {
+		struct sofia_push_cut_call *c = &calls[k];
+		struct sofia_push_tokens *e;
+		int sent = 0, refused = 0;
+
+		ncut++;
+		if ((e = sofia_push_entry_get(c->peer, 0))) {
+			for (i = 0; i < c->ndev; i++) {
+				char token[SOFIA_PUSH_TOKEN_MAX] = "";
+				int j;
+
+				if (c->devcancelled[i]) {
+					continue;
+				}
+				ao2_lock(e);
+				for (j = 0; j < e->ndev; j++) {
+					if (!strcasecmp(e->dev[j].device_id, c->dev[i]) && !strcasecmp(e->dev[j].platform, "android")
+							&& !strcasecmp(e->dev[j].push_type, "fcm")) {
+						ast_copy_string(token, e->dev[j].token, sizeof(token));
+						break;
+					}
+				}
+				ao2_unlock(e);
+				if (token[0]) {
+					int tries = 0, rc;
+					/* a full queue drains: give it a moment (this is the database thread, not sofia_sched);
+					 * a lane that cannot serve (down, FCM credentials failing) is not retried */
+					while ((rc = sofia_push_sender_submit(SOFIA_PUSH_PURPOSE_CANCEL, "fcm", token, c->cid_num,
+							c->cid_num, c->callid, c->peer, c->dev[i], "cancelled")) < 0 && ++tries < 10) {
+						usleep(200000);
+					}
+					if (rc) {
+						refused++;
+					} else {
+						sent++;
+					}
+				}
+			}
+			ao2_ref(e, -1);
+		}
+		nsent += sent;
+		if (refused) {
+			/* not closed: a load within push_wait + SOFIA_PUSH_RESTART_LOOKBACK seconds of these rows tries again */
+			ast_log(LOG_WARNING, "Sofia PUSH: call %s peer='%s' was parked when gabpbx stopped: %d call_cancel(s) could not be queued (native lane busy or down)\n",
+				c->callid, c->peer, refused);
+			continue;
+		}
+		sofia_push_log_event(c->peer, "", c->callid, "orphaned", "restart");
+		ast_verb(2, "Sofia PUSH: call %s peer='%s' was parked when gabpbx stopped: call_cancel -> %d Android device(s)\n",
+			c->callid, c->peer, sent);
+	}
+	if (ncut) {
+		ast_verb(2, "Sofia PUSH: %d parked call(s) cut by the restart, %d call_cancel(s) queued\n", ncut, nsent);
+	}
+	ast_free(calls);
+	ast_free(ended);
+	sofia_push_restart_finished = 1;
+	return 0;
+}
+
+void sofia_push_rereg_start(void)
+{
+	if (!sofia_sched || sofia_push_rereg_sched_id >= 0) {
+		return;
+	}
+	sofia_push_rereg_sched_id = ast_sched_thread_add(sofia_sched, SOFIA_PUSH_REREG_TICK_MS, sofia_push_rereg_tick, NULL);
+	if (sofia_push_rereg_sched_id < 0) {
+		ast_log(LOG_WARNING, "Sofia PUSH: could not arm the re-register schedule - no re-register pushes\n");
+	}
+}
+
 /* ---------- CLI: sip show push [peer] (tokens ALWAYS redacted) ---------- */
 
 static char *sofia_push_cli_show(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
@@ -2670,8 +3123,14 @@ static char *sofia_push_cli_show(struct ast_cli_entry *e, int cmd, struct ast_cl
 	if (!sofia_push_cache) {
 		return CLI_SUCCESS;
 	}
-	ast_cli(a->fd, "%-20s %-14s %-7s %-5s %-22s %8s %8s %-14s %5s\n",
-		"Peer", "Device", "Plat", "Type", "Token", "Age", "RegExp", "LastResult", "Fails");
+	ast_cli(a->fd, "Re-register push: %s  lead=%ds  (native, FCM tokens only)\n",
+		!(sofia_cfg.push_enabled && sofia_cfg.push_reregister) ? "off"
+			: !sofia_push_cache_complete ? "on (waiting: token cache not complete)"
+			: !sofia_push_sender_available() ? "on (waiting: native lane down)"
+			: !sofia_push_restart_finished ? "on (waiting: restart call_cancel check)" : "on",
+		sofia_cfg.push_reregister_lead);
+	ast_cli(a->fd, "%-20s %-14s %-7s %-5s %-22s %8s %8s %-14s %5s %8s\n",
+		"Peer", "Device", "Plat", "Type", "Token", "Age", "RegExp", "LastResult", "Fails", "ReReg");
 	it = ao2_iterator_init(sofia_push_cache, 0);
 	{
 		struct sofia_push_tokens *te;
@@ -2683,15 +3142,22 @@ static char *sofia_push_cli_show(struct ast_cli_entry *e, int cmd, struct ast_cl
 			}
 			ao2_lock(te);
 			for (i = 0; i < te->ndev; i++) {
-				char red[64];
-				ast_cli(a->fd, "%-20s %-14s %-7s %-5s %-22s %7lds %7lds %-14s %5d\n",
+				char red[64], rr[16];
+				time_t due = sofia_cfg.push_enabled && sofia_cfg.push_reregister
+					? sofia_push_rereg_due(te->peername, &te->dev[i], now) : 0;
+				if (due) {
+					snprintf(rr, sizeof(rr), "%lds", (long) (due > now ? due - now : 0));
+				} else {
+					ast_copy_string(rr, "-", sizeof(rr));
+				}
+				ast_cli(a->fd, "%-20s %-14s %-7s %-5s %-22s %7lds %7lds %-14s %5d %8s\n",
 					te->peername, te->dev[i].device_id, te->dev[i].platform,
 					te->dev[i].push_type,
 					sofia_push_redact(te->dev[i].token, red, sizeof(red)),
 					(long) (now - te->dev[i].updated_at),
 					(long) (te->dev[i].reg_expires - now),
 					te->dev[i].last_result[0] ? te->dev[i].last_result : "-",
-					te->dev[i].fail_count);
+					te->dev[i].fail_count, rr);
 				shown++;
 			}
 			ao2_unlock(te);
@@ -2752,6 +3218,8 @@ int sofia_push_init(void)
 		ast_log(LOG_WARNING, "Sofia PUSH: sender taskprocessor unavailable - pushes disabled (parks would be silent, so parking disables too)\n");
 	}
 	ast_cli_register_multiple(sofia_push_cli, ARRAY_LEN(sofia_push_cli));
+
+	sofia_push_load_time = time(NULL);	/* the restart reader looks only at rows written before this */
 
 	/* Native sender lane (sofia_push_sender.c) — non-fatal like the taskprocessors above:
 	 * without it, push_sender=native auto-falls back to the script sender per job. */

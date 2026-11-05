@@ -73,6 +73,8 @@ int sofia_contact_requested_expiry(sip_contact_t const *m, int fallback);
 struct sofia_peer;		/* full definition below */
 struct sofia_register_update;	/* full definition below */
 int sofia_push_init(void);
+/* Arm the re-register schedule on sofia_sched (after sofia_sched exists; idempotent). */
+void sofia_push_rereg_start(void);
 void sofia_push_on_register(struct sofia_peer *peer, sip_t const *sip, const struct sofia_register_update *update);
 int sofia_push_peer_enabled(const struct sofia_peer *peer);
 int sofia_push_peer_pushable(struct sofia_peer *peer);
@@ -1332,6 +1334,8 @@ struct sofia_config {
 	int push_min_interval;     /* seconds per-device push floor (the phone itself cancels a push <5 s after the previous); 0 = off */
 	int push_noresponse;       /* P2: seconds without ANY 1xx/2xx on a connection-oriented single-contact INVITE to a tokened peer before pushing with the same Call-ID (0 = off; clamp 2..10, must stay < push_wait); default 4 */
 	int push_resume_window;    /* multi-ring: seconds the resume holds a parked call open after the FIRST wake REGISTER so every pushed device can bind; then ONE fork INVITE per live binding, all carrying the announced Call-ID (0 = legacy first-registrant-wins; clamp 0..5); default 2 */
+	int push_reregister;       /* push_reregister=yes|no: silent re-register push to every FCM-token device push_reregister_lead seconds before its registration ends, scheduled from the stored rows (survives a restart); native sender only. Default yes. */
+	int push_reregister_lead;  /* seconds before reg_expires the re-register push goes (clamp 30..600); default 120 */
 	int push_sender_native;    /* push_sender=native|script: 1 = in-process libcurl HTTP/2 sender (sofia_push_sender.c, persistent connections + cached JWT/OAuth), 0 = fork/exec the .py scripts. Default 1 (native); auto-falls back to script per-job when the native lane is unavailable. */
 	/* Bounded REGISTER realtime-DB-write offload pool (kill-switch, default OFF). */
 	int register_pool;          /* offload the realtime REGISTER DB writes to a bounded pool */

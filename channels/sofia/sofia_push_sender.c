@@ -1148,7 +1148,8 @@ int sofia_push_sender_submit(enum sofia_push_purpose purpose, const char *push_t
 		return 1;
 	}
 	/* A call_cancel may use half the queue at most, so call pushes always find room. */
-	if (ast_atomic_fetchadd_int(&nat_depth, +1) >= (purpose == SOFIA_PUSH_PURPOSE_CANCEL ? NATQ_MAX / 2 : NATQ_MAX)) {
+	if (ast_atomic_fetchadd_int(&nat_depth, +1) >= (purpose == SOFIA_PUSH_PURPOSE_CANCEL ? NATQ_MAX / 2
+			: purpose == SOFIA_PUSH_PURPOSE_REREGISTER ? NATQ_MAX / 4 : NATQ_MAX)) {	/* a call push always finds room */
 		ast_atomic_fetchadd_int(&nat_depth, -1);
 		return -1;	/* full: caller drops (bounded, never degrade a burst into fork/exec) */
 	}
