@@ -11578,10 +11578,13 @@ static void sofia_nonce_hmac(const char *msg, char *out_hex)
 	sofia_hex_encode(mac, 16, out_hex);	/* 128-bit truncation: enough for an online challenge token */
 }
 
-/* Build a FRESH stateless nonce: s1.<ts_hex>.<rand_hex>.<hmac_hex>. scope = peer name (or "*" for an
- * unknown-peer challenge). Does NOT touch peer state. out >= 96. */
-static void sofia_make_auth_nonce(const char *scope, const char *realm, const char *method,
-		char *out, size_t outlen)
+/* Build a FRESH stateless nonce: s1.<ts_hex>.<rand_hex>.<hmac_hex>, bound to realm + method only. Not to the
+ * account name: a nonce scoped to a name answered differently (401 stale vs 403) when replayed under a name that
+ * exists and one that does not, which revealed which accounts exist. The digest response already binds the
+ * account (HA1 = user:realm:password), the replay cache is keyed by the nonce itself and the secret changes on
+ * every load, so the name added nothing. The scope part of the HMAC input stays "*" (the old unknown-account
+ * value). Does NOT touch peer state. out >= 96. */
+static void sofia_make_auth_nonce(const char *realm, const char *method, char *out, size_t outlen)
 {
 	char ts_hex[24], rand_hex[33], hmac_hex[33], msg[640];
 	unsigned char rnd[16];
@@ -11594,17 +11597,16 @@ static void sofia_make_auth_nonce(const char *scope, const char *realm, const ch
 	 * and binding the nonce to that could false-stale legit NAT/proxy/TCP/WS traffic - the exact bug
 	 * class this fix removes. Replay is covered by the per-nonce nc cache. Source-IP binding is a v2
 	 * "s2" option IF/when reliable packet-source metadata is plumbed in (IP only, never port). */
-	snprintf(msg, sizeof(msg), "s1:%s:%s:%s:%s:%s", ts_hex, rand_hex,
-		realm ? realm : "", method ? method : "", scope ? scope : "*");
+	snprintf(msg, sizeof(msg), "s1:%s:%s:%s:%s:*", ts_hex, rand_hex,
+		realm ? realm : "", method ? method : "");
 	sofia_nonce_hmac(msg, hmac_hex);
 	snprintf(out, outlen, "s1.%s.%s.%s", ts_hex, rand_hex, hmac_hex);
 }
 
-/* Validate a returned nonce statelessly. Recomputes the HMAC for `scope`, then "*" (so an unknown-peer
- * challenge that became a known peer on the authenticated retry still validates). Returns:
+/* Validate a returned nonce statelessly (same realm + method binding as sofia_make_auth_nonce, so any account
+ * name gets the same verdict for the same nonce). Returns:
  *   0 = valid HMAC + within TTL (issue_ts out), 1 = valid HMAC but expired/future (stale), -1 = invalid. */
-static int sofia_validate_auth_nonce(const char *nonce, const char *scope, const char *realm,
-		const char *method, time_t *issue_ts)
+static int sofia_validate_auth_nonce(const char *nonce, const char *realm, const char *method, time_t *issue_ts)
 {
 	char ts_hex[24], rand_hex[40], hmac_hex[40], msg[640], want_hex[33];
 	char nonce_extra;	/* end-anchor sentinel: sscanf assigns it (==4 fields) iff trailing junk */
@@ -11625,16 +11627,11 @@ static int sofia_validate_auth_nonce(const char *nonce, const char *scope, const
 	if (strlen(hmac_hex) != 32) {
 		return -1;	/* our HMAC is exactly 128-bit (32 hex) */
 	}
-	snprintf(msg, sizeof(msg), "s1:%s:%s:%s:%s:%s", ts_hex, rand_hex,
-		realm ? realm : "", method ? method : "", scope ? scope : "*");
+	snprintf(msg, sizeof(msg), "s1:%s:%s:%s:%s:*", ts_hex, rand_hex,
+		realm ? realm : "", method ? method : "");
 	sofia_nonce_hmac(msg, want_hex);
 	if (sofia_ct_memcmp(want_hex, hmac_hex, 32) != 0) {
-		snprintf(msg, sizeof(msg), "s1:%s:%s:%s:%s:*", ts_hex, rand_hex,
-			realm ? realm : "", method ? method : "");
-		sofia_nonce_hmac(msg, want_hex);
-		if (sofia_ct_memcmp(want_hex, hmac_hex, 32) != 0) {
-			return -1;	/* bad HMAC: forged/foreign nonce */
-		}
+		return -1;	/* bad HMAC: forged/foreign nonce */
 	}
 	ts = strtoull(ts_hex, NULL, 16);
 	if (issue_ts) *issue_ts = (time_t)ts;
@@ -11807,7 +11804,7 @@ static enum sofia_auth_result sofia_verify_digest_auth_ex(struct sofia_peer *pee
 	/* No Authorization header: challenge with a FRESH stateless nonce (s1.ts.rand.hmac; no peer nonce state). */
 	if (!au) {
 		char nonce[96];
-		sofia_make_auth_nonce(peer->name, realm, method, nonce, sizeof(nonce));
+		sofia_make_auth_nonce(realm, method, nonce, sizeof(nonce));
 		sofia_emit_auth_challenge(nua, nh, realm, nonce, 0, NULL);
 
 		if (sofia_debug) {
@@ -11914,7 +11911,7 @@ static enum sofia_auth_result sofia_verify_digest_auth_ex(struct sofia_peer *pee
 	if (!auth_realm || strcmp(auth_realm, realm) != 0) {
 		char chal_nonce[96];
 		/* Fresh stateless nonce (no peer nonce state to clobber). */
-		sofia_make_auth_nonce(peer->name, realm, method, chal_nonce, sizeof(chal_nonce));
+		sofia_make_auth_nonce(realm, method, chal_nonce, sizeof(chal_nonce));
 		sofia_emit_auth_challenge(nua, nh, realm, chal_nonce, 1, NULL);
 		ast_verbose("Sofia: %s auth realm mismatch for '%s' - expected '%s' got '%s'\n",
 			method, peer->name, realm, auth_realm ? auth_realm : "(none)");
@@ -11971,10 +11968,10 @@ static enum sofia_auth_result sofia_verify_digest_auth_ex(struct sofia_peer *pee
 	/* Stateless nonce validation (replaces the per-peer nonce_dead/nonce_matches/nc_replay model):
 	 * pure HMAC + TTL, no peer lock. Invalid (forged/foreign) or expired -> re-challenge fresh (stale). */
 	{
-		int nv = sofia_validate_auth_nonce(auth_nonce, peer->name, realm, method, &nonce_issue_ts);
+		int nv = sofia_validate_auth_nonce(auth_nonce, realm, method, &nonce_issue_ts);
 		if (nv != 0) {
 			char fresh[96];
-			sofia_make_auth_nonce(peer->name, realm, method, fresh, sizeof(fresh));
+			sofia_make_auth_nonce(realm, method, fresh, sizeof(fresh));
 			sofia_emit_auth_challenge(nua, nh, realm, fresh, 1, NULL);
 			if (sofia_debug) {
 				ast_verbose("Sofia: %s auth for '%s' - %s nonce; re-challenged\n",
@@ -12036,7 +12033,7 @@ static enum sofia_auth_result sofia_verify_digest_auth_ex(struct sofia_peer *pee
 			 * before the urandom read inside sofia_make_auth_nonce). */
 			ast_copy_string(pname, peer->name, sizeof(pname));
 			ast_mutex_unlock(&peer->lock);
-			sofia_make_auth_nonce(pname, realm, method, fresh_nonce, sizeof(fresh_nonce));
+			sofia_make_auth_nonce(realm, method, fresh_nonce, sizeof(fresh_nonce));
 			sofia_build_md5_challenge(hdr_md5, sizeof(hdr_md5), realm, fresh_nonce, /*stale=*/1);
 			nua_respond(nh, SIP_401_UNAUTHORIZED,
 				SIPTAG_WWW_AUTHENTICATE_STR(hdr_md5),
@@ -12093,7 +12090,7 @@ static enum sofia_auth_result sofia_verify_digest_auth_ex(struct sofia_peer *pee
 	if (using_qop && !register_method) {
 		if (sofia_nonce_replay_check(auth_nonce, new_nc, nonce_issue_ts)) {
 			char fresh_nonce[96];
-			sofia_make_auth_nonce(peer->name, realm, method, fresh_nonce, sizeof(fresh_nonce));
+			sofia_make_auth_nonce(realm, method, fresh_nonce, sizeof(fresh_nonce));
 			sofia_emit_auth_challenge(nua, nh, realm, fresh_nonce, 1, NULL);
 			if (sofia_debug) {
 				ast_verbose("Sofia: %s auth for '%s' - valid but nc replay on this nonce; re-challenged\n",
@@ -12637,9 +12634,9 @@ static void sofia_send_auth_challenge(nua_t *nua, nua_handle_t *nh, sip_t const 
 	char fresh_nonce[96];
 	struct ast_sockaddr src;
 
-	/* SAME stateless nonce format as the verifier, scope "*" (unknown peer): the nonce SHAPE no longer
-	 * leaks known-vs-unknown, and the verifier's wildcard fallback validates it on the authenticated retry. */
-	sofia_make_auth_nonce("*", realm, method, fresh_nonce, sizeof(fresh_nonce));
+	/* SAME stateless nonce as the verifier (bound to realm + method, never to an account): the nonce shape
+	 * and its validation are identical for every name, known or not. */
+	sofia_make_auth_nonce(realm, method, fresh_nonce, sizeof(fresh_nonce));
 
 	/* Header-injection defense-in-depth: validate the realm + fresh_nonce
 	 * charset before emission (realm is operator-config, nonce is hex-only by
