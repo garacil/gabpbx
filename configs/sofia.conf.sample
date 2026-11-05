@@ -3089,7 +3089,9 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;srtpcipher=AEAD_AES_256_GCM,AES_CM_128_HMAC_SHA1_80    ; srtpcipher: per-peer comma-separated outbound a=crypto cipher preference (RFC 4568 §6.1 multi-line); empty = inherit [general] default_srtpcipher; if both empty, sdp_crypto.c defaults to AES_CM_128_HMAC_SHA1_80
 ;session-timers=originate                  ; session timers RFC 4028: originate / accept / refuse; per-peer override of [general] default; "originate" recommended for trunks behind stateful firewall/NAT
 ;session-expires=1800                      ; per-peer Session-Expires seconds; chan_sip parity; minimum 90 per RFC 4028 §3
-;session-minse=90                          ; per-peer Min-SE seconds; chan_sip parity; floor 90 per RFC 4028 §3
+;session-minse=90                          ; per-peer Min-SE seconds (floor 90, RFC 4028 §3): a first INVITE with Supported: timer
+;                                          ; that asks less gets 422 with this Min-SE (chan_sip parity); a request without it is
+;                                          ; accepted at the interval it asked, never raised (RFC 4028 §9)
 ;session-refresher=uac                     ; per-peer refresher preference auto/uac/uas; "uac" recommended for inside-NAT side so refresh re-INVITE originates from the side that needs to keep firewall state alive
 ;mailbox=1234                ; MWI: subscribe-trigger source; "1234" defaults to "1234@default" context
 ;mailbox=1234@phones         ; explicit context form

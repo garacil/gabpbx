@@ -742,6 +742,7 @@ struct sofia_pvt {
 	int st_remote_expires;          /* the peer's Session-Expires delta, 0 = none */
 	int st_remote_refresher;        /* 0 any / 1 us / 2 the peer, from its refresher parameter (or Require: timer) */
 	int st_remote_min_se;           /* the peer's Min-SE, 0 = none */
+	int st_min_se_given;           /* the Min-SE last handed to the stack on this leg's handle (NUTAG_MIN_SE, kept by the handle), 0 = none: the stack's own ([general] session-minse) */
 	int st_remote_update;           /* the peer's Allow lists UPDATE (set once an Allow was seen) */
 	int session_we_refresh;         /* the stack made us the refresher */
 	int session_interval;           /* the negotiated session interval (s), 0 = no timer */

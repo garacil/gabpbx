@@ -2077,6 +2077,7 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	master->last_sdp_body = child->last_sdp_body;
 	child->last_sdp_body = NULL;
 	master->last_sdp_version = child->last_sdp_version;
+	master->st_min_se_given = child->st_min_se_given;	/* the Min-SE the stolen handle holds */
 	if (sip) {
 		sofia_session_timer_store(master, sip);
 		sofia_session_timer_plan(master, 0);
@@ -6039,10 +6040,34 @@ static void sofia_session_timer_store(struct sofia_pvt *pvt, sip_t const *sip)
 	}
 }
 
+/* RFC 4028 §9: the UAS "MUST NOT increase the value of the Session-Expires header field" of the request it accepts.
+ * sofia-sip's session_timer_negotiate raises the interval to the handle's Min-SE, so on a 2xx to the peer's request that
+ * asked for less than that (req_se, 0 = no Session-Expires) the Min-SE given to the stack is lowered to req_se. Such a
+ * request said no Supported: timer: with it, the first INVITE was refused with 422 (sofia_process_invite) and a later
+ * one by the stack against the handle's Min-SE; without it a request cannot be refused. st_min_se is the configured
+ * value for this answer (0 = none). The handle keeps what it is given: pvt->st_min_se_given records it for
+ * sofia_session_timer_plan. A lowered value also becomes the handle's 422 threshold for later in-dialog requests
+ * (chan_sip would 422 them with the peer's session-minse; RFC 4028 makes that 422 a MAY). Returns the Min-SE to give
+ * the stack (0 = leave the handle's). pvt->lock held, or the pvt not shared yet. */
+static int sofia_session_timer_uas_min_se(struct sofia_pvt *pvt, int st_min_se, int req_se)
+{
+	int current = st_min_se > 0 ? st_min_se
+		: (pvt->st_min_se_given > 0 ? pvt->st_min_se_given : sofia_cfg.default_session_minse);
+
+	if (req_se >= 90 && current > req_se) {
+		st_min_se = req_se;
+	}
+	if (st_min_se > 0) {
+		pvt->st_min_se_given = st_min_se;
+	}
+	return st_min_se;
+}
+
 /* The stack's session_timer_negotiate for this leg: our preferences are the NUTAG values the last nua_invite /
  * nua_respond of this leg carried (sofia_session_timer_values for the leg's direction), else the stack's defaults
- * (session timer 1800 s as a cap, Min-SE 120 s); "timer" is always in our Supported. uas: 1 when the transaction
- * was the peer's request that we answered 2xx, 0 when it was our INVITE answered 2xx. pvt->lock held. */
+ * (session timer 1800 s as a cap); the Min-SE is the one the handle holds (pvt->st_min_se_given, else [general]
+ * session-minse, the stack's own since 176); "timer" is always in our Supported. uas: 1 when the transaction was the
+ * peer's request that we answered 2xx, 0 when it was our INVITE answered 2xx. pvt->lock held. */
 static void sofia_session_timer_plan(struct sofia_pvt *pvt, int uas)
 {
 	int st_seconds, st_min_se, st_refresher;
@@ -6055,7 +6080,7 @@ static void sofia_session_timer_plan(struct sofia_pvt *pvt, int uas)
 	} else {
 		local_defaults = 1800;
 	}
-	local_min_se = st_min_se > 0 ? st_min_se : 120;
+	local_min_se = pvt->st_min_se_given > 0 ? pvt->st_min_se_given : sofia_cfg.default_session_minse;
 
 	if (!pvt->st_remote_supported) {
 		refresher = nua_local_refresher;
@@ -6552,6 +6577,11 @@ int sofia_post_invite(struct sofia_pvt *pvt, struct ast_channel *ast, const char
 		/* Outbound session timers (RFC 4028). */
 		int st_seconds, st_min_se, st_refresher;
 		sofia_session_timer_values(pvt->peer, 1 /* outbound */, &st_seconds, &st_min_se, &st_refresher);
+		if (st_min_se > 0) {
+			ast_mutex_lock(&pvt->lock);
+			pvt->st_min_se_given = st_min_se;	/* what the INVITE's handle will hold */
+			ast_mutex_unlock(&pvt->lock);
+		}
 		/* RFC 3261 §20.22 Max-Forwards. */
 		char mf_str_call[8];
 		snprintf(mf_str_call, sizeof(mf_str_call), "%d", pvt->peer ? pvt->peer->maxforwards : sofia_cfg.default_max_forwards);
@@ -6804,6 +6834,9 @@ static int sofia_fork_dial_one(struct sofia_pvt *pvt, struct sofia_fork *fork,
 			/* Per-child session timers (RFC 4028). */
 			int st_seconds, st_min_se, st_refresher;
 			sofia_session_timer_values(pvt->peer, 1 /* outbound */, &st_seconds, &st_min_se, &st_refresher);
+			if (st_min_se > 0) {
+				child->st_min_se_given = st_min_se;	/* the branch's handle (sofia_fork_pick_winner copies it) */
+			}
 			/* RFC 3261 §20.22 Max-Forwards. */
 			char mf_str_child[8];
 			snprintf(mf_str_child, sizeof(mf_str_child), "%d", child->peer ? child->peer->maxforwards : sofia_cfg.default_max_forwards);
@@ -7548,9 +7581,12 @@ static int sofia_answer(struct ast_channel *ast)
 	sofia_append_history_code(pvt, 200, "Tx 200", "answer to INVITE (200 OK)");
 
 	{
-		/* Inbound 200-OK accept-path session timers (RFC 4028). */
+		/* Inbound 200-OK accept-path session timers (RFC 4028), never above the interval asked for (§9). */
 		int st_seconds, st_min_se, st_refresher;
 		sofia_session_timer_values(pvt->peer, 0 /* inbound */, &st_seconds, &st_min_se, &st_refresher);
+		ast_mutex_lock(&pvt->lock);
+		st_min_se = sofia_session_timer_uas_min_se(pvt, st_min_se, pvt->st_remote_expires);	/* the INVITE's */
+		ast_mutex_unlock(&pvt->lock);
 		/* Stamp Contact from the per-leg kernel-routed source (pvt->ourip): on a
 		 * multihomed wildcard bind, sofia's auto-Contact would pick one interface for
 		 * every dialog → a leg on another interface gets an unroutable Contact and the
@@ -9024,11 +9060,20 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	}
 
 	if (sdp_ok) {
+		/* Never above the interval this re-INVITE asks for (RFC 4028 §9): the handle keeps the Min-SE of the
+		 * earlier answers, which may exceed it. 0 = leave the handle's. */
+		int min_se_cap;
+
+		ast_mutex_lock(&pvt->lock);
+		min_se_cap = sofia_session_timer_uas_min_se(pvt, 0,
+			sip->sip_session_expires ? (int) sip->sip_session_expires->x_delta : 0);
+		ast_mutex_unlock(&pvt->lock);
 		/* A re-INVITE 200 OK is a target-refresh response (RFC 3261 §12.2.1.2);
 		 * stamp Contact from pvt->ourip (see sofia_answer) so a multihomed bind
 		 * doesn't move the target onto the wrong interface. */
 		nua_respond(nh, SIP_200_OK,
 			NUTAG_WITH_THIS(nua),
+			TAG_IF(min_se_cap > 0, NUTAG_MIN_SE(min_se_cap)),
 			TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
 			SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 			SIPTAG_PAYLOAD_STR(sdp_buf),
@@ -9232,7 +9277,15 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 	/* Reflect the peer's session-timer policy on the 2xx (RFC 4028 — UPDATE is a valid refresh method),
 	 * mirroring sofia_answer; otherwise sofia-sip would stamp its default 1800/120 handle prefs. */
 	int st_seconds, st_min_se, st_refresher;
-	sofia_session_timer_values(pvt->peer, 0 /* inbound */, &st_seconds, &st_min_se, &st_refresher);
+	sofia_session_timer_values(pvt->peer, pvt->outgoing, &st_seconds, &st_min_se, &st_refresher);	/* the leg's own */
+	/* Never above the interval this UPDATE asks for (§9); one without Session-Expires keeps the previous one.
+	 * Only for the 2xx: the 500 below hands the stack no Min-SE. */
+	if (!has_offer || sdp_ok) {
+		ast_mutex_lock(&pvt->lock);
+		st_min_se = sofia_session_timer_uas_min_se(pvt, st_min_se,
+			(sip && sip->sip_session_expires) ? (int) sip->sip_session_expires->x_delta : pvt->st_remote_expires);
+		ast_mutex_unlock(&pvt->lock);
+	}
 
 	if (has_offer) {
 		if (sdp_ok) {
@@ -9277,16 +9330,18 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 		}
 	}
 
-	/* A 2xx we send to an UPDATE that carries Session-Expires re-negotiates the session timer in the
-	 * stack (an UPDATE without it changes nothing there), and the stack leaves its timer alone while an
-	 * INVITE of ours is in flight. The peer's Allow is noted either way. */
+	/* A 2xx we send to an UPDATE re-runs the stack's session-timer negotiation (nua_update_server_respond:
+	 * session_timer_set), with the UPDATE's Session-Expires when it carries one (nua_update_server_init stores
+	 * only then), unless an INVITE of ours is in flight. The peer's Allow is noted either way. */
 	if (sip && (!has_offer || sdp_ok)) {
 		ast_mutex_lock(&pvt->lock);
 		if (sip->sip_allow) {
 			pvt->st_remote_update = sip_is_allowed(sip->sip_allow, sip_method_update, NULL) ? 1 : 0;
 		}
-		if (sip->sip_session_expires && !pvt->reinvite_pending) {
-			sofia_session_timer_store(pvt, sip);
+		if (!pvt->reinvite_pending) {
+			if (sip->sip_session_expires) {
+				sofia_session_timer_store(pvt, sip);
+			}
 			sofia_session_timer_plan(pvt, 1);
 			sofia_session_refresh_arm(pvt);
 		}
@@ -9740,6 +9795,27 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		if (contact) {
 			sofia_pvt_set_active_contact(pvt, contact);
 			ao2_ref(contact, -1);
+		}
+	}
+
+	/* RFC 4028 §9 (chan_sip parity, handle_request_invite: 422 with the dialog's Min-SE): the stack checks a first
+	 * INVITE against [general] session-minse only (nua_set_params at load); a peer configured with a larger one is
+	 * checked here, with its value. Only for a request that says Supported: timer, as the stack and §9 do; one
+	 * without it is accepted without raising its interval (sofia_session_timer_uas_min_se). */
+	if (pvt->peer && sip->sip_session_expires && sip_has_feature(sip->sip_supported, "timer")) {
+		int st_seconds, st_min_se, st_refresher;
+
+		sofia_session_timer_values(pvt->peer, 0 /* inbound */, &st_seconds, &st_min_se, &st_refresher);
+		if (st_min_se > 0 && sip->sip_session_expires->x_delta < (unsigned long) st_min_se) {
+			char mse[16];
+
+			snprintf(mse, sizeof(mse), "%d", st_min_se < 90 ? 90 : st_min_se);
+			ast_log(LOG_NOTICE, "Sofia: INVITE from peer '%s' asks Session-Expires %lu, below its session-minse %s - 422\n",
+				pvt->peer->name, (unsigned long) sip->sip_session_expires->x_delta, mse);
+			nua_respond(nh, SIP_422_SESSION_TIMER_TOO_SMALL, SIPTAG_MIN_SE_STR(mse),
+				NUTAG_WITH_THIS(nua), TAG_END());
+			ao2_ref(pvt, -1);
+			return;
 		}
 	}
 
@@ -19338,6 +19414,17 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		 * re-INVITE with the current SDP. */
 		if (sofia_debug)
 			ast_verbose("Sofia: UPDATE response %d %s\n", status, phrase);
+		if (pvt && status >= 200 && status < 300 && sip) {
+			/* The stack stores this 2xx's session timer and re-arms (nua_update_client_response) unless an
+			 * INVITE is in flight: mirror it. */
+			ast_mutex_lock(&pvt->lock);
+			if (!pvt->reinvite_pending) {
+				sofia_session_timer_store(pvt, sip);
+				sofia_session_timer_plan(pvt, 0);
+				sofia_session_refresh_arm(pvt);
+			}
+			ast_mutex_unlock(&pvt->lock);
+		}
 		if (pvt && status >= 200 && status < 300 && sip && sip->sip_session_expires) {
 			char own_name[80] = "";
 			char own_uniqueid[150] = "";
