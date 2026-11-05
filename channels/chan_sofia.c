@@ -2687,6 +2687,35 @@ static void sofia_stack_ended_session(struct sofia_pvt *pvt, int status, const c
 	ast_channel_unref(owner);
 }
 
+/* The stack itself answered our inbound INVITE with a final response before the call was answered: a reliable
+ * provisional (RFC 3262, 100rel) was never PRACKed and, after 64*T1, nua_session.c process_timeout answers 504
+ * "PRACK Timeout" on its own. The INVITE is dead, but nothing told the channel, so the dialplan kept running (a
+ * Dial kept ringing a callee for a caller that was gone). Hang it up with cause 18 (no user response, chan_sip's
+ * cause for an unanswered critical packet), and record the final response so sofia_hangup does not try to send a
+ * second one. Not for an answered call (the 171 path) nor when another path already ended it. */
+static void sofia_stack_rejected_invite(struct sofia_pvt *pvt, int status, const char *why)
+{
+	struct ast_channel *owner;
+
+	ast_mutex_lock(&pvt->lock);
+	owner = (pvt->alreadygone || pvt->uas_final_sent || pvt->outgoing) ? NULL : pvt->owner;
+	if (!owner || owner->_state == AST_STATE_UP) {
+		ast_mutex_unlock(&pvt->lock);
+		return;
+	}
+	pvt->uas_final_sent = 1;	/* the stack sent the final response */
+	sofia_alreadygone(pvt);
+	ast_channel_ref(owner);
+	ast_mutex_unlock(&pvt->lock);
+	ast_log(LOG_NOTICE, "Sofia: the stack answered the INVITE on '%s' with %d (%s) — hanging up the channel\n",
+		pvt->callid ? pvt->callid : "(no-callid)", status, why);
+	ast_channel_lock(owner);
+	owner->hangupcause = AST_CAUSE_NO_USER_RESPONSE;
+	ast_channel_unlock(owner);
+	ast_queue_hangup_with_cause(owner, AST_CAUSE_NO_USER_RESPONSE);
+	ast_channel_unref(owner);
+}
+
 /* Safety-net timer for REFER transferer-leg BYE deferral. After we send the
  * terminal NOTIFY 200 OK for a transfer, sofia_hangup leaves the SIP dialog
  * alive so the transferer's UA can BYE per RFC 5589 §6.1. If no BYE arrives
@@ -19340,7 +19369,12 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			int callstate = -1;
 
 			tl_gets(tags, NUTAG_CALLSTATE_REF(callstate), TAG_END());
-			if (callstate == nua_callstate_terminating) {
+			if (callstate == nua_callstate_terminated && status == 504) {
+				/* The stack's own 504 to our inbound INVITE: a reliable provisional was never PRACKed
+				 * (process_timeout). Only 504: every other final to an inbound INVITE is ours and is
+				 * recorded by its sender (sofia_mark_uas_final_sent). */
+				sofia_stack_rejected_invite(pvt, status, phrase ? phrase : "Gateway Time-out");
+			} else if (callstate == nua_callstate_terminating) {
 				int st = status >= 300 ? status
 					: (phrase && !strcmp(phrase, "ACK Timeout")) ? 408
 					: (phrase && !strcmp(phrase, "PRACK Timeout")) ? 504 : 0;
