@@ -754,6 +754,8 @@ struct sofia_pvt {
 	 * timeout). sip_callid = the PRE-GENERATED SIP Call-ID of the deferred INVITE — the
 	 * uuid the push announces to the phone; distinct from pvt->callid (debug pointer hex). */
 	int push_parked;
+	int route_defaddr;		/* pre-channel: a host=dynamic peer whose kept bindings all expired and that is
+					 * unregistered routes to its defaultip= (chan_sip create_addr_from_peer -> defaddr) */
 	int push_appending;		/* multi-ring fork resume posted; the parked-registry entry stays live for LATE APPENDS until answer/hangup - the hangup hook must run even though push_parked already dropped to 0 */
 	int push_inflight;		/* P2: the no-provisional guard parked this pvt with its INVITE on the wire; the hangup hook reaps that entry too */
 	char sip_callid[64];

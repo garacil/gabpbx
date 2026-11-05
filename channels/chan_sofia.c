@@ -7111,7 +7111,7 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		 * peer->src_addr aggregate (RFC 3261 soft state: expired = unavailable). Fail with the cause the request
 		 * gives the same peer (AST_CAUSE_UNREGISTERED; app_dial copies a non-zero cause after a failed ast_call).
 		 * Dynamic-only — a static peer always keeps its configured target; total==0 was settled by request_call. */
-		if (live == 0 && total > 0 && !pvt->active_contact && peer_is_dynamic) {
+		if (live == 0 && total > 0 && !pvt->active_contact && peer_is_dynamic && !pvt->route_defaddr) {
 			ast_log(LOG_NOTICE, "Sofia: peer '%s' registration expired at call time - %d contact(s), 0 unexpired - no route\n",
 				S_OR(pvt->peername, "unknown"), total);
 			ast->hangupcause = AST_CAUSE_UNREGISTERED;
@@ -8647,6 +8647,15 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 						 * wake REGISTER binds the new contact). */
 						pvt->push_parked = 1;	/* pre-channel: pvt not shared yet, no lock needed */
 						ast_log(LOG_NOTICE, "Sofia PUSH: peer '%s' unroutable (%d contact(s), 0 unexpired) - will park for push\n",
+							peername, n_total);
+					} else if (dyn_defaddr) {
+						/* The kept bindings (ignoreregexpire) all expired and the expiry sweep has unregistered
+						 * the account, but defaultip= is set: the aggregate url already targets it
+						 * (sofia_resolve_peer_target), as chan_sip routes an expired registration to defaddr
+						 * (expire_register clears the address, create_addr_from_peer uses defaddr). An expired
+						 * binding itself is still never routed. */
+						pvt->route_defaddr = 1;	/* pre-channel: pvt not shared yet, no lock needed */
+						ast_verb(3, "Sofia: peer '%s' registration expired (%d contact(s), 0 unexpired) - routing to its defaultip\n",
 							peername, n_total);
 					} else {
 					/* Registration EXPIRED — no re-REGISTER before the granted Contact expiry (RFC 3261 §10.3
