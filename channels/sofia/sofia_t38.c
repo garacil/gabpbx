@@ -72,6 +72,7 @@ void sofia_change_t38_state(struct sofia_pvt *pvt, int new_state)
 		parameters.request_response = AST_T38_NEGOTIATED;
 		break;
 	case SOFIA_T38_DISABLED:
+		sofia_rtcp_t38_end(pvt, chan);	/* a fax without audio refused or ended: the audio RTCP comes back */
 		if (old == SOFIA_T38_ENABLED) {
 			parameters.request_response = AST_T38_TERMINATED;
 		} else if (old == SOFIA_T38_LOCAL_REINVITE) {

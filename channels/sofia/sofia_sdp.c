@@ -2087,6 +2087,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	int t38_stage_withdraw = 0;		/* sofia_change_t38_state(DISABLED) + cancel t38id at commit */
 	int t38_stage_local_accept = 0;		/* outbound (LOCAL_REINVITE) answer accepted T.38 → ENABLED at commit (FIX 1b) */
 	int t38_stage_local_refuse = 0;		/* outbound (LOCAL_REINVITE) answer declined T.38 (no m=image) → DISABLED at commit */
+	int t38_no_audio = 0;			/* T.38 without audio this parse: the leg's RTCP pauses (sofia_rtcp_pause) */
 	/* The fax-redirect inputs are evaluated at COMMIT under the channel lock; only
 	 * the advance intent is staged here. */
 
@@ -2290,7 +2291,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 				 * own setup. Only with a scheduler, which runs the reports; the channel polls the RTCP socket
 				 * from the commit below. A second enable (a re-INVITE, the crypto commit) is a no-op. */
 				if (!pvt->is_webrtc && (media->m_proto == sdp_proto_rtp || media->m_proto == sdp_proto_srtp)
-				    && sofia_sched) {
+				    && sofia_sched && !pvt->rtcp_direct_off) {	/* not while the media go direct (sofia_rtcp_direct) */
 					ast_rtp_instance_set_prop(pvt->rtp, AST_RTP_PROPERTY_RTCP, 1);
 				}
 				if (!pvt->is_webrtc) {
@@ -3716,7 +3717,14 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	 * sees the UDPTL fd) → arm/cancel t38id → snapshot fax-redirect inputs; THEN drop
 	 * the lock and run ast_exists_extension / FAXEXTEN / ast_async_goto (they take
 	 * their own locks). Advance and withdraw are mutually exclusive. */
-	if (staged_chosen_audio_valid || t38_stage_fds5 || t38_stage_enter_reinvite || t38_stage_withdraw || t38_stage_local_accept || t38_stage_local_refuse || vrtp_stage_fds23 || audio_webrtc_offered) {	/* + audio_webrtc_offered so the WebRTC nativeformats/fds sync below is never skipped by an unusual parse with no chosen-audio side effect */
+	/* T.38 without audio (chan_sip process_sdp): a live image stream, no audio chosen by this SDP, and a fax under way or
+	 * being set up by it (a broken image line or a failed UDPTL leaves T.38 DISABLED: no pause). */
+	t38_no_audio = image_active_seen && !staged_chosen_audio_valid && !pvt->is_webrtc && pvt->rtp
+		&& (pvt->t38_state != SOFIA_T38_DISABLED || t38_stage_enter_reinvite || t38_stage_local_accept);
+	/* + audio_webrtc_offered so the WebRTC nativeformats/fds sync below is never skipped by an unusual parse with no
+	 * chosen-audio side effect; + a T.38-without-audio SDP whose RTCP pause is due even with no other side effect. */
+	if (staged_chosen_audio_valid || t38_stage_fds5 || t38_stage_enter_reinvite || t38_stage_withdraw || t38_stage_local_accept || t38_stage_local_refuse || vrtp_stage_fds23 || audio_webrtc_offered
+	    || (t38_no_audio && !pvt->rtcp_t38_off)) {
 		struct ast_channel *o = pvt->owner;
 		if (o) {
 			char fax_context[AST_MAX_CONTEXT] = "";
@@ -3734,6 +3742,22 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 				}
 				if (t38_stage_fds5 && pvt->udptl) {
 					o->fds[5] = ast_udptl_fd(pvt->udptl);
+				}
+				if (t38_no_audio && !pvt->rtcp_t38_off) {
+					/* The audio stream is gone while the fax runs: its RTCP pauses (already off when the media go
+					 * direct). The next SDP with audio brings it back (below), and a refused or ended fax too
+					 * (sofia_change_t38_state -> sofia_rtcp_t38_end). */
+					pvt->rtcp_t38_off = 1;
+					sofia_rtcp_pause(pvt, o, 1);
+				} else if (staged_chosen_audio_valid && pvt->rtcp_t38_off) {
+					pvt->rtcp_t38_off = 0;	/* the audio is back */
+					if (!pvt->rtcp_direct_off) {
+						if (ast_rtp_instance_fd(pvt->rtp, 1) >= 0) {
+							pvt->rtcp_paused = 0;	/* the audio commit reopened it; fds[1] follows below */
+						} else {
+							sofia_rtcp_pause(pvt, o, 0);
+						}
+					}
 				}
 				if (staged_chosen_audio_valid && !pvt->is_webrtc && pvt->rtp
 				    && o->fds[1] != ast_rtp_instance_fd(pvt->rtp, 1)) {

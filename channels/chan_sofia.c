@@ -5907,6 +5907,7 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 		/* Untagged caller (e.g. the directmedia relay-revert) → default to directmedia semantics. */
 		pvt->reinvite_purpose = SOFIA_REINVITE_DIRECTMEDIA;
 	}
+	ast_sockaddr_copy(&pvt->offered_redirip, &pvt->redirip);	/* the target this SDP carries: its 2xx moves the RTCP */
 	nua_invite(pvt->nh,
 		SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 		SIPTAG_PAYLOAD_STR(sdp_buf),
@@ -6202,6 +6203,66 @@ static void sofia_session_refresh_root(void *data)
 	}
 	ast_mutex_unlock(&pvt->lock);
 	ao2_ref(pvt, -1);
+}
+
+/* Pause or resume this leg's audio RTCP (chan_sip sip_set_rtp_peer / process_sdp). The property closes the socket, so
+ * the channel stops polling it first (fds[1]) and polls the new one after; a reopened RTCP has no destination until the
+ * remote address is set again (res_rtp: rtcp->them), so it is set again with the current one. Only an RTCP this code
+ * closed is reopened: a leg the SDP never gave one (no scheduler, another profile) keeps none. Caller holds the channel
+ * lock (and pvt->lock where it has it). */
+void sofia_rtcp_pause(struct sofia_pvt *pvt, struct ast_channel *chan, int pause)
+{
+	if (!pvt->rtp || pvt->is_webrtc) {
+		return;
+	}
+	if (pause) {
+		if (pvt->rtcp_paused || ast_rtp_instance_fd(pvt->rtp, 1) < 0) {
+			return;
+		}
+		ast_channel_set_fd(chan, 1, -1);
+		ast_rtp_instance_set_prop(pvt->rtp, AST_RTP_PROPERTY_RTCP, 0);
+		pvt->rtcp_paused = 1;
+	} else if (pvt->rtcp_paused) {
+		struct ast_sockaddr them;
+
+		ast_rtp_instance_set_prop(pvt->rtp, AST_RTP_PROPERTY_RTCP, 1);
+		ast_rtp_instance_get_remote_address(pvt->rtp, &them);
+		if (!ast_sockaddr_isnull(&them)) {
+			ast_rtp_instance_set_remote_address(pvt->rtp, &them);
+		}
+		ast_channel_set_fd(chan, 1, ast_rtp_instance_fd(pvt->rtp, 1));
+		pvt->rtcp_paused = 0;
+	}
+}
+
+/* This leg's RTCP is off while its media go directly between the endpoints and back on when they return to the PBX
+ * (chan_sip sip_set_rtp_peer): the leg carries nothing meanwhile, so its reports would only repeat frozen counters.
+ * Applied when the media actually move: the 2xx to our directmedia re-INVITE, with the target it offered. A fax without
+ * audio keeps it off (its end restores it, sofia_rtcp_t38_end). Caller holds the channel lock, then pvt->lock. */
+static void sofia_rtcp_direct(struct sofia_pvt *pvt, struct ast_channel *chan, int direct)
+{
+	if (!pvt->rtp || pvt->is_webrtc || pvt->rtcp_direct_off == direct) {
+		return;
+	}
+	pvt->rtcp_direct_off = direct;
+	if (direct) {
+		sofia_rtcp_pause(pvt, chan, 1);
+	} else if (!pvt->rtcp_t38_off) {
+		sofia_rtcp_pause(pvt, chan, 0);
+	}
+}
+
+/* T.38 ended or was refused (DISABLED): the audio RTCP paused for a fax without audio comes back, unless the media go
+ * direct. Called by sofia_change_t38_state with the channel lock held. */
+void sofia_rtcp_t38_end(struct sofia_pvt *pvt, struct ast_channel *chan)
+{
+	if (!pvt->rtcp_t38_off) {
+		return;
+	}
+	pvt->rtcp_t38_off = 0;
+	if (!pvt->rtcp_direct_off) {
+		sofia_rtcp_pause(pvt, chan, 0);
+	}
 }
 
 static int sofia_set_rtp_peer(struct ast_channel *chan, struct ast_rtp_instance *instance,
@@ -19375,6 +19436,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			if (rejected) {
 				/* Peer refused; revert to PBX relay. */
 				memset(&pvt->redirip, 0, sizeof(pvt->redirip));
+				if (owner && reinvite_purpose == SOFIA_REINVITE_DIRECTMEDIA) {
+					sofia_rtcp_direct(pvt, owner, 0);	/* the directmedia offer refused: the media stay with the PBX, their RTCP too */
+				}
 				/* FIX 1: a REFUSED/timed-out outbound T.38 (LOCAL_REINVITE) re-INVITE
 				 * must not leave T.38 stuck — transition to DISABLED so res_fax gets
 				 * AST_T38_REFUSED and falls back (chan_sip parity). Channel lock held
@@ -19384,6 +19448,14 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				}
 			} else if (has_sdp) {
 				sdp_rc = sofia_parse_sdp(pvt, sip, 0 /* answer: directmedia/T38 re-INVITE 2xx */);
+			}
+			if (owner && !rejected && sdp_rc >= 0 && reinvite_purpose == SOFIA_REINVITE_DIRECTMEDIA) {
+				/* The media now go where this offer sent them (a 2xx without SDP too): the leg's RTCP follows. */
+				sofia_rtcp_direct(pvt, owner, !ast_sockaddr_isnull(&pvt->offered_redirip));
+			}
+			if (owner && !rejected && has_sdp && sdp_rc < 0
+			    && !pvt->alreadygone && pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh) {
+				sofia_rtcp_direct(pvt, owner, 0);	/* the revert below keeps the media, and the RTCP, with the PBX */
 			}
 			if (owner) {
 				/* Release the channel LOCK now (so the relay re-INVITE runs under

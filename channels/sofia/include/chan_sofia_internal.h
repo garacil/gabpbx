@@ -286,6 +286,8 @@ struct ast_sched_thread;
 extern struct ast_sched_thread *sofia_sched;
 int sofia_should_use_externaddr(const struct ast_sockaddr *peer_addr);
 void sofia_change_t38_state(struct sofia_pvt *pvt, int new_state);
+void sofia_rtcp_t38_end(struct sofia_pvt *pvt, struct ast_channel *chan);
+void sofia_rtcp_pause(struct sofia_pvt *pvt, struct ast_channel *chan, int pause);
 int sofia_t38_abort(const void *data);
 int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_control_t38_parameters *parameters);
 int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer);
@@ -659,6 +661,10 @@ struct sofia_pvt {
 	char dev_contact[256];
 	char dev_instance[128];
 	struct ast_sockaddr redirip;     /* directmedia: peer's RTP target; zero = relay through PBX */
+	struct ast_sockaddr offered_redirip;	/* the media target our last re-INVITE offered (redirip when sent); its 2xx moves the RTCP */
+	int rtcp_direct_off;             /* directmedia: this leg's RTCP is off while the media go direct (chan_sip sip_set_rtp_peer); under the channel lock */
+	int rtcp_t38_off;                /* T.38 without audio: this leg's RTCP is off while the fax runs (chan_sip process_sdp); under the channel lock */
+	int rtcp_paused;                 /* sofia_rtcp_pause closed this leg's RTCP and will reopen it (never one it did not close) */
 	int reinvite_pending;            /* an in-dialog re-INVITE we sent is in flight; gates the response handler + glare */
 	int reinvite_purpose;            /* why reinvite_pending is set (sofia_reinvite_purpose): NONE/DIRECTMEDIA/T38/LOCAL_HOLD — the 2xx/reject handler branches on this so a hold re-INVITE does NOT run the directmedia redirip/T.38 rollback */
 	int local_hold_mode_prev;        /* local_hold_mode before the in-flight hold re-INVITE — restored if the peer rejects it */
