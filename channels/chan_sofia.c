@@ -11011,6 +11011,70 @@ static void sofia_deregister_one_contact(struct sofia_peer *peer, sip_t const *s
 	}
 }
 
+/* Qualify the peer at the next tick and drop a probe still in flight (its late answer is about the old address),
+ * as chan_sip pokes a peer as soon as it registers. The status changes only with the answer to the new probe.
+ * Caller holds peer->lock. */
+static void sofia_qualify_soon(struct sofia_peer *peer)
+{
+	memset(&peer->last_qualify, 0, sizeof(peer->last_qualify));
+	if (peer->qualify_nh) {
+		nua_handle_t *qnh = peer->qualify_nh;
+		peer->qualify_nh = NULL;
+		nua_handle_bind(qnh, NULL);
+		sofia_nh_destroy_async(qnh);
+	}
+}
+
+/* A device left while others stay (its Contact;expires=0, a lapse, a closed flow): keep the peer's aggregate
+ * address (src_addr + reg_transport: the qualify target, the NAT next hop, the route without a binding) on a
+ * binding that is still there. Left on the departed device, the qualify probes an address nothing is registered
+ * from and the account shows unreachable until another device refreshes. Preference: an unexpired binding
+ * (ignoreregexpire keeps lapsed ones in the container, unroutable) at the current address, else the most
+ * recently registered unexpired one, else the same among lapsed ones (unless live_only); a move is qualified at
+ * the next tick. Returns 1 when the address now follows a binding, 0 when none qualified (nothing changed).
+ * Caller holds peer->lock (then each contact's lock); no-op without bindings, where the callers clear the
+ * address themselves. */
+static int sofia_peer_src_follow_contacts(struct sofia_peer *peer, int live_only)
+{
+	struct ao2_iterator i;
+	struct sofia_contact *c;
+	struct ast_sockaddr best_src;
+	char best_transport[sizeof(peer->reg_transport)] = "";
+	time_t now = time(NULL), best_reg = 0;
+	int best_rank = 0;	/* 4 unexpired at the current address, 3 unexpired, 2 lapsed at the current address, 1 lapsed */
+
+	ast_sockaddr_setnull(&best_src);
+	i = ao2_iterator_init(peer->contacts, 0);
+	while (best_rank < 4 && (c = ao2_iterator_next(&i))) {
+		ao2_lock(c);
+		if (!ast_sockaddr_isnull(&c->src_addr)) {
+			int current = !ast_sockaddr_cmp(&c->src_addr, &peer->src_addr);
+			int rank = sofia_contact_is_unexpired(c->expires, now) ? (current ? 4 : 3) : (current ? 2 : 1);
+
+			if (rank > best_rank || (rank == best_rank && !current && c->last_register > best_reg)) {
+				ast_sockaddr_copy(&best_src, &c->src_addr);
+				ast_copy_string(best_transport, S_OR(c->transport, "udp"), sizeof(best_transport));
+				best_reg = c->last_register;
+				best_rank = rank;
+			}
+		}
+		ao2_unlock(c);
+		ao2_ref(c, -1);
+	}
+	ao2_iterator_destroy(&i);
+	if (!best_rank || (live_only && best_rank < 3)) {
+		return 0;
+	}
+	if (ast_sockaddr_cmp(&peer->src_addr, &best_src)) {
+		ast_sockaddr_copy(&peer->src_addr, &best_src);
+		if (peer->qualify) {
+			sofia_qualify_soon(peer);	/* the address moved to another device: probe it, not the departed one */
+		}
+	}
+	ast_copy_string(peer->reg_transport, best_transport, sizeof(peer->reg_transport));
+	return 1;
+}
+
 /* Apply a REGISTER's Contact bindings to the peer. Caller holds peer->lock.
  * Returns 0 ok, -1 ACL-denied, -2 malformed wildcard, -3 OOM. Unregister
  * side-effects are deferred to the caller via *update (see emit_unregister). */
@@ -11331,24 +11395,23 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 	sofia_peer_expiry_hint_update(peer);	/* bindings changed: tell the expiry sweep when to look at this peer next */
 
 	/* Update legacy src_addr from the newest contact + the registered flag. */
-	if (ao2_container_count(peer->contacts) > 0) {
+	if (ao2_container_count(peer->contacts) > 0 && update
+			&& update->contacts_added + update->contacts_refreshed == 0) {
+		/* This REGISTER bound nothing (it only removed a device while others stay): its source is the device
+		 * that left, so the address follows a remaining binding instead (the qualify is reset only when the
+		 * address moves). A peer the expiry sweep unregistered because every binding lapsed (they stay, with
+		 * ignoreregexpire) stays unregistered unless an unexpired binding remains. */
+		if (sofia_peer_src_follow_contacts(peer, !peer->registered)) {
+			peer->registered = 1;
+		}
+	} else if (ao2_container_count(peer->contacts) > 0) {
 		peer->registered = 1;
 		peer->expire = expires;
-		/* A REGISTER from a peer its qualify left UNREACHABLE, or from a new source: qualify it at the next
-		 * tick, as chan_sip pokes a peer as soon as it registers, and drop a probe still in flight (its late
-		 * 408 is about the old address). The status changes only with the answer to that probe (no event
-		 * per REGISTER); meanwhile sofia_qualify_refuses does not refuse a binding registered after the
-		 * unanswered probe was sent. Only for a REGISTER that bound, refreshed or moved a binding: one that
-		 * only removed a device (Contact;expires=0 while another stays) proves nothing about the others. */
-		if (peer->qualify && (!update || update->contacts_added + update->contacts_refreshed + update->contacts_moved > 0)
-				&& (peer->peer_status == PEER_UNREACHABLE || ast_sockaddr_cmp(&peer->src_addr, &src))) {
-			memset(&peer->last_qualify, 0, sizeof(peer->last_qualify));
-			if (peer->qualify_nh) {
-				nua_handle_t *qnh = peer->qualify_nh;
-				peer->qualify_nh = NULL;
-				nua_handle_bind(qnh, NULL);
-				sofia_nh_destroy_async(qnh);
-			}
+		/* A REGISTER that bound or refreshed a binding, from a peer its qualify left UNREACHABLE or from a new
+		 * source: qualify it at the next tick (no event per REGISTER); meanwhile sofia_qualify_refuses does not
+		 * refuse a binding registered after the unanswered probe was sent. */
+		if (peer->qualify && (peer->peer_status == PEER_UNREACHABLE || ast_sockaddr_cmp(&peer->src_addr, &src))) {
+			sofia_qualify_soon(peer);
 		}
 		memcpy(&peer->src_addr, &src, sizeof(peer->src_addr));
 		/* Snapshot transport beside src_addr so NAT-proxy resolution routes a
@@ -11374,7 +11437,9 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 	if (update) {
 		update->now_registered = peer->registered;
 		update->contacts_after = ao2_container_count(peer->contacts);
-		ast_sockaddr_copy(&update->new_src, &peer->src_addr);
+		/* The device this REGISTER is about (events, push resume): its own source when it bound nothing. */
+		ast_sockaddr_copy(&update->new_src, (peer->registered && update->contacts_added + update->contacts_refreshed == 0)
+			? &src : &peer->src_addr);
 		update->new_expires = expires;	/* negotiated TTL (s); emitted in PeerStatus Registered so presence can TTL-expire */
 	}
 
@@ -13099,9 +13164,42 @@ static void sofia_rtupdate_emit(const char *table, const char *name, int registe
 	}
 }
 
+/* The row of a registration (ipaddr, port, regseconds, fullcontact), from one snapshot under peer->lock: the
+ * peer's address, the host of the REGISTER's Contact and now; or, for a REGISTER that bound nothing (a device
+ * left while others stay; follow), the host and the last REGISTER of the binding the address now follows, so the
+ * row describes one device. */
+static void sofia_rtupdate_row(struct sofia_peer *peer, sip_t const *sip, int follow, char *ip, size_t iplen,
+	char *port, size_t portlen, char *regsec, size_t regseclen, char *host, size_t hostlen)
+{
+	struct sofia_contact *c = NULL;
+	time_t when = time(NULL);
+
+	host[0] = '\0';
+	ast_mutex_lock(&peer->lock);
+	ast_copy_string(ip, ast_sockaddr_stringify_host(&peer->src_addr), iplen);
+	snprintf(port, portlen, "%d", ast_sockaddr_port(&peer->src_addr));
+	if (follow) {
+		c = sofia_peer_find_contact_by_addr(peer, &peer->src_addr);
+	}
+	ast_mutex_unlock(&peer->lock);
+	if (c) {
+		ao2_lock(c);
+		ast_copy_string(host, c->host, hostlen);
+		if (c->last_register) {
+			when = c->last_register;
+		}
+		ao2_unlock(c);
+		ao2_ref(c, -1);
+	} else if (sip->sip_contact && sip->sip_contact->m_url->url_host) {
+		/* A wildcard "Contact: *" has m_url->url_host == NULL (m_url itself is an embedded array, never NULL). */
+		ast_copy_string(host, sip->sip_contact->m_url->url_host, hostlen);
+	}
+	snprintf(regsec, regseclen, "%ld", (long) when);
+}
+
 /* Inline (legacy) path: resolve the args from peer/sip on sofia_thread and write now.
  * Identical behaviour to the original inline blocks; used when the pool is OFF or full. */
-static void sofia_rtupdate_inline(struct sofia_peer *peer, sip_t const *sip)
+static void sofia_rtupdate_inline(struct sofia_peer *peer, sip_t const *sip, int follow)
 {
 	const char *table = ast_check_realtime("sipregs") ? "sipregs" : "sippeers";
 	const char *sysname = ast_config_AST_SYSTEM_NAME;
@@ -13113,16 +13211,12 @@ static void sofia_rtupdate_inline(struct sofia_peer *peer, sip_t const *sip)
 		syslabel = "regserver";
 	}
 	if (peer->registered) {
-		char port_str[32], regsec_str[32];
-		/* A wildcard "Contact: *" has m_url->url_host == NULL — guard it (m_url itself
-		 * is an embedded array, never NULL), mirroring the PeerStatus emit. */
-		const char *contact_str = (sip->sip_contact && sip->sip_contact->m_url->url_host) ?
-			sip->sip_contact->m_url->url_host : "";
-		snprintf(port_str, sizeof(port_str), "%d", ast_sockaddr_port(&peer->src_addr));
-		snprintf(regsec_str, sizeof(regsec_str), "%ld", (long)time(NULL));
+		char ip_str[64], port_str[32], regsec_str[32], contact_str[256];
+
+		sofia_rtupdate_row(peer, sip, follow, ip_str, sizeof(ip_str), port_str, sizeof(port_str),
+			regsec_str, sizeof(regsec_str), contact_str, sizeof(contact_str));
 		sofia_rtupdate_emit(table, peer->name, 1,
-			ast_sockaddr_stringify_host(&peer->src_addr),
-			port_str, regsec_str, contact_str, syslabel, sysname);
+			ip_str, port_str, regsec_str, contact_str, syslabel, sysname);
 	} else {
 		sofia_rtupdate_emit(table, peer->name, 0, "", "", "", "", syslabel, sysname);
 	}
@@ -13152,14 +13246,14 @@ static int sofia_rtupdate_task_exe(void *data)
  * slow DB and drains (threads stay bounded at N).  If the write genuinely cannot be queued
  * (OOM, or the taskprocessor is gone) we log and DROP this update rather than reorder; the
  * next REGISTER refresh re-writes the row. */
-static void sofia_rtupdate_submit(struct sofia_peer *peer, sip_t const *sip)
+static void sofia_rtupdate_submit(struct sofia_peer *peer, sip_t const *sip, int follow)
 {
 	int lane;
 	const char *sysname;
 	struct sofia_rtupdate_ctx *c;
 
 	if (!sofia_regpool_enabled) {
-		sofia_rtupdate_inline(peer, sip);
+		sofia_rtupdate_inline(peer, sip, follow);
 		return;
 	}
 	/* unsigned modulo: ast_str_case_hash() can return a negative int (abs(INT_MIN)); with a
@@ -13182,14 +13276,8 @@ static void sofia_rtupdate_submit(struct sofia_peer *peer, sip_t const *sip)
 		ast_copy_string(c->sysname, sysname, sizeof(c->sysname));
 	}
 	if (c->registered) {
-		/* A wildcard "Contact: *" has m_url->url_host == NULL — guard it (m_url itself
-		 * is an embedded array, never NULL), mirroring the PeerStatus emit. */
-		const char *contact_str = (sip->sip_contact && sip->sip_contact->m_url->url_host) ?
-			sip->sip_contact->m_url->url_host : "";
-		ast_copy_string(c->ipaddr, ast_sockaddr_stringify_host(&peer->src_addr), sizeof(c->ipaddr));
-		snprintf(c->port, sizeof(c->port), "%d", ast_sockaddr_port(&peer->src_addr));
-		snprintf(c->regseconds, sizeof(c->regseconds), "%ld", (long)time(NULL));
-		ast_copy_string(c->fullcontact, contact_str, sizeof(c->fullcontact));
+		sofia_rtupdate_row(peer, sip, follow, c->ipaddr, sizeof(c->ipaddr), c->port, sizeof(c->port),
+			c->regseconds, sizeof(c->regseconds), c->fullcontact, sizeof(c->fullcontact));
 	}
 	if (ast_taskprocessor_push(sofia_regpool[lane], sofia_rtupdate_task_exe, c) < 0) {
 		ast_log(LOG_WARNING, "Sofia: register_pool push failed — dropped realtime update for peer '%s' (next REGISTER refreshes it)\n", peer->name);
@@ -13400,6 +13488,11 @@ void sofia_emit_register_side_effects(struct sofia_peer *peer, sip_t const *sip,
 			peer->accountcode);
 		ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
 		return;	/* mutually exclusive with the registered tail */
+	}
+	if (!update->now_registered) {
+		/* Nothing is registered and nothing was unregistered now: a REGISTER that only removed a lapsed binding
+		 * of a peer the expiry sweep had already unregistered (ignoreregexpire keeps them). No Registered event. */
+		return;
 	}
 	/* Registered / refresh: regexten + PeerStatus Registered fire on every real 200 OK,
 	 * devstate only on an actual registration transition (sofia_register_changed). */
@@ -13618,7 +13711,7 @@ static enum sofia_register_nh_fate sofia_process_register_impl(nua_t *nua, nua_h
 		}
 		/* rtupdate=no skips all realtime DB writes (chan_sip parity). */
 		if (peer->is_realtime && sofia_cfg.peer_rtupdate) {
-			sofia_rtupdate_submit(peer, sip);
+			sofia_rtupdate_submit(peer, sip, reg_update.contacts_added + reg_update.contacts_refreshed == 0);
 		}
 		/* RFC 3261 §10.3: enumerate the bindings with their GRANTED per-Contact expires (not an echo of the
 		 * request Contact + one global Expires — which would show the requested value while Expires shows a
@@ -13761,7 +13854,7 @@ static enum sofia_register_nh_fate sofia_process_register_impl(nua_t *nua, nua_h
 
 		/* rtupdate=no skips all realtime DB writes (chan_sip parity). */
 		if (peer->is_realtime && sofia_cfg.peer_rtupdate) {
-			sofia_rtupdate_submit(peer, sip);
+			sofia_rtupdate_submit(peer, sip, reg_update.contacts_added + reg_update.contacts_refreshed == 0);
 		}
 
 		/* RFC 3261 §10.3 per-binding granted expires (see the other REGISTER 200 OK path). */
@@ -18086,6 +18179,8 @@ static void sofia_peer_expire_sweep(struct sofia_peer *peer, time_t now)
 		ast_copy_string(peer->reg_transport, "udp", sizeof(peer->reg_transport));
 		peer->expire = 0;
 		peer->reg_expiry = 0;
+	} else {
+		sofia_peer_src_follow_contacts(peer, 0);	/* the lapsed binding may have been the one the address pointed to */
 	}
 	ast_mutex_unlock(&peer->lock);
 
@@ -18325,6 +18420,8 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 							peer->reg_expiry = 0;
 							became_empty = 1;
 							emit_unregister = peer->flowclose_emit_unregister;	/* policy under lock */
+						} else {
+							sofia_peer_src_follow_contacts(peer, !peer->registered);	/* off the closed flow, onto a binding that stays */
 						}
 					}
 					ao2_ref(c, -1);			/* finder */
@@ -19535,6 +19632,14 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				pingtime = 1;
 
 			ast_mutex_lock(&peer->lock);
+			if (peer->qualify_nh != nh) {
+				/* The answer to a probe already dropped (its binding moved, sofia_qualify_soon) but delivered
+				 * before its handle was unbound: it is about an address the peer no longer probes. Its handle
+				 * is already queued for destruction. */
+				ast_mutex_unlock(&peer->lock);
+				ao2_ref(peer, -1);
+				break;
+			}
 			{
 				enum sofia_peer_status old_status = peer->peer_status;
 				/* Any final response proves the device is there: a 405, 401 or 501 to OPTIONS too. Only
