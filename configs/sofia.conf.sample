@@ -114,16 +114,19 @@ realm=gabpbx
 ; not advertised is rejected 400), so a sha256-only deployment cannot be silently
 ; downgraded to MD5.
 ;
-;   both    - offer MD5 + SHA-256 (MD5 listed first for legacy phones; built-in default if unset)
-;   md5     - offer MD5 only (chan_sip drop-in parity, maximum handset compatibility)
+;   both    - offer MD5 + SHA-256 (MD5 listed first for legacy phones)
+;   md5     - offer MD5 only (chan_sip drop-in parity, maximum handset compatibility; built-in default if unset)
 ;   sha256  - offer SHA-256 only (RFC 7616; refuse the weaker MD5)
 ;
-; This file ships md5 ACTIVE (below) for maximum compatibility / chan_sip parity.
-; Remove the line to fall back to the built-in default (both = MD5 + SHA-256).
+; The built-in default (no line, or an invalid value) is md5: many phones support no
+; other algorithm. This file ships it active (below).
 ;
 ; Note: a peer configured with md5secret (a pre-hashed MD5 credential) and no
 ; plaintext secret can only authenticate with MD5; keep auth_algorithms at md5 or
-; both for such deployments, otherwise those peers cannot register.
+; both for such deployments, otherwise those peers cannot register. With both, such
+; a peer answers a SHA-256 digest differently from every other name (it is
+; re-challenged with MD5 only), which tells a scanner which names are md5secret
+; accounts; with md5 every SHA-256 answer is refused the same way.
 ;
 auth_algorithms = md5
 

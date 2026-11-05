@@ -915,9 +915,10 @@ char *sofia_cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 	ast_cli(a->fd, "  WebRTC (default):       %s\n", AST_CLI_YESNO(sofia_cfg.webrtc));
 	/* Force INVITE auth (chan_sofia-only global security override). */
 	ast_cli(a->fd, "  Force INVITE auth:      %s\n", AST_CLI_YESNO(sofia_cfg.force_invite_auth));
-	/* Auth algorithms (RFC 7616): static report; challenges are MD5-first, SHA-256
-	 * omitted for md5secret-only peers. */
-	ast_cli(a->fd, "  Auth algorithms:        MD5, SHA-256\n");
+	/* Auth algorithms (RFC 7616): what the 401 offers ([general] auth_algorithms; MD5 first when both). */
+	ast_cli(a->fd, "  Auth algorithms:        %s\n",
+		sofia_cfg.auth_algorithms == SOFIA_AUTH_ALG_BOTH ? "MD5, SHA-256"
+		: sofia_cfg.auth_algorithms == SOFIA_AUTH_ALG_SHA256 ? "SHA-256" : "MD5");
 	/* auth_qop: yes = RFC 2617/7616 qop="auth" MD5 challenge; no = chan_sip legacy no-qop (RFC 2069). */
 	ast_cli(a->fd, "  Auth qop:               %s\n", AST_CLI_YESNO(sofia_cfg.auth_qop));
 	/* apply_peer_callerid: yes = force matched-peer callerid on inbound (chan_sip parity); no = keep From. */

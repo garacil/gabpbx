@@ -284,7 +284,7 @@
 
 
 
-struct sofia_config sofia_cfg;
+struct sofia_config sofia_cfg = { .auth_algorithms = SOFIA_AUTH_ALG_MD5 };	/* also with no sofia.conf */
 
 	su_root_t *sofia_root;
 	nua_t *sofia_nua;
@@ -21292,7 +21292,7 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			}
 		} else if (!strcasecmp(v->name, "auth_algorithms")) {
 			/* Digest algorithm(s) OFFERED in WWW-Authenticate: both (MD5+SHA-256) / md5 / sha256.
-			 * Verification accepts exactly what was offered (anti-downgrade). Invalid -> both + warn. */
+			 * Verification accepts exactly what was offered (anti-downgrade). Invalid -> md5 + warn. */
 			if (!strcasecmp(v->value, "both") || !strcasecmp(v->value, "md5+sha256")) {
 				sofia_cfg.auth_algorithms = SOFIA_AUTH_ALG_BOTH;
 			} else if (!strcasecmp(v->value, "md5")) {
@@ -21301,8 +21301,8 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 				sofia_cfg.auth_algorithms = SOFIA_AUTH_ALG_SHA256;
 			} else {
 				ast_log(LOG_WARNING, "Sofia: invalid auth_algorithms '%s' "
-					"(use both|md5|sha256); using default both\n", v->value);
-				sofia_cfg.auth_algorithms = SOFIA_AUTH_ALG_BOTH;
+					"(use both|md5|sha256); using default md5\n", v->value);
+				sofia_cfg.auth_algorithms = SOFIA_AUTH_ALG_MD5;
 			}
 		} else if (!strcasecmp(v->name, "auth_qop")) {
 			/* no (default) = chan_sip legacy no-qop MD5 challenge (RFC 2069, no nc/cnonce replay
@@ -22780,8 +22780,9 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.force_invite_auth = 0;
 	/* default 0 = use SOFIA_NONCE_TTL_SEC_DEFAULT (3600s). */
 	sofia_cfg.nonce_ttl_seconds = 0;
-	/* default BOTH = offer MD5 + SHA-256 (shipped sofia.conf sets md5). */
-	sofia_cfg.auth_algorithms = SOFIA_AUTH_ALG_BOTH;
+	/* default MD5 only, as chan_sip: many phones support no other digest algorithm, and with both an account
+	 * whose credential is an md5secret (MD5 only) answers a SHA-256 digest differently from every other name. */
+	sofia_cfg.auth_algorithms = SOFIA_AUTH_ALG_MD5;
 	/* default 0 = chan_sip legacy no-qop MD5 challenge (RFC 2069, no replay protection);
 	 * auth_qop=yes restores the RFC 2617/7616 qop="auth" form. */
 	sofia_cfg.auth_qop = 0;

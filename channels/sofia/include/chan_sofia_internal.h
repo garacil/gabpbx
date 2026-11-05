@@ -217,8 +217,8 @@ void *sofia_dc_pair_bridged(struct sofia_pvt *self_pvt, void *self_dc);
 #define SOFIA_TRANSPORT_WSS 16
 #define SOFIA_NAT_FORCE_RPORT (1 << 0)
 #define SOFIA_NAT_COMEDIA     (1 << 1)
-#define SOFIA_AUTH_ALG_BOTH   0   /* offer MD5 + SHA-256 (default) */
-#define SOFIA_AUTH_ALG_MD5    1   /* offer MD5 only */
+#define SOFIA_AUTH_ALG_BOTH   0   /* offer MD5 + SHA-256 */
+#define SOFIA_AUTH_ALG_MD5    1   /* offer MD5 only (default) */
 #define SOFIA_AUTH_ALG_SHA256 2   /* offer SHA-256 only */
 
 enum sofia_session_timer_mode {
@@ -1169,7 +1169,7 @@ struct sofia_config {
 	int srtp_per_suite_keys;          /* 0 = shared-key (one master_key across all suites in a multi-cipher offer) / 1 = per-suite-fresh-key (independent random key per suite — forensic key separation). [general]-only; no chan_sip equivalent. */
 	int force_invite_auth;            /* 0 = chan_sip parity (per-peer insecure=invite bypass active) / 1 = global lockdown: ALL inbound INVITEs require digest auth regardless of insecure=invite. [general]-only security override; logs NOTICE when overriding a peer. */
 	int nonce_ttl_seconds;            /* Digest auth nonce TTL override; 0 = SOFIA_NONCE_TTL_SEC_DEFAULT (3600s) */
-	int auth_algorithms;              /* SOFIA_AUTH_ALG_BOTH/MD5/SHA256: which digest algo(s) to OFFER in WWW-Authenticate. GLOBAL, no per-peer override. Verification accepts only what was offered (anti-downgrade). Code default BOTH; shipped sofia.conf sets md5. */
+	int auth_algorithms;              /* SOFIA_AUTH_ALG_BOTH/MD5/SHA256: which digest algo(s) to OFFER in WWW-Authenticate. GLOBAL, no per-peer override. Verification accepts only what was offered (anti-downgrade). Default MD5 (chan_sip parity; with both an md5secret account answers a SHA-256 digest differently). */
 	int auth_qop;                     /* 1 = emit qop="auth" in the digest challenge (RFC 2617/7616, replay-protected via nc/cnonce); 0 = chan_sip legacy no-qop MD5 challenge (RFC 2069, NO replay protection). [general]-only. Default 0 (chan_sip compatibility). Affects the MD5 challenge form only; SHA-256 always keeps qop="auth". */
 	/* session timers (RFC 4028): chan_sip-parity defaults inherited by peers; sofia-sip handles wire mechanics via NUTAG_SESSION_TIMER/MIN_SE/SESSION_REFRESHER. */
 	int default_session_timers;       /* SESSION_TIMERS_OFF/ACCEPT/ORIGINATE/REFUSE; default=ACCEPT (honor inbound, no initiate) */
