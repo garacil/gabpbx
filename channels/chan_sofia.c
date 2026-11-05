@@ -280,6 +280,7 @@
 #define DEFAULT_QUALIFYFREQ   60
 #define DEFAULT_QUALIFYTIMEOUT 3
 #define DEFAULT_FREQ_NOTOK    10
+#define SOFIA_REGEXPIRE_GRACE_SECS 10	/* a binding is LAPSED this long after its expiry (chan_sip: Expires + 10 s) */
 
 
 
@@ -4479,6 +4480,7 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 	 * right after a realtime reload (before the peer re-REGISTERs). */
 	char reg_ipaddr[64] = "";
 	int reg_port = 0;
+	long reg_seconds = 0;
 	for (; v; v = v->next) {
 		if (!strcasecmp(v->name, "encryption") && ast_strlen_zero(v->value)) {
 			peer->encryption = 0;
@@ -4588,6 +4590,9 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 		} else if (!strcasecmp(v->name, "ipaddr")) {
 			/* C: registration source IP (sipregs column); applied to peer->src_addr after the loop */
 			ast_copy_string(reg_ipaddr, v->value, sizeof(reg_ipaddr));
+		} else if (!strcasecmp(v->name, "regseconds")) {
+			/* C: when that registration was made (sofia_rtupdate writes time(NULL)) */
+			reg_seconds = strtol(v->value, NULL, 10);
 		} else if (!strcasecmp(v->name, "insecure")) {
 			peer->insecure = sofia_parse_insecure(v->value);
 		} else if (!strcasecmp(v->name, "dtmfmode")) {
@@ -4963,9 +4968,16 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 	 * registration source (sipregs ipaddr/port), seed peer->src_addr + mark registered so an outbound
 	 * INVITE to a NAT'd peer routes to the PUBLIC source (via NUTAG_PROXY) immediately after a reload,
 	 * before the peer re-REGISTERs. Without this, src_addr is NULL after load and routing falls back to
-	 * the private Contact (the bug). Only when ipaddr is present (a live registration exists).
-	 * NOTE: regseconds-expiry refinement (drop a stale binding) is a tracked follow-up. */
-	if (!ast_strlen_zero(reg_ipaddr)) {
+	 * the private Contact (the bug). Only when ipaddr is present (a registration was stored), only for
+	 * host=dynamic (a static peer is called at its host, and its REGISTER is refused: an address it once
+	 * registered from could never be refreshed or cleared; chan_sip build_peer seeds dynamic peers only), and
+	 * only while that registration can still be current: regseconds is its instant here (chan_sip stores the
+	 * expiry), so it lapses at most maxexpiry + the sweep's grace later. Unlike chan_sip, ignoreregexpire does
+	 * not make a lapsed one callable, as it does not make a lapsed binding in memory routable
+	 * (sofia_peer_select_single_live_contact): a call would half-connect to a device that is gone. The row is
+	 * never written here. */
+	if (!ast_strlen_zero(reg_ipaddr) && !strcasecmp(peer->host, "dynamic") && reg_seconds > 0
+			&& (long) time(NULL) <= reg_seconds + sofia_cfg.max_expiry + SOFIA_REGEXPIRE_GRACE_SECS) {
 		struct ast_sockaddr probe;
 		memset(&probe, 0, sizeof(probe));
 		if (ast_sockaddr_parse(&probe, reg_ipaddr, 0) && !ast_sockaddr_isnull(&probe)) {
@@ -10501,7 +10513,6 @@ static void sofia_contact_uri_from_url(char *buf, size_t len, const url_t *url)
 
 /* Registration expiry timing, used by the active expiry sweep (sofia_peer_expire_sweep, further down). */
 #define SOFIA_REGEXPIRE_SWEEP_SECS 10	/* how often the sweep runs */
-#define SOFIA_REGEXPIRE_GRACE_SECS 10	/* a binding is LAPSED this long after its expiry (chan_sip: Expires + 10 s) */
 #define SOFIA_REGEXPIRE_MAX 6		/* the max_contacts ceiling (sofia_clamp_max_contacts) */
 
 /* Recompute peer->next_expiry_check: the earliest lapse instant among the bindings not reported yet.
