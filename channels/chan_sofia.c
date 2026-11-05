@@ -387,6 +387,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 static const char *sofia_get_realm_for_dialog(sip_t const *sip, char *buf, size_t buflen);
 
 static void sofia_emit_timing_equalized_reject(void);
+static void sofia_stop_media_flows(struct sofia_pvt *pvt);
 static void sofia_reject_as_unknown(nua_t *nua, nua_handle_t *nh, sip_t const *sip, const char *method,
 	const char *realm, int blacklist);
 static void sofia_send_auth_challenge(nua_t *nua, nua_handle_t *nh, sip_t const *sip,
@@ -1985,6 +1986,11 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	master->vrtp = child->vrtp;
 	child->vrtp = NULL;
 	ast_mutex_unlock(&child->lock);
+	/* The caller may have hung up the master before the winner was picked (its sofia_hangup stopped only the
+	 * master's pre-fork instances): the stolen ones go quiet too. */
+	if (!master->owner) {
+		sofia_stop_media_flows(master);
+	}
 	SOFIA_FORKDBG("rtp-steal master_nh=%p master_rtp=%p master_vrtp=%p (rtp=%p = res_rtp inst join key)",
 		(void *)master->nh, (void *)master->rtp, (void *)master->vrtp, (void *)master->rtp);
 
@@ -7344,6 +7350,22 @@ static int sofia_hangup_cause2sip(int cause)
 	}
 }
 
+/* chan_sip stop_media_flows: the channel is gone and so are its media. The RTCP scheduler stops and nothing more is
+ * sent while the dialog finishes (a BYE in flight for up to 64*T1, a transfer's deferred BYE); the instances are
+ * destroyed with the pvt (sofia_rtp_stop_destroy; a second stop is harmless). pvt->lock held. */
+static void sofia_stop_media_flows(struct sofia_pvt *pvt)
+{
+	if (pvt->rtp) {
+		ast_rtp_instance_stop(pvt->rtp);
+	}
+	if (pvt->vrtp) {
+		ast_rtp_instance_stop(pvt->vrtp);
+	}
+	if (pvt->udptl) {
+		ast_udptl_stop(pvt->udptl);
+	}
+}
+
 static int sofia_hangup(struct ast_channel *ast)
 {
 	struct sofia_pvt *pvt = ast->tech_pvt;
@@ -7434,6 +7456,7 @@ static int sofia_hangup(struct ast_channel *ast)
 	/* defer-bye-on-transfer: detach the channel side but leave the SIP dialog alive
 	 * (no nua_bye/unlink) — sofia_defer_bye_cb or the incoming BYE tears it down. */
 	if (pvt->defer_bye) {
+		sofia_stop_media_flows(pvt);
 		pvt->owner = NULL;
 		ast->tech_pvt = NULL;
 		ast_mutex_unlock(&pvt->lock);
@@ -7481,6 +7504,7 @@ static int sofia_hangup(struct ast_channel *ast)
 		}
 	}
 
+	sofia_stop_media_flows(pvt);
 	pvt->owner = NULL;
 	ast->tech_pvt = NULL;
 	pvt->state = SOFIA_DIALOG_STATE_DOWN;
