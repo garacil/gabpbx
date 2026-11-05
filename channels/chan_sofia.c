@@ -796,10 +796,13 @@ const char *sofia_transport_name(int transport)
 }
 
 /* The source a request came from, as the URI of the next hop back to it: sip:<address>:<port> with the
- * ;transport= it arrived on (the delivering tport, else ws/wss from the top Via, else the Via sent-protocol,
- * RFC 3261 §18.2.2). src gets the address (null when unknown, and buf is then ""). Inside a nua event
- * callback only (sofia_incoming_transport). */
-static void sofia_request_source_uri(nua_t *nua, sip_t const *sip, struct ast_sockaddr *src, char *buf, size_t len)
+ * ;transport= it arrived on (RFC 3261 §18.2.2): the delivering tport when the stack still exposes it, else ws/wss
+ * from the top Via, else the Via sent-protocol. Inside a nua event callback the tport is no longer exposed, so the
+ * Via decides; nta drops a request whose Via transport does not match the connection it came on, and adds the
+ * received/rport the address is read from. src gets the address (null when unknown, and buf is then ""); tp, when
+ * not NULL, the transport name ("" when unknown). */
+static void sofia_request_source_uri(nua_t *nua, sip_t const *sip, struct ast_sockaddr *src, char *buf, size_t len,
+	char *tp, size_t tplen)
 {
 	char tbuf[8] = "";
 	char hbuf[80];
@@ -826,6 +829,9 @@ static void sofia_request_source_uri(nua_t *nua, sip_t const *sip, struct ast_so
 			sofia_uri_format_host(ast_sockaddr_stringify_host(src), hbuf, sizeof(hbuf)),
 			ast_sockaddr_port(src));
 		sofia_uri_append_transport(buf, len, tbuf);
+	}
+	if (tp && tplen) {
+		ast_copy_string(tp, tbuf, tplen);
 	}
 }
 
@@ -15956,7 +15962,7 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 		/* Next hop of every in-dialog NOTIFY: the source this SUBSCRIBE arrived from, over the
 		 * transport it arrived on (presence engine idiom; a NAT device or a WebSocket client is
 		 * reachable only there, never at the Contact it advertised). */
-		sofia_request_source_uri(nua, sip, &sub_src, sub_proxy, sizeof(sub_proxy));
+		sofia_request_source_uri(nua, sip, &sub_src, sub_proxy, sizeof(sub_proxy), NULL, 0);
 	}
 
 	/* An in-dialog refresh or unsubscribe does not reliably arrive on the dialog's handle: this stack
@@ -16122,6 +16128,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	char l_context[AST_MAX_CONTEXT];
 	char l_peername[80];
 	char l_proxy[128] = "";			/* NAT proxy target for the NOTIFY (empty = none) */
+	int l_nat;				/* the watcher's nat= flags */
 	char l_contact[300] = "";		/* Contact of our NOTIFYs (empty = our address is not known) */
 	char l_exten[AST_MAX_EXTENSION];	/* bounded copy of the watched user — keeps subkey consistent with sub->exten */
 	char subkey[200];
@@ -16225,10 +16232,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		ast_copy_string(l_context, "default", sizeof(l_context));
 	}
 	ast_copy_string(l_peername, peer->name, sizeof(l_peername));
-	/* NAT proxy target (built under peer->lock): for nat watchers the NOTIFYs route
-	 * to the registered public source via NUTAG_PROXY instead of the unreachable
-	 * private Contact (else every NOTIFY 408s). Empty for non-NAT peers. */
-	sofia_build_nat_proxy_url_from_peer(peer, l_proxy, sizeof(l_proxy));
+	l_nat = peer->nat;	/* the NOTIFYs' next hop is decided below, from the SUBSCRIBE's source */
 	ast_mutex_unlock(&peer->lock);
 	ao2_ref(peer, -1);
 	peer = NULL;
@@ -16289,11 +16293,22 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	{
 		char l_source[160];
 		char l_target[168];
+		char l_tp[8];
 		int secure = (sip->sip_request && sip->sip_request->rq_url
 				&& sip->sip_request->rq_url->url_type == url_sips)
 			|| (sip->sip_contact && sip->sip_contact->m_url && sip->sip_contact->m_url->url_type == url_sips);
 
-		sofia_request_source_uri(nua, sip, &src, l_source, sizeof(l_source));
+		sofia_request_source_uri(nua, sip, &src, l_source, sizeof(l_source), l_tp, sizeof(l_tp));
+		/* Next hop of every NOTIFY for a NAT watcher or a WebSocket client: the source this SUBSCRIBE came from,
+		 * over the transport it came on (as the MWI subscription does), since such a device is reachable only
+		 * there, never at the Contact it advertised (RFC 3261 §18.2.2, RFC 5626 §5.3, RFC 7118 §5). Not the
+		 * peer's last registration: with several devices on one account that is another device, and a
+		 * browser subscribing while the last registration was a UDP phone would see its NOTIFYs sent to its
+		 * placeholder Contact. Any other watcher is reached at its Contact, as the dialog says. */
+		if (l_source[0] && ((l_nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA))
+				|| !strcasecmp(l_tp, "ws") || !strcasecmp(l_tp, "wss"))) {
+			ast_copy_string(l_proxy, l_source, sizeof(l_proxy));
+		}
 		snprintf(l_target, sizeof(l_target), "%s%s", secure && !strncmp(l_source, "sip:", 4) ? "sips:" : "",
 			secure && !strncmp(l_source, "sip:", 4) ? l_source + 4 : l_source);
 		sofia_subscription_contact(l_target, NULL, l_exten, l_contact, sizeof(l_contact));
@@ -16352,6 +16367,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 			nua_notify(nh,
 				NUTAG_M_USERNAME(l_exten),
 				TAG_IF(l_contact[0], SIPTAG_CONTACT_STR(l_contact)),
+				TAG_IF(l_proxy[0], NUTAG_PROXY(l_proxy)),	/* the same next hop as the subscription's NOTIFYs */
 				SIPTAG_EVENT_STR(norm),
 				NUTAG_SUBSTATE(nua_substate_terminated),
 				SIPTAG_SUBSCRIPTION_STATE_STR("terminated;reason=timeout"),
