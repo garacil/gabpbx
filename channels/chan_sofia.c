@@ -2954,10 +2954,9 @@ static int sofia_rtp_init(struct sofia_pvt *pvt)
 	 * it exists — NOT gated on pvt->peer->webrtc. Inbound INVITEs create the RTP instance BEFORE the peer
 	 * is resolved (sofia_rtp_init precedes the pvt->peer assignment), so a peer->webrtc gate here is
 	 * racy/false for real inbound calls and would leave a WebRTC leg with rtp->sched==NULL, segfaulting
-	 * the DTLS retransmit timer (ast_sched_add_variable(NULL)). The sched is only a stored pointer for a
-	 * plain call: non-WebRTC never arms a DTLS timer, and audio RTCP/RED only schedule when rtp->rtcp /
-	 * rtp->red are non-NULL (which chan_sofia never enables for plain audio) — zero load, zero regression.
-	 * set_configuration is the instance-level fail-closed proof (returns -1 on a NULL sched). */
+	 * the DTLS retransmit timer (ast_sched_add_variable(NULL)). On a plain call it also runs the RTCP
+	 * reports (enabled by sofia_parse_sdp for RTP/AVP and RTP/SAVP legs); RED only schedules when rtp->red
+	 * is non-NULL. set_configuration is the instance-level fail-closed proof (returns -1 on a NULL sched). */
 	if (sofia_sched) {
 		pvt->rtp = ast_rtp_instance_new("gabpbx",
 			ast_sched_thread_get_context(sofia_sched), &addr, NULL);

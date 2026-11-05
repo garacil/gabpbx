@@ -2282,6 +2282,17 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 				 * using it to aim DTLS flights, and it reset rxseqno / strict_rtp_state / rtcp->them
 				 * as a side effect — on every re-INVITE, hold included. The ICE responder sets the
 				 * destination from the authenticated check (phase A) or the nomination (phase B). */
+				/* RTCP on every non-WebRTC audio leg, RTP/AVP and RTP/SAVP (RFC 3550 section 6: functions 1-3
+				 * SHOULD be used in all environments; Asterisk's res_pjsip_sdp_rtp enables it on every RTP
+				 * stream). Enabled before the remote address is set, so that address also sets the RTCP
+				 * destination (its port + 1): an SDES leg used to get RTCP only from the crypto commit, after
+				 * this point, and then never sent reports. WebRTC legs (DTLS-SRTP, rtcp-mux) are left to their
+				 * own setup. Only with a scheduler, which runs the reports; the channel polls the RTCP socket
+				 * from the commit below. A second enable (a re-INVITE, the crypto commit) is a no-op. */
+				if (!pvt->is_webrtc && (media->m_proto == sdp_proto_rtp || media->m_proto == sdp_proto_srtp)
+				    && sofia_sched) {
+					ast_rtp_instance_set_prop(pvt->rtp, AST_RTP_PROPERTY_RTCP, 1);
+				}
 				if (!pvt->is_webrtc) {
 					ast_rtp_instance_set_remote_address(pvt->rtp, &remote);
 				}
@@ -3723,6 +3734,14 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 				}
 				if (t38_stage_fds5 && pvt->udptl) {
 					o->fds[5] = ast_udptl_fd(pvt->udptl);
+				}
+				if (staged_chosen_audio_valid && !pvt->is_webrtc && pvt->rtp
+				    && o->fds[1] != ast_rtp_instance_fd(pvt->rtp, 1)) {
+					/* RTCP enabled by this parse on a channel that already exists (outbound: the answer;
+					 * late offer: the ACK): sofia_new bound fds[1] while the instance had no RTCP socket
+					 * (-1), so the peer's reports were never read. Poll it now (Asterisk's
+					 * res_pjsip_sdp_rtp adds the RTCP read callback whenever RTCP is not muxed). */
+					ast_channel_set_fd(o, 1, ast_rtp_instance_fd(pvt->rtp, 1));
 				}
 				if (vrtp_stage_fds23 && pvt->vrtp) {
 					/* A re-INVITE lazily created vrtp AFTER sofia_new ran — attach its fds now
