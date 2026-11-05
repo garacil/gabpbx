@@ -1,3 +1,50 @@
+## 1.9.15 — one answer for every request that cannot authenticate, and a phone that does not answer is not rung
+
+A fix release for `chan_sofia`. A request that cannot authenticate now gets the answers of a wrong password
+whatever the name, a phone that does not answer its qualify is no longer rung, SUBSCRIBE and NOTIFY carry a Contact,
+and a few session-timer, realtime and RTCP corner cases follow the RFCs. Only `chan_sofia.so` changes. The packages
+for Debian 12 and 13, Ubuntu 22.04 and 24.04 and RHEL 9 are attached to the release with `SHA256SUMS`.
+
+### Changed
+
+- **Every request that cannot authenticate gets the answers of a wrong password**, whatever the name: `401` with a
+  challenge when it carries no credentials (RFC 3261 section 22.2), `403` when they are not accepted (section 22.1).
+  That covers a name that is not an account, an address the account's `deny`/`permit` refuses and a `REGISTER` for
+  an account that is not `host=dynamic`, for `REGISTER`, `INVITE`, `MESSAGE` and `SUBSCRIBE`, with the same
+  credential header and the same blacklist counting as a real account. An ACL-denied address used to get `403` at
+  once; `allowsubscribe=no` and the `420` of a `path=yes` peer now come after the digest. `alwaysauthreject` always
+  takes its default (`yes`): `no` is logged and ignored.
+
+### Fixes
+
+- **A phone that does not answer its qualify is not rung.** A call to a peer whose `OPTIONS` probe went unanswered
+  is refused at once with cause 20 (`CHANUNAVAIL`), as `chan_sip` does, when the probe went to the peer's single
+  live registration after it last registered and the `INVITE` would go to that same address; a peer with push
+  tokens, a fork to several registrations and a `LAGGED` peer are never refused. Any final answer to `OPTIONS` now
+  means the device is there (a `405`, `401` or `501` too); a new `REGISTER` triggers an immediate qualify.
+- **`SUBSCRIBE` and `NOTIFY` carry a `Contact`** (RFC 3265 section 7.1): the presence `NOTIFY`s and their `2xx`
+  (user = the watched extension), the outbound `mwi_subscribe=` / `subscribe_event=` `SUBSCRIBE`s and their
+  refreshes, and the `NOTIFY` of `sip notify` / `SIPnotify`; a `sips:` URI when the target is one.
+- **A realtime peer is called at its stored registration only while it can still be current**: only for
+  `host=dynamic` rows, and only until `regseconds` + `maxexpiry`. A static peer was called at an address it once
+  registered from, and a long-lapsed registration was still called.
+- **A peer's `session-minse` above `[general]`**: a first `INVITE` with `Supported: timer` below it gets `422` with
+  the peer's `Min-SE`; a request without it (INVITE, re-INVITE, UPDATE) is accepted at the interval it asked for.
+  The `200` used to raise `Session-Expires` to the peer's minimum (RFC 4028 section 9 forbids it).
+- **A leg's media stop when its channel hangs up**, also while a blind transfer's deferred `BYE` keeps the dialog
+  open: the transferer kept receiving RTCP reports for up to 32 s.
+- A rejected refresh on a presence subscription no longer destroys the subscription's handle.
+
+### Upgrading
+
+- `alwaysauthreject=no` is ignored, so `allowguest` admits no unknown `INVITE` or `MESSAGE`: a provider whose calls
+  come from addresses no peer matches needs a peer for each source address (`host=` with `insecure=invite`).
+- A `REGISTER` without credentials from an unknown name no longer counts toward the blacklist; a wrong digest still
+  does, for every name.
+- A `host=dynamic` realtime peer whose stored registration is older than `maxexpiry` is not called until it
+  registers again, also with `ignoreregexpire=yes`.
+- With `qualify=yes`, a phone that never answers `OPTIONS` now has its calls refused; check such peers.
+
 ## 1.9.14 — calls end when the SIP session ends, and survive what should not end them
 
 A fix release for `chan_sofia` and SRTP. A refused re-INVITE, a session refresh, a late or a
