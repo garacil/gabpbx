@@ -1,3 +1,56 @@
+## 1.9.14 — calls end when the SIP session ends, and survive what should not end them
+
+A fix release for `chan_sofia` and SRTP. A refused re-INVITE, a session refresh, a late or a
+repeated SRTP packet no longer cut, silence or freeze a call; a session that the SIP stack ends by
+itself (a 2xx never acknowledged, an expired session timer, a reliable provisional never PRACKed)
+now ends the channel too. Plain and SDES audio legs get RTCP. The packages for Debian 12 and 13,
+Ubuntu 22.04 and 24.04 and RHEL 9 are attached to the release with `SHA256SUMS`.
+
+### New
+
+- **`srtpreplayprotection`** in `rtp.conf` `[general]`, default `yes` (RFC 3711 section 3.3.2).
+  A packet behind the replay window is discarded instead of re-creating the SRTP session. Set it
+  to `no` only for a device known to reset its RTP sequence numbers in the middle of a call.
+
+### Fixes
+
+- **A refused re-INVITE keeps the call.** A 3xx-6xx to a re-INVITE (hold, a session refresh, an
+  identity update) on an answered call ended it. The call now continues unless the response is
+  one that ends the dialog (RFC 3261 section 14.1; RFC 5057).
+- **Session refreshes carry the current session.** The refresh re-INVITE resent the first
+  INVITE's SDP, an older offer that a peer could refuse, and on inbound calls it carried no offer.
+  It is now an UPDATE without SDP when the peer allows UPDATE, or a re-INVITE with the current
+  SDP (RFC 4028 section 7.4; RFC 3264 section 8). A peer that refuses the UPDATE gets re-INVITEs.
+- **The 2xx to our own re-INVITE is acknowledged at once** on NAT and WebSocket legs. It was only
+  acknowledged with the BYE, and the next re-INVITE waited behind it.
+- **A late SRTP packet no longer breaks the audio.** A packet that arrived more than 64 packets
+  late, typically from the previous network path after a Wi-Fi/mobile handover, made res_srtp
+  re-create the whole session and reset its roll-over counter: the audio stopped one way or both.
+- **A duplicate SRTP packet is discarded** instead of being decoded as a short burst of noise.
+- **The channel ends when the SIP stack ends the session by itself**: a 2xx never ACKed (RFC 3261
+  section 13.3.1.4) and a session the refresher let expire (RFC 4028 section 10) hang the channel
+  up with cause 18. They left it up until the dialplan ended it.
+- **RTCP on plain and SDES audio legs.** Only WebRTC legs sent RTCP; plain RTP/AVP legs sent no
+  reports and SDES legs none either. On outbound and late-offer legs the RTCP socket is now read too.
+- **`[general] session-minse` reaches the SIP stack.** The stack checked every first INVITE
+  against its own 120 s and answered 422 below it, whatever the setting.
+- **A reliable provisional never PRACKed ends the call.** The stack answers 504 "PRACK Timeout";
+  the inbound channel kept running the dialplan.
+- **The digest nonce no longer reveals which accounts exist.** It was bound to the account name,
+  so a replayed nonce was answered differently for a real and a non-existent account.
+- **`defaultip=` is used once an expired registration is gone**, as for any unregistered
+  `host=dynamic` peer, instead of refusing the call.
+- **A reload that turns a peer from `host=dynamic` into a static host drops its registrations**,
+  so calls go to the configured host; the other way round, the old host address is forgotten.
+
+### Upgrading
+
+- **`res_srtp.so` and `res_rtp_gabpbx.so` go together.** `res_rtp_gabpbx` now passes the
+  replay-protection flag to `res_srtp`; a new `res_rtp_gabpbx` with an old `res_srtp` breaks
+  SRTP audio. Installing the package upgrades both.
+- Plain SIP phones now exchange RTCP with the PBX on the RTP port + 1, inside the RTP range.
+- Session-Expires values between `session-minse` and 120 are now accepted on inbound calls.
+
 ## 1.9.13 — an Android phone woken by push stops ringing when the call ends
 
 A release for phones woken by push. An Android phone shows the incoming-call card as soon as
