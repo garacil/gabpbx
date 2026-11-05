@@ -21359,6 +21359,7 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 	/* RFC 5626/5627: snapshot gruu/sip_outbound BEFORE the reload reset (sofia_peer_set_defaults zeroes
 	 * them) so the tail can tell whether a toggle needs the REGISTER handle rebuilt. */
 	int old_gruu = 0, old_sip_outbound = 0;
+	int old_dynamic = 0, dropped_bindings = 0;	/* a reload that turns a host=dynamic peer static */
 	/* Per-peer header= counter for the unique __SIPADDHEADERpre%2d= var name. */
 	int headercount = 0;
 
@@ -21393,6 +21394,8 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 		}
 		ast_mutex_lock(&peer->lock);
 		locked = 1;
+		/* Before any field is reset below (host is cleared for the re-parse): was it host=dynamic? */
+		old_dynamic = ast_strlen_zero(peer->host) || !strcasecmp(peer->host, "dynamic");
 		/* Reset ACL chains so the permit/deny parsers append onto a fresh list, else each
 		 * reload grows peer->ha (and contactha/directmediaha) linearly. */
 		if (peer->ha) {
@@ -21919,6 +21922,28 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			peer->sip_outbound_active = 0;
 			peer->flow_timer = 0;
 		}
+		/* host changed between dynamic and static (chan_sip build_peer drops the association the same way,
+		 * chan_sip.c host= handling). Dynamic -> static: the registered bindings must not keep receiving
+		 * the calls — the device can no longer refresh or clear them (a non-dynamic peer's REGISTER is
+		 * refused) — so they go now, exactly as `sip unregister` does; the side effects follow below,
+		 * outside the lock. An outbound register => line keeps its own upstream state. Static -> dynamic:
+		 * forget the old host's address, which is not a registration. */
+		{
+			int new_dynamic = !strcasecmp(peer->host, "dynamic");
+
+			if (old_dynamic && !new_dynamic && !peer->is_register_line
+			    && (peer->registered || ao2_container_count(peer->contacts) > 0)) {
+				ao2_callback(peer->contacts, OBJ_UNLINK | OBJ_NODATA | OBJ_MULTIPLE, NULL, NULL);
+				peer->registered = 0;
+				memset(&peer->src_addr, 0, sizeof(peer->src_addr));
+				ast_copy_string(peer->reg_transport, "udp", sizeof(peer->reg_transport));
+				peer->expire = 0;
+				peer->reg_expiry = 0;
+				dropped_bindings = 1;
+			} else if (!old_dynamic && new_dynamic && !peer->registered) {
+				memset(&peer->src_addr, 0, sizeof(peer->src_addr));
+			}
+		}
 		ast_mutex_unlock(&peer->lock);
 	}
 
@@ -21939,6 +21964,18 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 
 	sofia_dnsmgr_setup_peer(peer);
 	sofia_peer_ipport_reindex(peer);	/* B: index by IP+port after the config build (covers reload re-key) */
+	if (dropped_bindings) {
+		/* The bindings dropped above (dynamic -> static): the same side effects as natural expiry or
+		 * `sip unregister` (regexten cleanup, AMI PeerStatus Unregistered, devstate/BLF), outside
+		 * peer->lock (the regcontext cleanup takes conlock). */
+		struct sofia_register_update upd = { 0 };
+
+		upd.emit_unregister = 1;
+		upd.unregister_cause = "Reload";
+		sofia_emit_register_side_effects(peer, NULL, &upd);
+		ast_log(LOG_NOTICE, "Sofia: peer '%s' is no longer host=dynamic - its registered bindings were dropped\n",
+			peer->name);
+	}
 
 	/* dynamic_exclude_static: a static-IP peer appends a deny rule to the global contact_ha so
 	 * later REGISTERs from that address are rejected. */
