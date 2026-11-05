@@ -5000,6 +5000,9 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			ast_sockaddr_set_port(&probe, reg_port ? reg_port : 5060);
 			ast_sockaddr_copy(&peer->src_addr, &probe);
 			peer->registered = 1;
+			/* It has no binding to lapse: the expiry sweep unregisters it when it can no longer be current. */
+			peer->seed_until = reg_seconds + sofia_cfg.max_expiry + SOFIA_REGEXPIRE_GRACE_SECS;
+			peer->next_expiry_check = peer->seed_until;
 		}
 	}
 }
@@ -8506,6 +8509,21 @@ static const char *sofia_get_callid(struct ast_channel *ast)
  * which the probe did not test); and the peer cannot be woken by push (a sleeping app answers no OPTIONS; the
  * push path wakes it). A LAGGED peer did answer and is not refused, unlike chan_sip beyond maxms: a slow
  * answer is still an answer. Caller holds a reference on peer and on single, and no lock. */
+/* A call to a registration seeded from the realtime row (no binding in memory) is refused, as
+ * sofia_qualify_refuses refuses a binding's, when the peer's qualify left it UNREACHABLE and that unanswered
+ * probe went to the seeded address (no REGISTER came since, or it would have a binding). A pushable peer never
+ * gets here (it is parked for push first). Caller holds a reference on peer and no lock. */
+static int sofia_seed_qualify_refuses(struct sofia_peer *peer, const struct ast_sockaddr *addr)
+{
+	int refuse;
+
+	ast_mutex_lock(&peer->lock);
+	refuse = peer->qualify && peer->peer_status == PEER_UNREACHABLE && peer->qualify_failed_at
+		&& !ast_sockaddr_cmp(&peer->qualify_failed_addr, addr);
+	ast_mutex_unlock(&peer->lock);
+	return refuse;
+}
+
 static int sofia_qualify_refuses(struct sofia_peer *peer, struct sofia_contact *single)
 {
 	struct ast_sockaddr failed_addr, src;
@@ -8850,6 +8868,15 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 					pvt->push_parked = 1;
 					ast_log(LOG_NOTICE, "Sofia PUSH: peer '%s' has no binding - will park for push\n",
 						peername);
+				} else if (n_total == 0 && peer_is_dynamic && sel_ok && sofia_seed_qualify_refuses(peer, &sel_src)) {
+					/* A registration seeded from the realtime row (no binding in memory) whose qualify went
+					 * unanswered at that very address: refused as a binding's is (sofia_qualify_refuses). */
+					ast_log(LOG_NOTICE, "Sofia: peer '%s' is UNREACHABLE (no answer to its qualify) - refusing the call (CHANUNAVAIL)\n",
+						peername);
+					ao2_ref(peer, -1);
+					ao2_ref(pvt, -1);
+					*cause = AST_CAUSE_UNREGISTERED;
+					return NULL;
 				} else if (n_total == 0 && peer_is_dynamic && !sel_ok && !dyn_defaddr) {
 					/* Never registered (or unregistered), not wakeable, no defaultip=: nowhere to send
 					 * the INVITE. The aggregate url would be sip:<exten>@dynamic, a host that does not
@@ -10674,23 +10701,24 @@ static void sofia_peer_expiry_hint_update(struct sofia_peer *peer)
 	struct sofia_contact *c;
 	time_t next = 0;
 
-	if (!peer->contacts) {
-		peer->next_expiry_check = 0;
-		return;
-	}
-	ci = ao2_iterator_init(peer->contacts, 0);
-	while ((c = ao2_iterator_next(&ci))) {
-		ao2_lock(c);	/* peer->lock -> contact lock */
-		if (c->expires > 0 && !c->expiry_notified) {
-			time_t at = c->expires + SOFIA_REGEXPIRE_GRACE_SECS;
-			if (!next || at < next) {
-				next = at;
+	if (peer->contacts) {
+		ci = ao2_iterator_init(peer->contacts, 0);
+		while ((c = ao2_iterator_next(&ci))) {
+			ao2_lock(c);	/* peer->lock -> contact lock */
+			if (c->expires > 0 && !c->expiry_notified) {
+				time_t at = c->expires + SOFIA_REGEXPIRE_GRACE_SECS;
+				if (!next || at < next) {
+					next = at;
+				}
 			}
+			ao2_unlock(c);
+			ao2_ref(c, -1);
 		}
-		ao2_unlock(c);
-		ao2_ref(c, -1);
+		ao2_iterator_destroy(&ci);
 	}
-	ao2_iterator_destroy(&ci);
+	if (peer->seed_until && (!next || peer->seed_until < next)) {
+		next = peer->seed_until;	/* a registration seeded from the realtime row */
+	}
 	peer->next_expiry_check = next;
 }
 
@@ -11129,6 +11157,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 
 	/* Wildcard bulk unregister ("Contact: *" — validated above to require a global Expires:0). */
 	if (has_wildcard) {
+		peer->seed_until = 0;	/* a registration seeded from the realtime row is gone with the others */
 		ao2_callback(peer->contacts, OBJ_UNLINK | OBJ_NODATA | OBJ_MULTIPLE, NULL, NULL);
 		peer->registered = 0;
 		memset(&peer->src_addr, 0, sizeof(peer->src_addr));
@@ -11399,6 +11428,9 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 		}
 	}
 
+	/* A registration seeded from the realtime row is superseded by this REGISTER, now applied (one refused for its
+	 * Path, its Contact ACL or storage returned above and leaves the seed, and its lapse, in place). */
+	peer->seed_until = 0;
 	/* Opportunistic expiry sweep */
 	ao2_callback(peer->contacts, OBJ_UNLINK | OBJ_NODATA | OBJ_MULTIPLE,
 		sofia_expire_contacts_cb, &now);
@@ -18194,8 +18226,29 @@ static void sofia_peer_expire_sweep(struct sofia_peer *peer, time_t now)
 	ast_mutex_lock(&peer->lock);
 	/* Inbound registrations only: a register => line carries its OWN upstream registration state. */
 	if (peer->is_register_line || !peer->contacts || ao2_container_count(peer->contacts) == 0) {
+		struct sofia_register_update upd = { 0 };
+		int seed_lapsed = !peer->is_register_line && peer->seed_until && now >= peer->seed_until && peer->registered;
+
 		peer->next_expiry_check = 0;
+		peer->seed_until = 0;
+		if (seed_lapsed) {
+			/* A registration seeded from the realtime row, never refreshed by a REGISTER: it has no binding to
+			 * lapse, so it is unregistered here when it can no longer be current, as a lapsed binding is. */
+			ast_sockaddr_copy(&upd.new_src, &peer->src_addr);
+			peer->registered = 0;
+			memset(&peer->src_addr, 0, sizeof(peer->src_addr));
+			ast_copy_string(peer->reg_transport, "udp", sizeof(peer->reg_transport));
+			peer->expire = 0;
+			peer->reg_expiry = 0;
+		}
 		ast_mutex_unlock(&peer->lock);
+		if (seed_lapsed) {
+			ast_verb(3, "Sofia: registration of '%s' expired (stored in realtime, not renewed)\n", peer->name);
+			sofia_peer_ipport_reindex(peer);
+			upd.emit_unregister = 1;
+			upd.unregister_cause = "Expired";
+			sofia_emit_register_side_effects(peer, NULL, &upd);
+		}
 		return;
 	}
 	ci = ao2_iterator_init(peer->contacts, 0);

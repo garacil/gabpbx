@@ -1129,6 +1129,10 @@ struct sofia_peer {
 	 * sweep costs nothing per idle peer however many peers there are. Written under peer->lock; read without it
 	 * (a stale read only delays or repeats one scan - the scan itself recomputes it under the lock). */
 	time_t next_expiry_check;
+	/* A registration seeded from the realtime row (its ipaddr/port, no binding in memory): the instant it can no longer
+	 * be current (regseconds + maxexpiry + the grace); 0 = none. The expiry sweep unregisters it then (it has no
+	 * binding to lapse); any REGISTER clears it. Written under peer->lock, or before the peer is linked. */
+	time_t seed_until;
 	/* MWI per-peer mailbox list (NOLOCK; peer->lock guards). */
 	struct sofia_mailbox_list mailboxes;
 	nua_handle_t *mwi_subscription_handle; /* NULL until first SUBSCRIBE */
