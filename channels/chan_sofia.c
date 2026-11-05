@@ -2084,6 +2084,7 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	child->last_sdp_body = NULL;
 	master->last_sdp_version = child->last_sdp_version;
 	master->st_min_se_given = child->st_min_se_given;	/* the Min-SE the stolen handle holds */
+	ast_copy_string(master->dialog_callid, child->dialog_callid, sizeof(master->dialog_callid));	/* its dialog's Call-ID (a SUBSCRIBE reusing it is refused) */
 	if (sip) {
 		sofia_session_timer_store(master, sip);
 		sofia_session_timer_plan(master, 0);
@@ -9452,6 +9453,9 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 
 	pvt->nh = nh;
 	pvt->outgoing = 0; /* inbound INVITE — sofia_add_rpid reads this for ;party=called */
+	if (sip->sip_call_id && sip->sip_call_id->i_id) {
+		ast_copy_string(pvt->dialog_callid, sip->sip_call_id->i_id, sizeof(pvt->dialog_callid));
+	}
 	/* SIP history: apply the capture filter now the call identity is known (source = From-user,
 	 * destination = To/Request-URI user), then record the fresh inbound INVITE (this dialog has no
 	 * central-hook pvt yet). do_history was provisionally the global at pvt creation; refine it here. */
@@ -16523,6 +16527,30 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	}
 }
 
+/* ao2 predicate: a call whose dialog has this SIP Call-ID. */
+static int sofia_pvt_callid_cmp_cb(void *obj, void *arg, int flags)
+{
+	struct sofia_pvt *pvt = obj;
+
+	return !strcmp(pvt->dialog_callid, arg) ? (CMP_MATCH | CMP_STOP) : 0;
+}
+
+/* Whether a live call has this SIP Call-ID. sofia_thread only (where dialog_callid is written). */
+static int sofia_callid_is_call(const char *callid)
+{
+	struct sofia_pvt *pvt;
+
+	if (ast_strlen_zero(callid) || !dialogs) {
+		return 0;
+	}
+	pvt = ao2_callback(dialogs, 0, sofia_pvt_callid_cmp_cb, (void *) callid);
+	if (pvt) {
+		ao2_ref(pvt, -1);
+		return 1;
+	}
+	return 0;
+}
+
 static void sofia_process_subscribe(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
 		sip_t const *sip, tagi_t tags[])
 {
@@ -16541,6 +16569,20 @@ static void sofia_process_subscribe(nua_t *nua, nua_handle_t *nh, struct sofia_p
 			NUTAG_WITH_THIS(nua), TAG_END());
 		sofia_emit_subscribe_rejected(sip, NULL,
 			S_OR(event, "(missing)"), "AllowSubscribeClosed");
+		sofia_subscribe_reject_reap(nh);
+		return;
+	}
+
+	/* A SUBSCRIBE inside a call's dialog (its To-tag and Call-ID): this stack never gives it the call's
+	 * handle (nta.c leg_find is skipped for SUBSCRIBE), so accepting it would create a second dialog with
+	 * the call's identifiers, and the call's later BYE or re-INVITE could reach the subscription instead of
+	 * the call (481, a channel left up). Dialog reuse is deprecated (RFC 6665 §4.5); a notifier may refuse
+	 * it with 403, whose text SHOULD say that dialog sharing is not supported (§4.5.2). The subscriber then
+	 * subscribes on a dialog of its own. */
+	if (sip && sip->sip_to && sip->sip_to->a_tag && sip->sip_call_id && sip->sip_call_id->i_id
+			&& sofia_callid_is_call(sip->sip_call_id->i_id)) {
+		nua_respond(nh, 403, "Dialog sharing not supported", NUTAG_WITH_THIS(nua), TAG_END());
+		sofia_emit_subscribe_rejected(sip, NULL, S_OR(event, "(missing)"), "DialogSharing");
 		sofia_subscribe_reject_reap(nh);
 		return;
 	}
@@ -18599,6 +18641,10 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				event_name, status, S_OR(phrase, ""));
 		} else {
 			sofia_append_history(dialog_pvt, "Rx", "%s", event_name);
+		}
+		/* An outbound call learns its Call-ID from the first response (read on this thread only). */
+		if (!dialog_pvt->dialog_callid[0] && sip && sip->sip_call_id && sip->sip_call_id->i_id) {
+			ast_copy_string(dialog_pvt->dialog_callid, sip->sip_call_id->i_id, sizeof(dialog_pvt->dialog_callid));
 		}
 	}
 

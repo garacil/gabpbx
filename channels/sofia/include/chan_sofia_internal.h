@@ -767,6 +767,7 @@ struct sofia_pvt {
 	int push_appending;		/* multi-ring fork resume posted; the parked-registry entry stays live for LATE APPENDS until answer/hangup - the hangup hook must run even though push_parked already dropped to 0 */
 	int push_inflight;		/* P2: the no-provisional guard parked this pvt with its INVITE on the wire; the hangup hook reaps that entry too */
 	char sip_callid[64];
+	char dialog_callid[256];	/* the SIP Call-ID of this call's dialog, once seen (sofia_thread): a SUBSCRIBE reusing it is refused */
 	/* P2 no-provisional guard: armed after the single-contact INVITE to a tokened peer on a
 	 * connection-oriented transport; a suspended phone's socket looks alive but swallows the
 	 * INVITE, so with no 1xx in push_noresponse seconds the driver pushes with the SAME
