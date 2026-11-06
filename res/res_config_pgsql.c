@@ -397,6 +397,25 @@ int pgsql_reconnect(int pgsqlCurrent)
         return 1;
 }
 
+/*! \brief Did this failed query fail because of the database (the lookup could not run), rather than because of what
+ * was asked? The connection is down, or the SQLSTATE class is connection exception (08), insufficient resources
+ * (53), operator intervention such as a shutdown (57), system error (58) or internal error (XX). A data or syntax
+ * error (22, 42...) comes from the request and keeps meaning "no answer for this key". */
+static int pgsql_failure_is_backend(PGconn *conn, PGresult *res)
+{
+	const char *state;
+
+	if (!conn || PQstatus(conn) != CONNECTION_OK || !res) {
+		return 1;
+	}
+	state = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+	if (!state || strlen(state) < 2) {
+		return 1;	/* no SQLSTATE: the client library failed (e.g. the connection dropped mid-query) */
+	}
+	return !strncmp(state, "08", 2) || !strncmp(state, "53", 2) || !strncmp(state, "57", 2)
+		|| !strncmp(state, "58", 2) || !strncmp(state, "XX", 2);
+}
+
 PGresult *execsql(char *sql, char *func, char *keyfield, int pgsqlCurrent)
 {
         PGresult *res = NULL;
@@ -418,6 +437,7 @@ PGresult *execsql(char *sql, char *func, char *keyfield, int pgsqlCurrent)
                 ast_log(LOG_DEBUG, "Postgresql RealTime pgsql pool %i\n", pgsqlCurrent);
 
         if (!pgsql_reconnect(pgsqlCurrent)) {
+                ast_realtime_backend_failed();	/* no connection to the database */
                 free(sql2);
                 return NULL;
         }
@@ -433,6 +453,9 @@ PGresult *execsql(char *sql, char *func, char *keyfield, int pgsqlCurrent)
                 if (option_debug)
                         ast_log(LOG_DEBUG, "SELECT SQL: ERROR\n");
                 if (!pgsql_reconnect(pgsqlCurrent)) {
+                        ast_realtime_backend_failed();	/* the connection is gone and cannot be made again */
+                        if (res)
+                                PQclear(res);
                         free(sql2);
                         return NULL;
                 }
@@ -441,6 +464,9 @@ PGresult *execsql(char *sql, char *func, char *keyfield, int pgsqlCurrent)
                 res = PQexec(pgsqlConn[pgsqlCurrent], cmd);
                 if ((PQresultStatus(res) != PGRES_TUPLES_OK) && (PQresultStatus(res) != PGRES_COMMAND_OK)) {
                         ast_log(LOG_ERROR,"FATAL ERROR: %s (%i)\n", PQresultErrorMessage(res), PQresultStatus(res));
+                        if (pgsql_failure_is_backend(pgsqlConn[pgsqlCurrent], res)) {
+                                ast_realtime_backend_failed();
+                        }
                         if (res)
                                 PQclear(res);
                         free(sql2);

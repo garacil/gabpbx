@@ -119,6 +119,13 @@ static int init_appendbuf(void *data)
 
 AST_THREADSTORAGE_CUSTOM(appendbuf, init_appendbuf, ast_free_ptr);
 
+/*! Per-thread outcome of the realtime lookups (ast_realtime_backend_failed, ast_realtime_last_lookup_failed). */
+struct realtime_lookup_status {
+	int engine_failed;	/*!< the engine called now reported a backend failure */
+	int last_failed;	/*!< the last lookup returned nothing because no engine could answer */
+};
+AST_THREADSTORAGE(realtime_lookup_status_buf);
+
 /* comment buffers are better implemented using the ast_str_*() API */
 #define CB_SIZE 250	/* initial size of comment buffers */
 
@@ -2348,25 +2355,81 @@ struct ast_config *ast_config_load2(const char *filename, const char *who_asked,
 	return result;
 }
 
+void ast_realtime_backend_failed(void)
+{
+	struct realtime_lookup_status *st = ast_threadstorage_get(&realtime_lookup_status_buf, sizeof(*st));
+
+	if (st) {
+		st->engine_failed = 1;
+	}
+}
+
+int ast_realtime_last_lookup_failed(void)
+{
+	struct realtime_lookup_status *st = ast_threadstorage_get(&realtime_lookup_status_buf, sizeof(*st));
+
+	return st ? st->last_failed : 0;
+}
+
+/*! \brief Before an engine call: forget what the previous one reported. */
+static void realtime_engine_call_start(struct realtime_lookup_status *st)
+{
+	if (st) {
+		st->engine_failed = 0;
+	}
+}
+
+/*! \brief After an engine call that returned nothing: did it fail, or answer "no row"? */
+static void realtime_engine_call_empty(struct realtime_lookup_status *st, int *failed, int *answered)
+{
+	if (st && st->engine_failed) {
+		*failed = 1;
+	} else {
+		*answered = 1;
+	}
+}
+
+/*! \brief End of a lookup: it failed when nothing came back, an engine failed and none answered. */
+static void realtime_lookup_done(struct realtime_lookup_status *st, int have_result, int failed, int answered)
+{
+	if (st) {
+		st->last_failed = !have_result && failed && !answered;
+	}
+}
+
 static struct ast_variable *ast_load_realtime_helper(const char *family, va_list ap)
 {
 	struct ast_config_engine *eng;
 	char db[256];
 	char table[256];
 	struct ast_variable *res=NULL;
+	struct realtime_lookup_status *st = ast_threadstorage_get(&realtime_lookup_status_buf, sizeof(*st));
+	int failed = 0, answered = 0;
 	int i;
 
 	for (i = 1; ; i++) {
 		if ((eng = find_engine(family, i, db, sizeof(db), table, sizeof(table)))) {
-			if (eng->realtime_func && (res = eng->realtime_func(db, table, ap))) {
-				return res;
+			if (eng->realtime_func) {
+				va_list aq;
+
+				/* Each engine walks the arguments itself: a failover engine gets them from the start. */
+				va_copy(aq, ap);
+				realtime_engine_call_start(st);
+				res = eng->realtime_func(db, table, aq);
+				va_end(aq);
+				if (res) {
+					realtime_lookup_done(st, 1, failed, answered);
+					return res;
+				}
+				realtime_engine_call_empty(st, &failed, &answered);
 			}
 		} else {
-			return NULL;
+			break;
 		}
 	}
 
-	return res;
+	realtime_lookup_done(st, 0, failed, answered);
+	return NULL;
 }
 
 struct ast_variable *ast_load_realtime_all(const char *family, ...)
@@ -2492,16 +2555,29 @@ struct ast_config *ast_load_realtime_multientry(const char *family, ...)
 	va_list ap;
 	int i;
 
+	struct realtime_lookup_status *st = ast_threadstorage_get(&realtime_lookup_status_buf, sizeof(*st));
+	int failed = 0, answered = 0;
+
 	va_start(ap, family);
 	for (i = 1; ; i++) {
 		if ((eng = find_engine(family, i, db, sizeof(db), table, sizeof(table)))) {
-			if (eng->realtime_multi_func && (res = eng->realtime_multi_func(db, table, ap))) {
-				/* If we were returned an empty cfg, destroy it and return NULL */
-				if (!res->root) {
-					ast_config_destroy(res);
-					res = NULL;
+			if (eng->realtime_multi_func) {
+				va_list aq;
+
+				va_copy(aq, ap);
+				realtime_engine_call_start(st);
+				res = eng->realtime_multi_func(db, table, aq);
+				va_end(aq);
+				if (res) {
+					answered = 1;	/* the engine ran its query */
+					/* If we were returned an empty cfg, destroy it and return NULL */
+					if (!res->root) {
+						ast_config_destroy(res);
+						res = NULL;
+					}
+					break;
 				}
-				break;
+				realtime_engine_call_empty(st, &failed, &answered);
 			}
 		} else {
 			break;
@@ -2509,6 +2585,7 @@ struct ast_config *ast_load_realtime_multientry(const char *family, ...)
 	}
 	va_end(ap);
 
+	realtime_lookup_done(st, res != NULL, failed, answered);
 	return res;
 }
 

@@ -3438,3 +3438,12 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;                                 ; e.g. t38pt_udptl = yes,redundancy. An empty realtime column keeps it.
 ;t38pt_usertpsource = no          ; default — use SDP c= for UDPTL destination ([general]: inherited too)
 ;t38_maxdatagram = -1             ; default — use built-in 200-byte default
+
+; realtime_retry_after (seconds, 0-3600, default 20): when a peer cannot be looked up because the realtime
+; backend failed (database unreachable or down, as opposed to "no such name"), REGISTER, INVITE, SUBSCRIBE and
+; MESSAGE get 503 Service Unavailable with Retry-After instead of the answers of an unknown name (401/403, a
+; blacklist count, the guest path): a 403 tells the phone not to try again (RFC 3261 section 21.4.4), a 503 tells
+; it to come back after Retry-After (section 21.5.4; RFC 5626 section 4.2.1). Each 503 picks a value between N/2
+; and N, so the phones of an outage do not all come back at once. 0 sends no Retry-After (the client then acts
+; as for a 500).
+;realtime_retry_after = 20

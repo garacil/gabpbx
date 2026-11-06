@@ -1126,6 +1126,7 @@ static struct ast_variable * realtime_handler(const char *database, const char *
 		ast_log(LOG_WARNING, "%s\n", S_OR(errormsg, sqlite3_errmsg(db)));
 		sqlite3_free(errormsg);
 		ast_variables_destroy(args.var);
+		ast_realtime_backend_failed();	/* the lookup could not run (the values are quoted: never caused by them) */
 		return NULL;
 	}
 	sqlite3_free(errormsg);
@@ -1294,6 +1295,7 @@ static struct ast_config *realtime_multi_handler(const char *database,
 		ast_log(LOG_WARNING, "%s\n", S_OR(errormsg, sqlite3_errmsg(db)));
 		sqlite3_free(errormsg);
 		ast_config_destroy(cfg);
+		ast_realtime_backend_failed();	/* the lookup could not run */
 		return NULL;
 	}
 	sqlite3_free(errormsg);

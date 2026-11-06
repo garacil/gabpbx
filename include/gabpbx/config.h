@@ -309,6 +309,30 @@ struct ast_variable *ast_load_realtime(const char *family, ...) attribute_sentin
 struct ast_variable *ast_load_realtime_all(const char *family, ...) attribute_sentinel;
 
 /*!
+ * \brief Tell the core that this realtime lookup could not be answered because the backend failed
+ *
+ * \details
+ * Called by a realtime engine, in the thread doing the lookup, when its query could not run (no connection to the
+ * database, the database refused or lost it, an I/O error), never when the query ran and found no row. The lookup
+ * functions turn it into the answer of ast_realtime_last_lookup_failed().
+ */
+void ast_realtime_backend_failed(void);
+
+/*!
+ * \brief Whether this thread's last realtime lookup returned nothing because the backend failed
+ *
+ * \details
+ * Refers to the last ast_load_realtime(), ast_load_realtime_all() or ast_load_realtime_multientry() made by the
+ * calling thread. When it returned no result, this tells "no backend could answer" (1: every engine tried reported
+ * ast_realtime_backend_failed()) from "no matching row" (0). A caller can then answer a temporary failure instead of
+ * treating the key as unknown.
+ *
+ * \retval 1 the backend failed
+ * \retval 0 the lookup was answered (a result, or none), or no lookup was made on this thread
+ */
+int ast_realtime_last_lookup_failed(void);
+
+/*!
  * \brief Release any resources cached for a realtime family
  * \since 1.6.1
  *

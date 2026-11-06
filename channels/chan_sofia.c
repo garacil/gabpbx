@@ -5064,13 +5064,66 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
  * realtime-by-addr path passes its winning by-IP row) — skip the by-name DB query and do NOT free
  * prevar (the caller frees it exactly once). prevar == NULL: load by name + free here, as before.
  * sofia_apply_peer_variables is copy-only, so the source list is safe to free after the build. */
+/* Whether this thread's last peer lookup (sofia_find_peer, sofia_find_peer_realtime_by_addr) found no peer because
+ * the realtime backend could not be read (ast_realtime_last_lookup_failed), rather than because the name or address
+ * is unknown. Each lookup sets it; the SIP requests are handled on sofia_thread, which reads it right after. */
+AST_THREADSTORAGE(sofia_lookup_status_buf);
+
+static void sofia_peer_lookup_set_failed(int failed)
+{
+	int *st = ast_threadstorage_get(&sofia_lookup_status_buf, sizeof(*st));
+
+	if (st) {
+		*st = failed;
+	}
+}
+
+int sofia_peer_lookup_failed(void)
+{
+	int *st = ast_threadstorage_get(&sofia_lookup_status_buf, sizeof(*st));
+
+	return st ? *st : 0;
+}
+
+/* A request whose account could not be looked up because the realtime backend failed: 503 Service Unavailable with
+ * Retry-After (RFC 3261 §21.5.4, §20.33), never the answers of an unknown name (401/403, the blacklist count, the
+ * guest path): a 403 tells the client not to repeat the request (§21.4.4) and a phone stops for good, while a
+ * registering UA waits Retry-After and tries again (RFC 5626 §4.2.1). Retry-After is realtime_retry_after spread
+ * over N/2..N so the clients of an outage do not all return at once. The caller reaps the handle as for its other
+ * rejections. sofia_thread. */
+void sofia_reject_backend_unavailable(nua_t *nua, nua_handle_t *nh, const char *method, const char *who)
+{
+	static time_t last_warn;
+	static unsigned int suppressed;
+	char ra[16] = "";
+	int n = sofia_cfg.realtime_retry_after;
+	time_t now = time(NULL);
+
+	if (n > 0) {
+		snprintf(ra, sizeof(ra), "%d", (n + 1) / 2 + (int) (ast_random() % (unsigned int) (n / 2 + 1)));
+	}
+	nua_respond(nh, SIP_503_SERVICE_UNAVAILABLE, TAG_IF(ra[0], SIPTAG_RETRY_AFTER_STR(ra)),
+		NUTAG_WITH_THIS(nua), TAG_END());
+	if (now - last_warn >= 10) {
+		ast_log(LOG_WARNING, "Sofia: %s from '%s' answered 503 (Retry-After %s): the realtime backend could not be read%s\n",
+			method, S_OR(who, "?"), ra[0] ? ra : "none", suppressed ? " (more in the last seconds)" : "");
+		last_warn = now;
+		suppressed = 0;
+	} else {
+		suppressed++;
+	}
+}
+
 static struct sofia_peer *sofia_find_peer_realtime_build(const char *name, struct ast_variable *prevar)
 {
 	struct ast_variable *var;
 	struct sofia_peer *peer;
 
 	var = prevar ? prevar : ast_load_realtime("sippeers", "name", name, SENTINEL);
-	if (!var) return NULL;
+	if (!var) {
+		sofia_peer_lookup_set_failed(ast_realtime_last_lookup_failed());	/* no row, or the backend failed */
+		return NULL;
+	}
 
 	peer = sofia_peer_alloc(name);
 	if (!peer) {
@@ -5347,6 +5400,7 @@ static struct sofia_peer *sofia_find_peer_impl(const char *name, struct ast_vari
 	int built_realtime = 0;	/* set when THIS call linked a NEW realtime peer -> create its hint after unlock */
 	struct sofia_peer_key key = { .name = name };
 
+	sofia_peer_lookup_set_failed(0);
 	/* Fast path: cache hit under the peers lock. The container lock is the single
 	 * global gate for EVERY inbound INVITE/REGISTER/SUBSCRIBE/OPTIONS + devicestate
 	 * query, so it MUST NOT be held across the realtime DB query or the DNS lookup
@@ -5679,6 +5733,7 @@ static struct sofia_peer *sofia_find_peer_realtime_by_addr(const struct ast_sock
 	const char *step = NULL;	/* which by-IP step matched, for the debug trace */
 	char ipbuf[48], portbuf[8], namebuf[80];
 
+	sofia_peer_lookup_set_failed(0);
 	if (!src || ast_sockaddr_isnull(src) || !ast_check_realtime("sippeers")) {
 		return NULL;
 	}
@@ -5709,6 +5764,12 @@ static struct sofia_peer *sofia_find_peer_realtime_by_addr(const struct ast_sock
 		step = "ipaddr+insecure~port";
 	}
 	if (!var) {
+		if (ast_realtime_last_lookup_failed()) {
+			/* The backend failed: not "no such trunk", so no negative-cache entry (it would turn the outage
+			 * into 10 s of unknown-caller answers for this address after the database is back). */
+			sofia_peer_lookup_set_failed(1);
+			return NULL;
+		}
 		sofia_rtlookup_neg_add(ipbuf);
 		return NULL;
 	}
@@ -10113,10 +10174,12 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 
 	/* Peer lookup + ACL run BEFORE sofia_parse_sdp so the encryption-policy check
 	 * sees pvt->peer and banned IPs never trigger SRTP key generation. */
+	int caller_rt_failed = 0;	/* a lookup found no caller because the realtime backend failed */
 	{
 		struct sofia_peer *caller_peer = NULL;
 		if (cid_num[0]) {
 			caller_peer = sofia_find_peer(cid_num);
+			caller_rt_failed = !caller_peer && sofia_peer_lookup_failed();
 			/* chan_sip FINDUSERS-then-FINDPEERS parity (chan_sip.c:16990-16997): only a type=user/friend
 			 * may be identified by the From-user NAME. A type=peer whose name collides with the caller-ID
 			 * (an inbound IP-trunk INVITE whose From-user equals a local extension that is itself a
@@ -10144,6 +10207,9 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 				 * source IP+port (chan_sip realtime_peer_by_addr parity) so insecure=invite
 				 * trunks defined only in realtime can place inbound calls. */
 				caller_peer = sofia_find_peer_realtime_by_addr(&src);
+				if (!caller_peer && sofia_peer_lookup_failed()) {
+					caller_rt_failed = 1;
+				}
 			}
 		}
 		if (caller_peer) {
@@ -10257,6 +10323,12 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 				return;
 			}
 		}
+	} else if (caller_rt_failed) {
+		/* The caller could not be identified because the realtime backend failed: 503 with Retry-After,
+		 * never the unknown-caller answers (401/403) nor the guest path. */
+		sofia_reject_backend_unavailable(nua, nh, "INVITE", cid_num);
+		ao2_ref(pvt, -1);
+		return;
 	} else if (sofia_cfg.alwaysauthreject) {
 		/* Unknown peer: run the SAME digest verifier against the static bogus peer so a no-auth
 		 * request is challenged (401) and a credentialed retry gets the IDENTICAL 400/401-stale/403
@@ -13060,6 +13132,17 @@ struct sofia_peer *sofia_message_authenticate_sender(nua_t *nua, nua_handle_t *n
 	}
 	auth_user = sofia_pick_auth_username(sip, from_user, auth_user_buf, sizeof(auth_user_buf));
 	peer = (!ast_strlen_zero(auth_user)) ? sofia_find_peer(auth_user) : NULL;
+	if (!peer && !ast_strlen_zero(auth_user) && sofia_peer_lookup_failed()) {
+		/* The sender could not be read (realtime backend down): 503, then the same reap. */
+		sofia_reject_backend_unavailable(nua, nh, "MESSAGE", auth_user);
+		if (nua_handle_magic(nh) == NULL) {
+			nua_handle_destroy(nh);
+		}
+		if (challenged) {
+			*challenged = 1;
+		}
+		return NULL;
+	}
 
 	/* Source-IP ACL (peer->ha) BEFORE the digest, parity with INVITE/REGISTER/SUBSCRIBE. On deny, drop
 	 * the peer and fall to the unknown-peer challenge below (401) rather than 403, so peer existence is
@@ -14167,6 +14250,12 @@ static enum sofia_register_nh_fate sofia_process_register_impl(nua_t *nua, nua_h
 	}
 
 	peer = sofia_find_peer(user);
+	if (!peer && sofia_peer_lookup_failed()) {
+		/* The account could not be read (realtime backend down): a temporary failure, not an unknown name. */
+		sofia_reject_backend_unavailable(nua, nh, "REGISTER", user);
+		sofia_log_register_outcome("REJECT (realtime unavailable, 503)", user, sip);
+		return SOFIA_REG_NH_ANSWERED;
+	}
 	if (!peer) {
 		/* Unknown peer: the answers, the work and the blacklist count of a real account with a wrong
 		 * password (the verifier counts a bad digest for every name; an extra count here would let a
@@ -16437,6 +16526,11 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 	to_user = sip->sip_to->a_url->url_user;
 
 	peer = sofia_find_peer(to_user);
+	if (!peer && sofia_peer_lookup_failed()) {
+		sofia_reject_backend_unavailable(nua, nh, "SUBSCRIBE", to_user);
+		sofia_mwi_reject_reap(nh);
+		return;
+	}
 	if (!peer) {
 		if (sofia_cfg.alwaysauthreject) {
 			ast_log(LOG_NOTICE, "Sofia MWI: SUBSCRIBE for unknown peer '%s' — answered as a wrong password\n", to_user);
@@ -16742,6 +16836,11 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 
 	/* Identify the subscriber peer (gating + context source). */
 	peer = sofia_find_peer(from_user);
+	if (!peer && sofia_peer_lookup_failed()) {
+		sofia_reject_backend_unavailable(nua, nh, "SUBSCRIBE", from_user);
+		sofia_subscribe_reject_reap(nh);
+		return;
+	}
 	if (!peer) {
 		if (sofia_cfg.alwaysauthreject) {
 			/* The answers a real account with a wrong password gets (401, then 403 for credentials, not a
@@ -16837,6 +16936,8 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		}
 	}
 	if (!ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, l_context, watched)) {
+		int target_rt_failed = 0;
+
 		/* Local-domain guard: only turn the watched user into a realtime lookup for our own domain(s)
 		 * (empty domain_list = no configured local-domain truth -> permissive, as the INVITE path). */
 		if (AST_LIST_EMPTY(&domain_list) || ast_strlen_zero(watched_host)
@@ -16846,7 +16947,15 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 			if (target) {
 				sofia_create_peer_hint(target, "realtime");
 				ao2_ref(target, -1);
+			} else {
+				target_rt_failed = sofia_peer_lookup_failed();
 			}
+		}
+		if (target_rt_failed && !ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, l_context, watched)) {
+			/* The watched extension could not be read: 503, not "no such extension". */
+			sofia_reject_backend_unavailable(nua, nh, "SUBSCRIBE", l_peername);
+			sofia_subscribe_reject_reap(nh);
+			return;
 		}
 		if (!ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, l_context, watched)) {
 			if (sofia_debug) {
@@ -22299,6 +22408,14 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			 * [general] t38pt_udptl (handle_t38_options into global_flags, copied into each peer). */
 			sofia_parse_t38pt_udptl(v->value, &sofia_cfg.default_t38pt_udptl, &sofia_cfg.default_t38_ec_mode,
 				&sofia_cfg.default_t38_maxdatagram, "[general]");
+		} else if (!strcasecmp(v->name, "realtime_retry_after")) {
+			/* Retry-After of the 503 answered when the realtime backend fails; 0 sends none. */
+			int x;
+			if (sscanf(v->value, "%30d", &x) == 1 && x >= 0 && x <= 3600) {
+				sofia_cfg.realtime_retry_after = x;
+			} else {
+				ast_log(LOG_WARNING, "Sofia: invalid [general] realtime_retry_after '%s' (0-3600 seconds)\n", v->value);
+			}
 		} else if (!strcasecmp(v->name, "t38pt_usertpsource")) {
 			/* Default UDPTL destination override inherited by peers (chan_sip SIP_PAGE2_UDPTL_DESTINATION). */
 			sofia_cfg.default_t38pt_usertpsource = ast_true(v->value) ? 1 : 0;
@@ -23610,6 +23727,8 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.default_t38pt_udptl = 0;
 	sofia_cfg.default_t38_ec_mode = SOFIA_T38_EC_FEC;
 	sofia_cfg.default_t38pt_usertpsource = 0;
+	/* 503 Retry-After when the realtime backend fails (sofia_reject_backend_unavailable). */
+	sofia_cfg.realtime_retry_after = 20;
 	/* default 32000ms (= 64 * DEFAULT_TIMER_T1); implemented via NTATAG_SIP_T1X64. */
 	sofia_cfg.default_timer_b = 32000;
 	/* default 500ms; implemented via NTATAG_SIP_T1. */

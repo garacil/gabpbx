@@ -333,6 +333,8 @@ void sofia_sdp_offer_answered(struct sofia_pvt *pvt);
 int sofia_sdp_extract_hold(sip_t const *sip, su_home_t *home);
 
 struct sofia_peer *sofia_find_peer(const char *name);
+int sofia_peer_lookup_failed(void);	/* this thread's last peer lookup found nothing because the realtime backend failed */
+void sofia_reject_backend_unavailable(nua_t *nua, nua_handle_t *nh, const char *method, const char *who);
 struct sofia_peer *sofia_find_peer_cached(const char *name);	/* cache-only: no realtime fallback */
 /* Out-of-dialog MESSAGE digest gate (RFC 3428): challenge/verify a credentialed peer with the
  * SAME path as INVITE before dialplan. peer NULL or creds-less -> 0 (proceed; caller's allowguest
@@ -1393,6 +1395,8 @@ struct sofia_config {
 	int default_t38pt_udptl;   /* [general] t38pt_udptl: T.38 enabled for every peer that does not set its own (chan_sip global_flags SIP_PAGE2_T38SUPPORT); default 0 */
 	int default_t38_ec_mode;   /* [general] t38pt_udptl EC mode inherited with it (SOFIA_T38_EC_*); default FEC */
 	int default_t38pt_usertpsource; /* [general] t38pt_usertpsource inherited by peers (chan_sip SIP_PAGE2_UDPTL_DESTINATION); default 0 */
+	int realtime_retry_after;  /* [general] realtime_retry_after: seconds in the Retry-After of the 503 answered when the realtime
+	                            * backend could not be read (RFC 3261 §21.5.4); each 503 picks N/2..N; 0 = no Retry-After; default 20 */
 	int default_timer_b;       /* RFC 3261 Timer B inherited by peers; default 32000ms (64*T1); via NTATAG_SIP_T1X64 at nua_create */
 	int default_timer_t1;      /* RFC 3261 T1 retransmission interval (ms) inherited by peers; default 500ms; via NTATAG_SIP_T1 at nua_create */
 	int default_allowoverlap_mode; /* tri-state overlap-dial mode inherited by peers; default YES (SOFIA_OVERLAP_YES=1). DTMF mode is fall-through (chan_sip design). */
