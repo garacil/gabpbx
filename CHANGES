@@ -1,3 +1,43 @@
+## 1.9.22 — 503 when the account database is down, SDP lines kept across re-INVITEs, re-INVITEs never lost
+
+`gabpbx` (the core), `res_config_pgsql.so`, `res_config_sqlite3.so` and `chan_sofia.so` change: install the four
+together, the core first (the realtime engines report a failed backend through a new core function).
+
+### Fixed
+
+- **An account that could not be read because the realtime database was down was answered as if it did not
+  exist.** REGISTER got 401, then 403 to the retry with credentials (RFC 3261 §21.4.4: the request should not be
+  repeated, so a softphone stops for good) and a blacklist count, so an outage could ban the phone's address for
+  24 h. `chan_sip` does the same.
+  - The realtime engines now report a lookup that could not run: the connection down or a server-side SQLSTATE
+    (classes 08, 25, 40, 53, 55P03, 57, 58, XX) for PostgreSQL, anything but a query error for SQLite. The core
+    keeps it per thread (`ast_realtime_last_lookup_failed`), and each engine gets its own copy of the argument
+    list (a failover engine used to get a consumed one).
+  - `chan_sofia` answers **503 Service Unavailable with Retry-After** (RFC 3261 §21.5.4; RFC 5626 §4.2.1: the UA
+    waits and retries) to REGISTER, INVITE, MESSAGE and SUBSCRIBE (presence, MWI) when the account could not be
+    read: no digest check, no blacklist count, never the guest path. New `[general] realtime_retry_after`
+    (default 20: each 503 picks a value between N/2 and N; 0 sends none).
+  - After a failure the lookups of peers not in memory skip the backend for 2 s (or as long as the failed lookup
+    took, up to 60 s). The by-address lookup stops at the first step the backend could not answer. An INVITE
+    matched only by its source address to a peer that is neither a trunk nor the exact address and port gets the
+    503 unless the credentials are that peer's.
+- **A plain-SIP SDP answer dropped offered m= lines.** The answer now has exactly the offer's m= lines in their
+  order, the declined ones at port 0 (RFC 3264 §6, §8.2): video with an unknown codec, lines offered at port 0,
+  `m=text`, `m=application`, a second `m=audio`. An offer of more than 16 lines is refused with 488. Our later
+  offers (session refresh, hold, T.38, directmedia) keep the session's lines in place and add new streams at the
+  end (§8, §8.1); the audio comes back on the image line at the end of an image-only fax (§8.3.3).
+- **A re-INVITE that found another one in flight was lost**: a hold or a resume (a lost resume left the peer
+  held, sending no media), a connected-line update, and a 491 to a session refresh or to a connected-line
+  re-INVITE was never retried. Now they wait for the slot and go in order (T.38 offer, directmedia target, hold
+  direction, connected line, session refresh), as `chan_sip`'s deferred re-INVITE; a 491 is retried for every
+  purpose after the RFC 3261 §14.1 delay (at most 3 in a row); a refused session refresh gets one more attempt
+  halfway to the moment the peer may end the session (RFC 4028 §10), and with UPDATE refreshes a refused
+  re-INVITE re-arms our refresh instead of stopping it.
+
+### Upgrading
+
+Install the core and the three modules together. `[general] realtime_retry_after` is optional (default 20).
+
 ## 1.9.21 — [general] t38pt_udptl applies to every peer, as in chan_sip
 
 Only `chan_sofia.so` changes.
