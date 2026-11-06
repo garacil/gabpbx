@@ -714,6 +714,14 @@ struct sofia_pvt {
 	int need_reinvite;
 	int need_t38_reinvite;           /* a T.38 offer (LOCAL_REINVITE, or the audio one at the end of a fax) waits for the
 	                                  * slot or a 491 retry; sent by sofia_reinvite_followup_locked */
+	int local_hold_want;             /* the hold direction last asked for (hold_reinvite): a hold re-INVITE is due while
+	                                  * it differs from local_hold_mode and none is in flight */
+	int need_cl_reinvite;            /* a connected-line update waits for the slot or a 491 retry (cl_rpid) */
+	char cl_rpid[512];               /* RPID/PAI of the latest connected-line update, built when it was asked, with the
+	                                  * channel locked (sofia_update_connectedline); the re-INVITE carries it */
+	int need_session_refresh;        /* our RFC 4028 refresh waits for the slot or a 491 retry */
+	time_t session_refresh_base;     /* when the last negotiation (re)armed the refresh (sofia_session_refresh_arm) */
+	int session_refresh_last_chance; /* the one retry after a refused refresh was used in this interval */
 	int reinvite_force;              /* a directmedia offer was refused: redirip no longer says where the peer sends, so
 	                                  * the next target is offered without comparing (cleared when an offer goes out) */
 	int t38_offer_out;               /* what our re-INVITE on the wire carries for T.38 (SOFIA_T38_OUT_*), set by
@@ -867,6 +875,7 @@ struct sofia_pvt {
 	int session_update_refresh;     /* NUTAG_UPDATE_REFRESH(1) applied on the handle: the stack refreshes with UPDATE */
 	int session_update_refused;     /* the peer refused an UPDATE refresh: re-INVITE for the rest of the call */
 	int session_refresh_sched_id;   /* -1 = none; our re-INVITE refresh timer (del-or-fire idiom) */
+	int session_refresh_cancelled;  /* refresh timers cancelled while their callback was already running */
 	int allowtransfer; /* per-call REFER policy; inherits peer->allowtransfer; gated at sofia_process_refer */
 	/* Blind/attended-transfer BYE deferral (RFC 5589 §6.1): we must not race the
 	 * transferer's UA BYE with our own nua_bye, or sofia-sip drops the pending

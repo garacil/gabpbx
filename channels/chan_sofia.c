@@ -1883,6 +1883,7 @@ static void sofia_fork_try_early_media(struct sofia_fork *fork, struct sofia_pvt
 
 /* RFC 4028 session refresh bookkeeping (defined with the re-INVITE senders below). */
 static void sofia_session_timer_store(struct sofia_pvt *pvt, sip_t const *sip);
+static void sofia_reinvite_kick(struct sofia_pvt *pvt);
 static void sofia_session_timer_plan(struct sofia_pvt *pvt, int uas);
 static void sofia_session_refresh_arm(struct sofia_pvt *pvt);
 
@@ -2159,6 +2160,8 @@ static int sofia_fork_pick_winner(struct sofia_fork *fork, struct sofia_pvt *chi
 	if (push_appending) {
 		sofia_push_on_fork_answered(master);
 	}
+
+	sofia_reinvite_kick(master);	/* what was asked before the answer (a hold, a connected-line update) */
 
 	/* Release the master lifetime ref taken under fork->lock above. */
 	ao2_ref(master, -1);
@@ -6080,9 +6083,9 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 	/* A T.38 offer that is due (LOCAL_REINVITE, or the audio offer at the end of a fax) is in every SDP built now
 	 * (sofia_generate_sdp), so this re-INVITE is that offer, and its response is handled as one (the T.38
 	 * purpose: refusal, 491 retry, hang-up after a refused end-of-fax offer). It can be another one claimed just
-	 * before the T.38 request was deferred: a hold waits for the operator's next hold (its direction goes back),
-	 * a connected-line update is dropped (as when the slot is busy), a directmedia target is carried and queued
-	 * again in case the offer is refused, a session refresh is done by this one. */
+	 * before the T.38 request was deferred: a hold or a connected-line update goes after it (still due), a
+	 * directmedia target is carried and queued again in case the offer is refused, a session refresh is done by
+	 * this one. */
 	if (pvt && pvt->nh && pvt->reinvite_purpose == SOFIA_REINVITE_T38
 			&& pvt->t38_state != SOFIA_T38_LOCAL_REINVITE
 			&& !(pvt->t38_state == SOFIA_T38_ENABLED && pvt->t38_ending)) {
@@ -6098,7 +6101,13 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 			&& (pvt->t38_state == SOFIA_T38_LOCAL_REINVITE
 				|| (pvt->t38_state == SOFIA_T38_ENABLED && pvt->t38_ending))) {
 		if (pvt->reinvite_purpose == SOFIA_REINVITE_LOCAL_HOLD) {
-			pvt->local_hold_mode = pvt->local_hold_mode_prev;
+			pvt->local_hold_mode = pvt->local_hold_mode_prev;	/* still due (local_hold_want): goes after */
+		} else if (pvt->reinvite_purpose == SOFIA_REINVITE_CONNECTED_LINE) {
+			pvt->need_cl_reinvite = 1;	/* goes after */
+		} else if (pvt->reinvite_purpose == SOFIA_REINVITE_SESSION_REFRESH) {
+			/* this offer refreshes the session as well (RFC 4028 §7.4); if it is refused the refresh is still owed
+			 * (a 2xx clears it, sofia_session_refresh_arm) */
+			pvt->need_session_refresh = 1;
 		} else if (pvt->reinvite_purpose == SOFIA_REINVITE_DIRECTMEDIA && !pvt->need_reinvite) {
 			ast_sockaddr_copy(&pvt->redirip_next, &pvt->redirip);
 			pvt->need_reinvite = 1;
@@ -6130,6 +6139,7 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 			}
 			if (prev_purpose == SOFIA_REINVITE_LOCAL_HOLD && pvt->reinvite_purpose == SOFIA_REINVITE_LOCAL_HOLD) {
 				pvt->local_hold_mode = pvt->local_hold_mode_prev;	/* the hold direction did not go out */
+				pvt->local_hold_want = pvt->local_hold_mode;	/* given up: no loop on an SDP that cannot be built */
 			}
 			pvt->reinvite_pending = 0;
 			pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
@@ -6152,13 +6162,13 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 		ast_mutex_lock(&pvt->peer->lock);
 		mf = pvt->peer->maxforwards;
 		have_gruu = sofia_gruu_dialog_contact(pvt->peer, gruu_contact, sizeof(gruu_contact));
-		/* A connected-line re-INVITE exists solely to carry the new identity, so build the
-		 * RPID/PAI under the same peer->lock span as the other stringfield readers
-		 * (chan_sip add_rpid on its update_connectedline INVITE, chan_sip.c:14030). */
-		if (pvt->reinvite_purpose == SOFIA_REINVITE_CONNECTED_LINE) {
-			sofia_add_rpid(pvt, rpid_buf, sizeof(rpid_buf));
-		}
 		ast_mutex_unlock(&pvt->peer->lock);
+	}
+	/* A connected-line re-INVITE exists solely to carry the new identity (chan_sip add_rpid on its
+	 * update_connectedline INVITE, chan_sip.c:14030): the RPID/PAI built when the update was asked, with the channel
+	 * locked (sofia_update_connectedline) - here, on sofia_thread, the channel's connected line cannot be read. */
+	if (pvt->reinvite_purpose == SOFIA_REINVITE_CONNECTED_LINE) {
+		ast_copy_string(rpid_buf, pvt->cl_rpid, sizeof(rpid_buf));
 	}
 	snprintf(mf_str, sizeof(mf_str), "%d", mf);
 
@@ -6193,9 +6203,11 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 }
 
 /* pvt->lock held, on sofia_thread, the re-INVITE just completed (reinvite_pending cleared): what waited for it is
- * offered now, as chan_sip sends a SIP_NEEDREINVITE from check_pendings after the ACK. A T.38 offer goes first (the
- * application waits for it); a media target the bridge asked for meanwhile (need_reinvite) goes when it differs
- * from the current one, or whatever it is after a refused directmedia offer (reinvite_force). Waits while a 491
+ * offered now, as chan_sip sends a SIP_NEEDREINVITE from check_pendings after the ACK, one re-INVITE at a time, in
+ * this order: a T.38 offer (the application waits for it); a media target the bridge asked for meanwhile
+ * (need_reinvite), when it differs from the current one or whatever it is after a refused directmedia offer
+ * (reinvite_force); a hold direction (local_hold_want); a connected-line update (need_cl_reinvite); a session
+ * refresh (need_session_refresh). Waits while a 491
  * retry is armed (the timer calls it) and while a peer T.38 offer is held for the application (the stack would
  * answer ours 491 locally; the held answer calls it); nothing goes on a dialog whose channel has gone (a deferred
  * BYE). */
@@ -6217,31 +6229,111 @@ static void sofia_reinvite_followup_locked(struct sofia_pvt *pvt)
 			}
 		}
 	}
-	if (!pvt->need_reinvite) {
-		return;
+	if (pvt->need_reinvite) {
+		pvt->need_reinvite = 0;
+		if (pvt->reinvite_force || ast_sockaddr_cmp(&pvt->redirip_next, &pvt->redirip)) {
+			ast_sockaddr_copy(&pvt->redirip, &pvt->redirip_next);
+			pvt->reinvite_purpose = SOFIA_REINVITE_DIRECTMEDIA;
+			sofia_send_reinvite(pvt);
+			if (pvt->reinvite_pending) {
+				return;	/* it also carries the current hold direction */
+			}
+		}
 	}
-	pvt->need_reinvite = 0;
-	if (!pvt->reinvite_force && !ast_sockaddr_cmp(&pvt->redirip_next, &pvt->redirip)) {
-		return;	/* the media already go there */
+	/* A hold direction asked for meanwhile (hold_reinvite): an unhold left out would leave the peer held (sending
+	 * no media). */
+	if (pvt->local_hold_want != pvt->local_hold_mode) {
+		pvt->local_hold_mode_prev = pvt->local_hold_mode;	/* for the rollback on a refusal */
+		pvt->local_hold_mode = pvt->local_hold_want;
+		pvt->reinvite_purpose = SOFIA_REINVITE_LOCAL_HOLD;
+		sofia_send_reinvite(pvt);
+		if (pvt->reinvite_pending) {
+			return;
+		}
 	}
-	ast_sockaddr_copy(&pvt->redirip, &pvt->redirip_next);
-	pvt->reinvite_purpose = SOFIA_REINVITE_DIRECTMEDIA;
-	sofia_send_reinvite(pvt);
+	/* A connected-line update asked for meanwhile: the latest identity (cl_rpid). */
+	if (pvt->need_cl_reinvite) {
+		pvt->need_cl_reinvite = 0;
+		pvt->reinvite_purpose = SOFIA_REINVITE_CONNECTED_LINE;
+		sofia_send_reinvite(pvt);
+		if (pvt->reinvite_pending) {
+			return;
+		}
+	}
+	/* The session refresh, when no re-INVITE above went (any 2xx to one of them refreshes the session and re-arms it,
+	 * RFC 4028 §7.4). */
+	if (pvt->need_session_refresh) {
+		pvt->need_session_refresh = 0;
+		if (pvt->session_we_refresh) {
+			pvt->reinvite_purpose = SOFIA_REINVITE_SESSION_REFRESH;
+			sofia_send_reinvite(pvt);
+		}
+	}
 }
+
+/* pvt->lock held: something waits to be offered (sofia_reinvite_followup_locked). */
+static int sofia_reinvite_any_due_locked(struct sofia_pvt *pvt)
+{
+	return pvt->need_t38_reinvite || pvt->need_reinvite || pvt->local_hold_want != pvt->local_hold_mode
+		|| pvt->need_cl_reinvite || pvt->need_session_refresh;
+}
+
+/* The re-INVITE slot can be claimed now: nothing of ours in flight, no 491 wait, no T.38 offer waiting, no peer T.38
+ * offer held for the application (the stack would answer ours 491). pvt->lock held. */
+static int sofia_reinvite_slot_free_locked(struct sofia_pvt *pvt)
+{
+	return pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh && !pvt->alreadygone && !pvt->reinvite_pending
+		&& pvt->reinvite_retry_id == -1 && !pvt->need_t38_reinvite && !pvt->t38_answer_pending;
+}
+
+static void sofia_session_refresh_after_failure_locked(struct sofia_pvt *pvt, int purpose, int status);
 
 static int sofia_reinvite_arm_retry_locked(struct sofia_pvt *pvt);
 
 /* pvt->lock held, sofia_thread: the re-INVITE in flight got its final response. What waited for it is offered now,
  * or after the RFC 3261 §14.1 delay when that response was a 491 (another offer now would most likely cross the
  * peer's again; chan_sip's check_pendings waits for its waitid too). The 491 count restarts on any other response. */
-static void sofia_reinvite_done_locked(struct sofia_pvt *pvt, int status)
+static void sofia_reinvite_done_locked(struct sofia_pvt *pvt, int status, int purpose)
 {
+	if (status >= 300) {
+		sofia_session_refresh_after_failure_locked(pvt, purpose, status);
+	}
 	if (status != 491) {
 		pvt->reinvite_491_count = 0;
-	} else if ((pvt->need_t38_reinvite || pvt->need_reinvite) && sofia_reinvite_arm_retry_locked(pvt)) {
+	} else if (sofia_reinvite_any_due_locked(pvt) && sofia_reinvite_arm_retry_locked(pvt)) {
 		return;	/* the timer runs the follow-up */
 	}
 	sofia_reinvite_followup_locked(pvt);
+}
+
+/* sofia_thread: run the follow-up (a call that has just come up, sofia_reinvite_kick). */
+static void sofia_reinvite_kick_root(void *data)
+{
+	struct sofia_pvt *pvt = data;
+
+	ast_mutex_lock(&pvt->lock);
+	sofia_reinvite_followup_locked(pvt);
+	ast_mutex_unlock(&pvt->lock);
+	ao2_ref(pvt, -1);
+}
+
+/* A call has just come up (an outgoing call's 2xx, the ACK of our 200): what was asked before (a hold, a
+ * connected-line update) goes now, after that ACK (chan_sip check_pendings). Dispatched, so it runs after the stack
+ * is done with the transaction. No lock held. */
+static void sofia_reinvite_kick(struct sofia_pvt *pvt)
+{
+	int due;
+
+	ast_mutex_lock(&pvt->lock);
+	due = sofia_reinvite_any_due_locked(pvt);
+	ast_mutex_unlock(&pvt->lock);
+	if (!due) {
+		return;
+	}
+	ao2_ref(pvt, +1);
+	if (sofia_dispatch_to_root_thread(sofia_reinvite_kick_root, pvt) < 0) {
+		ao2_ref(pvt, -1);
+	}
 }
 
 /* For sofia_t38.c: sofia_thread, pvt->lock held, after the held peer T.38 offer got its answer. */
@@ -6300,10 +6392,12 @@ static int sofia_reinvite_arm_retry_locked(struct sofia_pvt *pvt)
 	return 1;
 }
 
-/* pvt->lock held: our directmedia or T.38 re-INVITE got 491 (glare): offer it again after the RFC 3261 §14.1 delay
- * (sofia_reinvite_arm_retry_locked). A directmedia retry offers the latest target (a newer one asked for meanwhile
- * wins); a T.38 one the current T.38 state. At most 3 retries for consecutive 491s (the count restarts on any other
- * final response). Returns 1 when it will be sent again, 0 when not (the caller's refusal path runs). */
+/* pvt->lock held: our re-INVITE got 491 (glare): offer it again after the RFC 3261 §14.1 delay
+ * (sofia_reinvite_arm_retry_locked), as chan_sip does for any (sip_reinvite_retry). A directmedia retry offers the
+ * latest target (a newer one asked for meanwhile wins); a T.38 one the current T.38 state; a hold the direction last
+ * asked for; a connected-line update the latest identity; a session refresh the current session. At most 3 retries
+ * for consecutive 491s (the count restarts on any other final response). Returns 1 when it will be sent again, 0
+ * when not (the caller's refusal path runs). */
 static int sofia_reinvite_491_retry_locked(struct sofia_pvt *pvt, int purpose)
 {
 	if (pvt->reinvite_retry_id == -1 && ++pvt->reinvite_491_count > 3) {
@@ -6315,6 +6409,12 @@ static int sofia_reinvite_491_retry_locked(struct sofia_pvt *pvt, int purpose)
 	}
 	if (purpose == SOFIA_REINVITE_T38) {
 		pvt->need_t38_reinvite = 1;
+	} else if (purpose == SOFIA_REINVITE_CONNECTED_LINE) {
+		pvt->need_cl_reinvite = 1;
+	} else if (purpose == SOFIA_REINVITE_SESSION_REFRESH) {
+		pvt->need_session_refresh = 1;
+	} else if (purpose == SOFIA_REINVITE_LOCAL_HOLD) {
+		/* due again while local_hold_want differs from the rolled-back local_hold_mode */
 	} else if (!pvt->need_reinvite) {
 		ast_sockaddr_copy(&pvt->redirip_next, &pvt->offered_redirip);
 		pvt->need_reinvite = 1;
@@ -6350,8 +6450,9 @@ static void sofia_reinvite_root(void *data)
  * LOCAL_HOLD re-INVITE onto sofia_thread (shared sofia_reinvite_root -> sofia_send_reinvite builds the
  * offer with the new direction). Runs on the channel thread from AST_CONTROL_HOLD/UNHOLD. Mode: 0
  * resume (sendrecv), 1 sendonly, 2 inactive. Saves the prior mode so a rejected re-INVITE rolls back.
- * If a re-INVITE is already pending, or a T.38 offer waits for the slot, we do NOT fire (glare) — the mode
- * is left unchanged so we don't desync the confirmed state; the operator's next hold/unhold retries. */
+ * When the slot is busy (a re-INVITE in flight, a 491 wait, a T.38 offer first) the direction asked for is kept
+ * (local_hold_want) and offered when the slot frees (sofia_reinvite_followup_locked), as chan_sip defers a
+ * re-INVITE (SIP_NEEDREINVITE); only the latest direction goes. */
 static void sofia_hold_reinvite(struct sofia_pvt *pvt, int mode)
 {
 	int dispatch = 0;
@@ -6359,14 +6460,14 @@ static void sofia_hold_reinvite(struct sofia_pvt *pvt, int mode)
 		return;
 	}
 	ast_mutex_lock(&pvt->lock);
+	pvt->local_hold_want = mode;
 	if (pvt->local_hold_mode == mode) {
-		/* Already in the requested direction — a repeated HOLD or a stray UNHOLD changes nothing,
+		/* Already the direction our offers carry — a repeated HOLD or a stray UNHOLD changes nothing,
 		 * so don't emit a pointless in-dialog re-INVITE. */
 		ast_mutex_unlock(&pvt->lock);
 		return;
 	}
-	if (pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh && !pvt->reinvite_pending && !pvt->alreadygone
-			&& !pvt->need_t38_reinvite) {	/* a T.38 offer waiting for the slot goes first */
+	if (sofia_reinvite_slot_free_locked(pvt)) {
 		pvt->local_hold_mode_prev = pvt->local_hold_mode;	/* for rollback on reject */
 		pvt->local_hold_mode = mode;
 		pvt->reinvite_pending = 1;
@@ -6380,6 +6481,7 @@ static void sofia_hold_reinvite(struct sofia_pvt *pvt, int mode)
 		pvt->reinvite_pending = 0;
 		pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
 		pvt->local_hold_mode = pvt->local_hold_mode_prev;	/* dispatch failed — undo the optimistic set */
+		pvt->local_hold_want = pvt->local_hold_mode;	/* and give it up: nothing would send it */
 		ast_mutex_unlock(&pvt->lock);
 		ao2_ref(pvt, -1);
 	}
@@ -6398,16 +6500,41 @@ static void sofia_hold_reinvite(struct sofia_pvt *pvt, int mode)
  * 10 s before the stack's nominal time (5 s before its earliest), which the stack then re-arms from that 2xx. */
 static void sofia_session_refresh_root(void *data);
 static int sofia_session_refresh_cb(const void *data);
+static int sofia_session_refresh_poll_cb(const void *data);
 
-/* Cancel our refresh timer. pvt->lock held; the caller holds a reference of its own. */
+/* Cancel our refresh timer. pvt->lock held; the caller holds a reference of its own. A timer that could not be
+ * deleted is running: its callback, waiting for pvt->lock, is told it was cancelled (session_refresh_cancelled), so
+ * it neither acts nor clears the id of a timer armed after it. */
 static void sofia_session_refresh_cancel_locked(struct sofia_pvt *pvt)
 {
 	if (pvt->session_refresh_sched_id != -1 && sofia_sched) {
 		if (ast_sched_thread_del(sofia_sched, pvt->session_refresh_sched_id) == 0) {
 			ao2_ref(pvt, -1);	/* the timer never ran: drop its reference */
+		} else {
+			pvt->session_refresh_cancelled++;
 		}
 		pvt->session_refresh_sched_id = -1;
 	}
+}
+
+/* Scheduler thread, a refresh timer fired: 1 when it was cancelled meanwhile (its reference is dropped here), else
+ * its id is cleared and the caller hands the reference on. */
+static int sofia_session_refresh_fired(struct sofia_pvt *pvt)
+{
+	int cancelled;
+
+	ast_mutex_lock(&pvt->lock);
+	cancelled = pvt->session_refresh_cancelled > 0;
+	if (cancelled) {
+		pvt->session_refresh_cancelled--;
+	} else {
+		pvt->session_refresh_sched_id = -1;
+	}
+	ast_mutex_unlock(&pvt->lock);
+	if (cancelled) {
+		ao2_ref(pvt, -1);
+	}
+	return cancelled;
 }
 
 /* What the peer's last request (we are its UAS) or response (we are the UAC) said about the session timer and
@@ -6526,6 +6653,10 @@ static void sofia_session_refresh_arm(struct sofia_pvt *pvt)
 	int delay;
 
 	sofia_session_refresh_cancel_locked(pvt);
+	/* A negotiation refreshed the session: the interval starts again (sofia_session_refresh_after_failure_locked). */
+	pvt->session_refresh_base = time(NULL);
+	pvt->need_session_refresh = 0;
+	pvt->session_refresh_last_chance = 0;
 	if (!pvt->session_we_refresh || pvt->session_interval <= 0 || !pvt->nh || pvt->alreadygone) {
 		return;
 	}
@@ -6554,32 +6685,42 @@ static int sofia_session_refresh_cb(const void *data)
 {
 	struct sofia_pvt *pvt = (struct sofia_pvt *) data;
 
-	ast_mutex_lock(&pvt->lock);
-	pvt->session_refresh_sched_id = -1;
-	ast_mutex_unlock(&pvt->lock);
+	if (sofia_session_refresh_fired(pvt)) {
+		return 0;
+	}
 	if (sofia_dispatch_to_root_thread(sofia_session_refresh_root, pvt) < 0) {
 		ao2_ref(pvt, -1);
 	}
 	return 0;
 }
 
-/* Send the refresh re-INVITE with the current SDP now, or in 2 s when another re-INVITE of ours is in flight, a
- * T.38 offer waits for the slot, a 491 retry is armed (RFC 3261 §14.1) or a peer T.38 offer is held for the
- * application. sofia_thread, pvt->lock held, call UP.
+/* Arm our refresh timer to fire in delay_ms milliseconds (cb: the refresh, or the poll below). pvt->lock held. */
+static void sofia_session_refresh_schedule_locked(struct sofia_pvt *pvt, int delay_ms, ast_sched_cb cb)
+{
+	if (pvt->session_refresh_sched_id != -1 || !sofia_sched) {
+		return;
+	}
+	ao2_ref(pvt, +1);
+	pvt->session_refresh_sched_id = ast_sched_thread_add(sofia_sched, delay_ms, cb, pvt);
+	if (pvt->session_refresh_sched_id < 0) {
+		pvt->session_refresh_sched_id = -1;
+		ao2_ref(pvt, -1);
+	}
+}
+
+/* Send the refresh re-INVITE with the current SDP now; when the slot is busy (a re-INVITE of ours in flight, a T.38
+ * offer waiting, a 491 retry armed, RFC 3261 §14.1, or a peer T.38 offer held for the application) it is owed
+ * (need_session_refresh) and goes when the slot frees (sofia_reinvite_followup_locked); a 2 s look again covers a
+ * release that runs no follow-up. sofia_thread, pvt->lock held, call UP.
  * Its 2xx is handled by the SESSION_REFRESH purpose path, and the negotiation on that 2xx re-arms the timer. */
 static void sofia_session_refresh_send_locked(struct sofia_pvt *pvt)
 {
-	if (pvt->reinvite_pending || pvt->need_t38_reinvite || pvt->reinvite_retry_id != -1 || pvt->t38_answer_pending) {
-		if (pvt->session_refresh_sched_id == -1) {
-			ao2_ref(pvt, +1);
-			pvt->session_refresh_sched_id = ast_sched_thread_add(sofia_sched, 2000, sofia_session_refresh_cb, pvt);
-			if (pvt->session_refresh_sched_id < 0) {
-				pvt->session_refresh_sched_id = -1;
-				ao2_ref(pvt, -1);
-			}
-		}
+	if (!sofia_reinvite_slot_free_locked(pvt)) {
+		pvt->need_session_refresh = 1;
+		sofia_session_refresh_schedule_locked(pvt, 2000, sofia_session_refresh_poll_cb);
 		return;
 	}
+	pvt->need_session_refresh = 0;
 	pvt->reinvite_purpose = SOFIA_REINVITE_SESSION_REFRESH;
 	sofia_send_reinvite(pvt);
 }
@@ -6590,11 +6731,89 @@ static void sofia_session_refresh_root(void *data)
 	struct sofia_pvt *pvt = data;
 
 	ast_mutex_lock(&pvt->lock);
-	if (!pvt->alreadygone && pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh && pvt->session_we_refresh) {
+	if (!pvt->alreadygone && pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh && pvt->owner && pvt->session_we_refresh) {
 		sofia_session_refresh_send_locked(pvt);
 	}
 	ast_mutex_unlock(&pvt->lock);
 	ao2_ref(pvt, -1);
+}
+
+/* sofia_thread: the 2 s look again of a refresh that found the slot busy: only one still owed goes (the follow-up
+ * may have sent it meanwhile). */
+static void sofia_session_refresh_poll_root(void *data)
+{
+	struct sofia_pvt *pvt = data;
+
+	ast_mutex_lock(&pvt->lock);
+	if (pvt->need_session_refresh && !pvt->alreadygone && pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh
+			&& pvt->owner && pvt->session_we_refresh) {
+		sofia_session_refresh_send_locked(pvt);
+	}
+	ast_mutex_unlock(&pvt->lock);
+	ao2_ref(pvt, -1);
+}
+
+static int sofia_session_refresh_poll_cb(const void *data)
+{
+	struct sofia_pvt *pvt = (struct sofia_pvt *) data;
+
+	if (sofia_session_refresh_fired(pvt)) {
+		return 0;
+	}
+	if (sofia_dispatch_to_root_thread(sofia_session_refresh_poll_root, pvt) < 0) {
+		ao2_ref(pvt, -1);
+	}
+	return 0;
+}
+
+/* One of our re-INVITEs got a final non-2xx that keeps the session (RFC 3261 §14.1), and we are the refresher
+ * (RFC 4028). Only a 2xx extends the session (RFC 4028 §10), and the stack clears its own refresh timer when it sends
+ * an INVITE and sets it again only on a 2xx (nua_session.c), so:
+ * - the refresh itself refused (a 491 is retried, RFC 3261 §14.1): one more attempt in this interval, halfway to the
+ *   time the peer may end the session (expiry - min(32 s, interval/3), RFC 4028 §10), "retry if possible" without
+ *   retrying continuously;
+ * - any other re-INVITE refused while the stack refreshes with UPDATE: its timer is gone, so the refresh goes as our
+ *   re-INVITE at its time (interval/2 - 10 s after the last negotiation), whose 2xx brings UPDATE back;
+ * - otherwise our own refresh timer is still armed. pvt->lock held, sofia_thread. */
+/* A delay computed from the wall clock, kept within 5 s .. interval/2 so that a clock step neither fires it at once
+ * nor pushes it past the session's expiry. */
+static int sofia_session_refresh_delay(const struct sofia_pvt *pvt, time_t delay)
+{
+	time_t max = pvt->session_interval / 2 > 5 ? pvt->session_interval / 2 : 5;
+
+	return (int) (delay < 5 ? 5 : delay > max ? max : delay);
+}
+
+static void sofia_session_refresh_after_failure_locked(struct sofia_pvt *pvt, int purpose, int status)
+{
+	time_t now = time(NULL);
+	int delay;
+
+	if (!pvt->session_we_refresh || pvt->session_interval <= 0 || pvt->alreadygone || !pvt->nh || !pvt->owner) {
+		return;
+	}
+	if (purpose == SOFIA_REINVITE_SESSION_REFRESH) {
+		int guard = pvt->session_interval / 3 < 32 ? pvt->session_interval / 3 : 32;
+
+		if (status == 491 && pvt->need_session_refresh) {
+			return;	/* offered again after the RFC 3261 §14.1 delay */
+		}
+		pvt->need_session_refresh = 0;	/* only the one attempt below (or none) */
+		if (pvt->session_refresh_last_chance) {
+			ast_log(LOG_WARNING, "Sofia: session refresh on '%s' refused again (%d) — the peer may end the session at "
+				"its expiry\n", pvt->callid ? pvt->callid : "(no-callid)", status);
+			return;
+		}
+		pvt->session_refresh_last_chance = 1;
+		delay = sofia_session_refresh_delay(pvt, (pvt->session_refresh_base + pvt->session_interval - guard - now) / 2);
+		sofia_session_refresh_cancel_locked(pvt);
+		sofia_session_refresh_schedule_locked(pvt, delay * 1000, sofia_session_refresh_cb);
+		ast_log(LOG_NOTICE, "Sofia: session refresh on '%s' refused (%d) — one more attempt in %d s\n",
+			pvt->callid ? pvt->callid : "(no-callid)", status, delay);
+	} else if (pvt->session_update_refresh && pvt->session_refresh_sched_id == -1) {
+		delay = sofia_session_refresh_delay(pvt, pvt->session_refresh_base + pvt->session_interval / 2 - 10 - now);
+		sofia_session_refresh_schedule_locked(pvt, delay * 1000, sofia_session_refresh_cb);
+	}
 }
 
 /* Pause or resume this leg's audio RTCP (chan_sip sip_set_rtp_peer / process_sdp). The property closes the socket, so
@@ -8534,10 +8753,9 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 		break;
 	case AST_CONTROL_UNHOLD:
 		ast_moh_stop(ast);
-		/* Resume: re-INVITE back to a=sendrecv (mirrors the hold_reinvite HOLD path). */
-		if (sofia_cfg.hold_reinvite) {
-			sofia_hold_reinvite(pvt, 0);
-		}
+		/* Resume: re-INVITE back to a=sendrecv (mirrors the hold_reinvite HOLD path). Always asked: a hold
+		 * offered before a reload turned hold_reinvite off must still be taken back (a no-op otherwise). */
+		sofia_hold_reinvite(pvt, 0);
 		break;
 	case AST_CONTROL_SRCUPDATE:
 		/* Source changed WITHOUT identity change: marker bit, same SSRC. Must
@@ -15291,29 +15509,35 @@ static void sofia_update_connectedline(struct sofia_pvt *pvt)
 
 	/* Mid-call: re-INVITE carrying the new identity (chan_sip.c:14023 sends an
 	 * INVITE/UPDATE with add_rpid + add_sdp; sofia_send_reinvite re-offers the SDP and
-	 * stamps the RPID for this purpose). Claim the single re-INVITE slot exactly like the
-	 * T.38 and local-hold paths. If one is already in flight, or a T.38 offer waits for the slot,
-	 * the update is dropped rather than glaring — chan_sip defers it via SIP_NEEDREINVITE; here only
-	 * a directmedia target and a T.38 offer are deferred (sofia_reinvite_followup_locked). */
+	 * stamps this RPID). The RPID/PAI is built now, with the channel locked (sofia_indicate), into cl_rpid;
+	 * the slot is claimed exactly like the T.38 and local-hold paths. When it is busy (a re-INVITE in flight, a
+	 * 491 wait, a T.38 offer first), or an outgoing call is not answered yet, the update waits and goes when the
+	 * slot frees or the call comes up, carrying the latest identity (chan_sip SIP_NEEDREINVITE). */
 	ast_mutex_lock(&pvt->lock);
-	if (pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh && !pvt->alreadygone
-			&& !pvt->reinvite_pending && !pvt->need_t38_reinvite) {	/* a waiting T.38 offer goes first */
+	if (pvt->peer) {
+		ast_mutex_lock(&pvt->peer->lock);
+		sofia_add_rpid(pvt, pvt->cl_rpid, sizeof(pvt->cl_rpid));
+		ast_mutex_unlock(&pvt->peer->lock);
+	}
+	if (sofia_reinvite_slot_free_locked(pvt)) {
 		pvt->reinvite_pending = 1;
 		pvt->reinvite_purpose = SOFIA_REINVITE_CONNECTED_LINE;
 		ao2_ref(pvt, +1);	/* dispatch ref; sofia_reinvite_root drops it */
 		dispatch = 1;
+	} else if (!pvt->alreadygone) {
+		pvt->need_cl_reinvite = 1;
 	}
 	ast_mutex_unlock(&pvt->lock);
 
 	if (!dispatch) {
-		ast_debug(1, "Sofia: connected-line update on '%s' skipped — a re-INVITE is already in flight\n",
-			pvt->owner->name);
+		ast_debug(1, "Sofia: connected-line update on '%s' waits for the re-INVITE slot\n", pvt->owner->name);
 		return;
 	}
 	if (sofia_dispatch_to_root_thread(sofia_reinvite_root, pvt) < 0) {
 		ast_mutex_lock(&pvt->lock);
 		pvt->reinvite_pending = 0;
 		pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
+		pvt->need_cl_reinvite = 1;	/* the next completion sends it */
 		ast_mutex_unlock(&pvt->lock);
 		ao2_ref(pvt, -1);
 		ast_log(LOG_WARNING, "Sofia: failed to dispatch connected-line re-INVITE on '%s'\n",
@@ -19579,6 +19803,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		break;
 	case nua_i_ack:
 		sofia_process_ack(nua, nh, pvt, sip, tags);
+		if (pvt) {
+			sofia_reinvite_kick(pvt);	/* what was asked before our 200 was ACKed (a hold) goes now (chan_sip check_pendings) */
+		}
 		break;
 
 	case nua_r_register: {
@@ -20012,6 +20239,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				int has_sdp = (!rejected && sip && sip->sip_payload && sip->sip_payload->pl_data);
 				int sdp_rc = 0;
 				int rolled_back = 0;
+				int retried = 0;	/* a 491 offered again after the RFC 3261 §14.1 delay */
 				struct ast_channel *owner = NULL;
 				ast_mutex_lock(&pvt->lock);
 				for (;;) {	/* re-acquire channel->pvt order for a safe sofia_parse_sdp (set_format) */
@@ -20036,24 +20264,36 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					sdp_rc = sofia_parse_sdp(pvt, sip, 0 /* answer: local-hold re-INVITE 2xx */);
 				}
 				if (rejected || !has_sdp || sdp_rc < 0) {
-					/* Not confirmed (reject / no answer / unusable SDP) - roll the direction back. */
+					/* Not confirmed (reject / no answer / unusable SDP) - roll the direction back. A 491 offers
+					 * it again after the RFC 3261 §14.1 delay; anything else gives it up (a lost unhold leaves
+					 * the peer held, sending no media: say so). */
 					pvt->local_hold_mode = pvt->local_hold_mode_prev;
 					rolled_back = 1;
+					retried = status == 491 && sofia_reinvite_491_retry_locked(pvt, SOFIA_REINVITE_LOCAL_HOLD);
+					if (!retried && pvt->local_hold_want != pvt->local_hold_mode) {
+						if (pvt->local_hold_want == 0) {
+							ast_log(LOG_WARNING, "Sofia: the unhold re-INVITE on '%s' was not accepted (%d%s) — "
+								"the peer may stay held, sending no media\n", pvt->callid ? pvt->callid : "(no-callid)",
+								status, rejected ? "" : ", no usable answer");
+						}
+						pvt->local_hold_want = pvt->local_hold_mode;
+					}
 				}
 				if (owner) {
 					ast_channel_unlock(owner);
 				}
 				pvt->t38_offer_out = SOFIA_T38_OUT_NONE;	/* never a T.38 offer: sofia_send_reinvite retags those T38 */
 				if (!rejected || !sofia_reinvite_failure_ends_session(status, sip_method_invite)) {
-					sofia_reinvite_done_locked(pvt, status);	/* what waited for this re-INVITE */
+					sofia_reinvite_done_locked(pvt, status, SOFIA_REINVITE_LOCAL_HOLD);	/* what waited for this re-INVITE */
 				}
 				ast_mutex_unlock(&pvt->lock);
 				if (owner) {
 					ast_channel_unref(owner);
 				}
 				if (rejected) {
-					ast_log(LOG_NOTICE, "Sofia: local-hold re-INVITE rejected on '%s' (%d %s) — reverted hold direction\n",
-						pvt->callid ? pvt->callid : "(no-callid)", status, phrase ? phrase : "");
+					ast_log(LOG_NOTICE, "Sofia: local-hold re-INVITE rejected on '%s' (%d %s) — reverted hold direction%s\n",
+						pvt->callid ? pvt->callid : "(no-callid)", status, phrase ? phrase : "",
+						retried ? ", offered again after the RFC 3261 §14.1 delay" : "");
 				} else if (rolled_back) {
 					ast_log(LOG_WARNING, "Sofia: local-hold re-INVITE 2xx on '%s' had no usable SDP answer — reverted hold direction\n",
 						pvt->callid ? pvt->callid : "(no-callid)");
@@ -20071,10 +20311,12 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				 * unchanged, so a 2xx only brings the peer's answer to apply; the session timer was
 				 * re-negotiated and our timer re-armed above (the 2xx block before the purposes).
 				 * A refusal keeps the session, as any re-INVITE's does (RFC 3261 §14.1), unless the
-				 * stack ends it; the stack arms no further refresh after a refused one, and the peer
-				 * may end the session when it expires (RFC 4028 §10). */
+				 * stack ends it. A 491 is offered again after the §14.1 delay; any other refusal gets one
+				 * more attempt in the interval (sofia_session_refresh_after_failure_locked, RFC 4028 §10:
+				 * the peer may end the session when it expires). */
 				int rejected = (status >= 300);
 				int has_sdp = (!rejected && sip && sip->sip_payload && sip->sip_payload->pl_data);
+				int retried = 0;	/* a 491 offered again after the RFC 3261 §14.1 delay */
 				struct ast_channel *owner = NULL;
 
 				ast_mutex_lock(&pvt->lock);
@@ -20099,21 +20341,29 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				if (has_sdp) {
 					sofia_parse_sdp(pvt, sip, 0 /* answer: session-refresh re-INVITE 2xx */);
 				}
+				if (status == 491) {
+					/* RFC 4028 §10 + RFC 3261 §14.1 */
+					retried = sofia_reinvite_491_retry_locked(pvt, SOFIA_REINVITE_SESSION_REFRESH);
+				}
 				if (owner) {
 					ast_channel_unlock(owner);
 				}
 				pvt->t38_offer_out = SOFIA_T38_OUT_NONE;	/* never a T.38 offer: sofia_send_reinvite retags those T38 */
 				if (!rejected || !sofia_reinvite_failure_ends_session(status, sip_method_invite)) {
-					sofia_reinvite_done_locked(pvt, status);	/* what waited for this re-INVITE */
+					sofia_reinvite_done_locked(pvt, status, SOFIA_REINVITE_SESSION_REFRESH);	/* what waited for this re-INVITE */
 				}
 				ast_mutex_unlock(&pvt->lock);
 				if (owner) {
 					ast_channel_unref(owner);
 				}
-				if (rejected) {
-					ast_log(LOG_NOTICE, "Sofia: session-refresh re-INVITE on '%s' refused (%d %s)\n",
+				if (retried) {
+					ast_log(LOG_NOTICE, "Sofia: session-refresh re-INVITE on '%s' got 491 — offered again after the "
+						"RFC 3261 §14.1 delay\n", pvt->callid ? pvt->callid : "(no-callid)");
+				} else if (rejected && sofia_debug) {
+					/* (the follow-up decision is logged by sofia_session_refresh_after_failure_locked) */
+					ast_verbose("Sofia: session-refresh re-INVITE on '%s' refused (%d %s)\n",
 						pvt->callid ? pvt->callid : "(no-callid)", status, phrase ? phrase : "");
-				} else if (sofia_debug) {
+				} else if (!rejected && sofia_debug) {
 					ast_verbose("Sofia: session-refresh re-INVITE accepted on '%s'\n",
 						pvt->callid ? pvt->callid : "(no-callid)");
 				}
@@ -20154,12 +20404,15 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				if (has_sdp) {
 					sofia_parse_sdp(pvt, sip, 0 /* answer: connected-line re-INVITE 2xx */);
 				}
+				if (status == 491) {
+					sofia_reinvite_491_retry_locked(pvt, SOFIA_REINVITE_CONNECTED_LINE);
+				}
 				if (owner) {
 					ast_channel_unlock(owner);
 				}
 				pvt->t38_offer_out = SOFIA_T38_OUT_NONE;	/* never a T.38 offer: sofia_send_reinvite retags those T38 */
 				if (!rejected || !sofia_reinvite_failure_ends_session(status, sip_method_invite)) {
-					sofia_reinvite_done_locked(pvt, status);	/* what waited for this re-INVITE */
+					sofia_reinvite_done_locked(pvt, status, SOFIA_REINVITE_CONNECTED_LINE);	/* what waited for this re-INVITE */
 				}
 				ast_mutex_unlock(&pvt->lock);
 				if (owner) {
@@ -20167,7 +20420,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				}
 				if (rejected) {
 					/* Purely informational: the peer declined an identity refresh, the
-					 * session itself is unaffected. */
+					 * session itself is unaffected (a 491 is offered again). */
 					ast_debug(1, "Sofia: connected-line re-INVITE rejected on '%s' (%d %s)\n",
 						pvt->callid ? pvt->callid : "(no-callid)", status, phrase ? phrase : "");
 				}
@@ -20292,7 +20545,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				reverted_to_relay = 1;
 			}
 			if ((!rejected || !sofia_reinvite_failure_ends_session(status, sip_method_invite)) && !end_after_fax) {
-				sofia_reinvite_done_locked(pvt, status);	/* what waited for this re-INVITE (none while the revert is out) */
+				sofia_reinvite_done_locked(pvt, status, reinvite_purpose);	/* what waited for this re-INVITE (none while the revert is out) */
 			}
 			ast_mutex_unlock(&pvt->lock);
 			if (owner) {
@@ -20468,6 +20721,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				ast_mutex_lock(&pvt->lock);
 				pvt->state = SOFIA_DIALOG_STATE_UP;
 				ast_mutex_unlock(&pvt->lock);
+				sofia_reinvite_kick(pvt);	/* what was asked before the answer (a hold, a connected-line update) */
 				/* Mask the inbound caller's answer video to what THIS outbound leg accepted before
 				 * answering the caller — chan_sofia does not transcode video (single-contact path; the
 				 * fork path does the same in sofia_fork_pick_winner). SDP-only; no-op if the caller is
