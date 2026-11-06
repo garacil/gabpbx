@@ -2679,6 +2679,16 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 				ast_log(LOG_WARNING, "Sofia: ignoring m=image media with non-UDPTL proto\n");
 				continue;
 			}
+			/* A peer without t38pt_udptl=yes cannot run T.38: an offer with a live image stream is refused
+			 * (488), as chan_sip refuses it (initialize_udptl fails, process_sdp rejects the offer), instead of
+			 * accepting a fax stream nobody will run. Answers are not checked: an image stream is only offered
+			 * to a peer with T.38. */
+			if (current_offer && (!pvt->peer || !pvt->peer->t38pt_udptl)) {
+				ast_log(LOG_WARNING, "Sofia: rejecting an offer with a T.38 image stream: T.38 is not enabled for "
+					"this peer (t38pt_udptl)\n");
+				sofia_append_history_code(pvt, 488, "SDP", "T.38 not enabled");
+				goto sdp_reject;
+			}
 			image_active_seen = 1;	/* a live UDPTL T.38 image leg is present this parse */
 
 			if (!conn && sdp->sdp_connection) {

@@ -3275,6 +3275,15 @@ static void sofia_pvt_destructor(void *obj)
 		pvt->peer = NULL;
 	}
 
+	/* A held T.38 re-INVITE (t38_answer_pending) still keeps its saved nua event: free it on sofia_thread. */
+	if (pvt->t38_saved[0]) {
+		void *saved = pvt->t38_saved[0];
+		pvt->t38_saved[0] = NULL;
+		if (sofia_dispatch_to_root_thread(sofia_t38_saved_free_root, saved) < 0) {
+			ast_log(LOG_NOTICE, "Sofia: pvt destructor — sofia_thread dispatch failed for a saved T.38 request; leaking it\n");
+		}
+	}
+
 	/* hmagic UAF closure for pvt->nh (nh->nh_magic points at pvt). The destructor
 	 * runs on any thread and nua_handle_destroy is async, so an in-flight event
 	 * could deref a freed pvt; nua_handle_bind(nh, NULL) (synchronous) runs FIRST so
@@ -8223,7 +8232,11 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 			if (t38_rc < 0) {
 				return -1;
 			}
-			if (t38_rc > 0) {
+			if (t38_rc == SOFIA_T38_PARMS_SENT) {
+				/* res_fax checks this value (chan_sip returns it too): the parameters were re-sent. */
+				return AST_T38_REQUEST_PARMS;
+			}
+			if (t38_rc == SOFIA_T38_SEND_REINVITE) {
 				/* Claim the re-INVITE slot ATOMICALLY: set reinvite_pending + purpose=T38 under
 				 * pvt->lock (gated on no re-INVITE already in flight) so a concurrent directmedia/
 				 * hold can't see pending==0 and stomp the purpose. Tag T38 so the 2xx/reject handler
@@ -9102,6 +9115,8 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	int trans;
 	int sdp_ok;
 	int st_refresh = 0; /* RFC 4028 uas-refresh discriminator */
+	int t38_was_disabled = 0;	/* T.38 state before this offer */
+	int t38_held = 0;		/* this re-INVITE is a T.38 offer answered later (sofia_t38_answer_root / a 488) */
 	int st_refresh_seconds = 0;
 	const char *st_refresher_str = NULL;
 	/* Session-Expires on an inbound re-INVITE = uas-side refresh fire. */
@@ -9117,6 +9132,7 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	}
 
 	ast_mutex_lock(&pvt->lock);
+	t38_was_disabled = (pvt->t38_state == SOFIA_T38_DISABLED);
 	old_hold = pvt->hold_state;
 	new_hold = sofia_sdp_extract_hold(sip, pvt->home);
 	trans = (old_hold != new_hold);
@@ -9150,7 +9166,7 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 				ast_channel_unlock(owner);
 				ast_channel_unref(owner);
 			}
-			ast_log(LOG_NOTICE, "Sofia: in-dialog re-INVITE rejected — encryption mismatch on '%s'\n",
+			ast_log(LOG_NOTICE, "Sofia: in-dialog re-INVITE rejected (488) — its offer is not acceptable on '%s'\n",
 				pvt->callid ? pvt->callid : "(no-callid)");
 			{
 				char rb[128] = "";	/* RFC 3326 Q.850 Reason (chan_sip parity); sofia_cfg read is lock-free */
@@ -9181,7 +9197,18 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 			ast_queue_control(owner, AST_CONTROL_UNHOLD);
 		}
 	}
-	sdp_ok = (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf), 1 /* answer */) != NULL);
+	/* A T.38 offer (this parse moved DISABLED -> PEER_REINVITE and asked the core with AST_T38_REQUEST_NEGOTIATE)
+	 * is answered when someone takes the fax, as chan_sip does (handle_request_invite: T38_PEER_REINVITE sends
+	 * no final response, interpret_t38_parameters answers 200 on AST_T38_NEGOTIATED or 488 on a refusal, the
+	 * 5 s timer 488): the request is kept and nothing is sent now but the stack's 100. Answering 200 at once
+	 * accepted an image stream no one would run (a call bridged to a leg without fax went silent). Set under
+	 * pvt->lock, before the core can see the REQUEST_NEGOTIATE. */
+	if (t38_was_disabled && pvt->t38_state == SOFIA_T38_PEER_REINVITE && !pvt->t38_saved[0]
+			&& nua_save_event(nua, pvt->t38_saved)) {
+		pvt->t38_answer_pending = 1;
+		t38_held = 1;
+	}
+	sdp_ok = t38_held ? 0 : (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf), 1 /* answer */) != NULL);
 	ast_mutex_unlock(&pvt->lock);
 	char contact_buf[1024];	/* sized for an opaque GRUU Contact (RFC 5627), not just sip:user@host */
 	contact_buf[0] = '\0';
@@ -9205,7 +9232,10 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 		ast_mutex_unlock(&pvt->peer->lock);
 	}
 
-	if (sdp_ok) {
+	if (t38_held) {
+		ast_debug(1, "Sofia: T.38 re-INVITE on '%s' held until the fax is taken or refused\n",
+			pvt->callid ? pvt->callid : "(no-callid)");
+	} else if (sdp_ok) {
 		/* Never above the interval this re-INVITE asks for (RFC 4028 §9): the handle keeps the Min-SE of the
 		 * earlier answers, which may exceed it. 0 = leave the handle's. */
 		int min_se_cap;
@@ -9281,6 +9311,91 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	if (owner) {
 		ast_channel_unref(owner);
 	}
+}
+
+/* sofia_thread: the held T.38 re-INVITE of pvt (t38_answer_pending), now that T.38 is accepted (ENABLED), is answered
+ * 200 with the image answer, as sofia_process_reinvite answers an offer at once: same SDP builder, Contact and session
+ * timer bookkeeping, bound to the saved request (in a dispatched callback nua_current_request() is NULL). Nothing is
+ * sent when the request was already answered (a 488) or the call is gone. Consumes the +1 pvt ref of the dispatch. */
+void sofia_t38_answer_root(void *data)
+{
+	struct sofia_pvt *pvt = data;
+	struct ast_channel *owner = NULL;
+	char sdp_buf[4096];
+	char contact_buf[1024] = "";
+	nua_saved_event_t saved[1] = { NULL };
+	msg_t *req;
+	sip_t const *rsip;
+	int sdp_ok, min_se_cap;
+
+	/* channel -> pvt -> peer order: the Contact reads the owner's connected line */
+	ast_mutex_lock(&pvt->lock);
+	for (;;) {
+		owner = pvt->owner;
+		if (!owner) {
+			break;
+		}
+		ast_channel_ref(owner);
+		ast_mutex_unlock(&pvt->lock);
+		ast_channel_lock(owner);
+		ast_mutex_lock(&pvt->lock);
+		if (pvt->owner == owner) {
+			break;
+		}
+		ast_channel_unlock(owner);
+		ast_channel_unref(owner);
+		owner = NULL;
+	}
+	if (pvt->t38_answer_pending && pvt->t38_saved[0]) {
+		pvt->t38_answer_pending = 0;
+		saved[0] = pvt->t38_saved[0];
+		pvt->t38_saved[0] = NULL;
+	}
+	req = saved[0] ? nua_saved_event_request(saved) : NULL;
+	rsip = req ? sip_object(req) : NULL;
+	if (rsip && pvt->nh && !pvt->alreadygone) {
+		sdp_ok = (sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf), 1 /* answer */) != NULL);
+		if (pvt->peer) {
+			ast_mutex_lock(&pvt->peer->lock);
+		}
+		sofia_build_contact(pvt, contact_buf, sizeof(contact_buf));
+		if (pvt->peer) {
+			ast_mutex_unlock(&pvt->peer->lock);
+		}
+		if (sdp_ok) {
+			min_se_cap = sofia_session_timer_uas_min_se(pvt, 0,
+				rsip->sip_session_expires ? (int) rsip->sip_session_expires->x_delta : 0);
+			nua_respond(pvt->nh, SIP_200_OK,
+				NUTAG_WITH(req),
+				TAG_IF(min_se_cap > 0, NUTAG_MIN_SE(min_se_cap)),
+				TAG_IF(!ast_sockaddr_isnull(&pvt->ourip), SIPTAG_CONTACT_STR(contact_buf)),
+				SIPTAG_CONTENT_TYPE_STR("application/sdp"),
+				SIPTAG_PAYLOAD_STR(sdp_buf),
+				TAG_END());
+			sofia_session_timer_store(pvt, rsip);
+			sofia_session_timer_plan(pvt, 1);
+			sofia_session_refresh_arm(pvt);
+		} else {
+			nua_respond(pvt->nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH(req), TAG_END());
+		}
+	}
+	ast_mutex_unlock(&pvt->lock);
+	if (owner) {
+		ast_channel_unlock(owner);
+		ast_channel_unref(owner);
+	}
+	if (saved[0]) {
+		nua_destroy_event(saved);
+	}
+	ao2_ref(pvt, -1);
+}
+
+/* sofia_thread: free a saved nua event handed over by pointer (the pvt destructor runs on any thread). */
+void sofia_t38_saved_free_root(void *data)
+{
+	nua_saved_event_t saved[1] = { data };
+
+	nua_destroy_event(saved);
 }
 
 /* Handle an inbound in-dialog UPDATE (RFC 3311) — media renegotiation / hold / session-timer refresh
@@ -10062,7 +10177,7 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			 * Free srtp/vsrtp explicitly. */
 			char rb[128] = "";
 			int hr = sofia_cfg.use_q850_reason && sofia_reason_build_for_status(488, rb, sizeof(rb));
-			ast_log(LOG_NOTICE, "Sofia: 488 reject — encryption mismatch (peer=%s, peer_encryption=%d)\n",
+			ast_log(LOG_NOTICE, "Sofia: 488 reject — the offer is not acceptable (peer=%s, peer_encryption=%d)\n",
 				pvt->peer ? pvt->peer->name : "<unknown>",
 				pvt->peer ? pvt->peer->encryption : 0);
 			nua_respond(nh, SIP_488_NOT_ACCEPTABLE,

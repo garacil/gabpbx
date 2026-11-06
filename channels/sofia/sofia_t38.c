@@ -29,6 +29,18 @@
 /* respond_488_root is used only within this module (interpret_t38_parameters dispatches it). */
 static void sofia_t38_respond_488_root(void *data);
 
+/* The peer's held T.38 re-INVITE (t38_answer_pending) is refused: 488 on sofia_thread. Caller holds pvt->lock. */
+static void sofia_t38_refuse_held(struct sofia_pvt *pvt)
+{
+	if (!pvt->t38_answer_pending) {
+		return;
+	}
+	ao2_ref(pvt, +1);	/* dispatch ref; sofia_t38_respond_488_root drops it */
+	if (sofia_dispatch_to_root_thread(sofia_t38_respond_488_root, pvt) < 0) {
+		ao2_ref(pvt, -1);
+	}
+}
+
 /* T.38 4-state machine. Caller holds pvt->lock, and the channel lock when
  * pvt->owner is live. Queues an AST_CONTROL_T38_PARAMETERS frame for 3 of 4
  * states (LOCAL_REINVITE is silent, awaiting the peer response). */
@@ -207,6 +219,9 @@ int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_contr
 				}
 				pvt->t38id = -1;
 			}
+			if (was_peer_reinvite) {
+				sofia_t38_refuse_held(pvt);	/* the peer's offer: 488 */
+			}
 		} else if (pvt->t38_state == SOFIA_T38_PEER_REINVITE) {
 			/* Accepting the peer offer — cancel the 5s timer. */
 			if (pvt->t38id != -1 && sofia_sched) {
@@ -231,6 +246,13 @@ int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_contr
 			pvt->t38_our_parms.rate_management = pvt->t38_their_parms.rate_management;
 			ast_udptl_set_local_max_ifp(pvt->udptl, pvt->t38_our_parms.max_ifp);
 			sofia_change_t38_state(pvt, SOFIA_T38_ENABLED);
+			/* The held re-INVITE gets its 200 with the image answer now (chan_sip parity). */
+			if (pvt->t38_answer_pending) {
+				ao2_ref(pvt, +1);	/* dispatch ref; sofia_t38_answer_root drops it */
+				if (sofia_dispatch_to_root_thread(sofia_t38_answer_root, pvt) < 0) {
+					ao2_ref(pvt, -1);
+				}
+			}
 		} else if (pvt->t38_state != SOFIA_T38_ENABLED) {
 			/* app_fax/res_fax (SendFAX/ReceiveFAX/fax gateway) requests an outbound
 			 * T.38 upgrade (voice → fax). Originating side: lazy-create the UDPTL
@@ -274,7 +296,7 @@ int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_contr
 			pvt->t38_our_parms = *parameters;
 			ast_udptl_set_local_max_ifp(pvt->udptl, pvt->t38_our_parms.max_ifp);
 			sofia_change_t38_state(pvt, SOFIA_T38_LOCAL_REINVITE);
-			res = 1;	/* tell sofia_indicate to dispatch the outbound re-INVITE */
+			res = SOFIA_T38_SEND_REINVITE;	/* tell sofia_indicate to dispatch the outbound re-INVITE */
 		}
 		break;
 	case AST_T38_TERMINATED:
@@ -289,15 +311,18 @@ int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_contr
 				pvt->t38id = -1;
 			}
 			sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
+			sofia_t38_refuse_held(pvt);	/* the peer's offer: 488 (chan_sip parity) */
 		} else if (pvt->t38_state == SOFIA_T38_ENABLED) {
 			sofia_change_t38_state(pvt, SOFIA_T38_LOCAL_REINVITE);
 		}
 		break;
 	case AST_T38_REQUEST_PARMS:
-		/* Fax stack asks for the far-end parms — return their_parms via a frame. */
+		/* The fax stack (res_fax, on a channel already NEGOTIATING) asks for the far end's parameters again: they
+		 * come back as AST_T38_REQUEST_NEGOTIATE, the request it answers, and the caller returns
+		 * AST_T38_REQUEST_PARMS, which res_fax checks to go on (chan_sip interpret_t38_parameters). As there,
+		 * the 5 s timer stops: the application now answers the offer. */
 		if (pvt->t38_state == SOFIA_T38_PEER_REINVITE) {
 			struct ast_control_t38_parameters reply;
-			/* Negotiation acknowledged — cancel the 5s timer. */
 			if (pvt->t38id != -1 && sofia_sched) {
 				if (ast_sched_thread_del(sofia_sched, pvt->t38id) == 0) {
 					ao2_ref(pvt, -1);
@@ -306,10 +331,11 @@ int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_contr
 			}
 			reply = pvt->t38_their_parms;
 			reply.max_ifp = ast_udptl_get_far_max_ifp(pvt->udptl);
-			reply.request_response = AST_T38_REQUEST_PARMS;
-			res = ast_queue_control_data(pvt->owner, AST_CONTROL_T38_PARAMETERS,
-				&reply, sizeof(reply));
-			return res;
+			reply.request_response = AST_T38_REQUEST_NEGOTIATE;
+			if (pvt->owner) {
+				ast_queue_control_data(pvt->owner, AST_CONTROL_T38_PARAMETERS, &reply, sizeof(reply));
+			}
+			return SOFIA_T38_PARMS_SENT;
 		}
 		break;
 	}
@@ -322,16 +348,30 @@ int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_contr
 static void sofia_t38_respond_488_root(void *data)
 {
 	struct sofia_pvt *pvt = data;
+	nua_saved_event_t saved[1] = { NULL };
+	msg_t *req = NULL;
 
 	ast_mutex_lock(&pvt->lock);
-	if (pvt->nh) {
+	/* The held re-INVITE (t38_answer_pending): bound to the saved request, which is still waiting for its final
+	 * response. Nothing to answer when it already got one (a 200 on AST_T38_NEGOTIATED). */
+	if (pvt->t38_answer_pending && pvt->t38_saved[0]) {
+		pvt->t38_answer_pending = 0;
+		saved[0] = pvt->t38_saved[0];
+		pvt->t38_saved[0] = NULL;
+		req = nua_saved_event_request(saved);
+	}
+	if (pvt->nh && req) {
 		/* RFC 3326 Q.850 Reason (chan_sip parity). A well-formed SIPTAG_REASON_STR is
 		 * delivered as a Reason header on a UAS reject response. */
 		char rb[128] = "";
 		int hr = sofia_cfg.use_q850_reason && sofia_reason_build_for_status(488, rb, sizeof(rb));
-		nua_respond(pvt->nh, 488, "Not Acceptable Here", TAG_IF(hr, SIPTAG_REASON_STR(rb)), TAG_END());
+		nua_respond(pvt->nh, 488, "Not Acceptable Here", NUTAG_WITH(req),
+			TAG_IF(hr, SIPTAG_REASON_STR(rb)), TAG_END());
 	}
 	ast_mutex_unlock(&pvt->lock);
+	if (saved[0]) {
+		nua_destroy_event(saved);
+	}
 	ao2_ref(pvt, -1);
 }
 

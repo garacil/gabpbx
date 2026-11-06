@@ -292,6 +292,10 @@ void sofia_rtcp_t38_end(struct sofia_pvt *pvt, struct ast_channel *chan);
 void sofia_rtcp_pause(struct sofia_pvt *pvt, struct ast_channel *chan, int pause);
 int sofia_t38_abort(const void *data);
 int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_control_t38_parameters *parameters);
+#define SOFIA_T38_SEND_REINVITE 1	/* sofia_interpret_t38_parameters: the caller sends a T.38 re-INVITE */
+#define SOFIA_T38_PARMS_SENT    2	/* ... the far end's parameters were queued (answer AST_T38_REQUEST_PARMS) */
+void sofia_t38_answer_root(void *data);	/* sofia_thread: answer the held T.38 re-INVITE 200 (+1 pvt ref consumed) */
+void sofia_t38_saved_free_root(void *data);	/* sofia_thread: free a saved nua event (the pointer itself) */
 int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer);
 int sofia_dtmf_wants_rfc2833(const struct sofia_pvt *pvt);	/* g1/g3: effective mode carries DTMF as RFC2833/telephone-event (rfc2833 || unresolved-auto || is_webrtc) */
 void sofia_dtmf_reconfigure(struct sofia_pvt *pvt);		/* g2: re-apply RTP property + dtmf mode + fax-safe DSP from pvt->dtmf_effective (call after an AUTO resolution / SIPDtmfMode / DIGIT_DETECT toggle) */
@@ -741,6 +745,12 @@ struct sofia_pvt {
 	struct ast_udptl *udptl;
 	int t38_state;
 	int t38id;
+	/* A peer's T.38 offer is answered only when someone takes the fax (chan_sip parity): the re-INVITE that moved
+	 * T.38 to PEER_REINVITE is kept (nua_save_event) and answered 200 by sofia_t38_answer_root on
+	 * AST_T38_NEGOTIATED, or 488 on a refusal or the 5 s timeout (sofia_t38_respond_488_root). Under pvt->lock;
+	 * the event is freed on sofia_thread. */
+	int t38_answer_pending;
+	nua_saved_event_t t38_saved[1];
 	unsigned int t38_max_ifp;
 	int t38_maxdatagram;
 	int t38_ec_mode;
