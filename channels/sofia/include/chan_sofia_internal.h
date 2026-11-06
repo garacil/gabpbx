@@ -602,6 +602,21 @@ enum sofia_reinvite_purpose {
 	SOFIA_REINVITE_SESSION_REFRESH,	/* RFC 4028 session refresh sent by chan_sofia with the current SDP */
 };
 
+/* One m= line of the offer being answered (plain SIP): the answer has one m= line per offered one, in the same order
+ * (RFC 3264 section 6). role says which of our sections answers it; every other line is declined at port 0 with
+ * the offered media type, transport and first format. */
+#define SOFIA_OFFER_MLINES_MAX	16
+#define SOFIA_ML_DECLINE	0
+#define SOFIA_ML_AUDIO		1
+#define SOFIA_ML_VIDEO		2
+#define SOFIA_ML_IMAGE		3
+struct sofia_offer_mline {
+	char type_name[32];
+	char proto[40];
+	char fmt[32];
+	int role;
+};
+
 /* sofia_pvt.t38_offer_out: what our re-INVITE on the wire carries for T.38 */
 #define SOFIA_T38_OUT_NONE	0
 #define SOFIA_T38_OUT_OFFER	1	/* a live m=image offer (LOCAL_REINVITE) */
@@ -803,6 +818,12 @@ struct sofia_pvt {
 	int offer_audio_port0;
 	char offer_audio0_proto[24];
 	char offer_audio0_fmt[16];
+	/* The m= lines of the last plain-SIP offer answered (sofia_parse_sdp, current offers only): the answer mirrors
+	 * them in order (sofia_generate_sdp). offer_mline_valid is 0 for a WebRTC offer (its own mirror,
+	 * webrtc_reject_m) and before any offer. Under pvt->lock. */
+	int offer_mline_valid;
+	int offer_mline_count;
+	struct sofia_offer_mline offer_mline[SOFIA_OFFER_MLINES_MAX];
 	/* The audio m= line of the last SDP we sent (SOFIA_AUDIO_LINE_*): a re-offer while a fax runs keeps it as it was
 	 * (RFC 3264 §8: absent in an image-only session, at port 0 when declined). Same writer as image_mline. */
 	int audio_line_last;

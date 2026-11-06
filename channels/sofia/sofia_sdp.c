@@ -696,8 +696,28 @@ static void sofia_sdp_keep_version(struct sofia_pvt *pvt, char *buf, size_t len)
 	memcpy(o, head, hl);
 }
 
+/* Copy a finished SDP section aside (the plain-SIP answer mirror places it later); 1 when it does not fit, and the
+ * whole SDP then fails closed like any other truncation. */
+static int sofia_sdp_set_aside(char *dst, size_t size, const char *src)
+{
+	size_t n = strlen(src);
+
+	if (n >= size) {
+		return 1;
+	}
+	memcpy(dst, src, n + 1);
+	return 0;
+}
+
 char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_answer)
 {
+	/* A plain-SIP answer mirrors the offer's m= lines in order (RFC 3264 section 6, offer_mline): the audio, video and
+	 * image sections are built as usual, kept apart, and placed at the offered line each one answers; every other
+	 * offered line is declined at port 0. */
+	int plain_mirror = !pvt->is_webrtc && is_answer && pvt->offer_mline_valid && pvt->offer_mline_count > 0;
+	char video_m_buf[2048] = "";
+	char image_m_buf[1024] = "";
+	size_t sect_start;
 	int audio_line = 0;	/* this SDP has the non-WebRTC m=audio line... */
 	int audio_port0 = 0;	/* ...at port 0 (pvt->audio_line_last) */
 	int image_line = 0;	/* ...and an m=image after it (any port): pvt->image_mline */
@@ -1277,7 +1297,7 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 			audio_line = 1;
 			audio_port0 = 1;
 		}
-	} else if (!(is_answer && !pvt->is_webrtc && !pvt->offer_had_audio
+	} else if (!plain_mirror && !(is_answer && !pvt->is_webrtc && !pvt->offer_had_audio
 			&& pvt->udptl && pvt->t38_state != SOFIA_T38_DISABLED)) {
 		int blen = strlen(buf);
 		if (is_answer && !pvt->is_webrtc && pvt->offer_audio_port0
@@ -1355,6 +1375,7 @@ webrtc_m_lines_done:
 	 * not in a=group:BUNDLE) makes the browser reject the WHOLE SDP with 488 Not Acceptable Here — this is
 	 * the 207<->204 browser-to-browser failure. An audio-only offer/answer is valid (RFC 3264); video-over-
 	 * WebRTC is deferred. */
+	sect_start = strlen(buf);
 	if (!pvt->is_webrtc && pvt->vrtp && (pvt->capability & AST_FORMAT_VIDEO_MASK)) {
 		struct ast_sockaddr vrtp_addr;
 		char vhost[128];
@@ -1471,6 +1492,14 @@ webrtc_m_lines_done:
 		}
 	}
 
+	if (plain_mirror && buf[sect_start]) {
+		/* the video section waits for its slot */
+		if (sofia_sdp_set_aside(video_m_buf, sizeof(video_m_buf), buf + sect_start)) {
+			overflow = 1;
+		}
+		buf[sect_start] = '\0';
+	}
+
 	/* T.38 fax UDPTL outbound emitter: m=image + a=T38Fax* (5 mandatory + 3 optional
 	 * bare-flag attrs, emitted only when the our_parms bit is set). Gated on udptl AND an ACTIVE t38_state
 	 * (!= DISABLED): a refused/failed T.38 leaves pvt->udptl allocated (we keep it, non-destructive), so
@@ -1479,6 +1508,7 @@ webrtc_m_lines_done:
 	/* SUPPRESSED on a WebRTC leg (the WebRTC answer/offer paths are audio-only): a plain m=image udptl t38 in a WebRTC SDP is the
 	 * same mixed-media 488 class as plain video — no mid/ICE/fingerprint/BUNDLE. T.38 fax
 	 * is never active on a browser audio call anyway; gate for completeness. */
+	sect_start = strlen(buf);
 	if (!pvt->is_webrtc && pvt->udptl && pvt->t38_state == SOFIA_T38_ENABLED && pvt->t38_ending && !is_answer) {
 		/* The fax is over: our offer gives the audio back. A session that also had audio keeps the image
 		 * stream's m-line at port 0 (RFC 3264 §8.2: a stream is removed by setting its port to zero); an
@@ -1585,7 +1615,7 @@ webrtc_m_lines_done:
 				overflow = 1;
 			}
 		}
-	} else if (!pvt->is_webrtc && (is_answer ? pvt->offer_image_line : pvt->image_mline)) {
+	} else if (!plain_mirror && !pvt->is_webrtc && (is_answer ? pvt->offer_image_line : pvt->image_mline)) {
 		/* No live T.38: an offer keeps the image stream of the last SDP we sent at port 0 (RFC 3264 §8: the number
 		 * of m= lines never decreases), an answer declines the offered one at port 0 (§6). chan_sip answers the
 		 * same way (add_sdp's offered_media, "m=image 0 udptl t38"). */
@@ -1594,6 +1624,51 @@ webrtc_m_lines_done:
 			overflow = 1;
 		}
 		image_line = 1;
+	}
+
+	if (plain_mirror) {
+		int i;
+		int seen_audio = 0;
+
+		if (buf[sect_start]) {
+			/* the live T.38 section waits for its slot */
+			if (sofia_sdp_set_aside(image_m_buf, sizeof(image_m_buf), buf + sect_start)) {
+				overflow = 1;
+			}
+			buf[sect_start] = '\0';
+		}
+		/* One line per offered line, in order: our section where we took the line, else the offered line at port 0
+		 * with its media type, transport and first format (RFC 3264 sections 6 and 8.2). */
+		audio_line = audio_port0 = image_line = 0;
+		for (i = 0; i < pvt->offer_mline_count; i++) {
+			const struct sofia_offer_mline *ml = &pvt->offer_mline[i];
+			const char *section = NULL;
+			int blen = strlen(buf);
+
+			if (ml->role == SOFIA_ML_AUDIO) {
+				section = audio_m_buf;
+			} else if (ml->role == SOFIA_ML_VIDEO && video_m_buf[0]) {
+				section = video_m_buf;
+			} else if (ml->role == SOFIA_ML_IMAGE && image_m_buf[0]) {
+				section = image_m_buf;
+			}
+			if (section) {
+				if (snprintf(buf + blen, len - blen, "%s", section) >= (int)(len - blen)) {
+					overflow = 1;
+				}
+			} else if (snprintf(buf + blen, len - blen, "m=%s 0 %s %s\r\n", ml->type_name, ml->proto, ml->fmt)
+					>= (int)(len - blen)) {
+				overflow = 1;
+			}
+			/* RFC 3264 section 8 bookkeeping (image_mline, audio_line_last), as for the fixed layout */
+			if (!strcasecmp(ml->type_name, "audio") && !seen_audio) {
+				seen_audio = 1;
+				audio_line = 1;
+				audio_port0 = (section == NULL);
+			} else if (!strcasecmp(ml->type_name, "image") && seen_audio) {
+				image_line = 1;
+			}
+		}
 	}
 
 	/* Any fragment/final truncation → fail the whole SDP (callers treat NULL as "no SDP"). */
@@ -1951,6 +2026,11 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	int m_audio_present = 0;	/* any m=audio line in the offer (incl. port 0); RFC 3264 §6 answer-mirror gate for T.38 */
 	int m_image_line = 0;	/* an m=image line (any port): offer_image_line */
 	int m_audio_port0 = 0;		/* the first m=audio line is at port 0: offer_audio_port0 */
+	struct sofia_offer_mline staged_ml[SOFIA_OFFER_MLINES_MAX];	/* every offered m= line, in order (offer_mline) */
+	int staged_ml_count = 0;
+	int staged_ml_overflow = 0;
+	int ml_audio = -1, ml_video = -1, ml_image = -1;	/* the line each of our sections answers (the last taken wins) */
+	int cur_ml = -1;
 	char m_audio0_proto[24] = "";
 	char m_audio0_fmt[16] = "";
 	int video_offered = 0;
@@ -2193,6 +2273,28 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 		pvt->webrtc_video_bundled = 0;	/* BUNDLE: when we ANSWER a CURRENT offer we re-derive bundle from THIS offer (current role, NOT the permanent webrtc_offerer); applying an ANSWER to our own offer (current_offer==0) keeps the flag provision_offer set */
 	}
 	for (media = sdp->sdp_media; media; media = media->m_next) {
+		/* Record the line for the answer's mirror (RFC 3264 section 6): declined unless a branch below takes it. */
+		cur_ml = -1;
+		if (staged_ml_count < SOFIA_OFFER_MLINES_MAX) {
+			struct sofia_offer_mline *ml = &staged_ml[staged_ml_count];
+
+			memset(ml, 0, sizeof(*ml));
+			ast_copy_string(ml->type_name, !ast_strlen_zero(media->m_type_name) ? media->m_type_name
+				: (media->m_type == sdp_media_audio) ? "audio" : (media->m_type == sdp_media_video) ? "video"
+				: (media->m_type == sdp_media_image) ? "image" : "application", sizeof(ml->type_name));
+			ast_copy_string(ml->proto, S_OR(media->m_proto_name, "RTP/AVP"), sizeof(ml->proto));
+			if (media->m_rtpmaps) {
+				snprintf(ml->fmt, sizeof(ml->fmt), "%u", (unsigned int) media->m_rtpmaps->rm_pt);
+			} else if (media->m_format && media->m_format->l_text) {
+				ast_copy_string(ml->fmt, media->m_format->l_text, sizeof(ml->fmt));
+			} else {
+				ast_copy_string(ml->fmt, "0", sizeof(ml->fmt));
+			}
+			ml->role = SOFIA_ML_DECLINE;
+			cur_ml = staged_ml_count++;
+		} else {
+			staged_ml_overflow = 1;
+		}
 		if (media->m_type == sdp_media_audio) {
 			if (!m_audio_present && media->m_port == 0) {
 				m_audio_port0 = 1;
@@ -2337,6 +2439,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 			} else {
 				continue;
 			}
+			ml_audio = cur_ml;	/* our audio section answers this line (a later live audio line takes over) */
 
 			{
 				/* Never feed an uninitialized ast_sockaddr to the RTP engine:
@@ -2753,6 +2856,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 				}
 				/* Map built; install into pvt->vrtp deferred to commit. */
 				staged_video_valid = 1;
+				ml_video = cur_ml;	/* our video section answers this line */
 			}
 		} else if (media->m_type == sdp_media_image && media->m_port != 0) {
 			/* T.38 fax UDPTL handling: populate t38_their_parms from the offer,
@@ -2801,6 +2905,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 				 * since a pre-existing udptl already had fds[5] bound. */
 				t38_stage_fds5 = 1;
 			}
+			ml_image = cur_ml;	/* our T.38 section answers this line */
 
 			/* Set the UDPTL peer. With NAT + t38pt_usertpsource=yes, override the
 			 * destination with the audio RTP remote (the seen endpoint, fixing T.38
@@ -3192,6 +3297,14 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 
 	sdp_parser_free(parser);
 	parser = NULL;	/* so sdp_reject's free is a no-op for post-loop rejects */
+
+	/* More m= lines than the answer can mirror: refuse the offer rather than answer it with fewer lines than it
+	 * had (RFC 3264 section 6). */
+	if (current_offer && staged_ml_overflow && !audio_webrtc_offered && !pvt->is_webrtc) {
+		ast_log(LOG_WARNING, "Sofia: SDP offer for '%s' has more than %d m= lines — rejecting\n",
+			S_OR(pvt->callid, "<unknown>"), SOFIA_OFFER_MLINES_MAX);
+		goto sdp_reject;
+	}
 
 	/* SRTP policy enforcement */
 	if (audio_secure_offered && !processed_crypto_audio) {
@@ -4007,6 +4120,19 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 		pvt->offer_audio_port0 = m_audio_port0;
 		ast_copy_string(pvt->offer_audio0_proto, m_audio0_proto, sizeof(pvt->offer_audio0_proto));
 		ast_copy_string(pvt->offer_audio0_fmt, m_audio0_fmt, sizeof(pvt->offer_audio0_fmt));
+		/* The answer's m= lines (RFC 3264 section 6), for a plain-SIP offer: a WebRTC one has its own mirror. */
+		pvt->offer_mline_valid = !audio_webrtc_offered && !pvt->is_webrtc;
+		pvt->offer_mline_count = 0;
+		if (pvt->offer_mline_valid) {
+			int i;
+
+			for (i = 0; i < staged_ml_count; i++) {
+				pvt->offer_mline[i] = staged_ml[i];
+				pvt->offer_mline[i].role = (i == ml_audio) ? SOFIA_ML_AUDIO : (i == ml_video) ? SOFIA_ML_VIDEO
+					: (i == ml_image) ? SOFIA_ML_IMAGE : SOFIA_ML_DECLINE;
+			}
+			pvt->offer_mline_count = staged_ml_count;
+		}
 	}
 	if (current_offer && offered_video_mode != -1) {
 		pvt->offered_video_mode = offered_video_mode;
