@@ -3338,6 +3338,13 @@ static void sofia_pvt_destructor(void *obj)
 		}
 		pvt->t38id = -1;
 	}
+	/* 491 retry timer safety net (normally unreachable while armed: it holds a pvt ref). */
+	if (pvt->reinvite_retry_id != -1 && sofia_sched) {
+		if (ast_sched_thread_del(sofia_sched, pvt->reinvite_retry_id) == 0) {
+			ao2_ref(pvt, -1);
+		}
+		pvt->reinvite_retry_id = -1;
+	}
 	/* P2 guard safety net (same del-or-fire; normally unreachable while armed — the
 	 * scheduler entry holds a pvt ref — but cheap insurance against future motion). */
 	if (pvt->push_guard_sched_id != -1 && sofia_sched) {
@@ -3405,6 +3412,7 @@ static struct sofia_pvt *sofia_pvt_alloc(void)
 	pvt->defer_bye_sched_id = -1;
 	pvt->push_guard_sched_id = -1;	/* P2 no-provisional guard: same sentinel discipline */
 	pvt->session_refresh_sched_id = -1;	/* RFC 4028 refresh timer: same sentinel discipline */
+	pvt->reinvite_retry_id = -1;		/* 491 retry timer: same sentinel discipline */
 	pvt->st_remote_supported = pvt->st_remote_expires = pvt->st_remote_refresher = pvt->st_remote_min_se = 0;
 	pvt->st_remote_update = pvt->session_we_refresh = pvt->session_interval = pvt->session_update_refresh = 0;
 	pvt->session_update_refused = 0;
@@ -5876,6 +5884,8 @@ static const char *sofia_reinvite_purpose_str(int purpose)
 
 /* Send an in-dialog re-INVITE. LOCK: caller MUST hold pvt->lock (reads redirip,
  * writes reinvite_pending; both also touched by the sofia event-loop thread). */
+static void sofia_reinvite_followup_locked(struct sofia_pvt *pvt);
+
 static void sofia_send_reinvite(struct sofia_pvt *pvt)
 {
 	char sdp_buf[4096];	/* WebRTC video (multi-PT rtcp-fb + ICE candidates) can exceed 2048 → SDP dropped fail-closed; RFC 8843/6184 headroom */
@@ -5885,15 +5895,89 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 	int have_gruu = 0;
 	int mf = sofia_cfg.default_max_forwards;
 
+	int folded = 0;
+	int prev_purpose = SOFIA_REINVITE_NONE;
+	struct ast_sockaddr prev_redirip = {{0,}};
+
+	if (pvt) {
+		prev_purpose = pvt->reinvite_purpose;
+		ast_sockaddr_copy(&prev_redirip, &pvt->redirip);
+	}
+	/* A directmedia offer carries the latest target the bridge asked for: one that came after it was queued
+	 * (sofia_set_rtp_peer while it was pending) is folded in here, before the SDP is built. */
+	if (pvt && pvt->nh && pvt->need_reinvite && pvt->reinvite_purpose == SOFIA_REINVITE_DIRECTMEDIA) {
+		ast_sockaddr_copy(&pvt->redirip, &pvt->redirip_next);
+		pvt->need_reinvite = 0;
+		folded = 1;
+	}
+	/* A T.38 offer that is due (LOCAL_REINVITE, or the audio offer at the end of a fax) is in every SDP built now
+	 * (sofia_generate_sdp), so this re-INVITE is that offer, and its response is handled as one (the T.38
+	 * purpose: refusal, 491 retry, hang-up after a refused end-of-fax offer). It can be another one claimed just
+	 * before the T.38 request was deferred: a hold waits for the operator's next hold (its direction goes back),
+	 * a connected-line update is dropped (as when the slot is busy), a directmedia target is carried and queued
+	 * again in case the offer is refused, a session refresh is done by this one. */
+	if (pvt && pvt->nh && pvt->reinvite_purpose == SOFIA_REINVITE_T38
+			&& pvt->t38_state != SOFIA_T38_LOCAL_REINVITE
+			&& !(pvt->t38_state == SOFIA_T38_ENABLED && pvt->t38_ending)) {
+		/* The slot was claimed for a T.38 offer that is no longer due (a peer offer moved the state meanwhile):
+		 * send nothing (the stack would answer it 491 locally while that offer is held) and let what waits go. */
+		pvt->reinvite_pending = 0;
+		pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
+		pvt->need_t38_reinvite = 0;
+		sofia_reinvite_followup_locked(pvt);
+		return;
+	}
+	if (pvt && pvt->nh && pvt->reinvite_purpose != SOFIA_REINVITE_T38
+			&& (pvt->t38_state == SOFIA_T38_LOCAL_REINVITE
+				|| (pvt->t38_state == SOFIA_T38_ENABLED && pvt->t38_ending))) {
+		if (pvt->reinvite_purpose == SOFIA_REINVITE_LOCAL_HOLD) {
+			pvt->local_hold_mode = pvt->local_hold_mode_prev;
+		} else if (pvt->reinvite_purpose == SOFIA_REINVITE_DIRECTMEDIA && !pvt->need_reinvite) {
+			ast_sockaddr_copy(&pvt->redirip_next, &pvt->redirip);
+			pvt->need_reinvite = 1;
+		}
+		pvt->reinvite_purpose = SOFIA_REINVITE_T38;
+	}
 	if (!pvt || !pvt->nh || !sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf), 0 /* offer */)) {
 		/* Nothing sent — release the reinvite gate (pre-set by the directmedia
 		 * marshal) so a guard-fail doesn't leave it stuck. */
 		if (pvt) {
+			if (folded) {
+				ast_sockaddr_copy(&pvt->redirip, &prev_redirip);
+				pvt->need_reinvite = 1;	/* the target was not offered */
+			}
+			if (pvt->reinvite_purpose == SOFIA_REINVITE_T38 || pvt->need_t38_reinvite) {
+				/* A T.38 offer that cannot be built is dropped (nothing would send it later, and the others
+				 * wait for it): the end-of-fax one ends here; a LOCAL_REINVITE is refused by the 5 s T.38
+				 * timer (sofia_t38_abort: DISABLED, AST_T38_REFUSED), which takes the channel lock. */
+				pvt->t38_ending = 0;
+				pvt->need_t38_reinvite = 0;
+				if (pvt->t38_state == SOFIA_T38_LOCAL_REINVITE && sofia_sched && pvt->t38id == -1) {
+					ao2_ref(pvt, +1);	/* held by the scheduler entry */
+					pvt->t38id = ast_sched_thread_add(sofia_sched, SOFIA_T38_ABORT_TIMEOUT_MS, sofia_t38_abort, pvt);
+					if (pvt->t38id < 0) {
+						pvt->t38id = -1;
+						ao2_ref(pvt, -1);
+					}
+				}
+			}
+			if (prev_purpose == SOFIA_REINVITE_LOCAL_HOLD && pvt->reinvite_purpose == SOFIA_REINVITE_LOCAL_HOLD) {
+				pvt->local_hold_mode = pvt->local_hold_mode_prev;	/* the hold direction did not go out */
+			}
 			pvt->reinvite_pending = 0;
 			pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
 		}
 		return;
 	}
+	/* What this offer carries for T.38 (the SDP above was built from this state): its final response decides the
+	 * T.38 state, and a T.38 offer waiting for the slot needs nothing more. Every offer carries redirip. */
+	pvt->t38_offer_out = (pvt->t38_state == SOFIA_T38_LOCAL_REINVITE) ? SOFIA_T38_OUT_OFFER
+		: (pvt->t38_state == SOFIA_T38_ENABLED && pvt->t38_ending) ? SOFIA_T38_OUT_ENDING : SOFIA_T38_OUT_NONE;
+	if (pvt->t38_offer_out != SOFIA_T38_OUT_NONE) {
+		pvt->need_t38_reinvite = 0;
+	}
+	pvt->reinvite_carries_dm = (prev_purpose == SOFIA_REINVITE_DIRECTMEDIA);
+	pvt->reinvite_force = 0;
 	/* GRUU: a re-INVITE is a target-refresh request (RFC 5627 §4.4 / RFC 3261 §12.2) so it
 	 * carries the GRUU Contact too. Snapshot maxforwards + the GRUU Contact under peer->lock (order is
 	 * pvt->peer; canonical), then RELEASE before nua_invite — never hold peer->lock across the stack. */
@@ -5941,6 +6025,136 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 	}
 }
 
+/* pvt->lock held, on sofia_thread, the re-INVITE just completed (reinvite_pending cleared): what waited for it is
+ * offered now, as chan_sip sends a SIP_NEEDREINVITE from check_pendings after the ACK. A T.38 offer goes first (the
+ * application waits for it); a media target the bridge asked for meanwhile (need_reinvite) goes when it differs
+ * from the current one, or whatever it is after a refused directmedia offer (reinvite_force). Waits while a 491
+ * retry is armed (the timer calls it) and while a peer T.38 offer is held for the application (the stack would
+ * answer ours 491 locally; the held answer calls it); nothing goes on a dialog whose channel has gone (a deferred
+ * BYE). */
+static void sofia_reinvite_followup_locked(struct sofia_pvt *pvt)
+{
+	if (pvt->reinvite_pending || pvt->reinvite_retry_id != -1 || pvt->t38_answer_pending
+			|| pvt->alreadygone || pvt->state != SOFIA_DIALOG_STATE_UP || !pvt->nh || !pvt->owner) {
+		return;
+	}
+	if (pvt->need_t38_reinvite) {
+		pvt->need_t38_reinvite = 0;
+		if (pvt->t38_state == SOFIA_T38_LOCAL_REINVITE
+				|| (pvt->t38_state == SOFIA_T38_ENABLED && pvt->t38_ending)) {
+			pvt->reinvite_pending = 1;
+			pvt->reinvite_purpose = SOFIA_REINVITE_T38;
+			sofia_send_reinvite(pvt);
+			if (pvt->reinvite_pending) {
+				return;	/* a directmedia target waits for this one */
+			}
+		}
+	}
+	if (!pvt->need_reinvite) {
+		return;
+	}
+	pvt->need_reinvite = 0;
+	if (!pvt->reinvite_force && !ast_sockaddr_cmp(&pvt->redirip_next, &pvt->redirip)) {
+		return;	/* the media already go there */
+	}
+	ast_sockaddr_copy(&pvt->redirip, &pvt->redirip_next);
+	pvt->reinvite_purpose = SOFIA_REINVITE_DIRECTMEDIA;
+	sofia_send_reinvite(pvt);
+}
+
+static int sofia_reinvite_arm_retry_locked(struct sofia_pvt *pvt);
+
+/* pvt->lock held, sofia_thread: the re-INVITE in flight got its final response. What waited for it is offered now,
+ * or after the RFC 3261 §14.1 delay when that response was a 491 (another offer now would most likely cross the
+ * peer's again; chan_sip's check_pendings waits for its waitid too). The 491 count restarts on any other response. */
+static void sofia_reinvite_done_locked(struct sofia_pvt *pvt, int status)
+{
+	if (status != 491) {
+		pvt->reinvite_491_count = 0;
+	} else if ((pvt->need_t38_reinvite || pvt->need_reinvite) && sofia_reinvite_arm_retry_locked(pvt)) {
+		return;	/* the timer runs the follow-up */
+	}
+	sofia_reinvite_followup_locked(pvt);
+}
+
+/* For sofia_t38.c: sofia_thread, pvt->lock held, after the held peer T.38 offer got its answer. */
+void sofia_reinvite_followup_root_locked(struct sofia_pvt *pvt)
+{
+	sofia_reinvite_followup_locked(pvt);
+}
+
+/* sofia_thread: the 491 retry timer fired (its pvt ref is handed over). */
+static void sofia_reinvite_retry_root(void *data)
+{
+	struct sofia_pvt *pvt = data;
+
+	ast_mutex_lock(&pvt->lock);
+	pvt->reinvite_retry_id = -1;
+	sofia_reinvite_followup_locked(pvt);
+	ast_mutex_unlock(&pvt->lock);
+	ao2_ref(pvt, -1);
+}
+
+/* sched thread: one shot; nua runs on sofia_thread. */
+static int sofia_reinvite_retry_cb(const void *data)
+{
+	struct sofia_pvt *pvt = (struct sofia_pvt *) data;
+
+	if (sofia_dispatch_to_root_thread(sofia_reinvite_retry_root, pvt) < 0) {
+		ast_mutex_lock(&pvt->lock);
+		pvt->reinvite_retry_id = -1;
+		ast_mutex_unlock(&pvt->lock);
+		ao2_ref(pvt, -1);
+	}
+	return 0;
+}
+
+/* pvt->lock held: arm the RFC 3261 §14.1 timer after a 491, 2.1-4 s when this side owns the Call-ID (we placed the
+ * call), else 0-2 s, the delays chan_sip picks in handle_response_invite; it runs sofia_reinvite_followup_locked.
+ * Returns 1 when armed (or already armed). */
+static int sofia_reinvite_arm_retry_locked(struct sofia_pvt *pvt)
+{
+	int ms;
+
+	if (pvt->reinvite_retry_id != -1) {
+		return 1;
+	}
+	if (!sofia_sched) {
+		return 0;
+	}
+	ms = pvt->outgoing ? 2100 + (int) (ast_random() % 1900) : 10 + (int) (ast_random() % 1990);
+	ao2_ref(pvt, +1);	/* the scheduler's ref; sofia_reinvite_retry_root drops it */
+	pvt->reinvite_retry_id = ast_sched_thread_add(sofia_sched, ms, sofia_reinvite_retry_cb, pvt);
+	if (pvt->reinvite_retry_id < 0) {
+		pvt->reinvite_retry_id = -1;
+		ao2_ref(pvt, -1);
+		return 0;
+	}
+	return 1;
+}
+
+/* pvt->lock held: our directmedia or T.38 re-INVITE got 491 (glare): offer it again after the RFC 3261 §14.1 delay
+ * (sofia_reinvite_arm_retry_locked). A directmedia retry offers the latest target (a newer one asked for meanwhile
+ * wins); a T.38 one the current T.38 state. At most 3 retries for consecutive 491s (the count restarts on any other
+ * final response). Returns 1 when it will be sent again, 0 when not (the caller's refusal path runs). */
+static int sofia_reinvite_491_retry_locked(struct sofia_pvt *pvt, int purpose)
+{
+	if (pvt->reinvite_retry_id == -1 && ++pvt->reinvite_491_count > 3) {
+		pvt->reinvite_491_count = 0;	/* a later offer starts again */
+		return 0;
+	}
+	if (!sofia_reinvite_arm_retry_locked(pvt)) {
+		return 0;
+	}
+	if (purpose == SOFIA_REINVITE_T38) {
+		pvt->need_t38_reinvite = 1;
+	} else if (!pvt->need_reinvite) {
+		ast_sockaddr_copy(&pvt->redirip_next, &pvt->offered_redirip);
+		pvt->need_reinvite = 1;
+	}
+	return 1;
+}
+
 /* Runs a re-INVITE on sofia_thread (shared by directmedia, T.38 and local hold; dispatched with a
  * +1 pvt ref — the re-INVITE must not run on the bridge/channel thread). sofia_send_reinvite builds
  * the offer from current pvt state (redirip, t38_state, local_hold_mode), so callers just set that
@@ -5969,8 +6183,8 @@ static void sofia_reinvite_root(void *data)
  * LOCAL_HOLD re-INVITE onto sofia_thread (shared sofia_reinvite_root -> sofia_send_reinvite builds the
  * offer with the new direction). Runs on the channel thread from AST_CONTROL_HOLD/UNHOLD. Mode: 0
  * resume (sendrecv), 1 sendonly, 2 inactive. Saves the prior mode so a rejected re-INVITE rolls back.
- * If a re-INVITE is already pending we do NOT fire (glare) — the mode is left unchanged so we don't
- * desync the confirmed state; the operator's next hold/unhold retries. */
+ * If a re-INVITE is already pending, or a T.38 offer waits for the slot, we do NOT fire (glare) — the mode
+ * is left unchanged so we don't desync the confirmed state; the operator's next hold/unhold retries. */
 static void sofia_hold_reinvite(struct sofia_pvt *pvt, int mode)
 {
 	int dispatch = 0;
@@ -5984,7 +6198,8 @@ static void sofia_hold_reinvite(struct sofia_pvt *pvt, int mode)
 		ast_mutex_unlock(&pvt->lock);
 		return;
 	}
-	if (pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh && !pvt->reinvite_pending && !pvt->alreadygone) {
+	if (pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh && !pvt->reinvite_pending && !pvt->alreadygone
+			&& !pvt->need_t38_reinvite) {	/* a T.38 offer waiting for the slot goes first */
 		pvt->local_hold_mode_prev = pvt->local_hold_mode;	/* for rollback on reject */
 		pvt->local_hold_mode = mode;
 		pvt->reinvite_pending = 1;
@@ -6181,12 +6396,13 @@ static int sofia_session_refresh_cb(const void *data)
 	return 0;
 }
 
-/* Send the refresh re-INVITE with the current SDP now, or in 2 s when another re-INVITE of ours is in flight.
- * sofia_thread, pvt->lock held, call UP. Its 2xx is handled by the SESSION_REFRESH purpose path, and the
- * negotiation on that 2xx re-arms the timer. */
+/* Send the refresh re-INVITE with the current SDP now, or in 2 s when another re-INVITE of ours is in flight, a
+ * T.38 offer waits for the slot, a 491 retry is armed (RFC 3261 §14.1) or a peer T.38 offer is held for the
+ * application. sofia_thread, pvt->lock held, call UP.
+ * Its 2xx is handled by the SESSION_REFRESH purpose path, and the negotiation on that 2xx re-arms the timer. */
 static void sofia_session_refresh_send_locked(struct sofia_pvt *pvt)
 {
-	if (pvt->reinvite_pending) {
+	if (pvt->reinvite_pending || pvt->need_t38_reinvite || pvt->reinvite_retry_id != -1 || pvt->t38_answer_pending) {
 		if (pvt->session_refresh_sched_id == -1) {
 			ao2_ref(pvt, +1);
 			pvt->session_refresh_sched_id = ast_sched_thread_add(sofia_sched, 2000, sofia_session_refresh_cb, pvt);
@@ -6299,19 +6515,22 @@ static int sofia_set_rtp_peer(struct ast_channel *chan, struct ast_rtp_instance 
 		ast_mutex_unlock(&pvt->lock);
 		return 0;
 	}
-	/* Re-INVITE in flight: don't fire a second. Only fold the new directmedia target into the
-	 * pending offer when THAT offer is itself a directmedia one (its response handler re-reads
-	 * redirip); for a LOCAL_HOLD or T.38 re-INVITE, leave redirip UNCHANGED so a later bridge tick
-	 * still sees the address change and sends the directmedia re-INVITE normally. */
-	if (pvt->reinvite_pending) {
-		if (pvt->reinvite_purpose == SOFIA_REINVITE_DIRECTMEDIA) {
-			ast_sockaddr_copy(&pvt->redirip, &new_redirip);
-		}
+	/* Re-INVITE in flight (any purpose: directmedia, hold, T.38, session refresh, connected line), a 491
+	 * retry waiting (RFC 3261 §14.1) or a peer T.38 offer held for the application (the stack would answer
+	 * ours 491): don't fire another, remember the target (chan_sip SIP_NEEDREINVITE).
+	 * A directmedia offer not sent yet takes it (sofia_send_reinvite); otherwise it is offered when the one
+	 * in flight completes (sofia_reinvite_followup_locked). The core calls this once per change and never
+	 * again for the same one (remote_bridge_loop keeps the new address whatever is returned), so it must
+	 * not be lost. */
+	if (pvt->reinvite_pending || pvt->reinvite_retry_id != -1 || pvt->t38_answer_pending) {
+		ast_sockaddr_copy(&pvt->redirip_next, &new_redirip);
+		pvt->need_reinvite = 1;
 		ast_mutex_unlock(&pvt->lock);
 		return 0;
 	}
-	/* Only fire when the target actually changes. */
-	if (!ast_sockaddr_cmp(&new_redirip, &pvt->redirip)) {
+	pvt->need_reinvite = 0;	/* this one is sent now */
+	/* Only fire when the target actually changes (after a refused directmedia offer, whatever it is). */
+	if (!pvt->reinvite_force && !ast_sockaddr_cmp(&new_redirip, &pvt->redirip)) {
 		ast_mutex_unlock(&pvt->lock);
 		return 0;
 	}
@@ -8226,8 +8445,42 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 			 * transition happens when the answer's m=image is parsed (sofia_parse_sdp
 			 * commit). */
 			int t38_rc;
+			int t38_dispatch = 0;
+			int t38_deferred = 0;
 			ast_mutex_lock(&pvt->lock);
 			t38_rc = sofia_interpret_t38_parameters(pvt, (const struct ast_control_t38_parameters *)data);
+			/* SOFIA_T38_SEND_REINVITE: claim the re-INVITE slot (reinvite_pending + purpose T38) or defer, in the
+			 * same pvt->lock section as the state change, so nothing on sofia_thread builds an offer from the new
+			 * state in between. Tagged T38, the 2xx/reject handler runs the T.38 outcome (refusal -> DISABLED,
+			 * 491 retry), not hold/directmedia. */
+			if (t38_rc == SOFIA_T38_SEND_REINVITE) {
+				if (pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh && !pvt->alreadygone) {
+					if (!pvt->reinvite_pending && !pvt->t38_answer_pending
+							&& !(pvt->reinvite_retry_id != -1 && pvt->need_t38_reinvite)) {
+						/* Free slot: send now, even while a directmedia 491 retry waits (chan_sip sends the
+						 * T.38 re-INVITE at once then: res_fax gives up negotiating after 5 s); a T.38 retry
+						 * already armed keeps the RFC 3261 §14.1 delay. */
+						pvt->reinvite_pending = 1;
+						pvt->reinvite_purpose = SOFIA_REINVITE_T38;
+						ao2_ref(pvt, +1);	/* dispatch ref; sofia_reinvite_root drops it */
+						t38_dispatch = 1;
+					} else {
+						/* A re-INVITE in flight (or a T.38 retry, or a peer T.38 offer held): the T.38 offer
+						 * goes when it completes (sofia_reinvite_followup_locked), as chan_sip defers it
+						 * (SIP_NEEDREINVITE). Decided in the same pvt->lock section as the check, so a
+						 * completion in between cannot miss it. */
+						pvt->need_t38_reinvite = 1;
+						t38_deferred = 1;
+					}
+				} else {
+					/* The call is no longer up: a LOCAL_REINVITE with no INVITE to come would leave res_fax
+					 * waiting. Channel lock held (sofia_indicate), so the state change is safe. */
+					pvt->t38_ending = 0;	/* the audio offer at the end of a fax will not go out */
+					if (pvt->t38_state == SOFIA_T38_LOCAL_REINVITE) {
+						sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
+					}
+				}
+			}
 			ast_mutex_unlock(&pvt->lock);
 			if (t38_rc < 0) {
 				return -1;
@@ -8237,20 +8490,6 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 				return AST_T38_REQUEST_PARMS;
 			}
 			if (t38_rc == SOFIA_T38_SEND_REINVITE) {
-				/* Claim the re-INVITE slot ATOMICALLY: set reinvite_pending + purpose=T38 under
-				 * pvt->lock (gated on no re-INVITE already in flight) so a concurrent directmedia/
-				 * hold can't see pending==0 and stomp the purpose. Tag T38 so the 2xx/reject handler
-				 * runs the T.38 rollback (stuck-LOCAL_REINVITE -> DISABLED), not hold/directmedia. */
-				int t38_dispatch = 0;
-				ast_mutex_lock(&pvt->lock);
-				if (pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh && !pvt->alreadygone
-						&& !pvt->reinvite_pending) {
-					pvt->reinvite_pending = 1;
-					pvt->reinvite_purpose = SOFIA_REINVITE_T38;
-					ao2_ref(pvt, +1);	/* dispatch ref; sofia_reinvite_root drops it */
-					t38_dispatch = 1;
-				}
-				ast_mutex_unlock(&pvt->lock);
 				if (t38_dispatch) {
 					if (sofia_dispatch_to_root_thread(sofia_reinvite_root, pvt) < 0) {
 						ast_mutex_lock(&pvt->lock);
@@ -8266,16 +8505,10 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 						ao2_ref(pvt, -1);
 						ast_log(LOG_WARNING, "Sofia: failed to dispatch outbound T.38 re-INVITE on '%s'\n", ast->name);
 					}
+				} else if (t38_deferred) {
+					ast_debug(1, "Sofia: T.38 re-INVITE on '%s' waits for the one in flight\n", ast->name);
 				} else {
-					/* Slot busy (a re-INVITE already in flight). interpret_t38 already moved us to
-					 * LOCAL_REINVITE, so roll it back rather than stay stuck with no outbound INVITE. */
-					ast_mutex_lock(&pvt->lock);
-					pvt->t38_ending = 0;	/* the audio offer at the end of a fax did not go out */
-					if (pvt->t38_state == SOFIA_T38_LOCAL_REINVITE) {
-						sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
-					}
-					ast_mutex_unlock(&pvt->lock);
-					ast_log(LOG_WARNING, "Sofia: T.38 re-INVITE on '%s' skipped — a re-INVITE is already in flight\n", ast->name);
+					ast_log(LOG_WARNING, "Sofia: T.38 re-INVITE on '%s' skipped — the call is no longer up\n", ast->name);
 				}
 			}
 		}
@@ -9117,7 +9350,7 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	int trans;
 	int sdp_ok;
 	int st_refresh = 0; /* RFC 4028 uas-refresh discriminator */
-	int t38_was_disabled = 0;	/* T.38 state before this offer */
+	int t38_was_idle = 0;	/* before this offer T.38 was DISABLED, or LOCAL_REINVITE (our offer waiting) */
 	int t38_held = 0;		/* this re-INVITE is a T.38 offer answered later (sofia_t38_answer_root / a 488) */
 	int st_refresh_seconds = 0;
 	const char *st_refresher_str = NULL;
@@ -9134,7 +9367,7 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	}
 
 	ast_mutex_lock(&pvt->lock);
-	t38_was_disabled = (pvt->t38_state == SOFIA_T38_DISABLED);
+	t38_was_idle = (pvt->t38_state == SOFIA_T38_DISABLED || pvt->t38_state == SOFIA_T38_LOCAL_REINVITE);
 	old_hold = pvt->hold_state;
 	new_hold = sofia_sdp_extract_hold(sip, pvt->home);
 	trans = (old_hold != new_hold);
@@ -9199,13 +9432,14 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 			ast_queue_control(owner, AST_CONTROL_UNHOLD);
 		}
 	}
-	/* A T.38 offer (this parse moved DISABLED -> PEER_REINVITE and asked the core with AST_T38_REQUEST_NEGOTIATE)
-	 * is answered when someone takes the fax, as chan_sip does (handle_request_invite: T38_PEER_REINVITE sends
+	/* A T.38 offer (this parse moved DISABLED, or LOCAL_REINVITE with our own offer waiting, to PEER_REINVITE and
+	 * asked the core with AST_T38_REQUEST_NEGOTIATE) is answered when someone takes the fax, as chan_sip does
+	 * (handle_request_invite: T38_PEER_REINVITE sends
 	 * no final response, interpret_t38_parameters answers 200 on AST_T38_NEGOTIATED or 488 on a refusal, the
 	 * 5 s timer 488): the request is kept and nothing is sent now but the stack's 100, so the image stream is
 	 * accepted only when someone runs the fax. Set under pvt->lock, before the core can see the
 	 * REQUEST_NEGOTIATE. */
-	if (t38_was_disabled && pvt->t38_state == SOFIA_T38_PEER_REINVITE && !pvt->t38_saved[0]
+	if (t38_was_idle && pvt->t38_state == SOFIA_T38_PEER_REINVITE && !pvt->t38_saved[0]
 			&& nua_save_event(nua, pvt->t38_saved)) {
 		pvt->t38_answer_pending = 1;
 		t38_held = 1;
@@ -9385,6 +9619,7 @@ void sofia_t38_answer_root(void *data)
 		} else {
 			nua_respond(pvt->nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH(req), TAG_END());
 		}
+		sofia_reinvite_followup_locked(pvt);	/* what waited for the held offer */
 		ast_mutex_unlock(&pvt->lock);
 	} else {
 		ast_mutex_unlock(&pvt->lock);
@@ -10368,6 +10603,7 @@ static void sofia_process_cancel(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		struct ast_channel *owner = NULL;
 		nua_saved_event_t saved[1] = { NULL };
 		int up;
+		int dropped_t38 = 0;	/* the held T.38 offer was cancelled: what waited for it goes */
 
 		ast_mutex_lock(&op->lock);
 		for (;;) {
@@ -10392,6 +10628,7 @@ static void sofia_process_cancel(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		up = (op->state == SOFIA_DIALOG_STATE_UP);
 		if (up && op->t38_answer_pending) {
 			op->t38_answer_pending = 0;
+			dropped_t38 = 1;
 			saved[0] = op->t38_saved[0];
 			op->t38_saved[0] = NULL;
 			if (op->t38id != -1 && sofia_sched) {
@@ -10411,6 +10648,11 @@ static void sofia_process_cancel(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 				ast_queue_hangup_with_cause(owner, q850 ? q850 : AST_CAUSE_NORMAL_CLEARING);
 			}
 			ast_channel_unref(owner);
+		}
+		if (dropped_t38) {
+			ast_mutex_lock(&op->lock);
+			sofia_reinvite_followup_locked(op);	/* what waited for the held offer */
+			ast_mutex_unlock(&op->lock);
 		}
 		if (saved[0]) {
 			nua_destroy_event(saved);
@@ -14825,11 +15067,12 @@ static void sofia_update_connectedline(struct sofia_pvt *pvt)
 	/* Mid-call: re-INVITE carrying the new identity (chan_sip.c:14023 sends an
 	 * INVITE/UPDATE with add_rpid + add_sdp; sofia_send_reinvite re-offers the SDP and
 	 * stamps the RPID for this purpose). Claim the single re-INVITE slot exactly like the
-	 * T.38 and local-hold paths. If one is already in flight the update is dropped rather
-	 * than glaring — chan_sip defers via SIP_NEEDREINVITE, which has no equivalent here. */
+	 * T.38 and local-hold paths. If one is already in flight, or a T.38 offer waits for the slot,
+	 * the update is dropped rather than glaring — chan_sip defers it via SIP_NEEDREINVITE; here only
+	 * a directmedia target and a T.38 offer are deferred (sofia_reinvite_followup_locked). */
 	ast_mutex_lock(&pvt->lock);
 	if (pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh && !pvt->alreadygone
-			&& !pvt->reinvite_pending) {
+			&& !pvt->reinvite_pending && !pvt->need_t38_reinvite) {	/* a waiting T.38 offer goes first */
 		pvt->reinvite_pending = 1;
 		pvt->reinvite_purpose = SOFIA_REINVITE_CONNECTED_LINE;
 		ao2_ref(pvt, +1);	/* dispatch ref; sofia_reinvite_root drops it */
@@ -19494,6 +19737,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			char leg_proxy[128] = "";
 			ast_mutex_lock(&pvt->lock);
 			reinvite_purpose = pvt->reinvite_purpose;
+			if (status < 300) {
+				sofia_sdp_offer_answered(pvt);	/* its m= lines are the session's now (RFC 3264 §8) */
+			}
 			ast_copy_string(leg_proxy, S_OR(pvt->outbound_proxy, ""), sizeof(leg_proxy));
 			ast_mutex_unlock(&pvt->lock);
 			if (status < 300) {
@@ -19552,6 +19798,10 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				if (owner) {
 					ast_channel_unlock(owner);
 				}
+				pvt->t38_offer_out = SOFIA_T38_OUT_NONE;	/* never a T.38 offer: sofia_send_reinvite retags those T38 */
+				if (!rejected || !sofia_reinvite_failure_ends_session(status, sip_method_invite)) {
+					sofia_reinvite_done_locked(pvt, status);	/* what waited for this re-INVITE */
+				}
 				ast_mutex_unlock(&pvt->lock);
 				if (owner) {
 					ast_channel_unref(owner);
@@ -19607,6 +19857,10 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				if (owner) {
 					ast_channel_unlock(owner);
 				}
+				pvt->t38_offer_out = SOFIA_T38_OUT_NONE;	/* never a T.38 offer: sofia_send_reinvite retags those T38 */
+				if (!rejected || !sofia_reinvite_failure_ends_session(status, sip_method_invite)) {
+					sofia_reinvite_done_locked(pvt, status);	/* what waited for this re-INVITE */
+				}
 				ast_mutex_unlock(&pvt->lock);
 				if (owner) {
 					ast_channel_unref(owner);
@@ -19658,6 +19912,10 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				if (owner) {
 					ast_channel_unlock(owner);
 				}
+				pvt->t38_offer_out = SOFIA_T38_OUT_NONE;	/* never a T.38 offer: sofia_send_reinvite retags those T38 */
+				if (!rejected || !sofia_reinvite_failure_ends_session(status, sip_method_invite)) {
+					sofia_reinvite_done_locked(pvt, status);	/* what waited for this re-INVITE */
+				}
 				ast_mutex_unlock(&pvt->lock);
 				if (owner) {
 					ast_channel_unref(owner);
@@ -19679,6 +19937,12 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			int has_sdp = (!rejected && sip && sip->sip_payload && sip->sip_payload->pl_data);
 			int sdp_rc = 0;
 			int reverted_to_relay = 0;	/* the revert re-INVITE actually fired (vs guard-skipped) */
+			int t38_out;		/* what this offer carried for T.38 (SOFIA_T38_OUT_*) */
+			int dm_out;		/* this offer carried a directmedia target (reinvite_carries_dm) */
+			int revert = 0;		/* an unusable 2xx: offer the current state again */
+			int retried = 0;	/* a 491: the offer goes again (sofia_reinvite_491_retry_locked) */
+			int end_after_fax = 0;	/* the audio offer at the end of a fax refused: hang up (chan_sip) */
+			const char *what;
 			struct ast_channel *owner = NULL;
 			ast_mutex_lock(&pvt->lock);
 			/* Re-acquire in canonical channel->pvt order so sofia_parse_sdp's set_format
@@ -19702,31 +19966,72 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			}
 			pvt->reinvite_pending = 0;
 			pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
-			/* An audio offer at the end of a fax completed: its answer (parsed below) drops the image stream and
-			 * moves T.38 to DISABLED; a refusal leaves the call in T.38. */
-			pvt->t38_ending = 0;
+			/* What this offer carried for T.38 (sofia_send_reinvite): a live m=image offer or the audio offer at the
+			 * end of a fax. Its answer, parsed below, moves the T.38 state; a 491 sends it again; a refusal rolls a
+			 * T.38 offer back (AST_T38_REFUSED) and, for the end-of-fax offer, hangs up on 415/488/606 as chan_sip
+			 * does. A re-INVITE that carried neither leaves the T.38 state alone, even while a T.38 offer waits. */
+			t38_out = pvt->t38_offer_out;
+			dm_out = pvt->reinvite_carries_dm;
+			pvt->reinvite_carries_dm = 0;
+			what = t38_out != SOFIA_T38_OUT_NONE ? "T.38" : "directmedia";
+			if (t38_out == SOFIA_T38_OUT_ENDING) {
+				pvt->t38_ending = 0;
+			}
 			if (rejected) {
-				/* Peer refused; revert to PBX relay. */
-				memset(&pvt->redirip, 0, sizeof(pvt->redirip));
-				if (owner && reinvite_purpose == SOFIA_REINVITE_DIRECTMEDIA) {
-					sofia_rtcp_direct(pvt, owner, 0);	/* the directmedia offer refused: the media stay with the PBX, their RTCP too */
+				/* 491 (glare): our offer is sent again after the RFC 3261 §14.1 delay (chan_sip sip_reinvite_retry). */
+				if (status == 491 && (t38_out != SOFIA_T38_OUT_NONE || dm_out)) {
+					retried = sofia_reinvite_491_retry_locked(pvt,
+						t38_out != SOFIA_T38_OUT_NONE ? SOFIA_REINVITE_T38 : SOFIA_REINVITE_DIRECTMEDIA);
 				}
-				/* FIX 1: a REFUSED/timed-out outbound T.38 (LOCAL_REINVITE) re-INVITE
-				 * must not leave T.38 stuck — transition to DISABLED so res_fax gets
-				 * AST_T38_REFUSED and falls back (chan_sip parity). Channel lock held
-				 * here (re-acquire loop above), so sofia_change_t38_state is safe. */
-				if (owner && pvt->t38_state == SOFIA_T38_LOCAL_REINVITE) {
+				if (retried && t38_out == SOFIA_T38_OUT_ENDING) {
+					pvt->t38_ending = 1;	/* the retry offers the audio again */
+				}
+				/* chan_sip handle_response_invite: 415/488/606 to a re-INVITE that was not a T.38 upgrade hangs the
+				 * call up. Here only the audio offer at the end of a fax does, and so do the 491s once its retries
+				 * are spent: the call cannot leave T.38. */
+				if (t38_out == SOFIA_T38_OUT_ENDING
+						&& (status == 415 || status == 488 || status == 606 || (status == 491 && !retried))) {
+					end_after_fax = 1;
+				}
+				/* The refused offer changed nothing (RFC 3261 §14.1). A refused directmedia target leaves redirip at
+				 * relay from here on; as it may not be where the peer sends, the next target is offered whatever it
+				 * is (reinvite_force). Any other offer carried the current redirip. */
+				if (dm_out) {
+					memset(&pvt->redirip, 0, sizeof(pvt->redirip));
+					pvt->reinvite_force = 1;
+					if (owner) {
+						sofia_rtcp_direct(pvt, owner, 0);	/* the directmedia offer refused: the media stay with the PBX, their RTCP too */
+					}
+				}
+				/* A refused (not retried) T.38 offer must not leave T.38 in LOCAL_REINVITE: DISABLED gives res_fax
+				 * AST_T38_REFUSED and it falls back (chan_sip parity). Channel lock held here (re-acquire loop
+				 * above), so sofia_change_t38_state is safe. */
+				if (owner && !retried && t38_out == SOFIA_T38_OUT_OFFER && pvt->t38_state == SOFIA_T38_LOCAL_REINVITE) {
 					sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
 				}
 			} else if (has_sdp) {
 				sdp_rc = sofia_parse_sdp(pvt, sip, 0 /* answer: directmedia/T38 re-INVITE 2xx */);
 			}
-			if (owner && !rejected && sdp_rc >= 0 && reinvite_purpose == SOFIA_REINVITE_DIRECTMEDIA) {
+			pvt->t38_offer_out = SOFIA_T38_OUT_NONE;	/* after the parse, which reads it */
+			if (owner && !rejected && sdp_rc >= 0 && dm_out) {
 				/* The media now go where this offer sent them (a 2xx without SDP too): the leg's RTCP follows. */
 				sofia_rtcp_direct(pvt, owner, !ast_sockaddr_isnull(&pvt->offered_redirip));
 			}
-			if (owner && !rejected && has_sdp && sdp_rc < 0
+			/* A 2xx is FINAL — can't 488 it. An unusable answer to a directmedia offer that moved the media, or an
+			 * unusable or missing answer to a T.38 offer, is answered with a fresh offer of the PBX relay and the
+			 * audio: T.38 goes to DISABLED first (AST_T38_REFUSED, or TERMINATED for the end-of-fax offer). An
+			 * unusable answer to an offer of the relay itself is left alone, so a peer that keeps answering that
+			 * way cannot loop; so is a dialog whose channel has gone (the state could not change). Same teardown
+			 * gate as sofia_reinvite_root. */
+			if (owner && !rejected
+			    && ((has_sdp && sdp_rc < 0
+			         && (t38_out != SOFIA_T38_OUT_NONE || (dm_out && !ast_sockaddr_isnull(&pvt->offered_redirip))))
+			        || (!has_sdp && t38_out != SOFIA_T38_OUT_NONE))
 			    && !pvt->alreadygone && pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh) {
+				revert = 1;
+				if (t38_out != SOFIA_T38_OUT_NONE && pvt->t38_state != SOFIA_T38_DISABLED) {
+					sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
+				}
 				sofia_rtcp_direct(pvt, owner, 0);	/* the revert below keeps the media, and the RTCP, with the PBX */
 			}
 			if (owner) {
@@ -19736,38 +20041,56 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				 * destructor under pvt->lock). */
 				ast_channel_unlock(owner);
 			}
-			if (!rejected && has_sdp && sdp_rc < 0
-			    && !pvt->alreadygone && pvt->state == SOFIA_DIALOG_STATE_UP && pvt->nh) {
-				/* A 2xx is FINAL — can't 488 it. The directmedia answer was unusable
-				 * (pvt media left unchanged on reject), so revert to PBX relay: clear
-				 * redirip + send a fresh non-directmedia re-INVITE. Same teardown gate
-				 * as sofia_reinvite_root. */
+			if (revert) {
 				memset(&pvt->redirip, 0, sizeof(pvt->redirip));
 				sofia_send_reinvite(pvt);
 				reverted_to_relay = 1;
+			}
+			if ((!rejected || !sofia_reinvite_failure_ends_session(status, sip_method_invite)) && !end_after_fax) {
+				sofia_reinvite_done_locked(pvt, status);	/* what waited for this re-INVITE (none while the revert is out) */
 			}
 			ast_mutex_unlock(&pvt->lock);
 			if (owner) {
 				ast_channel_unref(owner);	/* unref AFTER pvt->lock dropped */
 				owner = NULL;
 			}
-			if (rejected) {
-				ast_log(LOG_NOTICE, "Sofia: directmedia re-INVITE rejected on '%s' (%d %s) — staying in relay mode\n",
-					pvt->callid ? pvt->callid : "(no-callid)", status, phrase ? phrase : "");
+			if (rejected && retried) {
+				ast_log(LOG_NOTICE, "Sofia: %s re-INVITE on '%s' got 491 — sending it again after the RFC 3261 §14.1 delay\n",
+					what, pvt->callid ? pvt->callid : "(no-callid)");
+			} else if (rejected) {
+				ast_log(LOG_NOTICE, "Sofia: %s re-INVITE rejected on '%s' (%d %s)%s\n", what,
+					pvt->callid ? pvt->callid : "(no-callid)", status, phrase ? phrase : "",
+					dm_out ? " — staying in relay mode" : "");
 			} else if (reverted_to_relay) {
-				ast_log(LOG_WARNING, "Sofia: directmedia re-INVITE 2xx had an unusable SDP on '%s' — reverted to relay\n",
-					pvt->callid ? pvt->callid : "(no-callid)");
+				ast_log(LOG_WARNING, "Sofia: %s re-INVITE 2xx had an unusable or no SDP on '%s' — reverted to relay%s\n",
+					what, pvt->callid ? pvt->callid : "(no-callid)", t38_out != SOFIA_T38_OUT_NONE ? " and audio" : "");
 			} else if (has_sdp && sdp_rc < 0) {
-				/* Unusable SDP but the call was no longer UP (teardown race) — revert
-				 * correctly skipped. */
-				ast_log(LOG_NOTICE, "Sofia: directmedia re-INVITE 2xx had an unusable SDP on '%s' but the call is no longer up — not reverting\n",
-					pvt->callid ? pvt->callid : "(no-callid)");
+				/* Unusable SDP to an offer of the relay itself, or the call was no longer UP (teardown race). */
+				ast_log(LOG_NOTICE, "Sofia: %s re-INVITE 2xx had an unusable SDP on '%s' — not reverting\n",
+					what, pvt->callid ? pvt->callid : "(no-callid)");
 			} else if (has_sdp) {
-				ast_verbose("Sofia: directmedia re-INVITE accepted on '%s'\n",
+				ast_verbose("Sofia: %s re-INVITE accepted on '%s'\n", what,
 					pvt->callid ? pvt->callid : "(no-callid)");
 			}
 			if (rejected && sofia_reinvite_failure_ends_session(status, sip_method_invite)) {
 				sofia_reinvite_failure_end_call(pvt, status, sip, "re-INVITE");	/* the stack is sending BYE */
+			} else if (end_after_fax) {
+				struct ast_channel *fax_owner;
+
+				ast_mutex_lock(&pvt->lock);
+				fax_owner = pvt->alreadygone ? NULL : pvt->owner;
+				if (fax_owner) {
+					ast_channel_ref(fax_owner);
+				}
+				ast_mutex_unlock(&pvt->lock);
+				if (fax_owner) {
+					ast_log(LOG_NOTICE, "Sofia: the audio offer at the end of a fax on '%s' was refused (%d) — hanging up\n",
+						pvt->callid ? pvt->callid : "(no-callid)", status);
+					sofia_queue_invite_failure(fax_owner, status,
+						(sofia_cfg.use_q850_reason && sip) ? sofia_reason_parse_cause(sip->sip_reason) : 0,
+						0, 1 /* answered: the hangup sends BYE */);
+					ast_channel_unref(fax_owner);
+				}
 			}
 			break;
 		}

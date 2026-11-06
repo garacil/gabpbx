@@ -296,6 +296,7 @@ int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_contr
 #define SOFIA_T38_PARMS_SENT    2	/* ... the far end's parameters were queued (answer AST_T38_REQUEST_PARMS) */
 void sofia_t38_answer_root(void *data);	/* sofia_thread: answer the held T.38 re-INVITE 200 (+1 pvt ref consumed) */
 void sofia_t38_saved_free_root(void *data);	/* sofia_thread: free a saved nua event (the pointer itself) */
+void sofia_reinvite_followup_root_locked(struct sofia_pvt *pvt);	/* sofia_thread, pvt->lock held: offer what waited */
 int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer);
 int sofia_dtmf_wants_rfc2833(const struct sofia_pvt *pvt);	/* g1/g3: effective mode carries DTMF as RFC2833/telephone-event (rfc2833 || unresolved-auto || is_webrtc) */
 void sofia_dtmf_reconfigure(struct sofia_pvt *pvt);		/* g2: re-apply RTP property + dtmf mode + fax-safe DSP from pvt->dtmf_effective (call after an AUTO resolution / SIPDtmfMode / DIGIT_DETECT toggle) */
@@ -328,6 +329,7 @@ int sofia_webrtc_provision_offer(struct sofia_pvt *pvt);
  * is_answer=0 => we are building an OFFER; direction reflects pvt->local_hold_mode
  * (0 sendrecv / 1 sendonly / 2 inactive), driven by the hold_reinvite knob. */
 char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_answer);
+void sofia_sdp_offer_answered(struct sofia_pvt *pvt);
 int sofia_sdp_extract_hold(sip_t const *sip, su_home_t *home);
 
 struct sofia_peer *sofia_find_peer(const char *name);
@@ -598,6 +600,15 @@ enum sofia_reinvite_purpose {
 	SOFIA_REINVITE_SESSION_REFRESH,	/* RFC 4028 session refresh sent by chan_sofia with the current SDP */
 };
 
+/* sofia_pvt.t38_offer_out: what our re-INVITE on the wire carries for T.38 */
+#define SOFIA_T38_OUT_NONE	0
+#define SOFIA_T38_OUT_OFFER	1	/* a live m=image offer (LOCAL_REINVITE) */
+#define SOFIA_T38_OUT_ENDING	2	/* the audio offer at the end of a fax (t38_ending) */
+/* sofia_pvt.audio_line_last */
+#define SOFIA_AUDIO_LINE_LIVE	0
+#define SOFIA_AUDIO_LINE_PORT0	1
+#define SOFIA_AUDIO_LINE_NONE	2
+
 /* The per-call/dialog object — the central media/signaling state. Shared so the SDP, T.38, register
  * and CLI(show channels) modules can reference it. */
 struct sofia_pvt {
@@ -680,6 +691,20 @@ struct sofia_pvt {
 	char dev_instance[128];
 	struct ast_sockaddr redirip;     /* directmedia: peer's RTP target; zero = relay through PBX */
 	struct ast_sockaddr offered_redirip;	/* the media target our last re-INVITE offered (redirip when sent); its 2xx moves the RTCP */
+	/* A media target the bridge asked for while a re-INVITE was in flight (chan_sip SIP_NEEDREINVITE): offered by
+	 * sofia_reinvite_followup_locked when that re-INVITE completes (or by the 491 retry timer). Under pvt->lock. */
+	struct ast_sockaddr redirip_next;
+	int need_reinvite;
+	int need_t38_reinvite;           /* a T.38 offer (LOCAL_REINVITE, or the audio one at the end of a fax) waits for the
+	                                  * slot or a 491 retry; sent by sofia_reinvite_followup_locked */
+	int reinvite_force;              /* a directmedia offer was refused: redirip no longer says where the peer sends, so
+	                                  * the next target is offered without comparing (cleared when an offer goes out) */
+	int t38_offer_out;               /* what our re-INVITE on the wire carries for T.38 (SOFIA_T38_OUT_*), set by
+	                                  * sofia_send_reinvite; of the answers, only its own moves a LOCAL_REINVITE */
+	int reinvite_carries_dm;         /* our re-INVITE on the wire offers a directmedia target (a directmedia one, or
+	                                  * one retagged T38 that took it): its response moves redirip and the RTCP */
+	int reinvite_retry_id;           /* RFC 3261 §14.1 491 retry timer (sofia_sched; -1 = none; holds a pvt ref) */
+	int reinvite_491_count;          /* consecutive 491s to our directmedia or T.38 re-INVITE (gives up after 3) */
 	int rtcp_direct_off;             /* directmedia: this leg's RTCP is off while the media go direct (chan_sip sip_set_rtp_peer); under the channel lock */
 	int rtcp_t38_off;                /* T.38 without audio: this leg's RTCP is off while the fax runs (chan_sip process_sdp); under the channel lock */
 	int rtcp_paused;                 /* sofia_rtcp_pause closed this leg's RTCP and will reopen it (never one it did not close) */
@@ -754,10 +779,31 @@ struct sofia_pvt {
 	 * the event is freed on sofia_thread. */
 	int t38_answer_pending;
 	nua_saved_event_t t38_saved[1];
-	/* The fax is over (AST_T38_REQUEST_TERMINATE while ENABLED): our re-INVITE offers the audio back with the
-	 * image stream at port 0; T.38 stays ENABLED until its answer drops the image (then DISABLED). Cleared when
-	 * that re-INVITE completes or cannot be sent. Under pvt->lock. */
+	/* The fax is over (AST_T38_REQUEST_TERMINATE while ENABLED): our re-INVITE offers the audio back (the image
+	 * stream at port 0 when the session also had audio); T.38 stays ENABLED until its answer drops the image
+	 * (then DISABLED). Cleared when the re-INVITE that carried it gets its final response (kept for a 491 retry),
+	 * when a T.38 re-INVITE cannot be built, and on any change away from ENABLED (sofia_change_t38_state). Under
+	 * pvt->lock. */
 	int t38_ending;
+	/* RFC 3264 §8: the last SDP we sent (offer or answer, non-WebRTC) had an m=image after its m=audio: the next offer
+	 * keeps that stream, at port 0 once T.38 is over (the number of m= lines never decreases). Written by
+	 * sofia_generate_sdp for an answer (under the channel lock for the answer and a 183, as sess_version, or
+	 * pvt->lock); an offer's values wait in *_offer and count once its 2xx comes (RFC 3261 §14.1: a refused
+	 * offer changes nothing), under pvt->lock. */
+	int image_mline;
+	int image_mline_offer;
+	int audio_line_last_offer;
+	/* The offer being answered had an m=image line (any port): an answer without live T.38 declines it at port 0,
+	 * after the audio (RFC 3264 §6: one m= line per offered one). Under pvt->lock. */
+	int offer_image_line;
+	/* The offer being answered had its m=audio at port 0 (a T.38 offer without audio): the answer marks it with port
+	 * 0 too (RFC 3264 §8.2), with the offer's transport and first format. Under pvt->lock. */
+	int offer_audio_port0;
+	char offer_audio0_proto[24];
+	char offer_audio0_fmt[16];
+	/* The audio m= line of the last SDP we sent (SOFIA_AUDIO_LINE_*): a re-offer while a fax runs keeps it as it was
+	 * (RFC 3264 §8: absent in an image-only session, at port 0 when declined). Same writer as image_mline. */
+	int audio_line_last;
 	unsigned int t38_max_ifp;
 	int t38_maxdatagram;
 	int t38_ec_mode;

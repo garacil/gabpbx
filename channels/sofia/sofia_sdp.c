@@ -698,6 +698,9 @@ static void sofia_sdp_keep_version(struct sofia_pvt *pvt, char *buf, size_t len)
 
 char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_answer)
 {
+	int audio_line = 0;	/* this SDP has the non-WebRTC m=audio line... */
+	int audio_port0 = 0;	/* ...at port 0 (pvt->audio_line_last) */
+	int image_line = 0;	/* ...and an m=image after it (any port): pvt->image_mline */
 	const char *audio_dir = sofia_answer_dir_attr(is_answer, pvt->offered_audio_mode, pvt->local_hold_mode);
 	const char *video_dir = sofia_answer_dir_attr(is_answer, pvt->offered_video_mode, pvt->local_hold_mode);
 	struct ast_sockaddr rtp_addr;
@@ -1257,16 +1260,39 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 
 	/* Audio section lands first (non-WebRTC leg, and the WebRTC OFFER-build direction below).
 	 * RFC 3264 §6: the answer MUST carry the same m-line set as the offer. Suppress the m=audio ONLY for the
-	 * exact image-only T.38 case: we are ANSWERING a non-WebRTC leg, the offer carried NO m=audio, and we are
-	 * emitting a live T.38 m=image below (same gate as that emitter) — otherwise the answer adds an m=audio the
-	 * offer never had. A normal audio call, or a T.38 re-INVITE that DID offer m=audio (even port 0), still
-	 * emits the audio section unchanged. */
-	if (!(is_answer && !pvt->is_webrtc && !pvt->offer_had_audio
+	 * exact image-only T.38 case: we are ANSWERING a non-WebRTC leg, the offer carried NO m=audio, and T.38 is
+	 * active (the m=image below, live or declined at port 0) — otherwise the answer adds an m=audio the offer
+	 * never had. A normal audio call, or a T.38 re-INVITE that DID offer m=audio, still emits the audio
+	 * section, at port 0 when the T.38 offer had it at port 0 (RFC 3264 §8.2). */
+	/* A re-offer while a fax runs (T.38 ENABLED, not the audio offer at its end) keeps the audio line of the last
+	 * SDP we sent (RFC 3264 §8): none in an image-only session, at port 0 when it was declined. */
+	if (!is_answer && !pvt->is_webrtc && pvt->udptl && pvt->t38_state == SOFIA_T38_ENABLED && !pvt->t38_ending
+			&& pvt->audio_line_last != SOFIA_AUDIO_LINE_LIVE) {
+		if (pvt->audio_line_last == SOFIA_AUDIO_LINE_PORT0) {
+			int blen = strlen(buf);
+			if (snprintf(buf + blen, len - blen, "m=audio 0 %s %s\r\n", S_OR(pvt->offer_audio0_proto, "RTP/AVP"),
+					S_OR(pvt->offer_audio0_fmt, "0")) >= (int)(len - blen)) {
+				overflow = 1;
+			}
+			audio_line = 1;
+			audio_port0 = 1;
+		}
+	} else if (!(is_answer && !pvt->is_webrtc && !pvt->offer_had_audio
 			&& pvt->udptl && pvt->t38_state != SOFIA_T38_DISABLED)) {
 		int blen = strlen(buf);
-		if (snprintf(buf + blen, len - blen, "%s", audio_m_buf) >= (int)(len - blen)) {
+		if (is_answer && !pvt->is_webrtc && pvt->offer_audio_port0
+				&& pvt->udptl && pvt->t38_state != SOFIA_T38_DISABLED) {
+			/* A T.38 offer with its audio at port 0: "A stream that is offered with a port of zero MUST be marked
+			 * with port zero in the answer" (RFC 3264 §8.2); the answer may list one format from the offer. */
+			if (snprintf(buf + blen, len - blen, "m=audio 0 %s %s\r\n", S_OR(pvt->offer_audio0_proto, "RTP/AVP"),
+					S_OR(pvt->offer_audio0_fmt, "0")) >= (int)(len - blen)) {
+				overflow = 1;
+			}
+			audio_port0 = 1;
+		} else if (snprintf(buf + blen, len - blen, "%s", audio_m_buf) >= (int)(len - blen)) {
 			overflow = 1;
 		}
+		audio_line = !pvt->is_webrtc;
 	}
 
 	/* WebRTC OFFER-build (!is_answer — current role, NOT the permanent webrtc_offerer): the canonical
@@ -1453,14 +1479,21 @@ webrtc_m_lines_done:
 	/* SUPPRESSED on a WebRTC leg (the WebRTC answer/offer paths are audio-only): a plain m=image udptl t38 in a WebRTC SDP is the
 	 * same mixed-media 488 class as plain video — no mid/ICE/fingerprint/BUNDLE. T.38 fax
 	 * is never active on a browser audio call anyway; gate for completeness. */
-	if (!pvt->is_webrtc && pvt->udptl && pvt->t38_state != SOFIA_T38_DISABLED && pvt->t38_ending && !is_answer) {
-		/* The fax is over: our offer gives the audio back and declines the image stream with port 0, keeping
-		 * its m-line (RFC 3264 §8.2: a stream is removed by setting its port to zero). */
+	if (!pvt->is_webrtc && pvt->udptl && pvt->t38_state == SOFIA_T38_ENABLED && pvt->t38_ending && !is_answer) {
+		/* The fax is over: our offer gives the audio back. A session that also had audio keeps the image
+		 * stream's m-line at port 0 (RFC 3264 §8.2: a stream is removed by setting its port to zero); an
+		 * image-only one gets the audio in place of the image (§8.3.3: voiceband fax and fax in one stream). */
 		int t38vlen = strlen(buf);
-		if (snprintf(buf + t38vlen, len - t38vlen, "m=image 0 udptl t38\r\n") >= (int)(len - t38vlen)) {
-			overflow = 1;
+		if (pvt->image_mline) {
+			if (snprintf(buf + t38vlen, len - t38vlen, "m=image 0 udptl t38\r\n") >= (int)(len - t38vlen)) {
+				overflow = 1;
+			}
+			image_line = 1;
 		}
-	} else if (!pvt->is_webrtc && pvt->udptl && pvt->t38_state != SOFIA_T38_DISABLED) {
+	} else if (!pvt->is_webrtc && pvt->udptl && pvt->t38_state != SOFIA_T38_DISABLED
+			&& !(is_answer && pvt->t38_state == SOFIA_T38_LOCAL_REINVITE)) {
+		/* (An answer while our own T.38 offer waits, LOCAL_REINVITE, answers the peer's offer only: no live image
+		 * the offer did not have, RFC 3264 §6; an offered one is declined at port 0 below.) */
 		struct ast_sockaddr udptl_local;
 		int t38vlen = strlen(buf);
 		const char *rate_mgmt_str;
@@ -1469,6 +1502,7 @@ webrtc_m_lines_done:
 		unsigned int max_datagram;
 
 		ast_udptl_get_us(pvt->udptl, &udptl_local);
+		image_line = 1;
 
 		/* T38MaxBitRate enum→integer (default AST_T38_RATE_14400). */
 		switch (pvt->t38_our_parms.rate) {
@@ -1551,6 +1585,15 @@ webrtc_m_lines_done:
 				overflow = 1;
 			}
 		}
+	} else if (!pvt->is_webrtc && (is_answer ? pvt->offer_image_line : pvt->image_mline)) {
+		/* No live T.38: an offer keeps the image stream of the last SDP we sent at port 0 (RFC 3264 §8: the number
+		 * of m= lines never decreases), an answer declines the offered one at port 0 (§6). chan_sip answers the
+		 * same way (add_sdp's offered_media, "m=image 0 udptl t38"). */
+		int t38vlen = strlen(buf);
+		if (snprintf(buf + t38vlen, len - t38vlen, "m=image 0 udptl t38\r\n") >= (int)(len - t38vlen)) {
+			overflow = 1;
+		}
+		image_line = 1;
 	}
 
 	/* Any fragment/final truncation → fail the whole SDP (callers treat NULL as "no SDP"). */
@@ -1559,9 +1602,31 @@ webrtc_m_lines_done:
 			S_OR(pvt->callid, "<unknown>"));
 		return NULL;
 	}
+	if (!pvt->is_webrtc) {
+		/* RFC 3264 §8: the next offer has at least the m= lines of this SDP, the last one the peer accepted (an
+		 * answer counts now; an offer once its 2xx comes, sofia_sdp_offer_answered) */
+		int il = audio_line && image_line;
+		int al = !audio_line ? SOFIA_AUDIO_LINE_NONE : audio_port0 ? SOFIA_AUDIO_LINE_PORT0 : SOFIA_AUDIO_LINE_LIVE;
+
+		if (is_answer) {
+			pvt->image_mline = il;
+			pvt->audio_line_last = al;
+		} else {
+			pvt->image_mline_offer = il;
+			pvt->audio_line_last_offer = al;
+		}
+	}
 
 	sofia_sdp_keep_version(pvt, buf, len);
 	return buf;
+}
+
+/* Our re-INVITE's offer got its 2xx: its m= lines become the ones the next offer must keep (RFC 3264 §8). A refused
+ * offer changes nothing (RFC 3261 §14.1). pvt->lock held. */
+void sofia_sdp_offer_answered(struct sofia_pvt *pvt)
+{
+	pvt->image_mline = pvt->image_mline_offer;
+	pvt->audio_line_last = pvt->audio_line_last_offer;
 }
 
 static int sofia_process_crypto(struct sofia_pvt *pvt, struct ast_rtp_instance *rtp,
@@ -1884,6 +1949,10 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	const char *sdp_data;
 	int audio_offered = 0;
 	int m_audio_present = 0;	/* any m=audio line in the offer (incl. port 0); RFC 3264 §6 answer-mirror gate for T.38 */
+	int m_image_line = 0;	/* an m=image line (any port): offer_image_line */
+	int m_audio_port0 = 0;		/* the first m=audio line is at port 0: offer_audio_port0 */
+	char m_audio0_proto[24] = "";
+	char m_audio0_fmt[16] = "";
 	int video_offered = 0;
 	int audio_secure_offered = 0;
 	int video_secure_offered = 0;
@@ -2093,6 +2162,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	int t38_stage_enter_reinvite = 0;	/* sofia_change_t38_state(PEER_REINVITE) + arm t38id at commit */
 	int t38_stage_withdraw = 0;		/* sofia_change_t38_state(DISABLED) + cancel t38id at commit */
 	int t38_stage_local_accept = 0;		/* outbound (LOCAL_REINVITE) answer accepted T.38 → ENABLED at commit (FIX 1b) */
+	int t38_enter_from_local = 0;		/* a peer T.38 offer while ours waited: PEER_REINVITE, no fax redirect */
 	int t38_stage_local_refuse = 0;		/* outbound (LOCAL_REINVITE) answer declined T.38 (no m=image) → DISABLED at commit */
 	int t38_no_audio = 0;			/* T.38 without audio this parse: the leg's RTCP pauses (sofia_rtcp_pause) */
 	/* The fax-redirect inputs are evaluated at COMMIT under the channel lock; only
@@ -2124,7 +2194,19 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	}
 	for (media = sdp->sdp_media; media; media = media->m_next) {
 		if (media->m_type == sdp_media_audio) {
+			if (!m_audio_present && media->m_port == 0) {
+				m_audio_port0 = 1;
+				ast_copy_string(m_audio0_proto, S_OR(media->m_proto_name, "RTP/AVP"), sizeof(m_audio0_proto));
+				if (media->m_rtpmaps) {
+					snprintf(m_audio0_fmt, sizeof(m_audio0_fmt), "%u", (unsigned int) media->m_rtpmaps->rm_pt);
+				} else if (media->m_format && media->m_format->l_text) {
+					ast_copy_string(m_audio0_fmt, media->m_format->l_text, sizeof(m_audio0_fmt));
+				}
+			}
 			m_audio_present = 1;	/* offer carried an m=audio line (any port) — see offer_had_audio */
+		}
+		if (media->m_type == sdp_media_image) {
+			m_image_line = 1;
 		}
 		if (media->m_type == sdp_media_audio && media->m_port != 0) {
 			sdp_attribute_t *a;
@@ -2837,9 +2919,14 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 
 			/* Advance DISABLED → PEER_REINVITE on first detect. Deferred to commit
 			 * (state stays DISABLED through the loop so the post-loop withdraw check
-			 * reads the pre-parse state, and a rejected SDP fires none of it). */
+			 * reads the pre-parse state, and a rejected SDP fires none of it). A peer offer while our own
+			 * T.38 offer waits (LOCAL_REINVITE: a 491, or another re-INVITE in flight) goes the same way, as
+			 * chan_sip's process_sdp does: the application answers it with its parameters merged. */
 			if (pvt->t38_state == SOFIA_T38_DISABLED) {
 				t38_stage_enter_reinvite = 1;
+			} else if (current_offer && pvt->t38_state == SOFIA_T38_LOCAL_REINVITE) {
+				t38_stage_enter_reinvite = 1;
+				t38_enter_from_local = 1;
 			}
 		}
 	}
@@ -3083,15 +3170,19 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	/* FIX 1b — OUTBOUND (LOCAL_REINVITE) ANSWER-APPLY (RFC 3264 §8: the offerer applies
 	 * the answer). We sent a T.38 (m=image) offer and are now parsing the peer's ANSWER
 	 * (this body arrives via the directmedia/reinvite 2xx path, or an 18x preview). The
-	 * t38_stage_enter_reinvite gate above fires PEER_REINVITE only from DISABLED, and the
-	 * withdraw gate is >= PEER_REINVITE, so LOCAL_REINVITE (==1) falls through both —
+	 * t38_stage_enter_reinvite gate above leaves LOCAL_REINVITE only for a peer offer, and the
+	 * withdraw gate is >= PEER_REINVITE, so an answer in LOCAL_REINVITE (==1) falls through both —
 	 * decide its transition here, deferred to the channel-locked commit:
 	 *   - answer ACCEPTED T.38 (a live m=image leg) → ENABLED  (chan_sip.c:10202-10204:
 	 *     SDP_T38_ACCEPT && T38_LOCAL_REINVITE → change_t38_state(T38_ENABLED));
 	 *   - answer DECLINED T.38 (no/zeroed m=image) → DISABLED (queues AST_T38_REFUSED).
-	 * Mutually exclusive with enter_reinvite/withdraw (LOCAL_REINVITE never satisfies
-	 * their state gates). */
-	if (pvt->t38_state == SOFIA_T38_LOCAL_REINVITE) {
+	 * Mutually exclusive with enter_reinvite/withdraw (an answer in LOCAL_REINVITE satisfies
+	 * neither of their gates).
+	 * Only the answer to the re-INVITE that carried our T.38 offer decides (t38_offer_out): while that offer waits
+	 * (another re-INVITE in flight, a 491 retry) an answer to something else leaves LOCAL_REINVITE alone. A peer
+	 * offer meanwhile: with a live m=image it goes to PEER_REINVITE (above); without one it changes nothing, our
+	 * offer still goes. */
+	if (pvt->t38_state == SOFIA_T38_LOCAL_REINVITE && !current_offer && pvt->t38_offer_out == SOFIA_T38_OUT_OFFER) {
 		if (image_active_seen) {
 			t38_stage_local_accept = 1;
 		} else {
@@ -3820,8 +3911,8 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 						}
 					}
 					/* Snapshot fax-redirect inputs while locked (faxdetect=t38 +
-					 * not already at "fax"). */
-					if (pvt->peer && (pvt->peer->faxdetect_mode & SOFIA_FAX_DETECT_T38)
+					 * not already at "fax"; not when our own T.38 offer was waiting). */
+					if (!t38_enter_from_local && pvt->peer && (pvt->peer->faxdetect_mode & SOFIA_FAX_DETECT_T38)
 					    && strcmp(o->exten, "fax")) {
 						ast_copy_string(fax_context, S_OR(o->macrocontext, o->context), sizeof(fax_context));
 						ast_copy_string(fax_exten, o->exten, sizeof(fax_exten));
@@ -3912,6 +4003,10 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	 * image-only T.38 re-INVITE clears a stale 1 from a prior audio offer). RFC 3264 §6 answer-mirror gate. */
 	if (current_offer) {
 		pvt->offer_had_audio = m_audio_present;
+		pvt->offer_image_line = m_image_line;
+		pvt->offer_audio_port0 = m_audio_port0;
+		ast_copy_string(pvt->offer_audio0_proto, m_audio0_proto, sizeof(pvt->offer_audio0_proto));
+		ast_copy_string(pvt->offer_audio0_fmt, m_audio0_fmt, sizeof(pvt->offer_audio0_fmt));
 	}
 	if (current_offer && offered_video_mode != -1) {
 		pvt->offered_video_mode = offered_video_mode;
