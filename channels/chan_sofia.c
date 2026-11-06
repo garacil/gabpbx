@@ -16279,7 +16279,10 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	int l_nat;				/* the watcher's nat= flags */
 	char l_contact[300] = "";		/* Contact of our NOTIFYs (empty = our address is not known) */
 	char l_exten[AST_MAX_EXTENSION];	/* bounded copy of the watched user — keeps subkey consistent with sub->exten */
-	char subkey[200];
+	char subkey[384];
+	char l_tp[8] = "";			/* transport the SUBSCRIBE came on */
+	const char *l_callid, *l_fromtag;	/* the SUBSCRIBE dialog (RFC 6665 §4.4.1) */
+	static unsigned int sub_seq;		/* creation order of the subscriptions (sofia_thread only) */
 	char hint[AST_MAX_EXTENSION];
 	struct ast_sockaddr src = { {0,} };	/* zero-init: sofia_get_source_addr leaves it untouched if no Via */
 	int firststate;
@@ -16426,11 +16429,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		}
 	}
 
-	/* Logical key: at most ONE sub per (watcher, watched-exten, context). Correlates a
-	 * re-SUBSCRIBE on a fresh dialog / Expires:0 unsubscribe here — NOT by nh, which
-	 * sofia-sip does not reliably reuse. */
 	ast_copy_string(l_exten, watched, sizeof(l_exten));
-	snprintf(subkey, sizeof(subkey), "%s|%s|%s", l_peername, l_exten, l_context);
 	/* Contact of our 2xx and of every NOTIFY of this subscription (RFC 3265 §7.1; RFC 6665 §3.1/§3.2,
 	 * SUBSCRIBE and NOTIFY are target refresh requests): the watched extension at our address as the
 	 * watcher's source sees it, over the transport the SUBSCRIBE came in on, a sips: URI when the SUBSCRIBE
@@ -16441,7 +16440,6 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	{
 		char l_source[160];
 		char l_target[168];
-		char l_tp[8];
 		int secure = (sip->sip_request && sip->sip_request->rq_url
 				&& sip->sip_request->rq_url->url_type == url_sips)
 			|| (sip->sip_contact && sip->sip_contact->m_url && sip->sip_contact->m_url->url_type == url_sips);
@@ -16461,6 +16459,28 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 			secure && !strncmp(l_source, "sip:", 4) ? l_source + 4 : l_source);
 		sofia_subscription_contact(l_target, NULL, l_exten, l_contact, sizeof(l_contact));
 	}
+	/* Key: ONE subscription per (watcher account, watched extension, context, device). A device is its
+	 * +sip.instance (RFC 5626 §4.1: persistent across power cycles) when its Contact carries one, else the
+	 * transport and source address it subscribes from. The same device that subscribes again in a new dialog
+	 * (a restarted phone, which never unsubscribed its old dialog) replaces its own subscription; two devices
+	 * of one account (a desk phone and a softphone) watch the same extension side by side, as chan_sip keeps a
+	 * dialog per SUBSCRIBE. Correlated here, not by nh: this stack gives every SUBSCRIBE a fresh handle. A
+	 * refresh is first matched by its dialog (Call-ID + the watcher's tag), whatever its source. */
+	{
+		char l_inst[160] = "";
+
+		if (sip && sip->sip_contact) {
+			sofia_contact_parse_instance(sip->sip_contact, l_inst, sizeof(l_inst), NULL);
+		}
+		if (l_inst[0]) {
+			snprintf(subkey, sizeof(subkey), "%s|%s|%s|i:%s", l_peername, l_exten, l_context, l_inst);
+		} else {
+			snprintf(subkey, sizeof(subkey), "%s|%s|%s|s:%s:%s", l_peername, l_exten, l_context,
+				l_tp[0] ? l_tp : "udp", ast_sockaddr_stringify(&src));
+		}
+	}
+	l_callid = (sip && sip->sip_call_id && sip->sip_call_id->i_id) ? sip->sip_call_id->i_id : "";
+	l_fromtag = (sip && sip->sip_from && sip->sip_from->a_tag) ? sip->sip_from->a_tag : "";
 	/* Clamp ex_delta before the int cast: > INT_MAX wraps negative and would read as
 	 * an unsubscribe (expires <= 0). */
 	if (!sip || !sip->sip_expires) {
@@ -16498,7 +16518,10 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		struct sofia_presence_sub *old;
 		memset(&keyobj, 0, sizeof(keyobj));
 		ast_copy_string(keyobj.subkey, subkey, sizeof(keyobj.subkey));
-		old = ao2_find(presence_subs, &keyobj, OBJ_POINTER);
+		old = sofia_presence_find_dialog(l_peername, l_exten, l_context, l_callid, l_fromtag);
+		if (!old) {
+			old = ao2_find(presence_subs, &keyobj, OBJ_POINTER);
+		}
 
 		if (expires <= 0) {
 			/* Unsubscribe (delivered on a fresh handle, not the notifier): accept +
@@ -16581,6 +16604,9 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	sub->expires_at = time(NULL) + expires;
 	sub->terminated = 0;
 	ast_copy_string(sub->subkey, subkey, sizeof(sub->subkey));
+	ast_copy_string(sub->callid, l_callid, sizeof(sub->callid));
+	ast_copy_string(sub->fromtag, l_fromtag, sizeof(sub->fromtag));
+	sub->seq = ++sub_seq;
 	ast_copy_string(sub->exten, l_exten, sizeof(sub->exten));
 	ast_copy_string(sub->context, l_context, sizeof(sub->context));
 	ast_copy_string(sub->peername, l_peername, sizeof(sub->peername));
@@ -16611,6 +16637,9 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		ast_copy_string(sub->event,
 			sub->format == SOFIA_SUB_DIALOG_INFO ? "dialog" : "presence", sizeof(sub->event));
 	}
+
+	/* Room for this device: at most SOFIA_PRESENCE_MAX_WATCHERS subscriptions of the account to this extension. */
+	sofia_presence_cap(l_peername, l_exten, l_context, SOFIA_PRESENCE_MAX_WATCHERS - 1);
 
 	/* Link into the registry (container holds the ref). On OOM the sub is untracked
 	 * (refresh/unsubscribe/expiry could never find it) — reject 500 and reap the
@@ -20004,8 +20033,12 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 		if (sofia_debug)
 			ast_verbose("Sofia: NOTIFY response %d %s\n", status, phrase);
 		/* Presence sub expiry/terminate: sofia-sip auto-sends the final NOTIFY and
-		 * reports nua_substate_terminated here. Correlate by handle and free it. */
-		if (sofia_substate_terminated(tags)) {
+		 * reports nua_substate_terminated here. A NOTIFY answered with one of the codes of RFC 6665
+		 * §4.2.2 ends the subscription too (the notifier MUST remove it): a 481 from a device that
+		 * restarted and forgot its dialog, as the MWI subscription does below. Correlate by handle. */
+		if (sofia_substate_terminated(tags)
+				|| status == 404 || status == 405 || status == 408 || status == 410 || status == 416
+				|| (status >= 480 && status <= 485) || status == 489 || status == 501 || status == 604) {
 			struct sofia_presence_sub *psub = sofia_presence_find_by_nh(nh);
 			if (psub) {
 				sofia_presence_teardown(psub, 0);

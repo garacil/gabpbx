@@ -442,6 +442,74 @@ struct sofia_presence_sub *sofia_presence_find_by_nh(nua_handle_t *nh)
 	return found;
 }
 
+/* sofia_thread: the subscription of this SUBSCRIBE dialog (RFC 6665 §4.4.1: Call-ID and the watcher's tag), whatever
+ * the device key says: a refresh from a source port its NAT moved is still that subscription. +1 ref or NULL. */
+struct sofia_presence_sub *sofia_presence_find_dialog(const char *peername, const char *exten, const char *context,
+	const char *callid, const char *fromtag)
+{
+	struct ao2_iterator it;
+	struct sofia_presence_sub *sub, *found = NULL;
+
+	if (!presence_subs || ast_strlen_zero(callid)) {
+		return NULL;
+	}
+	it = ao2_iterator_init(presence_subs, 0);
+	while ((sub = ao2_iterator_next(&it))) {
+		if (!sub->terminated && !strcmp(sub->callid, callid) && !strcmp(sub->fromtag, S_OR(fromtag, ""))
+				&& !strcmp(sub->peername, peername) && !strcmp(sub->exten, exten)
+				&& !strcmp(sub->context, context)) {
+			found = sub;	/* keep the +1 ref */
+			break;
+		}
+		ao2_ref(sub, -1);
+	}
+	ao2_iterator_destroy(&it);
+	return found;
+}
+
+/* sofia_thread: keep at most `keep` live subscriptions of peername to exten@context (one per device), ending the
+ * oldest with a terminated NOTIFY, so a watcher cannot pile up hint watchers from ever new source ports.
+ * Collect-then-teardown, as the expiry sweep. */
+void sofia_presence_cap(const char *peername, const char *exten, const char *context, int keep)
+{
+	struct ao2_iterator it;
+	struct sofia_presence_sub *sub, *mine[SOFIA_PRESENCE_MAX_WATCHERS * 2];
+	int n = 0, i;
+
+	if (!presence_subs || keep < 0) {
+		return;
+	}
+	it = ao2_iterator_init(presence_subs, 0);
+	while ((sub = ao2_iterator_next(&it))) {
+		if (!sub->terminated && n < (int) ARRAY_LEN(mine) && !strcmp(sub->peername, peername)
+				&& !strcmp(sub->exten, exten) && !strcmp(sub->context, context)) {
+			mine[n++] = sub;	/* keep the iterator's +1 ref */
+		} else {
+			ao2_ref(sub, -1);
+		}
+	}
+	ao2_iterator_destroy(&it);
+
+	while (n > keep) {
+		int oldest = 0;
+		for (i = 1; i < n; i++) {
+			if (mine[i]->seq < mine[oldest]->seq) {
+				oldest = i;
+			}
+		}
+		if (sofia_debug) {
+			ast_verbose("Sofia presence: SIP/%s watches %s@%s from %d devices - ending the oldest (%s)\n",
+				peername, exten, context, n + 1, mine[oldest]->watcher_addr);
+		}
+		sofia_presence_teardown(mine[oldest], 1);	/* terminated NOTIFY + destroy */
+		ao2_ref(mine[oldest], -1);
+		mine[oldest] = mine[--n];
+	}
+	for (i = 0; i < n; i++) {
+		ao2_ref(mine[i], -1);
+	}
+}
+
 /* Did sofia-sip mark this NOTIFY transaction as terminating the subscription? */
 int sofia_substate_terminated(tagi_t tags[])
 {

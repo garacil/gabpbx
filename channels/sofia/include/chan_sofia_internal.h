@@ -484,6 +484,8 @@ void sofia_peer_ipport_unindex(struct sofia_peer *peer);
 void sofia_emit_register_side_effects(struct sofia_peer *peer, sip_t const *sip, const struct sofia_register_update *update);
 
 #define SOFIA_PRESENCE_DEFAULT_EXPIRY 3600	/* used when the SUBSCRIBE omits Expires */
+#define SOFIA_PRESENCE_MAX_WATCHERS 8	/* subscriptions of one account to one resource (one per device); the oldest
+					 * is ended when another device subscribes */
 
 enum sofia_sub_format {
 	SOFIA_SUB_DIALOG_INFO = 0,	/* application/dialog-info+xml (BLF) */
@@ -493,7 +495,11 @@ enum sofia_sub_format {
 };
 
 struct sofia_presence_sub {
-	char subkey[200];			/* "peername|exten|context" — container key */
+	char subkey[384];			/* "peername|exten|context|device" — container key; device is
+						 * "i:<+sip.instance>" or "s:<transport>:<source address>" */
+	char callid[128];			/* the SUBSCRIBE dialog: Call-ID and the watcher's From tag */
+	char fromtag[64];
+	unsigned int seq;			/* creation order: the oldest is ended at SOFIA_PRESENCE_MAX_WATCHERS */
 	nua_handle_t *nh;			/* subscription dialog handle (NOT bound as hmagic;
 						 * correlated via sofia_presence_find_by_nh) */
 	char exten[AST_MAX_EXTENSION];		/* watched extension (To user) */
@@ -523,6 +529,9 @@ void sofia_presence_teardown(struct sofia_presence_sub *sub, int send_terminated
 int sofia_presence_state_cb(char *context, char *exten, enum ast_extension_states state, void *data);
 void sofia_presence_sub_destroy_cb(int id, void *data);
 struct sofia_presence_sub *sofia_presence_find_by_nh(nua_handle_t *nh);
+struct sofia_presence_sub *sofia_presence_find_dialog(const char *peername, const char *exten, const char *context,
+	const char *callid, const char *fromtag);
+void sofia_presence_cap(const char *peername, const char *exten, const char *context, int keep);
 const char *sofia_presence_mime(enum sofia_sub_format f);
 /* Shared presence/dialog-info body builder (one source of truth) used by the presence NOTIFY and the
  * outbound PUBLISH (sofia_publish.c). exten + entity are XML-escaped inside. */
