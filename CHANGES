@@ -1,4 +1,23 @@
-## Build — Sofia-SIP dependency pinned to `v2.0.5` (multihomed hosts)
+## 1.9.19 — static trunks are qualified, and a multihomed host sends from the right address
+
+Only `chan_sofia.so` changes, and the Sofia-SIP library it is built against moves to `v2.0.5` (below); the packages
+bundle it.
+
+### Fixed
+
+- **A peer with a fixed `host=` and `qualify=yes` was never qualified.** The qualify only probed registered peers, so
+  a static trunk stayed `UNKNOWN` for ever and a call to a trunk that was down waited for its INVITE to time out. As
+  `chan_sip` does, every peer with qualify and an address is now probed, at the address its INVITE goes to; its
+  status, the `PeerStatus` event (with that address) and its device state follow. A call to a static peer whose probe
+  got no answer at all (no response, a transport or DNS error) is refused at once with `CHANUNAVAIL`, so the dialplan
+  moves on to the next route, as `chan_sip` refuses a peer out of qualify range. Unlike `chan_sip`, a peer that answers
+  late (`LAGGED`) is not refused, nor is one reached through an `outboundproxy`, whose INVITE does not go where the
+  probe went.
+- **A `408` or `503` the far end sends to the qualify no longer refuses calls**, to a static peer or to a registered
+  device: the far end did answer, and `chan_sip` places calls to a peer that answers its poke with any final response.
+  The peer still shows `UNREACHABLE`.
+
+### Build — Sofia-SIP dependency pinned to `v2.0.5` (multihomed hosts)
 
 `chan_sofia` is now built and tested against Sofia-SIP `v2.0.5`. On a host with several addresses and the default
 `bindaddr=0.0.0.0`, the SIP stack opens one socket per local address, and every new request — the INVITE of an

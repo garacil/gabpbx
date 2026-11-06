@@ -8561,6 +8561,35 @@ static const char *sofia_get_callid(struct ast_channel *ast)
 	return pvt ? pvt->callid : "";
 }
 
+/* Whether the qualify probes peer: a registered one (at its binding's source), or one with a fixed host= (at
+ * that host), as chan_sip pokes every peer with qualify and an address (sip_poke_all_peers, sip_poke_peer): a
+ * static peer has its address from the configuration. Caller holds peer->lock. */
+static int sofia_peer_qualifiable(const struct sofia_peer *peer)
+{
+	return peer->registered || (!ast_strlen_zero(peer->host) && strcasecmp(peer->host, "dynamic"));
+}
+
+/* The address a static host= peer's INVITE goes to, as sofia_request computes it: an IP literal host at the
+ * peer's port, else the address the name resolved to at load (peer->src_addr) at that port. Returns 0 when
+ * it is not known without a DNS lookup. Caller holds peer->lock. */
+static int sofia_static_peer_addr(const struct sofia_peer *peer, struct ast_sockaddr *addr)
+{
+	int port = peer->port ? peer->port : 5060;
+
+	memset(addr, 0, sizeof(*addr));
+	if (ast_strlen_zero(peer->host) || !strcasecmp(peer->host, "dynamic")) {
+		return 0;
+	}
+	if (!ast_sockaddr_parse(addr, peer->host, PARSE_PORT_FORBID)) {
+		if (ast_sockaddr_isnull(&peer->src_addr)) {
+			return 0;
+		}
+		ast_sockaddr_copy(addr, &peer->src_addr);
+	}
+	ast_sockaddr_set_port(addr, port);
+	return 1;
+}
+
 /* Whether a call to peer's one live binding single is refused because its qualify found it unreachable
  * (chan_sip create_addr_from_peer: maxms set and lastms out of range -> AST_CAUSE_UNREGISTERED). Only where
  * the unanswered probe speaks for this call: qualify on and UNREACHABLE (no final answer, or the stack's own
@@ -8770,6 +8799,10 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 				struct ast_sockaddr target;
 				char lookup_host[256] = "";	/* static host= name to resolve after the unlock */
 				int target_port = peer->port ? peer->port : 5060;
+				int static_unreachable = 0;	/* static host= peer whose qualify left it UNREACHABLE */
+				struct ast_sockaddr static_failed_addr;	/* where that unanswered probe went */
+
+				memset(&static_failed_addr, 0, sizeof(static_failed_addr));
 
 				memset(&target, 0, sizeof(target));
 				if (peer->registered && !ast_sockaddr_isnull(&peer->src_addr)) {
@@ -8795,12 +8828,13 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 					 * target unset, ourip fell back to bindaddr and 0.0.0.0 went out in c= and Contact. */
 					const char *host = !ast_strlen_zero(peer->host) ? peer->host : "127.0.0.1";
 
-					if (ast_sockaddr_parse(&target, host, PARSE_PORT_FORBID)) {
-						ast_sockaddr_set_port(&target, target_port);
-					} else if (!ast_sockaddr_isnull(&peer->src_addr)) {
-						target = peer->src_addr;
-						ast_sockaddr_set_port(&target, target_port);
-					} else {
+					if (peer->qualify && peer->peer_status == PEER_UNREACHABLE && peer->qualify_failed_at) {
+						static_unreachable = 1;
+						ast_sockaddr_copy(&static_failed_addr, &peer->qualify_failed_addr);
+					}
+					/* The same address the qualify probes (sofia_static_peer_addr); a name with no address
+					 * yet is looked up below. */
+					if (!sofia_static_peer_addr(peer, &target)) {
 						ast_copy_string(lookup_host, host, sizeof(lookup_host));
 					}
 				}
@@ -8815,6 +8849,23 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 					if (!ast_get_ip_or_srv(&target, lookup_host, NULL)) {
 						ast_sockaddr_set_port(&target, target_port);
 					}
+				}
+				/* A static host= peer whose qualify went unanswered at the very address this INVITE goes to is
+				 * refused, as chan_sip refuses a peer out of qualify range (create_addr_from_peer:
+				 * AST_CAUSE_UNREGISTERED) and as a binding's call is refused (sofia_qualify_refuses): the
+				 * dialplan moves on at once instead of waiting for the INVITE to time out. Only a probe nothing
+				 * answered counts (qualify_failed_at is set for those only), a LAGGED peer did answer and is not
+				 * refused (unlike chan_sip beyond maxms), and a peer reached through an outboundproxy is not
+				 * refused: its INVITE does not go where the probe went. The next probe (every
+				 * DEFAULT_FREQ_NOTOK seconds while unreachable) clears it. */
+				if (static_unreachable && !route_buf[0] && !ast_sockaddr_isnull(&target)
+						&& !ast_sockaddr_cmp(&static_failed_addr, &target)) {
+					ast_log(LOG_NOTICE, "Sofia: peer '%s' is UNREACHABLE (no answer to its qualify) - refusing the call (CHANUNAVAIL)\n",
+						peername);
+					ao2_ref(peer, -1);
+					ao2_ref(pvt, -1);
+					*cause = AST_CAUSE_UNREGISTERED;
+					return NULL;
 				}
 				sofia_resolve_ourip(pvt, &target);
 			}
@@ -18191,13 +18242,13 @@ void sofia_qualify_peer(struct sofia_peer *peer)
 	char url[256];
 	nua_handle_t *nh;
 
-	if (!sofia_nua || !peer->registered)
+	if (!sofia_nua)
 		return;
 
 	ast_mutex_lock(&peer->lock);
 
-	/* Skip if a qualify is already in flight. */
-	if (peer->qualify_nh) {
+	/* Skip if a qualify is already in flight, or the peer has nowhere to be probed (sofia_peer_qualifiable). */
+	if (peer->qualify_nh || !sofia_peer_qualifiable(peer)) {
 		ast_mutex_unlock(&peer->lock);
 		return;
 	}
@@ -18214,7 +18265,13 @@ void sofia_qualify_peer(struct sofia_peer *peer)
 
 	peer->qualify_nh = nh;
 	peer->qualify_sent = ast_tvnow();
-	ast_sockaddr_copy(&peer->qualify_addr, &peer->src_addr);
+	/* The probed address: a registered peer's source; a static host= peer's INVITE target (what
+	 * sofia_request compares an unanswered probe with before refusing a call). */
+	if (!peer->registered || ast_sockaddr_isnull(&peer->src_addr)) {
+		sofia_static_peer_addr(peer, &peer->qualify_addr);
+	} else {
+		ast_sockaddr_copy(&peer->qualify_addr, &peer->src_addr);
+	}
 	if (sofia_debug)
 			ast_verbose("Sofia: Sending OPTIONS qualify to %s (url=%s, hmagic=%p)\n",
 			peer->name, url, (void *)peer);
@@ -18408,7 +18465,7 @@ static void *sofia_qualify_thread(void *data)
 			 * enqueue a no-op root callback every second. */
 			int do_dispatch = 0;
 			ast_mutex_lock(&peer->lock);
-			if (peer->qualify && peer->registered && !peer->qualify_pending && !peer->qualify_nh) {
+			if (peer->qualify && sofia_peer_qualifiable(peer) && !peer->qualify_pending && !peer->qualify_nh) {
 				time_t now = time(NULL);
 				int freq = peer->qualifyfreq > 0 ? peer->qualifyfreq : DEFAULT_QUALIFYFREQ;
 				if (peer->peer_status == PEER_UNREACHABLE) {
@@ -19845,8 +19902,16 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				} else {
 					peer->peer_status = PEER_UNREACHABLE;
 					peer->lastms = -1;
-					peer->qualify_failed_at = peer->qualify_sent.tv_sec;
-					ast_sockaddr_copy(&peer->qualify_failed_addr, &peer->qualify_addr);
+					/* Only a probe nothing answered may refuse a call (sofia_qualify_refuses, sofia_request):
+					 * the stack's own 408/503 (no answer, a transport or DNS error) or a nua 9xx. A 408 or 503
+					 * the far end sent shows it is there, and chan_sip places calls to it (any final answer to
+					 * its poke counts, chan_sip.c handle_response). */
+					if (status >= 700 || !sip || (sip->sip_flags & SOFIA_NTA_INTERNAL_MSG)) {
+						peer->qualify_failed_at = peer->qualify_sent.tv_sec;
+						ast_sockaddr_copy(&peer->qualify_failed_addr, &peer->qualify_addr);
+					} else {
+						peer->qualify_failed_at = 0;
+					}
 				}
 				if (old_status != peer->peer_status) {
 					transitioned = 1;
@@ -19857,7 +19922,8 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					ast_copy_string(l_name, peer->name, sizeof(l_name));
 					ast_copy_string(l_context, peer->context, sizeof(l_context));
 					ast_copy_string(l_accountcode, peer->accountcode, sizeof(l_accountcode));
-					ast_copy_string(l_address, ast_sockaddr_stringify(&peer->src_addr), sizeof(l_address));
+					ast_copy_string(l_address, ast_sockaddr_stringify(!peer->registered
+						? &peer->qualify_addr : &peer->src_addr), sizeof(l_address));
 					{	/* OPTIONS goes to the peer's current source, so the device is the contact registered from it */
 						struct sofia_contact *qc = sofia_peer_find_contact_by_addr(peer, &peer->src_addr);
 						if (qc) {
