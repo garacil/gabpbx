@@ -1453,7 +1453,14 @@ webrtc_m_lines_done:
 	/* SUPPRESSED on a WebRTC leg (the WebRTC answer/offer paths are audio-only): a plain m=image udptl t38 in a WebRTC SDP is the
 	 * same mixed-media 488 class as plain video — no mid/ICE/fingerprint/BUNDLE. T.38 fax
 	 * is never active on a browser audio call anyway; gate for completeness. */
-	if (!pvt->is_webrtc && pvt->udptl && pvt->t38_state != SOFIA_T38_DISABLED) {
+	if (!pvt->is_webrtc && pvt->udptl && pvt->t38_state != SOFIA_T38_DISABLED && pvt->t38_ending && !is_answer) {
+		/* The fax is over: our offer gives the audio back and declines the image stream with port 0, keeping
+		 * its m-line (RFC 3264 §8.2: a stream is removed by setting its port to zero). */
+		int t38vlen = strlen(buf);
+		if (snprintf(buf + t38vlen, len - t38vlen, "m=image 0 udptl t38\r\n") >= (int)(len - t38vlen)) {
+			overflow = 1;
+		}
+	} else if (!pvt->is_webrtc && pvt->udptl && pvt->t38_state != SOFIA_T38_DISABLED) {
 		struct ast_sockaddr udptl_local;
 		int t38vlen = strlen(buf);
 		const char *rate_mgmt_str;

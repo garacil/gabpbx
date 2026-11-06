@@ -8261,6 +8261,7 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 						if (pvt->t38_state == SOFIA_T38_LOCAL_REINVITE) {
 							sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
 						}
+						pvt->t38_ending = 0;	/* the audio offer did not go out: still T.38 */
 						ast_mutex_unlock(&pvt->lock);
 						ao2_ref(pvt, -1);
 						ast_log(LOG_WARNING, "Sofia: failed to dispatch outbound T.38 re-INVITE on '%s'\n", ast->name);
@@ -8269,6 +8270,7 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 					/* Slot busy (a re-INVITE already in flight). interpret_t38 already moved us to
 					 * LOCAL_REINVITE, so roll it back rather than stay stuck with no outbound INVITE. */
 					ast_mutex_lock(&pvt->lock);
+					pvt->t38_ending = 0;	/* the audio offer at the end of a fax did not go out */
 					if (pvt->t38_state == SOFIA_T38_LOCAL_REINVITE) {
 						sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
 					}
@@ -19650,6 +19652,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 			}
 			pvt->reinvite_pending = 0;
 			pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
+			/* An audio offer at the end of a fax completed: its answer (parsed below) drops the image stream and
+			 * moves T.38 to DISABLED; a refusal leaves the call in T.38. */
+			pvt->t38_ending = 0;
 			if (rejected) {
 				/* Peer refused; revert to PBX relay. */
 				memset(&pvt->redirip, 0, sizeof(pvt->redirip));

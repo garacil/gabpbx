@@ -312,8 +312,13 @@ int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_contr
 			}
 			sofia_change_t38_state(pvt, SOFIA_T38_DISABLED);
 			sofia_t38_refuse_held(pvt);	/* the peer's offer: 488 (chan_sip parity) */
-		} else if (pvt->t38_state == SOFIA_T38_ENABLED) {
-			sofia_change_t38_state(pvt, SOFIA_T38_LOCAL_REINVITE);
+		} else if (pvt->t38_state == SOFIA_T38_ENABLED && !pvt->t38_ending) {
+			/* The fax is over: offer the audio back, as chan_sip does (interpret_t38_parameters keeps ENABLED
+			 * and sends transmit_reinvite_with_sdp without T.38). The offer declines the image stream (port 0);
+			 * its answer moves T.38 to DISABLED, which tells the application AST_T38_TERMINATED. Before, the
+			 * state moved to LOCAL_REINVITE and nothing was sent: the call stayed image-only, with no audio. */
+			pvt->t38_ending = 1;
+			res = SOFIA_T38_SEND_REINVITE;
 		}
 		break;
 	case AST_T38_REQUEST_PARMS:

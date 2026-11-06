@@ -754,6 +754,10 @@ struct sofia_pvt {
 	 * the event is freed on sofia_thread. */
 	int t38_answer_pending;
 	nua_saved_event_t t38_saved[1];
+	/* The fax is over (AST_T38_REQUEST_TERMINATE while ENABLED): our re-INVITE offers the audio back with the
+	 * image stream at port 0; T.38 stays ENABLED until its answer drops the image (then DISABLED). Cleared when
+	 * that re-INVITE completes or cannot be sent. Under pvt->lock. */
+	int t38_ending;
 	unsigned int t38_max_ifp;
 	int t38_maxdatagram;
 	int t38_ec_mode;
