@@ -1,3 +1,18 @@
+## Build — Sofia-SIP dependency pinned to `v2.0.5` (multihomed hosts)
+
+`chan_sofia` is now built and tested against Sofia-SIP `v2.0.5`. On a host with several addresses and the default
+`bindaddr=0.0.0.0`, the SIP stack opens one socket per local address, and every new request — the INVITE of an
+outgoing call, its ACK, CANCEL and BYE, a qualify OPTIONS, a NOTIFY — left from the first one. Through a VPN tunnel or
+a second network the packet went out of the right interface but with the wrong source address and `Via`, and a peer
+that knows the PBX only by that address never answered. `chan_sip` sends from one wildcard socket, so the kernel
+picks the source address from the route; with `v2.0.5` a new request is sent, and a new TCP/TLS connection opened,
+from the address the routing table picks towards the destination, the same way. A connection a device opened to any
+of the local addresses is now reused too: a TCP device connected to an address other than the first one used to get
+`503` to every request (qualify, INVITE, NOTIFY). A host with a single address, or a `bindaddr` set to one address,
+behaves as before. No ABI change — the header directory (`sofia-sip-1.13`) and the soname (`0.6.0`) are unchanged:
+replace the library and restart GABPBX (`sip show version` keeps showing the headers chan_sofia was built against
+until it is rebuilt). See https://github.com/garacil/sofia-sip/releases/tag/v2.0.5.
+
 ## 1.9.18 — push_log stays bounded
 
 chan_sofia now keeps its `push_log` table bounded by itself, whatever `push_sender` says: every night at
