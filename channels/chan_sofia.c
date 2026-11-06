@@ -3912,10 +3912,12 @@ static void sofia_peer_set_defaults(struct sofia_peer *peer)
 	peer->promiscredir = sofia_cfg.default_promiscredir;
 	peer->autoframing = sofia_cfg.default_autoframing;
 	peer->faxdetect_mode = sofia_cfg.default_faxdetect_mode;
-	peer->t38pt_udptl = 0;
-	peer->t38_ec_mode = SOFIA_T38_EC_FEC;
+	/* T.38 from [general] (t38pt_udptl, t38pt_usertpsource, t38_maxdatagram), as chan_sip copies its global
+	 * flags into every peer (SIP_PAGE2_FLAGS_TO_COPY); a peer's own keys override them. */
+	peer->t38pt_udptl = sofia_cfg.default_t38pt_udptl;
+	peer->t38_ec_mode = sofia_cfg.default_t38_ec_mode;
 	peer->t38_maxdatagram = sofia_cfg.default_t38_maxdatagram;
-	peer->t38pt_usertpsource = 0;
+	peer->t38pt_usertpsource = sofia_cfg.default_t38pt_usertpsource;
 	peer->timer_b = sofia_cfg.default_timer_b;
 	peer->timer_t1 = sofia_cfg.default_timer_t1;
 	peer->allowoverlap_mode = sofia_cfg.default_allowoverlap_mode;
@@ -4504,6 +4506,46 @@ static void sofia_create_peer_hint(struct sofia_peer *peer, const char *source)
 
 /* Parse one ast_variable chain into peer fields. overlay=1 (sipregs pass) skips the
  * append-style list columns (ACLs/setvar/header/mailbox) to avoid duplication. */
+/* t38pt_udptl = yes|no|fec|redundancy|none[,maxdatagram=N] (comma-separated), as chan_sip's handle_t38_options:
+ * yes and fec enable T.38 with FEC, redundancy and none with that error correction, no disables it, maxdatagram
+ * overrides T38FaxMaxDatagram. A value starts from "disabled, FEC". Shared by [general] (the default every peer
+ * inherits) and the file and realtime peer parsers. An empty value changes nothing (a realtime column left
+ * empty keeps [general]'s) and returns 0. */
+static int sofia_parse_t38pt_udptl(const char *value, int *enabled, int *ec_mode, int *maxdatagram, const char *who)
+{
+	char *buf, *word, *next;
+
+	if (ast_strlen_zero(value) || ast_strlen_zero(ast_skip_blanks(value))) {
+		return 0;
+	}
+	buf = ast_strdupa(value);
+	next = buf;
+	*enabled = 0;
+	*ec_mode = SOFIA_T38_EC_FEC;
+	while ((word = strsep(&next, ","))) {
+		int x;
+
+		word = ast_strip(word);
+		if (!strcasecmp(word, "yes") || !strcasecmp(word, "fec")) {
+			*enabled = 1;
+			*ec_mode = SOFIA_T38_EC_FEC;
+		} else if (!strcasecmp(word, "no")) {
+			*enabled = 0;
+		} else if (!strcasecmp(word, "redundancy")) {
+			*enabled = 1;
+			*ec_mode = SOFIA_T38_EC_REDUNDANCY;
+		} else if (!strcasecmp(word, "none")) {
+			*enabled = 1;
+			*ec_mode = SOFIA_T38_EC_NONE;
+		} else if (sscanf(word, "maxdatagram=%30d", &x) == 1) {
+			*maxdatagram = x;
+		} else if (!ast_strlen_zero(word)) {
+			ast_log(LOG_WARNING, "Sofia: %s: unknown t38pt_udptl option '%s'\n", who, word);
+		}
+	}
+	return 1;
+}
+
 static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_variable *v, int overlay)
 {
 	/* Unique __SIPADDHEADERpre%2d= var name per header= entry. */
@@ -4811,38 +4853,14 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 				}
 			}
 		} else if (!strcasecmp(v->name, "t38pt_udptl")) {
-			/* Per-peer T.38 enable + EC mode + MaxDatagram. Comma-separated
-			 * yes|no|fec|redundancy|none[,maxdatagram=N]; yes defaults EC to FEC. */
-			char *value = ast_strdupa(v->value);
-			char *word, *next = value;
-			peer->t38pt_udptl = 0;
-			peer->t38_ec_mode = SOFIA_T38_EC_FEC;
-			while ((word = strsep(&next, ","))) {
-				int x;
-				if (!strcasecmp(word, "yes")) {
-					peer->t38pt_udptl = 1;
-					peer->t38_ec_mode = SOFIA_T38_EC_FEC;
-				} else if (!strcasecmp(word, "no")) {
-					peer->t38pt_udptl = 0;
-				} else if (!strcasecmp(word, "fec")) {
-					peer->t38pt_udptl = 1;
-					peer->t38_ec_mode = SOFIA_T38_EC_FEC;
-				} else if (!strcasecmp(word, "redundancy")) {
-					peer->t38pt_udptl = 1;
-					peer->t38_ec_mode = SOFIA_T38_EC_REDUNDANCY;
-				} else if (!strcasecmp(word, "none")) {
-					peer->t38pt_udptl = 1;
-					peer->t38_ec_mode = SOFIA_T38_EC_NONE;
-				} else if (sscanf(word, "maxdatagram=%30d", &x) == 1) {
-					peer->t38_maxdatagram = x;
-				} else {
-					ast_log(LOG_WARNING, "Sofia: peer '%s' unknown t38pt_udptl option '%s'\n",
-						peer->name, word);
-				}
-			}
+			/* Per-peer T.38 enable + EC mode + MaxDatagram; an empty value keeps [general]'s. */
+			sofia_parse_t38pt_udptl(v->value, &peer->t38pt_udptl, &peer->t38_ec_mode, &peer->t38_maxdatagram,
+				peer->name);
 		} else if (!strcasecmp(v->name, "t38pt_usertpsource")) {
-			/* symmetric-RTP UDPTL destination override (boolean). */
-			peer->t38pt_usertpsource = ast_true(v->value) ? 1 : 0;
+			/* symmetric-RTP UDPTL destination override (boolean); an empty value keeps [general]'s. */
+			if (!ast_strlen_zero(ast_skip_blanks(v->value))) {
+				peer->t38pt_usertpsource = ast_true(v->value) ? 1 : 0;
+			}
 		} else if (!strcasecmp(v->name, "allowoverlap")) {
 			/* Tri-state: yes → YES; "dtmf" → DTMF; else → NO. */
 			if (ast_true(v->value)) {
@@ -22276,6 +22294,14 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 					}
 				}
 			}
+		} else if (!strcasecmp(v->name, "t38pt_udptl")) {
+			/* The T.38 default of every peer (file and realtime) that does not set its own, as chan_sip's
+			 * [general] t38pt_udptl (handle_t38_options into global_flags, copied into each peer). */
+			sofia_parse_t38pt_udptl(v->value, &sofia_cfg.default_t38pt_udptl, &sofia_cfg.default_t38_ec_mode,
+				&sofia_cfg.default_t38_maxdatagram, "[general]");
+		} else if (!strcasecmp(v->name, "t38pt_usertpsource")) {
+			/* Default UDPTL destination override inherited by peers (chan_sip SIP_PAGE2_UDPTL_DESTINATION). */
+			sofia_cfg.default_t38pt_usertpsource = ast_true(v->value) ? 1 : 0;
 		} else if (!strcasecmp(v->name, "t38_maxdatagram") ||
 				!strcasecmp(v->name, "global_t38_maxdatagram")) {
 			/* Default T38FaxMaxDatagram override inherited by sofia_peer_alloc. Sentinel -1 = use
@@ -22991,38 +23017,14 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 				}
 			}
 		} else if (!strcasecmp(v->name, "t38pt_udptl")) {
-			/* Per-peer T.38 enable + EC mode + MaxDatagram. Comma-separated
-			 * yes|no|fec|redundancy|none[,maxdatagram=N]; yes defaults EC = FEC. */
-			char *value = ast_strdupa(v->value);
-			char *word, *next = value;
-			peer->t38pt_udptl = 0;
-			peer->t38_ec_mode = SOFIA_T38_EC_FEC;
-			while ((word = strsep(&next, ","))) {
-				int x;
-				if (!strcasecmp(word, "yes")) {
-					peer->t38pt_udptl = 1;
-					peer->t38_ec_mode = SOFIA_T38_EC_FEC;
-				} else if (!strcasecmp(word, "no")) {
-					peer->t38pt_udptl = 0;
-				} else if (!strcasecmp(word, "fec")) {
-					peer->t38pt_udptl = 1;
-					peer->t38_ec_mode = SOFIA_T38_EC_FEC;
-				} else if (!strcasecmp(word, "redundancy")) {
-					peer->t38pt_udptl = 1;
-					peer->t38_ec_mode = SOFIA_T38_EC_REDUNDANCY;
-				} else if (!strcasecmp(word, "none")) {
-					peer->t38pt_udptl = 1;
-					peer->t38_ec_mode = SOFIA_T38_EC_NONE;
-				} else if (sscanf(word, "maxdatagram=%30d", &x) == 1) {
-					peer->t38_maxdatagram = x;
-				} else {
-					ast_log(LOG_WARNING, "Sofia: peer '%s' unknown t38pt_udptl option '%s'\n",
-						peer->name, word);
-				}
-			}
+			/* Per-peer T.38 enable + EC mode + MaxDatagram; an empty value keeps [general]'s. */
+			sofia_parse_t38pt_udptl(v->value, &peer->t38pt_udptl, &peer->t38_ec_mode, &peer->t38_maxdatagram,
+				peer->name);
 		} else if (!strcasecmp(v->name, "t38pt_usertpsource")) {
-			/* symmetric-RTP UDPTL destination override (boolean). */
-			peer->t38pt_usertpsource = ast_true(v->value) ? 1 : 0;
+			/* symmetric-RTP UDPTL destination override (boolean); an empty value keeps [general]'s. */
+			if (!ast_strlen_zero(ast_skip_blanks(v->value))) {
+				peer->t38pt_usertpsource = ast_true(v->value) ? 1 : 0;
+			}
 		} else if (!strcasecmp(v->name, "allowoverlap")) {
 			/* tri-state yes/dtmf/no. */
 			if (ast_true(v->value)) {
@@ -23604,6 +23606,10 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.default_faxdetect_mode = SOFIA_FAX_DETECT_NONE;
 	/* T38FaxMaxDatagram sentinel -1 = use built-in 200-byte default. */
 	sofia_cfg.default_t38_maxdatagram = SOFIA_T38_MAXDATAGRAM_SENTINEL;
+	/* [general] t38pt_udptl / t38pt_usertpsource: off unless set (chan_sip's defaults). */
+	sofia_cfg.default_t38pt_udptl = 0;
+	sofia_cfg.default_t38_ec_mode = SOFIA_T38_EC_FEC;
+	sofia_cfg.default_t38pt_usertpsource = 0;
 	/* default 32000ms (= 64 * DEFAULT_TIMER_T1); implemented via NTATAG_SIP_T1X64. */
 	sofia_cfg.default_timer_b = 32000;
 	/* default 500ms; implemented via NTATAG_SIP_T1. */

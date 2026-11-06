@@ -3318,7 +3318,8 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ; chan_sofia ships full T.38 fax UDPTL parity per RFC 3362 + ITU-T T.38
 ; mirroring chan_sip behavior verbatim, validated.
 ;
-; Per-peer T.38 keys (mirror chan_sip.c:28038-28063 verbatim):
+; T.38 keys (mirror chan_sip.c:28038-28063 verbatim), per peer or in [general] as the default every
+; peer inherits (file and realtime peers alike; a peer's own key overrides it):
 ;
 ; t38pt_udptl       - T.38 enable + UDPTL EC mode + per-peer MaxDatagram override.
 ;                     Comma-separated value list:
@@ -3432,6 +3433,8 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ; ; [general] T.38 default MaxDatagram = 1500 (e.g. matching local MTU):
 ; ;   t38_maxdatagram = 1500
 ;
-;t38pt_udptl = no                 ; default — T.38 disabled
-;t38pt_usertpsource = no          ; default — use SDP c= for UDPTL destination
+;t38pt_udptl = no                 ; default — T.38 disabled. In [general] it is the default of every peer
+;                                 ; (from the file or realtime) that does not set its own, as in chan_sip;
+;                                 ; e.g. t38pt_udptl = yes,redundancy. An empty realtime column keeps it.
+;t38pt_usertpsource = no          ; default — use SDP c= for UDPTL destination ([general]: inherited too)
 ;t38_maxdatagram = -1             ; default — use built-in 200-byte default

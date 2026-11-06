@@ -1390,6 +1390,9 @@ struct sofia_config {
 	int default_autoframing;   /* parse-compatibility only (ptime auto-detect not implemented); default 0 */
 	int default_faxdetect_mode; /* fax CNG/T.38 detection mode inherited by peers; default NONE(0). Handles DSP CNG + T.38 reINVITE detect when set. */
 	int default_t38_maxdatagram; /* T38FaxMaxDatagram override inherited by peers; sentinel -1 = use SOFIA_T38_MAXDATAGRAM_BUILTIN (200) */
+	int default_t38pt_udptl;   /* [general] t38pt_udptl: T.38 enabled for every peer that does not set its own (chan_sip global_flags SIP_PAGE2_T38SUPPORT); default 0 */
+	int default_t38_ec_mode;   /* [general] t38pt_udptl EC mode inherited with it (SOFIA_T38_EC_*); default FEC */
+	int default_t38pt_usertpsource; /* [general] t38pt_usertpsource inherited by peers (chan_sip SIP_PAGE2_UDPTL_DESTINATION); default 0 */
 	int default_timer_b;       /* RFC 3261 Timer B inherited by peers; default 32000ms (64*T1); via NTATAG_SIP_T1X64 at nua_create */
 	int default_timer_t1;      /* RFC 3261 T1 retransmission interval (ms) inherited by peers; default 500ms; via NTATAG_SIP_T1 at nua_create */
 	int default_allowoverlap_mode; /* tri-state overlap-dial mode inherited by peers; default YES (SOFIA_OVERLAP_YES=1). DTMF mode is fall-through (chan_sip design). */

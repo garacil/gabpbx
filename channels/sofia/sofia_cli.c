@@ -899,6 +899,11 @@ char *sofia_cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 		sofia_cfg.default_faxdetect_mode == SOFIA_FAX_DETECT_NONE ? "no" :
 		sofia_cfg.default_faxdetect_mode == SOFIA_FAX_DETECT_BOTH ? "cng,t38" :
 		sofia_cfg.default_faxdetect_mode == SOFIA_FAX_DETECT_CNG ? "cng" : "t38");
+	/* [general] T.38 default inherited by peers (chan_sip "T.38 support" / "T.38 EC mode"). */
+	ast_cli(a->fd, "  T.38 support:           %s\n", AST_CLI_YESNO(sofia_cfg.default_t38pt_udptl));
+	ast_cli(a->fd, "  T.38 EC mode:           %s\n",
+		sofia_cfg.default_t38_ec_mode == SOFIA_T38_EC_REDUNDANCY ? "Redundancy" :
+		sofia_cfg.default_t38_ec_mode == SOFIA_T38_EC_FEC ? "FEC" : "None");
 	/* [general] T.38 default MaxDatagram: sentinel -1 displays as "(default 200)". */
 	if (sofia_cfg.default_t38_maxdatagram > 0) {
 		ast_cli(a->fd, "  T.38 MaxDatagram:       %d\n", sofia_cfg.default_t38_maxdatagram);
