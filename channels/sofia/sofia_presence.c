@@ -48,9 +48,10 @@
 #define SOFIA_PRESENCE_EXPIRY_GRACE 5		/* seconds past expires_at before a stale sub is swept */
 
 
-/* One active watcher subscription. ao2-managed, mutated only on sofia_thread. Keyed
- * by the LOGICAL triple (watcher peer, watched exten, context) — NOT by nh — so a
- * re-SUBSCRIBE on a fresh dialog REPLACES the prior sub instead of leaking a watcher. */
+/* One active watcher subscription. ao2-managed, mutated only on sofia_thread. Keyed by watcher peer, watched exten,
+ * context, event and device — NOT by nh, which this stack renews on every SUBSCRIBE — so a device that subscribes
+ * again in a new dialog replaces its own subscription instead of leaking a watcher, while several devices of one
+ * account watch the same extension side by side. */
 
 struct ao2_container *presence_subs;	/* keyed by subkey; created in load_module */
 struct ao2_container *sofia_presence_container(void) { return presence_subs; }
@@ -62,10 +63,21 @@ struct sofia_presence_dispatch {
 	int state;				/* snapshot of AST_EXTENSION_* at fire time */
 };
 
+/* Hash on the resource part of the key ("peername|exten|context|"): every subscription of one account to one
+ * extension, whatever its event and device, is in one bucket, which sofia_presence_find_dialog and
+ * sofia_presence_cap search alone (OBJ_POINTER). The compare still takes the whole key. */
 static int presence_sub_hash_fn(const void *obj, int flags)
 {
 	const struct sofia_presence_sub *sub = obj;	/* full sub or {.subkey} shim */
-	return ast_str_hash(sub->subkey);
+	char prefix[sizeof(sub->subkey)];
+	const char *p = sub->subkey;
+	int bars = 0;
+
+	while (*p && !(*p == '|' && ++bars == 3)) {
+		p++;
+	}
+	ast_copy_string(prefix, sub->subkey, MIN((size_t) (p - sub->subkey) + 1, sizeof(prefix)));
+	return ast_str_hash(prefix);
 }
 
 static int presence_sub_cmp_fn(void *obj, void *arg, int flags)
@@ -442,53 +454,79 @@ struct sofia_presence_sub *sofia_presence_find_by_nh(nua_handle_t *nh)
 	return found;
 }
 
-/* sofia_thread: the subscription of this SUBSCRIBE dialog (RFC 6665 §4.4.1: Call-ID and the watcher's tag), whatever
- * the device key says: a refresh from a source port its NAT moved is still that subscription. +1 ref or NULL. */
-struct sofia_presence_sub *sofia_presence_find_dialog(const char *peername, const char *exten, const char *context,
-	const char *callid, const char *fromtag)
+/* A {subkey prefix, keyevent, callid, fromtag} shim for the searches below: its subkey is the hashed resource part. */
+static void presence_resource_shim(struct sofia_presence_sub *shim, const char *peername, const char *exten,
+	const char *context, const char *event)
 {
-	struct ao2_iterator it;
-	struct sofia_presence_sub *sub, *found = NULL;
+	memset(shim, 0, sizeof(*shim));
+	snprintf(shim->subkey, sizeof(shim->subkey), "%s|%s|%s|", peername, exten, context);
+	ast_copy_string(shim->peername, peername, sizeof(shim->peername));
+	ast_copy_string(shim->exten, exten, sizeof(shim->exten));
+	ast_copy_string(shim->context, context, sizeof(shim->context));
+	ast_copy_string(shim->keyevent, event, sizeof(shim->keyevent));
+}
+
+static int presence_same_resource(const struct sofia_presence_sub *sub, const struct sofia_presence_sub *shim)
+{
+	return !sub->terminated && !strcmp(sub->peername, shim->peername) && !strcmp(sub->exten, shim->exten)
+		&& !strcmp(sub->context, shim->context) && !strcmp(sub->keyevent, shim->keyevent);
+}
+
+static int presence_dialog_cb(void *obj, void *arg, int flags)
+{
+	struct sofia_presence_sub *sub = obj, *shim = arg;
+
+	return presence_same_resource(sub, shim) && !strcmp(sub->callid, shim->callid)
+		&& !strcmp(sub->fromtag, shim->fromtag) ? (CMP_MATCH | CMP_STOP) : 0;
+}
+
+static int presence_resource_cb(void *obj, void *arg, int flags)
+{
+	return presence_same_resource(obj, arg) ? CMP_MATCH : 0;
+}
+
+/* sofia_thread: the subscription of this SUBSCRIBE dialog (RFC 6665 §4.4.1: Call-ID, the watcher's tag, the event),
+ * whatever the device part of the key says: a refresh from a source port its NAT moved is still that subscription.
+ * callid/fromtag as stored (truncated to the fields' size). +1 ref or NULL. */
+struct sofia_presence_sub *sofia_presence_find_dialog(const char *peername, const char *exten, const char *context,
+	const char *event, const char *callid, const char *fromtag)
+{
+	struct sofia_presence_sub shim;
 
 	if (!presence_subs || ast_strlen_zero(callid)) {
 		return NULL;
 	}
-	it = ao2_iterator_init(presence_subs, 0);
-	while ((sub = ao2_iterator_next(&it))) {
-		if (!sub->terminated && !strcmp(sub->callid, callid) && !strcmp(sub->fromtag, S_OR(fromtag, ""))
-				&& !strcmp(sub->peername, peername) && !strcmp(sub->exten, exten)
-				&& !strcmp(sub->context, context)) {
-			found = sub;	/* keep the +1 ref */
-			break;
-		}
-		ao2_ref(sub, -1);
-	}
-	ao2_iterator_destroy(&it);
-	return found;
+	presence_resource_shim(&shim, peername, exten, context, event);
+	ast_copy_string(shim.callid, callid, sizeof(shim.callid));
+	ast_copy_string(shim.fromtag, S_OR(fromtag, ""), sizeof(shim.fromtag));
+	return ao2_callback(presence_subs, OBJ_POINTER, presence_dialog_cb, &shim);
 }
 
-/* sofia_thread: keep at most `keep` live subscriptions of peername to exten@context (one per device), ending the
- * oldest with a terminated NOTIFY, so a watcher cannot pile up hint watchers from ever new source ports.
- * Collect-then-teardown, as the expiry sweep. */
-void sofia_presence_cap(const char *peername, const char *exten, const char *context, int keep)
+/* sofia_thread: keep at most `keep` live subscriptions of peername to exten@context for this event (one per device),
+ * ending the oldest — the least recently refreshed, as every refresh makes a new one — with a terminated NOTIFY, so
+ * a watcher cannot pile up hint watchers from ever new source ports. Collect-then-teardown, as the expiry sweep. */
+void sofia_presence_cap(const char *peername, const char *exten, const char *context, const char *event, int keep)
 {
-	struct ao2_iterator it;
-	struct sofia_presence_sub *sub, *mine[SOFIA_PRESENCE_MAX_WATCHERS * 2];
+	struct sofia_presence_sub shim, *sub, *mine[SOFIA_PRESENCE_MAX_WATCHERS * 2];
+	struct ao2_iterator *it;
 	int n = 0, i;
 
 	if (!presence_subs || keep < 0) {
 		return;
 	}
-	it = ao2_iterator_init(presence_subs, 0);
-	while ((sub = ao2_iterator_next(&it))) {
-		if (!sub->terminated && n < (int) ARRAY_LEN(mine) && !strcmp(sub->peername, peername)
-				&& !strcmp(sub->exten, exten) && !strcmp(sub->context, context)) {
+	presence_resource_shim(&shim, peername, exten, context, event);
+	it = ao2_callback(presence_subs, OBJ_POINTER | OBJ_MULTIPLE, presence_resource_cb, &shim);
+	if (!it) {
+		return;
+	}
+	while ((sub = ao2_iterator_next(it))) {
+		if (n < (int) ARRAY_LEN(mine)) {
 			mine[n++] = sub;	/* keep the iterator's +1 ref */
 		} else {
 			ao2_ref(sub, -1);
 		}
 	}
-	ao2_iterator_destroy(&it);
+	ao2_iterator_destroy(it);
 
 	while (n > keep) {
 		int oldest = 0;
@@ -498,8 +536,8 @@ void sofia_presence_cap(const char *peername, const char *exten, const char *con
 			}
 		}
 		if (sofia_debug) {
-			ast_verbose("Sofia presence: SIP/%s watches %s@%s from %d devices - ending the oldest (%s)\n",
-				peername, exten, context, n + 1, mine[oldest]->watcher_addr);
+			ast_verbose("Sofia presence: SIP/%s watches %s@%s (%s) from %d devices - ending the oldest (%s)\n",
+				peername, exten, context, event, n + 1, mine[oldest]->watcher_addr);
 		}
 		sofia_presence_teardown(mine[oldest], 1);	/* terminated NOTIFY + destroy */
 		ao2_ref(mine[oldest], -1);

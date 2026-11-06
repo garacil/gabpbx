@@ -92,7 +92,7 @@ static void sofia_gruu_unquote(const char *val, char *out, size_t outlen)
 	out[o] = '\0';
 }
 
-/* Parse RFC 5626 device-identity params from an INCOMING REGISTER Contact: +sip.instance (normalized -
+/* Parse RFC 5626 device-identity params from an INCOMING REGISTER (or SUBSCRIBE) Contact: +sip.instance (normalized -
  * dequoted, surrounding <> stripped) into inst, and a numeric reg-id (1..INT_MAX) into *reg_id. A reg-id
  * WITHOUT an instance is ignored (RFC 5626: a Contact with reg-id but no instance-id is not valid, the
  * registrar ignores the reg-id). inst="" / *reg_id=0 = absent. Used to rebind a binding when a NAT UA

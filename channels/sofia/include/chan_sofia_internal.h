@@ -377,7 +377,7 @@ void sofia_resolve_ourip(struct sofia_pvt *pvt, const struct ast_sockaddr *targe
 void sofia_remove_peer_hints(const char *regexten, const char *subscribecontext, const char *registrar);
 /* GRUU (RFC 5627/5626), sofia_gruu.c: advertise +sip.instance + consume the registrar's pub/temp-gruu. */
 void sofia_build_instance_feature(const struct sofia_peer *peer, char *buf, size_t len, int with_reg_id);
-void sofia_contact_parse_instance(sip_contact_t const *m, char *inst, size_t instlen, int *reg_id);	/* RFC 5626 +sip.instance/reg-id from an inbound REGISTER Contact */
+void sofia_contact_parse_instance(sip_contact_t const *m, char *inst, size_t instlen, int *reg_id);	/* RFC 5626 +sip.instance/reg-id from an inbound REGISTER or SUBSCRIBE Contact */
 void sofia_outbound_consume(struct sofia_peer *peer, sip_t const *sip, int keepalive_ms);	/* RFC 5626 REGISTER-2xx inspect */
 void sofia_gruu_consume(struct sofia_peer *peer, sip_t const *sip);
 void sofia_service_route_store(struct sofia_peer *peer, sip_t const *sip);	/* Service-Route RFC 3608, sofia_route.c */
@@ -488,8 +488,8 @@ void sofia_peer_ipport_unindex(struct sofia_peer *peer);
 void sofia_emit_register_side_effects(struct sofia_peer *peer, sip_t const *sip, const struct sofia_register_update *update);
 
 #define SOFIA_PRESENCE_DEFAULT_EXPIRY 3600	/* used when the SUBSCRIBE omits Expires */
-#define SOFIA_PRESENCE_MAX_WATCHERS 8	/* subscriptions of one account to one resource (one per device); the oldest
-					 * is ended when another device subscribes */
+#define SOFIA_PRESENCE_MAX_WATCHERS 32	/* subscriptions of one account to one resource and event (one per device);
+					 * the oldest (least recently refreshed) is ended when another one subscribes */
 
 enum sofia_sub_format {
 	SOFIA_SUB_DIALOG_INFO = 0,	/* application/dialog-info+xml (BLF) */
@@ -499,10 +499,13 @@ enum sofia_sub_format {
 };
 
 struct sofia_presence_sub {
-	char subkey[384];			/* "peername|exten|context|device" — container key; device is
-						 * "i:<+sip.instance>" or "s:<transport>:<source address>" */
-	char callid[128];			/* the SUBSCRIBE dialog: Call-ID and the watcher's From tag */
-	char fromtag[64];
+	char subkey[512];			/* "peername|exten|context|event|device" — container key (hashed on
+						 * peername|exten|context|); device is "i:<+sip.instance>" or
+						 * "s:<transport>:<source address>:<Contact user@host:port>" */
+	char keyevent[16];			/* the key's event: "dialog" or "presence" (the SUBSCRIBE's Event) */
+	char callid[256];			/* the SUBSCRIBE dialog: Call-ID and the watcher's From tag (as stored:
+						 * a longer value is compared truncated the same way) */
+	char fromtag[128];
 	unsigned int seq;			/* creation order: the oldest is ended at SOFIA_PRESENCE_MAX_WATCHERS */
 	nua_handle_t *nh;			/* subscription dialog handle (NOT bound as hmagic;
 						 * correlated via sofia_presence_find_by_nh) */
@@ -534,8 +537,8 @@ int sofia_presence_state_cb(char *context, char *exten, enum ast_extension_state
 void sofia_presence_sub_destroy_cb(int id, void *data);
 struct sofia_presence_sub *sofia_presence_find_by_nh(nua_handle_t *nh);
 struct sofia_presence_sub *sofia_presence_find_dialog(const char *peername, const char *exten, const char *context,
-	const char *callid, const char *fromtag);
-void sofia_presence_cap(const char *peername, const char *exten, const char *context, int keep);
+	const char *event, const char *callid, const char *fromtag);
+void sofia_presence_cap(const char *peername, const char *exten, const char *context, const char *event, int keep);
 const char *sofia_presence_mime(enum sofia_sub_format f);
 /* Shared presence/dialog-info body builder (one source of truth) used by the presence NOTIFY and the
  * outbound PUBLISH (sofia_publish.c). exten + entity are XML-escaped inside. */
