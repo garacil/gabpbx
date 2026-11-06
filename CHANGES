@@ -1,3 +1,23 @@
+## 1.9.17 — a stop is never lost
+
+A fix release for the core. `systemctl stop gabpbx` could hang until systemd killed the process 20 s later,
+on any box, after any child process had exited since the start (a fax or mail script, a push script, MixMonitor,
+AGI). Only `/usr/sbin/gabpbx` changes (and `chan_sofia.so`, one line in its push script lane).
+
+### Fixes
+
+- **A stop is never lost after a child's exit.** The main thread's signal loop read its wake-up pipe with a
+  blocking `read()` whatever its `poll()` returned; a signal handler running on the main thread (the SIGCHLD of
+  any child's exit, which Linux offers to the main thread first) ended the poll with EINTR and no token, the read
+  blocked, and the next stop's token woke and fed that read instead of the flag check: the stop was never acted
+  on. The flags are now checked after every poll, the pipe is read only when the poll reported data, both pipe
+  ends are non-blocking, the flags are one word each, and the quit handler is async-signal-safe.
+- **DEBUG_THREADS builds no longer wedge at start-up.** The tracking record of a lock was created on its first
+  use without synchronisation and could be re-initialised under another thread; the logger's list lock, first
+  used at once by the main, logger and console threads, was left corrupted. The record is now built in private
+  and published complete under one lock.
+- The push script lane no longer treats an interrupted wait as the script's timeout.
+
 ## 1.9.16 — the re-register push goes when each phone's registration is due, and survives a restart
 
 A feature and fix release for `chan_sofia`. Push phones get a silent re-register push before their registration ends,
