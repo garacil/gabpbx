@@ -1336,6 +1336,8 @@ struct sofia_config {
 	int push_resume_window;    /* multi-ring: seconds the resume holds a parked call open after the FIRST wake REGISTER so every pushed device can bind; then ONE fork INVITE per live binding, all carrying the announced Call-ID (0 = legacy first-registrant-wins; clamp 0..5); default 2 */
 	int push_reregister;       /* push_reregister=yes|no: silent re-register push to every FCM-token device push_reregister_lead seconds before its registration ends, scheduled from the stored rows (survives a restart); native sender only. Default yes. */
 	int push_reregister_lead;  /* seconds before reg_expires the re-register push goes (clamp 30..600); default 120 */
+	int push_log_retention;    /* days push_log keeps its rows (one per push step), purged on the database lane; 0 = keep them all (clamp 0..3650); default 7 */
+	int push_log_purge_minute; /* push_log_purge_time=HH:MM: local time of the nightly purge, as minutes after midnight; default 04:00 (240) */
 	int push_sender_native;    /* push_sender=native|script: 1 = in-process libcurl HTTP/2 sender (sofia_push_sender.c, persistent connections + cached JWT/OAuth), 0 = fork/exec the .py scripts. Default 1 (native); auto-falls back to script per-job when the native lane is unavailable. */
 	/* Bounded REGISTER realtime-DB-write offload pool (kill-switch, default OFF). */
 	int register_pool;          /* offload the realtime REGISTER DB writes to a bounded pool */

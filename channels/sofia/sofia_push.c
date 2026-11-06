@@ -2778,6 +2778,147 @@ static void sofia_push_rereg_unmark(const struct sofia_push_rereg_job *j)
 	ao2_ref(e, -1);
 }
 
+/* ---------- push_log retention ----------
+ *
+ * push_log only grows (one row per push step). push_log_retention days (0 = keep everything) bound it: every night at
+ * push_log_purge_time (local time) the rows older than that go, on the database lane (the only writer, so no write of
+ * ours ever waits on the engine's lock). One run removes at most one day of rows, counted from the oldest one left
+ * (ts < X LIMIT 1, an index lookup with push_log(ts)), so a long backlog (the first night, a lowered retention) never
+ * holds the database for long: the next tick takes the next day. The engine's delete must take an operator in the
+ * field name ("ts <"), as res_config_sqlite3 does; a delete that fails (an engine without it, a full disk, a database
+ * an operator holds) is reported and tried again the next night. A run acts on the settings it was planned with,
+ * never on ones a reload is still applying. The restart check reads only the last push_wait +
+ * SOFIA_PUSH_RESTART_LOOKBACK seconds. */
+#define SOFIA_PUSH_PURGE_SLICE 86400	/* at most one day of rows per run */
+
+static volatile time_t sofia_push_purge_next;
+static volatile int sofia_push_purge_inflight;
+static volatile int sofia_push_purge_failed;	/* nights in a row the delete failed (sip show push) */
+/* the settings sofia_push_purge_next was planned with (sched thread only): a change re-plans instead of running */
+static int sofia_push_purge_planned_for = -1, sofia_push_purge_planned_days = -1;
+static int sofia_push_purge_total, sofia_push_purge_runs;	/* this night's purge so far (database lane only) */
+
+struct sofia_push_purge_job {
+	int days;	/* the retention this run applies */
+	int minute;	/* the push_log_purge_time the next night is planned for */
+};
+
+/* the next push_log_purge_time (minutes after local midnight) strictly after now */
+static time_t sofia_push_purge_next_at(time_t now, int minute)
+{
+	struct timeval tv = { .tv_sec = now }, at;
+	struct ast_tm base, tm;
+	int day;
+
+	ast_localtime(&tv, &base, NULL);
+	for (day = 0; day < 3; day++) {
+		tm = base;
+		tm.tm_mday += day;	/* ast_mktime normalises the month end */
+		tm.tm_hour = minute / 60;
+		tm.tm_min = minute % 60;
+		tm.tm_sec = 0;
+		tm.tm_usec = 0;
+		tm.tm_isdst = -1;	/* whatever the offset is on that day */
+		at = ast_mktime(&tm, NULL);
+		if (at.tv_sec > now) {
+			return at.tv_sec;
+		}
+	}
+	return now + 86400;
+}
+
+static int sofia_push_log_purge_exe(void *data)
+{
+	struct sofia_push_purge_job *job = data;
+	int days = job->days, more = 0, failed = 0, n;
+	time_t now = time(NULL), cutoff, oldest = 0, upto;
+	struct ast_variable *row, *v;
+	char cut_s[24], upto_s[24];
+
+	if (ast_check_realtime("pushlog")) {
+		cutoff = now - (time_t) days * 86400;
+		snprintf(cut_s, sizeof(cut_s), "%ld", (long) cutoff);
+		if ((row = ast_load_realtime("pushlog", "ts <", cut_s, SENTINEL))) {
+			for (v = row; v; v = v->next) {
+				if (!strcasecmp(v->name, "ts")) {
+					oldest = (time_t) strtol(v->value, NULL, 10);
+				}
+			}
+			ast_variables_destroy(row);
+			upto = (oldest > 0 && oldest < cutoff - SOFIA_PUSH_PURGE_SLICE) ? oldest + SOFIA_PUSH_PURGE_SLICE : cutoff;
+			more = upto < cutoff;
+			snprintf(upto_s, sizeof(upto_s), "%ld", (long) upto);
+			if ((n = ast_destroy_realtime("pushlog", "ts <", upto_s, SENTINEL)) < 0) {
+				failed = 1;
+				more = 0;
+			} else {
+				sofia_push_purge_total += n;
+				sofia_push_purge_runs++;
+				ast_verb(4, "Sofia PUSH: push_log retention: %d row(s) before %s removed%s\n", n, upto_s,
+					more ? ", older ones next" : "");
+			}
+		}
+	}
+	if (!more && sofia_push_purge_total > 0) {
+		/* one line a night: the whole purge, however many steps it took */
+		ast_verb(3, "Sofia PUSH: push_log retention (%d day(s)): %d row(s) removed in %d step(s)\n",
+			days, sofia_push_purge_total, sofia_push_purge_runs);
+	}
+	if (!more) {
+		sofia_push_purge_total = sofia_push_purge_runs = 0;
+	}
+	if (failed) {
+		sofia_push_purge_failed++;
+		ast_log(LOG_WARNING, "Sofia PUSH: push_log retention: the database refused the delete (%d night(s) in a row) - next try at %02d:%02d\n",
+			sofia_push_purge_failed, job->minute / 60, job->minute % 60);
+	} else if (!more) {
+		sofia_push_purge_failed = 0;
+	}
+	/* a backlog goes on at the next tick; otherwise the next night */
+	sofia_push_purge_next = more ? now + SOFIA_PUSH_REREG_TICK_MS / 1000 : sofia_push_purge_next_at(now, job->minute);
+	ast_free(job);
+	sofia_push_purge_inflight = 0;
+	return 0;
+}
+
+/* from the 5 s tick, whatever the push lanes do: the rows of a box whose sender is down still age out */
+static void sofia_push_log_purge_check(time_t now)
+{
+	int days = sofia_cfg.push_log_retention, minute = sofia_cfg.push_log_purge_minute;
+	struct sofia_push_purge_job *job;
+
+	if (days <= 0 || !sofia_pushdb_tps) {
+		sofia_push_purge_planned_for = sofia_push_purge_planned_days = -1;	/* turned back on: planned afresh */
+		return;
+	}
+	if (sofia_push_purge_inflight) {
+		return;
+	}
+	if (sofia_push_purge_planned_for != minute || sofia_push_purge_planned_days != days) {
+		/* the load, or a reload that changed a setting (or is still applying it): plan, never run, this tick */
+		if (sofia_push_purge_planned_for != minute || !sofia_push_purge_next) {
+			sofia_push_purge_next = sofia_push_purge_next_at(now, minute);
+		}
+		sofia_push_purge_planned_for = minute;
+		sofia_push_purge_planned_days = days;
+		return;
+	}
+	if (now < sofia_push_purge_next || sofia_pushdb_depth > SOFIA_PUSH_DBQ_MAX / 4) {
+		return;	/* not yet, or the token and log writes are behind: they come first */
+	}
+	if (!(job = ast_calloc(1, sizeof(*job)))) {
+		return;	/* the next tick tries again */
+	}
+	job->days = days;
+	job->minute = minute;
+	sofia_push_purge_inflight = 1;
+	if (ast_taskprocessor_push(sofia_pushdb_tps, sofia_push_log_purge_exe, job)) {
+		ast_free(job);
+		sofia_push_purge_inflight = 0;
+		sofia_push_purge_next = sofia_push_purge_next_at(now, minute);
+	}
+}
+
 static int sofia_push_rereg_tick(const void *data)
 {
 	struct sofia_push_rereg_job *jobs;
@@ -2786,6 +2927,7 @@ static int sofia_push_rereg_tick(const void *data)
 	time_t now = time(NULL), next = 0;
 	int n = 0, planned = 0, first = 0, i;
 
+	sofia_push_log_purge_check(now);
 	if (!sofia_cfg.push_enabled || !sofia_push_cache || !sofia_push_cache_complete || !sofia_push_sender_available()) {
 		sofia_push_rereg_active = 0;	/* native only: a later tick retries, never the scripts */
 		return SOFIA_PUSH_REREG_TICK_MS;
@@ -3137,6 +3279,29 @@ static char *sofia_push_cli_show(struct ast_cli_entry *e, int cmd, struct ast_cl
 			: !sofia_push_sender_available() ? "on (waiting: native lane down)"
 			: !sofia_push_restart_finished ? "on (waiting: restart call_cancel check)" : "on",
 		sofia_cfg.push_reregister_lead);
+	if (sofia_cfg.push_log_retention <= 0) {
+		ast_cli(a->fd, "push_log retention: off (rows kept forever)\n");
+	} else if (!ast_check_realtime("pushlog")) {
+		ast_cli(a->fd, "push_log retention: %d day(s), idle: no pushlog family in extconfig.conf\n",
+			sofia_cfg.push_log_retention);
+	} else {
+		char when[40], fail[64] = "";
+		time_t nx = sofia_push_purge_next;
+
+		if (!nx) {
+			ast_copy_string(when, "not planned yet", sizeof(when));
+		} else if (sofia_push_purge_inflight || nx <= now + SOFIA_PUSH_REREG_TICK_MS / 1000) {
+			ast_copy_string(when, "running", sizeof(when));
+		} else {
+			snprintf(when, sizeof(when), "next in %ldh %02ldm", (long) (nx - now) / 3600, ((long) (nx - now) % 3600) / 60);
+		}
+		if (sofia_push_purge_failed) {
+			snprintf(fail, sizeof(fail), ", last run failed (%d night(s) in a row)", sofia_push_purge_failed);
+		}
+		ast_cli(a->fd, "push_log retention: %d day(s), every night at %02d:%02d (%s)%s\n",
+			sofia_cfg.push_log_retention, sofia_cfg.push_log_purge_minute / 60, sofia_cfg.push_log_purge_minute % 60,
+			when, fail);
+	}
 	ast_cli(a->fd, "%-20s %-14s %-7s %-5s %-22s %8s %8s %-14s %5s %8s\n",
 		"Peer", "Device", "Plat", "Type", "Token", "Age", "RegExp", "LastResult", "Fails", "ReReg");
 	it = ao2_iterator_init(sofia_push_cache, 0);

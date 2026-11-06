@@ -1,3 +1,23 @@
+## 1.9.18 — push_log stays bounded
+
+chan_sofia now keeps its `push_log` table bounded by itself, whatever `push_sender` says: every night at
+`push_log_purge_time` it removes the rows older than `push_log_retention` days. Only `chan_sofia.so` and
+`res_config_sqlite3.so` change.
+
+### New
+
+- **`push_log_retention` and `push_log_purge_time`** (`[general]` of `sofia.conf`; defaults 7 days and 04:00 local
+  time; `push_log_retention=0` keeps every row). The purge runs on chan_sofia's database lane, in steps of at most one
+  day of rows counted from the oldest row left, 5 s apart, so a long backlog never holds the database for long; one
+  line at verbose 3 sums up the night. A delete that fails (a full disk, a database another client holds) is reported
+  and tried again the next night. A run acts on the settings it was planned with, never on values a reload is still
+  applying. `sip show push` shows the retention, the next run and any failed nights. The token table is not touched.
+- **res_config_sqlite3: a realtime delete takes an operator in the field name** (`"ts <"`), as its SELECTs already
+  did; a bare field name still means equality and produces the same SQL as before.
+
+An index keeps the time-ordered read and the purge cheap:
+`CREATE INDEX IF NOT EXISTS push_log_ts ON push_log(ts);` (run it as the user gabpbx runs as).
+
 ## 1.9.17 — a stop is never lost
 
 A fix release for the core. `systemctl stop gabpbx` could hang until systemd killed the process 20 s later,

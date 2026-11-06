@@ -21754,6 +21754,30 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 				l = l < 30 ? 30 : 600;
 			}
 			sofia_cfg.push_reregister_lead = l;
+		} else if (!strcasecmp(v->name, "push_log_retention")) {
+			/* days push_log keeps its rows; 0 = keep them all */
+			char *end;
+			long d = strtol(v->value, &end, 10);
+			if (end == v->value || *ast_skip_blanks(end)) {
+				ast_log(LOG_WARNING, "Sofia PUSH: push_log_retention='%s' is not a number of days - keeping %d\n",
+					v->value, sofia_cfg.push_log_retention);
+			} else {
+				if (d < 0 || d > 3650) {
+					ast_log(LOG_WARNING, "Sofia PUSH: push_log_retention=%ld out of range (0..3650 days) - clamping\n", d);
+					d = d < 0 ? 0 : 3650;
+				}
+				sofia_cfg.push_log_retention = (int) d;
+			}
+		} else if (!strcasecmp(v->name, "push_log_purge_time")) {
+			/* local time of the nightly push_log purge, HH:MM and nothing else */
+			int hh = -1, mm = -1, used = 0;
+			if (sscanf(v->value, "%d:%d%n", &hh, &mm, &used) != 2 || *ast_skip_blanks(v->value + used)
+					|| hh < 0 || hh > 23 || mm < 0 || mm > 59) {
+				ast_log(LOG_WARNING, "Sofia PUSH: push_log_purge_time='%s' is not HH:MM - keeping %02d:%02d\n",
+					v->value, sofia_cfg.push_log_purge_minute / 60, sofia_cfg.push_log_purge_minute % 60);
+			} else {
+				sofia_cfg.push_log_purge_minute = hh * 60 + mm;
+			}
 		} else if (!strcasecmp(v->name, "push_sender")) {
 			/* Transport for the wake-up notifications: native = in-process libcurl HTTP/2
 			 * lane (persistent connections, cached credentials); script = fork/exec the
@@ -22989,6 +23013,8 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.push_sender_native = 1;	/* native in-process sender by default; script = fallback */
 	sofia_cfg.push_reregister = 1;	/* silent re-register push before a registration ends (native only) */
 	sofia_cfg.push_reregister_lead = 120;
+	sofia_cfg.push_log_retention = 7;	/* days of push_log rows kept */
+	sofia_cfg.push_log_purge_minute = 4 * 60;	/* the purge runs every night at 04:00 */
 	/* Register pool: default OFF + auto lane count. */
 	sofia_cfg.register_pool = 0;
 	sofia_cfg.register_pool_workers = 0;

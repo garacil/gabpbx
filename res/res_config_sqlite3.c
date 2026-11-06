@@ -1555,6 +1555,7 @@ static int realtime_destroy_handler(const char *database, const char *table,
 	const char *keyfield, const char *entity, va_list ap)
 {
 	char *query, *errormsg = NULL, *tmp_str;
+	const char *op;
 	const char **params = NULL, **vals = NULL;
 	size_t params_count;
 	int error, rows_num;
@@ -1580,7 +1581,9 @@ static int realtime_destroy_handler(const char *database, const char *table,
 	}
 
 	for (i = 0; i < params_count; i++) {
-		tmp_str = sqlite3_mprintf("%s %q = '%q' AND", query, params[i], vals[i]);
+		/* "field op" (e.g. "ts <") as in the SELECT handlers; a bare field name means equality */
+		op = strchr(params[i], ' ') ? "" : " =";
+		tmp_str = sqlite3_mprintf("%s %q%s '%q' AND", query, params[i], op, vals[i]);
 		sqlite3_free(query);
 
 		if (!tmp_str) {
@@ -1595,7 +1598,8 @@ static int realtime_destroy_handler(const char *database, const char *table,
 
 	ast_free(params);
 	ast_free(vals);
-	if (!(tmp_str = sqlite3_mprintf("%s %q = '%q';", query, keyfield, entity))) {
+	op = (keyfield && strchr(keyfield, ' ')) ? "" : " =";
+	if (!(tmp_str = sqlite3_mprintf("%s %q%s '%q';", query, keyfield, op, entity))) {
 		ast_log(LOG_WARNING, "Unable to reallocate SQL query\n");
 		sqlite3_free(query);
 		return -1;
