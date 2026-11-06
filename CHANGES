@@ -1,3 +1,31 @@
+## 1.9.21 — [general] t38pt_udptl applies to every peer, as in chan_sip
+
+Only `chan_sofia.so` changes.
+
+### Fixed
+
+- **`t38pt_udptl` in `[general]` was ignored.** chan_sofia read `t38pt_udptl` and `t38pt_usertpsource` only per peer,
+  so every peer without its own key had T.38 disabled whatever `[general]` said.
+  - `chan_sip` reads both keys in `[general]` and every peer it builds, from the file or from realtime, starts from
+    them. chan_sofia now does the same.
+  - `[general] t38pt_udptl` (with its error-correction mode and `maxdatagram=N`) and `t38pt_usertpsource` set the
+    default of every peer. A peer's own key overrides it.
+  - An empty value, such as a realtime column left empty, keeps the default.
+  - `sip show settings` shows the default (`T.38 support`, `T.38 EC mode`).
+
+### Upgrading
+
+With 1.9.20, a peer without `t38pt_udptl=yes` answers T.38 offers with `488`. To accept T.38 from every peer, set it
+once in `[general]`, as in `sip.conf`:
+
+```ini
+[general]
+t38pt_udptl = yes,redundancy
+```
+
+Peers loaded from realtime pick up a `[general]` change only after a restart, or when they are loaded again; a
+`sip reload` skips them.
+
 ## 1.9.20 — several phones on one BLF, T.38 negotiated like chan_sip, directmedia never loses a move
 
 Only `chan_sofia.so` changes.
