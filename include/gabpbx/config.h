@@ -319,6 +319,15 @@ struct ast_variable *ast_load_realtime_all(const char *family, ...) attribute_se
 void ast_realtime_backend_failed(void);
 
 /*!
+ * \brief Tell the core that this realtime lookup's query did run after all
+ *
+ * \details
+ * For an engine that makes several queries for one lookup (e.g. a cache refresh, then the query itself): a query
+ * that ran clears an earlier ast_realtime_backend_failed() of the same engine call.
+ */
+void ast_realtime_backend_answered(void);
+
+/*!
  * \brief Whether this thread's last realtime lookup returned nothing because the backend failed
  *
  * \details

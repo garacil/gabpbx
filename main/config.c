@@ -2364,6 +2364,15 @@ void ast_realtime_backend_failed(void)
 	}
 }
 
+void ast_realtime_backend_answered(void)
+{
+	struct realtime_lookup_status *st = ast_threadstorage_get(&realtime_lookup_status_buf, sizeof(*st));
+
+	if (st) {
+		st->engine_failed = 0;
+	}
+}
+
 int ast_realtime_last_lookup_failed(void)
 {
 	struct realtime_lookup_status *st = ast_threadstorage_get(&realtime_lookup_status_buf, sizeof(*st));

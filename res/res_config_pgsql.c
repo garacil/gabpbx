@@ -397,10 +397,12 @@ int pgsql_reconnect(int pgsqlCurrent)
         return 1;
 }
 
-/*! \brief Did this failed query fail because of the database (the lookup could not run), rather than because of what
- * was asked? The connection is down, or the SQLSTATE class is connection exception (08), insufficient resources
- * (53), operator intervention such as a shutdown (57), system error (58) or internal error (XX). A data or syntax
- * error (22, 42...) comes from the request and keeps meaning "no answer for this key". */
+/*! \brief Did this failed query fail because of the database (the lookup could not run), rather than because of the
+ * query? The connection is down, or the SQLSTATE says the server could not run it now: invalid transaction state
+ * such as a read-only standby (25), transaction rollback such as a serialization failure or deadlock (40),
+ * insufficient resources (53), lock not available (55P03), operator intervention such as a shutdown (57), system
+ * error (58), internal error (XX). A data error (22) or a syntax/schema error (42) keeps meaning "no answer for this
+ * key", as before. */
 static int pgsql_failure_is_backend(PGconn *conn, PGresult *res)
 {
 	const char *state;
@@ -412,7 +414,8 @@ static int pgsql_failure_is_backend(PGconn *conn, PGresult *res)
 	if (!state || strlen(state) < 2) {
 		return 1;	/* no SQLSTATE: the client library failed (e.g. the connection dropped mid-query) */
 	}
-	return !strncmp(state, "08", 2) || !strncmp(state, "53", 2) || !strncmp(state, "57", 2)
+	return !strncmp(state, "08", 2) || !strncmp(state, "25", 2) || !strncmp(state, "40", 2)
+		|| !strncmp(state, "53", 2) || !strncmp(state, "55P03", 5) || !strncmp(state, "57", 2)
 		|| !strncmp(state, "58", 2) || !strncmp(state, "XX", 2);
 }
 
@@ -474,6 +477,7 @@ PGresult *execsql(char *sql, char *func, char *keyfield, int pgsqlCurrent)
                 }
         }
         free(sql2);
+        ast_realtime_backend_answered();	/* the query ran: an earlier failure of this lookup (a cache refresh) is over */
         return res;
 }
 

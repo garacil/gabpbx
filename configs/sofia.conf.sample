@@ -3445,5 +3445,10 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ; blacklist count, the guest path): a 403 tells the phone not to try again (RFC 3261 section 21.4.4), a 503 tells
 ; it to come back after Retry-After (section 21.5.4; RFC 5626 section 4.2.1). Each 503 picks a value between N/2
 ; and N, so the phones of an outage do not all come back at once. 0 sends no Retry-After (the client then acts
-; as for a 500).
+; as for a 500). While the backend is failing: a request that cannot be matched to a peer in memory gets the 503,
+; so with allowguest=yes a guest call is refused too; an INVITE matched only by its source address to a peer that
+; is not a trunk (insecure=port/invite) and not the exact address and port gets it when its credentials are not
+; that peer's; after a failure chan_sofia's peer lookups do not query the backend again for 2 s (or as long as
+; the failed lookup took, up to 60 s); accounts already in memory keep their normal answers (401 challenge...), so
+; during the outage a 401 and a 503 tell an account in memory from any other name.
 ;realtime_retry_after = 20

@@ -385,6 +385,7 @@ static enum sofia_auth_result sofia_verify_digest_auth(struct sofia_peer *peer,
 		const char *method,
 		const char *realm);
 static const char *sofia_get_realm_for_dialog(sip_t const *sip, char *buf, size_t buflen);
+static const char *sofia_au_get_unq(sip_authorization_t const *au, const char *name, char *buf, size_t len);
 
 static void sofia_emit_timing_equalized_reject(void);
 static void sofia_stop_media_flows(struct sofia_pvt *pvt);
@@ -5042,32 +5043,46 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 	}
 }
 
-/* Build a realtime peer from the DB WITHOUT linking it into the peers container.
- * Runs entirely OUTSIDE ao2_lock(peers): the file's locking invariant (~:104-105)
- * forbids holding a lock across the blocking realtime DB query (ast_load_realtime).
- * The peers container lock is the single global gate for EVERY inbound INVITE/
- * REGISTER/SUBSCRIBE/OPTIONS + devicestate query, so holding it across the DB query
- * lets a slow/hung realtime DB stall ALL peer lookups (remotely amplifiable by
- * flooding lookups for non-cached usernames).
- *
- * PARSE-ONLY (FIX2 rework): this builder performs the realtime DB/sipregs PARSE and
- * nothing else. It takes NO extra refs and registers NO global side effects — no
- * dnsmgr setup (which would take an EXTRA peer ref that pins the refcount and stops
- * the destructor from running, see the reload rule ~:15468-15475), no
- * dynamic_exclude_static append to the global contact_ha, no allowsubscribe flip,
- * no dialplan hint. Those side effects MUST run only AFTER the peer wins ao2_link,
- * in the same link-first order the config path uses (~:14590-14625) — done by the
- * caller sofia_find_peer below. That way a double-build-dedup LOSER or an ao2_link
- * OOM has NOTHING to unwind: a plain ao2_ref(built,-1) takes the refcount to 0 and
- * the destructor fully frees this parse-only build. */
-/* prevar != NULL: build from a CALLER-OWNED variable list already loaded by another lookup (the
- * realtime-by-addr path passes its winning by-IP row) — skip the by-name DB query and do NOT free
- * prevar (the caller frees it exactly once). prevar == NULL: load by name + free here, as before.
- * sofia_apply_peer_variables is copy-only, so the source list is safe to free after the build. */
 /* Whether this thread's last peer lookup (sofia_find_peer, sofia_find_peer_realtime_by_addr) found no peer because
  * the realtime backend could not be read (ast_realtime_last_lookup_failed), rather than because the name or address
  * is unknown. Each lookup sets it; the SIP requests are handled on sofia_thread, which reads it right after. */
 AST_THREADSTORAGE(sofia_lookup_status_buf);
+
+/* After a lookup the realtime backend could not answer, chan_sofia's lookups of peers not in memory skip the backend
+ * for a moment and report the same failure (sofia_peer_lookup_failed), instead of each request of an outage queueing
+ * its own failing queries (and reconnects) on sofia_thread: the hold-off is SOFIA_RT_HOLDOFF_MS, or the time the
+ * failed lookup took when longer (a backend that fails slowly is probed at most half the time). A clock step never
+ * stretches it: a deadline further away than the hold-off itself counts as expired. */
+#define SOFIA_RT_HOLDOFF_MS 2000
+#define SOFIA_RT_HOLDOFF_MAX_MS 60000
+AST_MUTEX_DEFINE_STATIC(sofia_rt_down_lock);
+static struct timeval sofia_rt_down_until;
+static int64_t sofia_rt_down_len;	/* the hold-off armed with sofia_rt_down_until, ms */
+
+static void sofia_rt_note_failure(struct timeval started)
+{
+	struct timeval now = ast_tvnow();
+	int64_t took = ast_tvdiff_ms(now, started);
+	int64_t hold = took > SOFIA_RT_HOLDOFF_MS ? took : SOFIA_RT_HOLDOFF_MS;
+
+	if (hold > SOFIA_RT_HOLDOFF_MAX_MS) {
+		hold = SOFIA_RT_HOLDOFF_MAX_MS;
+	}
+	ast_mutex_lock(&sofia_rt_down_lock);
+	sofia_rt_down_until = ast_tvadd(now, ast_samp2tv(hold, 1000));
+	sofia_rt_down_len = hold;
+	ast_mutex_unlock(&sofia_rt_down_lock);
+}
+
+static int sofia_rt_held_off(void)
+{
+	int64_t left;
+
+	ast_mutex_lock(&sofia_rt_down_lock);
+	left = ast_tvzero(sofia_rt_down_until) ? 0 : ast_tvdiff_ms(sofia_rt_down_until, ast_tvnow());
+	ast_mutex_unlock(&sofia_rt_down_lock);
+	return left > 0 && left <= sofia_rt_down_len;
+}
 
 static void sofia_peer_lookup_set_failed(int failed)
 {
@@ -5104,9 +5119,14 @@ void sofia_reject_backend_unavailable(nua_t *nua, nua_handle_t *nh, const char *
 	}
 	nua_respond(nh, SIP_503_SERVICE_UNAVAILABLE, TAG_IF(ra[0], SIPTAG_RETRY_AFTER_STR(ra)),
 		NUTAG_WITH_THIS(nua), TAG_END());
-	if (now - last_warn >= 10) {
+	if (now - last_warn >= 10 || now < last_warn) {
+		char more[64] = "";
+
+		if (suppressed) {
+			snprintf(more, sizeof(more), " (%u more such answers in the last %d s)", suppressed, (int) (now - last_warn));
+		}
 		ast_log(LOG_WARNING, "Sofia: %s from '%s' answered 503 (Retry-After %s): the realtime backend could not be read%s\n",
-			method, S_OR(who, "?"), ra[0] ? ra : "none", suppressed ? " (more in the last seconds)" : "");
+			method, S_OR(who, "?"), ra[0] ? ra : "none", more);
 		last_warn = now;
 		suppressed = 0;
 	} else {
@@ -5114,14 +5134,48 @@ void sofia_reject_backend_unavailable(nua_t *nua, nua_handle_t *nh, const char *
 	}
 }
 
+/* Build a realtime peer from the DB WITHOUT linking it into the peers container.
+ * Runs entirely OUTSIDE ao2_lock(peers): the file's locking invariant (~:104-105)
+ * forbids holding a lock across the blocking realtime DB query (ast_load_realtime).
+ * The peers container lock is the single global gate for EVERY inbound INVITE/
+ * REGISTER/SUBSCRIBE/OPTIONS + devicestate query, so holding it across the DB query
+ * lets a slow/hung realtime DB stall ALL peer lookups (remotely amplifiable by
+ * flooding lookups for non-cached usernames).
+ *
+ * PARSE-ONLY (FIX2 rework): this builder performs the realtime DB/sipregs PARSE and
+ * nothing else. It takes NO extra refs and registers NO global side effects — no
+ * dnsmgr setup (which would take an EXTRA peer ref that pins the refcount and stops
+ * the destructor from running, see the reload rule ~:15468-15475), no
+ * dynamic_exclude_static append to the global contact_ha, no allowsubscribe flip,
+ * no dialplan hint. Those side effects MUST run only AFTER the peer wins ao2_link,
+ * in the same link-first order the config path uses (~:14590-14625) — done by the
+ * caller sofia_find_peer below. That way a double-build-dedup LOSER or an ao2_link
+ * OOM has NOTHING to unwind: a plain ao2_ref(built,-1) takes the refcount to 0 and
+ * the destructor fully frees this parse-only build. It does record the lookup's outcome for this thread
+ * (sofia_peer_lookup_failed) and, on a backend failure, the hold-off (sofia_rt_note_failure). */
+/* prevar != NULL: build from a CALLER-OWNED variable list already loaded by another lookup (the
+ * realtime-by-addr path passes its winning by-IP row) — skip the by-name DB query and do NOT free
+ * prevar (the caller frees it exactly once). prevar == NULL: load by name + free here, as before.
+ * sofia_apply_peer_variables is copy-only, so the source list is safe to free after the build. */
 static struct sofia_peer *sofia_find_peer_realtime_build(const char *name, struct ast_variable *prevar)
 {
 	struct ast_variable *var;
 	struct sofia_peer *peer;
 
+	struct timeval started = ast_tvnow();
+
+	if (!prevar && sofia_rt_held_off()) {
+		sofia_peer_lookup_set_failed(1);	/* the backend failed a moment ago: do not query it again yet */
+		return NULL;
+	}
 	var = prevar ? prevar : ast_load_realtime("sippeers", "name", name, SENTINEL);
 	if (!var) {
-		sofia_peer_lookup_set_failed(ast_realtime_last_lookup_failed());	/* no row, or the backend failed */
+		int failed = !prevar && ast_realtime_last_lookup_failed();
+
+		sofia_peer_lookup_set_failed(failed);	/* no row, or the backend failed */
+		if (failed) {
+			sofia_rt_note_failure(started);
+		}
 		return NULL;
 	}
 
@@ -5550,12 +5604,15 @@ struct sofia_peer *sofia_find_peer_cached(const char *name)
  * ephemeral connection port) outranks a merely drifted UDP source port. So a same-IP peer whose port
  * matches is never shadowed by an earlier wildcard one (multi-peer-behind-one-NAT), and a lone drifted
  * UDP peer still resolves via the low-rank fallback (backward-compatible). */
-static struct sofia_peer *sofia_find_peer_by_ip(const struct ast_sockaddr *src)
+/* The by-IP match, also telling how the address matched (*score_out: 3 exact IP+port, 2 wildcard, 1 IP only,
+ * 0 none). */
+static struct sofia_peer *sofia_find_peer_by_ip(const struct ast_sockaddr *src, int *score_out)
 {
 	struct ao2_iterator i;
 	struct sofia_peer *peer, *found = NULL, *best = NULL;
 	int best_score = 0;	/* 3=exact IP+port, 2=wildcard (insecure=port/conn-oriented/unknown), 1=IP-only port drift */
 
+	*score_out = 0;
 	if (!src || ast_sockaddr_isnull(src)) {
 		return NULL;
 	}
@@ -5564,6 +5621,7 @@ static struct sofia_peer *sofia_find_peer_by_ip(const struct ast_sockaddr *src)
 	 * wildcard insecure=port, connection-oriented, port drift, or an unindexed/stale entry — falls
 	 * through to the ranked O(N) scan below (unchanged correctness). */
 	if ((found = sofia_peer_ipport_lookup(src))) {
+		*score_out = 3;
 		return found;
 	}
 
@@ -5664,8 +5722,10 @@ static struct sofia_peer *sofia_find_peer_by_ip(const struct ast_sockaddr *src)
 		if (best) {
 			ao2_ref(best, -1);	/* an exact IP+port match won - release the held fallback */
 		}
+		*score_out = 3;
 		return found;
 	}
+	*score_out = best ? best_score : 0;
 	return best;	/* no exact IP+port - the highest-ranked IP fallback (or NULL) */
 }
 
@@ -5732,6 +5792,7 @@ static struct sofia_peer *sofia_find_peer_realtime_by_addr(const struct ast_sock
 	const char *name = NULL;
 	const char *step = NULL;	/* which by-IP step matched, for the debug trace */
 	char ipbuf[48], portbuf[8], namebuf[80];
+	int rt_failed = 0;	/* a step the realtime backend could not answer */
 
 	sofia_peer_lookup_set_failed(0);
 	if (!src || ast_sockaddr_isnull(src) || !ast_check_realtime("sippeers")) {
@@ -5741,6 +5802,10 @@ static struct sofia_peer *sofia_find_peer_realtime_by_addr(const struct ast_sock
 	ast_copy_string(portbuf, ast_sockaddr_stringify_port(src), sizeof(portbuf));
 
 	if (sofia_rtlookup_neg_check(ipbuf)) {
+		return NULL;
+	}
+	if (sofia_rt_held_off()) {
+		sofia_peer_lookup_set_failed(1);	/* the backend failed a moment ago: do not query it again yet */
 		return NULL;
 	}
 
@@ -5753,23 +5818,46 @@ static struct sofia_peer *sofia_find_peer_realtime_by_addr(const struct ast_sock
 	 * (res_config_pgsql.c:872), so "insecure LIKE","%port%" yields  insecure LIKE '%port%'  in the
 	 * WHERE — one ast_load_realtime, no multientry. No wide insecure sipregs scan
 	 * (chan_sip.c:5355-5405): that is the DoS-amplifiable path we deliberately omit. */
-	var = ast_load_realtime("sippeers", "host", ipbuf, "port", portbuf, SENTINEL);
-	if (var) {
-		step = "host+port";
-	} else if ((var = ast_load_realtime("sippeers", "ipaddr", ipbuf, "port", portbuf, SENTINEL))) {
-		step = "ipaddr+port";
-	} else if ((var = ast_load_realtime("sippeers", "host", ipbuf, "insecure LIKE", "%port%", SENTINEL))) {
-		step = "host+insecure~port";
-	} else if ((var = ast_load_realtime("sippeers", "ipaddr", ipbuf, "insecure LIKE", "%port%", SENTINEL))) {
-		step = "ipaddr+insecure~port";
-	}
-	if (!var) {
-		if (ast_realtime_last_lookup_failed()) {
+	/* The steps run in order of strength and stop at the first one the backend could not answer: a weaker step must
+	 * not stand in for it (another trunk on the same address would take the call), nor be taken for an unknown
+	 * address. */
+	{
+		static const char *const step_names[4] = { "host+port", "ipaddr+port", "host+insecure~port",
+			"ipaddr+insecure~port" };
+		struct timeval started = ast_tvnow();
+		int k;
+
+		for (k = 0; k < 4 && !var; k++) {
+			switch (k) {
+			case 0:
+				var = ast_load_realtime("sippeers", "host", ipbuf, "port", portbuf, SENTINEL);
+				break;
+			case 1:
+				var = ast_load_realtime("sippeers", "ipaddr", ipbuf, "port", portbuf, SENTINEL);
+				break;
+			case 2:
+				var = ast_load_realtime("sippeers", "host", ipbuf, "insecure LIKE", "%port%", SENTINEL);
+				break;
+			default:
+				var = ast_load_realtime("sippeers", "ipaddr", ipbuf, "insecure LIKE", "%port%", SENTINEL);
+				break;
+			}
+			if (var) {
+				step = step_names[k];
+			} else if (ast_realtime_last_lookup_failed()) {
+				rt_failed = 1;
+				break;
+			}
+		}
+		if (rt_failed) {
 			/* The backend failed: not "no such trunk", so no negative-cache entry (it would turn the outage
 			 * into 10 s of unknown-caller answers for this address after the database is back). */
+			sofia_rt_note_failure(started);
 			sofia_peer_lookup_set_failed(1);
 			return NULL;
 		}
+	}
+	if (!var) {
 		sofia_rtlookup_neg_add(ipbuf);
 		return NULL;
 	}
@@ -10175,6 +10263,7 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	/* Peer lookup + ACL run BEFORE sofia_parse_sdp so the encryption-policy check
 	 * sees pvt->peer and banned IPs never trigger SRTP key generation. */
 	int caller_rt_failed = 0;	/* a lookup found no caller because the realtime backend failed */
+	int caller_standin = 0;	/* the address match stands in for the From account that could not be read */
 	{
 		struct sofia_peer *caller_peer = NULL;
 		if (cid_num[0]) {
@@ -10201,7 +10290,18 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			 * are identified; else alwaysauthreject would 401 a trunk that can't answer. */
 			struct ast_sockaddr src;
 			sofia_get_source_addr(sip, &src);
-			caller_peer = sofia_find_peer_by_ip(&src);
+			int ip_score = 0;
+
+			caller_peer = sofia_find_peer_by_ip(&src, &ip_score);
+			if (caller_peer && caller_rt_failed && ip_score < 3) {
+				/* The account named in From could not be read (backend failure) and this peer only shares the
+				 * address (not a trunk, not the exact source port): it may be another account behind the same
+				 * address. It still takes the call when the caller proves to be it (its own credentials, or
+				 * none needed); other credentials get the 503 below, not its 403 and a blacklist count. */
+				ast_mutex_lock(&caller_peer->lock);
+				caller_standin = !(caller_peer->insecure & (SOFIA_INSECURE_PORT | SOFIA_INSECURE_INVITE));
+				ast_mutex_unlock(&caller_peer->lock);
+			}
 			if (!caller_peer) {
 				/* Not cached in memory: resolve a not-yet-loaded realtime IP-trunk by its
 				 * source IP+port (chan_sip realtime_peer_by_addr parity) so insecure=invite
@@ -10316,8 +10416,25 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			sip_authorization_t const *au = sip->sip_authorization
 				? sip->sip_authorization
 				: (sip_authorization_t const *)sip->sip_proxy_authorization;
-			enum sofia_auth_result auth_res = sofia_verify_digest_auth(
-				pvt->peer, nua, nh, sip, au, "INVITE", realm);
+			enum sofia_auth_result auth_res;
+
+			if (caller_standin && au) {
+				char au_user[128];
+				const char *user = sofia_au_get_unq(au, "username", au_user, sizeof(au_user));
+				int other;
+
+				ast_mutex_lock(&pvt->peer->lock);
+				other = user && strcmp(user, !ast_strlen_zero(pvt->peer->defaultuser)
+					? pvt->peer->defaultuser : pvt->peer->name);
+				ast_mutex_unlock(&pvt->peer->lock);
+				if (other) {
+					/* Not the address match's credentials: the caller is the account that could not be read. */
+					sofia_reject_backend_unavailable(nua, nh, "INVITE", cid_num);
+					ao2_ref(pvt, -1);
+					return;
+				}
+			}
+			auth_res = sofia_verify_digest_auth(pvt->peer, nua, nh, sip, au, "INVITE", realm);
 			if (auth_res != SOFIA_AUTH_OK) {
 				ao2_ref(pvt, -1);
 				return;
