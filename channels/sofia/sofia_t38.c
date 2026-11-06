@@ -172,15 +172,16 @@ void sofia_change_t38_state(struct sofia_pvt *pvt, int new_state)
  * (app_fax/res_fax requests). max_ifp==0 is a rejection gate → DISABLED; version
  * is MIN-clamped.
  *
- * RETURN: <0 = error; 0 = handled, nothing further; >0 (1) = the caller must SEND
- * an outbound (LOCAL_REINVITE) T.38 re-INVITE — sofia_indicate marshals
- * sofia_directmedia_reinvite_root onto sofia_thread, which builds the m=image
- * offer (sofia_generate_sdp gates on pvt->udptl) and fires nua_invite. For the
- * inbound (PEER_REINVITE) path the SDP answer is on the existing response path
- * (unchanged). Runs under channel->pvt locks (core tech->indicate already holds
- * the channel lock; the caller takes pvt->lock), so the lazy udptl create, T.38
- * pvt fields, and the pvt->owner->fds[5] attach are serialized with sofia-thread
- * SDP generation while staying safe for channel-thread read/write. */
+ * RETURN: <0 = error; 0 = handled, nothing further; SOFIA_T38_SEND_REINVITE = the caller must
+ * SEND a T.38 re-INVITE — the m=image offer (LOCAL_REINVITE) or, at the end of a fax, the audio
+ * offer (t38_ending) — which sofia_indicate marshals onto sofia_thread (sofia_reinvite_root builds
+ * the offer with sofia_generate_sdp); SOFIA_T38_PARMS_SENT = the far end's parameters were queued
+ * again (the caller returns AST_T38_REQUEST_PARMS). The peer's own offer (PEER_REINVITE) is held
+ * by sofia_process_reinvite and answered from here: 200 (sofia_t38_answer_root) on
+ * AST_T38_NEGOTIATED, 488 (sofia_t38_respond_488_root) on a refusal. Runs under channel->pvt
+ * locks (core tech->indicate already holds the channel lock; the caller takes pvt->lock), so the
+ * lazy udptl create, T.38 pvt fields, and the pvt->owner->fds[5] attach are serialized with
+ * sofia-thread SDP generation while staying safe for channel-thread read/write. */
 int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_control_t38_parameters *parameters)
 {
 	int res = 0;

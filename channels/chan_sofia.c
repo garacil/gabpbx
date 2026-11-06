@@ -8218,8 +8218,8 @@ static int sofia_indicate(struct ast_channel *ast, int condition, const void *da
 			return -1;
 		}
 		{
-			/* >0 = the dispatcher recorded LOCAL_REINVITE and we must SEND the outbound
-			 * T.38 (m=image) re-INVITE. Reuse the directmedia re-INVITE marshaling: it
+			/* SOFIA_T38_SEND_REINVITE = we must SEND a T.38 re-INVITE: the m=image offer (LOCAL_REINVITE) or,
+			 * at the end of a fax, the audio offer (t38_ending). Reuse the directmedia re-INVITE marshaling: it
 			 * runs sofia_send_reinvite on sofia_thread under pvt->lock (the re-INVITE
 			 * must NOT run on the bridge/channel thread), and sofia_generate_sdp now
 			 * emits m=image because pvt->udptl is set. The LOCAL_REINVITE → ENABLED
@@ -9202,9 +9202,9 @@ static void sofia_process_reinvite(struct sofia_pvt *pvt, nua_t *nua,
 	/* A T.38 offer (this parse moved DISABLED -> PEER_REINVITE and asked the core with AST_T38_REQUEST_NEGOTIATE)
 	 * is answered when someone takes the fax, as chan_sip does (handle_request_invite: T38_PEER_REINVITE sends
 	 * no final response, interpret_t38_parameters answers 200 on AST_T38_NEGOTIATED or 488 on a refusal, the
-	 * 5 s timer 488): the request is kept and nothing is sent now but the stack's 100. Answering 200 at once
-	 * accepted an image stream no one would run (a call bridged to a leg without fax went silent). Set under
-	 * pvt->lock, before the core can see the REQUEST_NEGOTIATE. */
+	 * 5 s timer 488): the request is kept and nothing is sent now but the stack's 100, so the image stream is
+	 * accepted only when someone runs the fax. Set under pvt->lock, before the core can see the
+	 * REQUEST_NEGOTIATE. */
 	if (t38_was_disabled && pvt->t38_state == SOFIA_T38_PEER_REINVITE && !pvt->t38_saved[0]
 			&& nua_save_event(nua, pvt->t38_saved)) {
 		pvt->t38_answer_pending = 1;
@@ -9364,6 +9364,11 @@ void sofia_t38_answer_root(void *data)
 		if (pvt->peer) {
 			ast_mutex_unlock(&pvt->peer->lock);
 		}
+		/* SDP and Contact are built: the channel lock is not needed for the nua calls (as in
+		 * sofia_process_reinvite). The ref is kept until the end. */
+		if (owner) {
+			ast_channel_unlock(owner);
+		}
 		if (sdp_ok) {
 			min_se_cap = sofia_session_timer_uas_min_se(pvt, 0,
 				rsip->sip_session_expires ? (int) rsip->sip_session_expires->x_delta : 0);
@@ -9380,10 +9385,14 @@ void sofia_t38_answer_root(void *data)
 		} else {
 			nua_respond(pvt->nh, SIP_500_INTERNAL_SERVER_ERROR, NUTAG_WITH(req), TAG_END());
 		}
+		ast_mutex_unlock(&pvt->lock);
+	} else {
+		ast_mutex_unlock(&pvt->lock);
+		if (owner) {
+			ast_channel_unlock(owner);
+		}
 	}
-	ast_mutex_unlock(&pvt->lock);
 	if (owner) {
-		ast_channel_unlock(owner);
 		ast_channel_unref(owner);
 	}
 	if (saved[0]) {
@@ -9443,8 +9452,10 @@ static void sofia_process_update(struct sofia_pvt *pvt, nua_t *nua,
 	}
 	/* (1b) Early-dialog SDP UPDATE: v1 has no early-media O/A tracking, so reject an offer before the
 	 * dialog is confirmed — RFC 3311 §5.2 received-offer overlap = 500 + Retry-After (1s, in 0–10s).
-	 * A no-SDP early UPDATE is a pure target-refresh and continues to a 200 below. */
-	if (has_offer && pvt->state != SOFIA_DIALOG_STATE_UP) {
+	 * The same while the peer's own T.38 offer is held for the fax application (t38_answer_pending): an
+	 * offer we received is still unanswered. A no-SDP early UPDATE is a pure target-refresh and continues
+	 * to a 200 below. */
+	if (has_offer && (pvt->state != SOFIA_DIALOG_STATE_UP || pvt->t38_answer_pending)) {
 		ast_mutex_unlock(&pvt->lock);
 		nua_respond(nh, 500, "Overlapping Offer/Answer",
 			NUTAG_WITH_THIS(nua),
@@ -10353,17 +10364,56 @@ static void sofia_process_cancel(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		/* Q.850 Reason (RFC 3326): use a received cause as the hangup cause, else NORMAL_CLEARING. */
 		int q850 = (sofia_cfg.use_q850_reason && sip) ? sofia_reason_parse_cause(sip->sip_reason) : 0;
 		/* TOCTOU/UAF fix: snapshot+ref op->owner under op->lock, queue outside it
-		 * (see sofia_process_bye). */
-		struct ast_channel *owner;
+		 * (see sofia_process_bye). Taken in channel -> pvt order, for the T.38 state below. */
+		struct ast_channel *owner = NULL;
+		nua_saved_event_t saved[1] = { NULL };
+		int up;
+
 		ast_mutex_lock(&op->lock);
-		owner = op->owner;
-		if (owner) {
+		for (;;) {
+			owner = op->owner;
+			if (!owner) {
+				break;
+			}
 			ast_channel_ref(owner);
+			ast_mutex_unlock(&op->lock);
+			ast_channel_lock(owner);
+			ast_mutex_lock(&op->lock);
+			if (op->owner == owner) {
+				break;
+			}
+			ast_channel_unlock(owner);
+			ast_channel_unref(owner);
+			owner = NULL;
+		}
+		/* A CANCEL on an established call cancels a re-INVITE (the stack has answered it 487), not the call:
+		 * the call goes on, as chan_sip ignores a CANCEL on an answered call (handle_request_cancel). When that
+		 * re-INVITE was the T.38 offer held for the fax application (t38_answer_pending), the offer is gone. */
+		up = (op->state == SOFIA_DIALOG_STATE_UP);
+		if (up && op->t38_answer_pending) {
+			op->t38_answer_pending = 0;
+			saved[0] = op->t38_saved[0];
+			op->t38_saved[0] = NULL;
+			if (op->t38id != -1 && sofia_sched) {
+				if (ast_sched_thread_del(sofia_sched, op->t38id) == 0) {
+					ao2_ref(op, -1);
+				}
+				op->t38id = -1;
+			}
+			if (owner && op->t38_state == SOFIA_T38_PEER_REINVITE) {
+				sofia_change_t38_state(op, SOFIA_T38_DISABLED);
+			}
 		}
 		ast_mutex_unlock(&op->lock);
 		if (owner) {
-			ast_queue_hangup_with_cause(owner, q850 ? q850 : AST_CAUSE_NORMAL_CLEARING);
+			ast_channel_unlock(owner);
+			if (!up) {
+				ast_queue_hangup_with_cause(owner, q850 ? q850 : AST_CAUSE_NORMAL_CLEARING);
+			}
 			ast_channel_unref(owner);
+		}
+		if (saved[0]) {
+			nua_destroy_event(saved);
 		}
 	}
 }
