@@ -58,6 +58,41 @@ GABPBX_FILE_VERSION(__FILE__, "$Revision: 369001 $")
 #undef pthread_cond_wait
 #undef pthread_cond_timedwait
 
+#ifdef DEBUG_THREADS
+/*!
+ * \brief The tracking record of a lock, created on its first use, race-free.
+ *
+ * A lock defined statically has no tracking record until it is first locked; the record used to be created
+ * by whichever thread got there first, and a second thread arriving before the first had finished called
+ * ast_reentrancy_init() on the SAME record: it reset the reentrancy count and re-initialised reentr_mutex while
+ * the first thread was inside them. The logger's message-list lock is first used at start-up by the main
+ * thread, the logger thread and the console threads at the same moment; the corrupted reentr_mutex then
+ * blocked every ast_log() for good, with the start-up signal mask still in place, and the process could only be
+ * killed. The record is now built in private and published complete, under one lock; a thread that already
+ * sees it takes the fast path.
+ */
+static pthread_mutex_t reentrancy_init_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static struct ast_lock_track *ast_reentrancy_get(struct ast_lock_track **plt)
+{
+	struct ast_lock_track *lt = *plt;
+
+	if (lt) {
+		return lt;
+	}
+	pthread_mutex_lock(&reentrancy_init_lock);
+	if (!(lt = *plt)) {
+		struct ast_lock_track *fresh = NULL;
+
+		ast_reentrancy_init(&fresh);
+		__sync_synchronize();	/* every field is written before the record becomes visible */
+		*plt = lt = fresh;
+	}
+	pthread_mutex_unlock(&reentrancy_init_lock);
+	return lt;
+}
+#endif /* DEBUG_THREADS */
+
 int __ast_pthread_mutex_init(int tracking, const char *filename, int lineno, const char *func,
 						const char *mutex_name, ast_mutex_t *t)
 {
@@ -115,10 +150,7 @@ int __ast_pthread_mutex_destroy(const char *filename, int lineno, const char *fu
 	}
 #endif
 
-	if (t->tracking && !t->track) {
-		ast_reentrancy_init(&t->track);
-	}
-	lt = t->track;
+	lt = t->tracking ? ast_reentrancy_get(&t->track) : t->track;
 
 	res = pthread_mutex_trylock(&t->mutex);
 	switch (res) {
@@ -197,10 +229,7 @@ int __ast_pthread_mutex_lock(const char *filename, int lineno, const char *func,
 	}
 #endif /* AST_MUTEX_INIT_W_CONSTRUCTORS */
 
-	if (t->tracking && !t->track) {
-		ast_reentrancy_init(&t->track);
-	}
-	lt = t->track;
+	lt = t->tracking ? ast_reentrancy_get(&t->track) : t->track;
 
 	if (t->tracking) {
 #ifdef HAVE_BKTR
@@ -329,10 +358,7 @@ int __ast_pthread_mutex_trylock(const char *filename, int lineno, const char *fu
 	}
 #endif /* AST_MUTEX_INIT_W_CONSTRUCTORS */
 
-	if (t->tracking && !t->track) {
-		ast_reentrancy_init(&t->track);
-	}
-	lt = t->track;
+	lt = t->tracking ? ast_reentrancy_get(&t->track) : t->track;
 
 	if (t->tracking) {
 #ifdef HAVE_BKTR
@@ -401,10 +427,7 @@ int __ast_pthread_mutex_unlock(const char *filename, int lineno, const char *fun
 	}
 #endif /* AST_MUTEX_INIT_W_CONSTRUCTORS */
 
-	if (t->tracking && !t->track) {
-		ast_reentrancy_init(&t->track);
-	}
-	lt = t->track;
+	lt = t->tracking ? ast_reentrancy_get(&t->track) : t->track;
 
 	if (t->tracking) {
 		ast_reentrancy_lock(lt);
@@ -511,10 +534,7 @@ int __ast_cond_wait(const char *filename, int lineno, const char *func,
 	}
 #endif /* AST_MUTEX_INIT_W_CONSTRUCTORS */
 
-	if (t->tracking && !t->track) {
-		ast_reentrancy_init(&t->track);
-	}
-	lt = t->track;
+	lt = t->tracking ? ast_reentrancy_get(&t->track) : t->track;
 
 	if (t->tracking) {
 		ast_reentrancy_lock(lt);
@@ -619,10 +639,7 @@ int __ast_cond_timedwait(const char *filename, int lineno, const char *func,
 	}
 #endif /* AST_MUTEX_INIT_W_CONSTRUCTORS */
 
-	if (t->tracking && !t->track) {
-		ast_reentrancy_init(&t->track);
-	}
-	lt = t->track;
+	lt = t->tracking ? ast_reentrancy_get(&t->track) : t->track;
 
 	if (t->tracking) {
 		ast_reentrancy_lock(lt);
@@ -718,6 +735,7 @@ int __ast_rwlock_init(int tracking, const char *filename, int lineno, const char
 #endif /* AST_MUTEX_INIT_W_CONSTRUCTORS */
 
 	if ((t->tracking = tracking)) {
+		t->track = NULL;	/* never re-initialise a record another thread may hold (as the mutex init does) */
 		ast_reentrancy_init(&t->track);
 	}
 #endif /* DEBUG_THREADS */
@@ -738,7 +756,7 @@ int __ast_rwlock_destroy(const char *filename, int lineno, const char *func, con
 	int res;
 
 #ifdef DEBUG_THREADS
-	struct ast_lock_track *lt = t->track;
+	struct ast_lock_track *lt = t->tracking ? ast_reentrancy_get(&t->track) : t->track;	/* a tracked lock destroyed before its first use has no record yet */
 	int canlog = strcmp(filename, "logger.c") & t->tracking;
 
 #if defined(AST_MUTEX_INIT_W_CONSTRUCTORS) && defined(CAN_COMPARE_MUTEX_TO_INIT_VALUE)
@@ -802,10 +820,7 @@ int __ast_rwlock_unlock(const char *filename, int line, const char *func, ast_rw
 	}
 #endif /* AST_MUTEX_INIT_W_CONSTRUCTORS */
 
-	if (t->tracking && !t->track) {
-		ast_reentrancy_init(&t->track);
-	}
-	lt = t->track;
+	lt = t->tracking ? ast_reentrancy_get(&t->track) : t->track;
 
 	if (t->tracking) {
 		ast_reentrancy_lock(lt);
@@ -888,10 +903,7 @@ int __ast_rwlock_rdlock(const char *filename, int line, const char *func, ast_rw
 	}
 #endif /* AST_MUTEX_INIT_W_CONSTRUCTORS */
 
-	if (t->tracking && !t->track) {
-		ast_reentrancy_init(&t->track);
-	}
-	lt = t->track;
+	lt = t->tracking ? ast_reentrancy_get(&t->track) : t->track;
 
 	if (t->tracking) {
 #ifdef HAVE_BKTR
@@ -1007,10 +1019,7 @@ int __ast_rwlock_wrlock(const char *filename, int line, const char *func, ast_rw
 	}
 #endif /* AST_MUTEX_INIT_W_CONSTRUCTORS */
 
-	if (t->tracking && !t->track) {
-		ast_reentrancy_init(&t->track);
-	}
-	lt = t->track;
+	lt = t->tracking ? ast_reentrancy_get(&t->track) : t->track;
 
 	if (t->tracking) {
 #ifdef HAVE_BKTR
@@ -1130,10 +1139,7 @@ int __ast_rwlock_timedrdlock(const char *filename, int line, const char *func, a
 	}
 #endif /* AST_MUTEX_INIT_W_CONSTRUCTORS */
 
-	if (t->tracking && !t->track) {
-		ast_reentrancy_init(&t->track);
-	}
-	lt = t->track;
+	lt = t->tracking ? ast_reentrancy_get(&t->track) : t->track;
 
 	if (t->tracking) {
 #ifdef HAVE_BKTR
@@ -1233,10 +1239,7 @@ int __ast_rwlock_timedwrlock(const char *filename, int line, const char *func, a
 	}
 #endif /* AST_MUTEX_INIT_W_CONSTRUCTORS */
 
-	if (t->tracking && !t->track) {
-		ast_reentrancy_init(&t->track);
-	}
-	lt = t->track;
+	lt = t->tracking ? ast_reentrancy_get(&t->track) : t->track;
 
 	if (t->tracking) {
 #ifdef HAVE_BKTR
@@ -1339,10 +1342,7 @@ int __ast_rwlock_tryrdlock(const char *filename, int line, const char *func, ast
 	}
 #endif /* AST_MUTEX_INIT_W_CONSTRUCTORS */
 
-	if (t->tracking && !t->track) {
-		ast_reentrancy_init(&t->track);
-	}
-	lt = t->track;
+	lt = t->tracking ? ast_reentrancy_get(&t->track) : t->track;
 
 	if (t->tracking) {
 #ifdef HAVE_BKTR
@@ -1409,10 +1409,7 @@ int __ast_rwlock_trywrlock(const char *filename, int line, const char *func, ast
 	}
 #endif /* AST_MUTEX_INIT_W_CONSTRUCTORS */
 
-	if (t->tracking && !t->track) {
-		ast_reentrancy_init(&t->track);
-	}
-	lt = t->track;
+	lt = t->tracking ? ast_reentrancy_get(&t->track) : t->track;
 
 	if (t->tracking) {
 #ifdef HAVE_BKTR

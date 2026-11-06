@@ -317,9 +317,11 @@ static char randompool[256];
 
 static int sig_alert_pipe[2] = { -1, -1 };
 static struct {
-	 unsigned int need_reload:1;
-	 unsigned int need_quit:1;
-	 unsigned int need_quit_handler:1;
+	/* One word each, not bit-fields of one word: a handler on any thread sets one of them while this
+	 * thread may be clearing another, and a read-modify-write of shared bits would lose the set. */
+	volatile sig_atomic_t need_reload;
+	volatile sig_atomic_t need_quit;
+	volatile sig_atomic_t need_quit_handler;
 } sig_flags;
 
 #if !defined(LOW_MEMORY)
@@ -1836,12 +1838,17 @@ static void really_quit(int num, shutdown_nice_t niceness, int restart)
 static void __quit_handler(int num)
 {
 	int a = 0;
+	int save_errno = errno;	/* a handler leaves errno as it found it */
 	sig_flags.need_quit = 1;
 	if (sig_alert_pipe[1] != -1) {
 		if (write(sig_alert_pipe[1], &a, sizeof(a)) < 0) {
-			fprintf(stderr, "quit_handler: write() failed: %s\n", strerror(errno));
+			/* only async-signal-safe calls here: no stdio, no strerror */
+			static const char msg[] = "quit_handler: write() failed\n";
+			if (write(STDERR_FILENO, msg, sizeof(msg) - 1) < 0) {
+			}
 		}
 	}
+	errno = save_errno;
 	/* There is no need to restore the signal handler here, since the app
 	 * is going to exit */
 }
@@ -3226,7 +3233,16 @@ static void *monitor_sig_flags(void *unused)
 	for (;;) {
 		struct pollfd p = { sig_alert_pipe[0], POLLIN, 0 };
 		int a;
-		ast_poll(&p, 1, -1);
+		int res = ast_poll(&p, 1, -1);
+
+		/* A signal handler that runs on this thread ends the poll with EINTR and leaves nothing in the
+		 * pipe: the SIGCHLD of every child process that exits (a fax or mail script, a push script) lands
+		 * here first, as the kernel offers a process-directed signal to the main thread before any other.
+		 * The pipe used to be read whatever the poll said, so after such a signal this thread sat in a
+		 * blocking read; the next quit signal's handler then set need_quit and wrote the token that woke
+		 * that read, the token was consumed, the loop went back to the poll, and the flag was never looked
+		 * at: `systemctl stop` hung until systemd killed the process. The flags are checked after every
+		 * poll, and the pipe is read only when the poll reported data. */
 		if (sig_flags.need_reload) {
 			sig_flags.need_reload = 0;
 			ast_module_reload(NULL);
@@ -3240,7 +3256,13 @@ static void *monitor_sig_flags(void *unused)
 				quit_handler(0, SHUTDOWN_NORMAL, 0);
 			}
 		}
-		if (read(sig_alert_pipe[0], &a, sizeof(a)) != sizeof(a)) {
+		if (res > 0 && (p.revents & POLLIN)) {
+			if (read(sig_alert_pipe[0], &a, sizeof(a)) != sizeof(a)) {
+			}
+		} else if (res > 0 && (p.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+			/* a pipe end gone for good: stop polling it rather than spin; the flags still get
+			 * checked whenever a handler runs on this thread */
+			sig_alert_pipe[0] = -1;
 		}
 	}
 
@@ -3991,8 +4013,19 @@ int main(int argc, char *argv[])
 	if (ast_opt_no_fork)
 		consolethread = pthread_self();
 
-	if (pipe(sig_alert_pipe))
+	if (pipe(sig_alert_pipe)) {
 		sig_alert_pipe[0] = sig_alert_pipe[1] = -1;
+	} else {
+		/* Neither end may ever block: the writer is a signal handler, and the reader
+		 * (monitor_sig_flags) reads only what its poll reported. */
+		int i;
+		for (i = 0; i < 2; i++) {
+			int flags = fcntl(sig_alert_pipe[i], F_GETFL);
+			if (flags != -1) {
+				fcntl(sig_alert_pipe[i], F_SETFL, flags | O_NONBLOCK);
+			}
+		}
+	}
 
 	ast_set_flag(&ast_options, AST_OPT_FLAG_FULLY_BOOTED);
 	manager_event(EVENT_FLAG_SYSTEM, "FullyBooted", "Status: Fully Booted\r\n");

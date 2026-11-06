@@ -790,6 +790,14 @@ static int sofia_push_send_exe(void *data)
 		for (;;) {
 			struct timeval it0 = ast_tvnow();
 			int pr = poll(&pf, 1, deadline);
+			if (pr < 0 && errno == EINTR) {
+				/* a signal handler ran on this thread (a child's SIGCHLD): not a timeout, wait on */
+				deadline -= (int) ast_tvdiff_ms(ast_tvnow(), it0);
+				if (deadline <= 0) {
+					break;
+				}
+				continue;
+			}
 			if (pr > 0) {
 				ssize_t n = read(pfd[0], out + got, sizeof(out) - 1 - got);
 				if (n <= 0) {
