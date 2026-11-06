@@ -365,6 +365,7 @@ static void sofia_t38_respond_488_root(void *data)
 	 * response. Nothing to answer when it already got one (a 200 on AST_T38_NEGOTIATED). */
 	if (pvt->t38_answer_pending && pvt->t38_saved[0]) {
 		pvt->t38_answer_pending = 0;
+		pvt->offer_mline_fresh = 0;	/* refused unanswered: its lines never become the session's */
 		saved[0] = pvt->t38_saved[0];
 		pvt->t38_saved[0] = NULL;
 		req = nua_saved_event_request(saved);

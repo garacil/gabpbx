@@ -696,7 +696,20 @@ static void sofia_sdp_keep_version(struct sofia_pvt *pvt, char *buf, size_t len)
 	memcpy(o, head, hl);
 }
 
-/* Copy a finished SDP section aside (the plain-SIP answer mirror places it later); 1 when it does not fit, and the
+/* The media type, transport and first format of a finished SDP section's m= line, for the session's line record
+ * (sofia_offer_mline); the port is not kept. */
+static void sofia_sdp_mline_of_section(const char *section, struct sofia_offer_mline *ml)
+{
+	char type[32] = "", proto[40] = "", fmt[32] = "";
+
+	if (sscanf(section, "m=%31s %*s %39s %31s", type, proto, fmt) >= 2) {
+		ast_copy_string(ml->type_name, type, sizeof(ml->type_name));
+		ast_copy_string(ml->proto, proto, sizeof(ml->proto));
+		ast_copy_string(ml->fmt, fmt[0] ? fmt : "0", sizeof(ml->fmt));
+	}
+}
+
+/* Copy a finished SDP section aside (the plain-SIP line walk places it later); 1 when it does not fit, and the
  * whole SDP then fails closed like any other truncation. */
 static int sofia_sdp_set_aside(char *dst, size_t size, const char *src)
 {
@@ -711,10 +724,14 @@ static int sofia_sdp_set_aside(char *dst, size_t size, const char *src)
 
 char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_answer)
 {
-	/* A plain-SIP answer mirrors the offer's m= lines in order (RFC 3264 section 6, offer_mline): the audio, video and
-	 * image sections are built as usual, kept apart, and placed at the offered line each one answers; every other
-	 * offered line is declined at port 0. */
-	int plain_mirror = !pvt->is_webrtc && is_answer && pvt->offer_mline_valid && pvt->offer_mline_count > 0;
+	/* A plain-SIP SDP follows the session's m= lines (offer_mline) when they are known: an answer mirrors the
+	 * offer's lines in order (RFC 3264 section 6), an offer keeps them in place and adds new streams at the end
+	 * (section 8). The audio, video and image sections are built as usual, kept apart, and placed at their line;
+	 * every other line goes at port 0. */
+	int plain_mirror;	/* this SDP follows recorded m= lines (lay) */
+	int answer_fresh;	/* an answer to the offer recorded by the last parse */
+	const struct sofia_offer_mline *lay = NULL;
+	int lay_n = 0;
 	char video_m_buf[2048] = "";
 	char image_m_buf[1024] = "";
 	size_t sect_start;
@@ -743,6 +760,20 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 
 	if (!pvt || !pvt->rtp) {
 		return NULL;
+	}
+	/* The lines this SDP follows: the offer being answered, when one waits for its answer; else the session's. */
+	answer_fresh = is_answer && !pvt->is_webrtc && pvt->offer_mline_valid && pvt->offer_mline_fresh
+		&& pvt->offer_mline_count > 0;
+	if (answer_fresh) {
+		lay = pvt->offer_mline;
+		lay_n = pvt->offer_mline_count;
+	} else if (!pvt->is_webrtc && pvt->session_mline_valid && pvt->session_mline_count > 0) {
+		lay = pvt->session_mline;
+		lay_n = pvt->session_mline_count;
+	}
+	plain_mirror = lay != NULL;
+	if (!is_answer && !pvt->is_webrtc) {
+		pvt->offer_mline_pending_valid = 0;	/* set again when this offer is built from the session's lines */
 	}
 
 	/* Local address from the RTP fd; ss_family dispatch handles IPv6. */
@@ -1145,8 +1176,8 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 	}
 	/* The m=audio SECTION (m= line + its a= block + a=sendrecv), built into its own buffer so the WebRTC
 	 * answer can place it at the audio's OFFER slot when the offer order is non-canonical (RFC 3264 §6 /
-	 * RFC 8829 §5.3 — the answer mirrors the offer's m-line ORDER). For a non-WebRTC leg (and the common
-	 * audio-first WebRTC offer) it lands first, byte-identical to before. */
+	 * RFC 8829 §5.3 — the answer mirrors the offer's m-line ORDER); a plain-SIP answer places it at its offered
+	 * line the same way (plain_mirror). Otherwise (our offers) it lands first. */
 	char audio_m_buf[sizeof(rtpmap_buf) + sizeof(payload_buf) + 128] = "";	/* holds the m=audio line + full payload list + rtpmap block + a=sendrecv */
 	if (snprintf(audio_m_buf, sizeof(audio_m_buf),
 		"m=audio %d %s %s\r\n"
@@ -1278,16 +1309,16 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 		goto webrtc_m_lines_done;	/* the WebRTC answer m-lines are fully emitted in offer order */
 	}
 
-	/* Audio section lands first (non-WebRTC leg, and the WebRTC OFFER-build direction below).
-	 * RFC 3264 §6: the answer MUST carry the same m-line set as the offer. Suppress the m=audio ONLY for the
-	 * exact image-only T.38 case: we are ANSWERING a non-WebRTC leg, the offer carried NO m=audio, and T.38 is
-	 * active (the m=image below, live or declined at port 0) — otherwise the answer adds an m=audio the offer
-	 * never had. A normal audio call, or a T.38 re-INVITE that DID offer m=audio, still emits the audio
-	 * section, at port 0 when the T.38 offer had it at port 0 (RFC 3264 §8.2). */
+	/* Audio section lands first (our non-WebRTC offers, and the WebRTC OFFER-build direction below). A plain-SIP
+	 * answer to a recorded offer places it at its offered line instead (plain_mirror, at the end of the
+	 * function, RFC 3264 §6); without that record (an answer to an offer this leg never parsed), the m=audio is
+	 * suppressed only for the image-only T.38 case: we are ANSWERING a non-WebRTC leg, the offer carried NO
+	 * m=audio, and T.38 is active — otherwise the answer adds an m=audio the offer never had; a T.38 offer that
+	 * had its m=audio at port 0 gets it at port 0 (RFC 3264 §8.2). */
 	/* A re-offer while a fax runs (T.38 ENABLED, not the audio offer at its end) keeps the audio line of the last
 	 * SDP we sent (RFC 3264 §8): none in an image-only session, at port 0 when it was declined. */
-	if (!is_answer && !pvt->is_webrtc && pvt->udptl && pvt->t38_state == SOFIA_T38_ENABLED && !pvt->t38_ending
-			&& pvt->audio_line_last != SOFIA_AUDIO_LINE_LIVE) {
+	if (!plain_mirror && !is_answer && !pvt->is_webrtc && pvt->udptl && pvt->t38_state == SOFIA_T38_ENABLED
+			&& !pvt->t38_ending && pvt->audio_line_last != SOFIA_AUDIO_LINE_LIVE) {
 		if (pvt->audio_line_last == SOFIA_AUDIO_LINE_PORT0) {
 			int blen = strlen(buf);
 			if (snprintf(buf + blen, len - blen, "m=audio 0 %s %s\r\n", S_OR(pvt->offer_audio0_proto, "RTP/AVP"),
@@ -1514,7 +1545,7 @@ webrtc_m_lines_done:
 		 * stream's m-line at port 0 (RFC 3264 §8.2: a stream is removed by setting its port to zero); an
 		 * image-only one gets the audio in place of the image (§8.3.3: voiceband fax and fax in one stream). */
 		int t38vlen = strlen(buf);
-		if (pvt->image_mline) {
+		if (pvt->image_mline || plain_mirror) {	/* (following the session's lines, their walk places it) */
 			if (snprintf(buf + t38vlen, len - t38vlen, "m=image 0 udptl t38\r\n") >= (int)(len - t38vlen)) {
 				overflow = 1;
 			}
@@ -1617,8 +1648,8 @@ webrtc_m_lines_done:
 		}
 	} else if (!plain_mirror && !pvt->is_webrtc && (is_answer ? pvt->offer_image_line : pvt->image_mline)) {
 		/* No live T.38: an offer keeps the image stream of the last SDP we sent at port 0 (RFC 3264 §8: the number
-		 * of m= lines never decreases), an answer declines the offered one at port 0 (§6). chan_sip answers the
-		 * same way (add_sdp's offered_media, "m=image 0 udptl t38"). */
+		 * of m= lines never decreases); an answer not mirrored (plain_mirror does its own) declines the offered
+		 * one at port 0 (§6). chan_sip answers the same way (add_sdp's offered_media, "m=image 0 udptl t38"). */
 		int t38vlen = strlen(buf);
 		if (snprintf(buf + t38vlen, len - t38vlen, "m=image 0 udptl t38\r\n") >= (int)(len - t38vlen)) {
 			overflow = 1;
@@ -1627,30 +1658,91 @@ webrtc_m_lines_done:
 	}
 
 	if (plain_mirror) {
-		int i;
+		struct sofia_offer_mline nl[SOFIA_OFFER_MLINES_MAX];	/* the lines of this SDP */
+		int nn = 0;
+		int slot;
 		int seen_audio = 0;
+		int line_audio = -1, line_video = -1, line_image = -1;	/* the line each of our sections goes on */
+		int swap_audio = 0;	/* the audio goes on the image line (end of an image-only fax) */
+		int has_audio_line = 0;
+		int image_live;
+		/* A re-offer while a fax runs (T.38 ENABLED, not its end) keeps the audio line as the last SDP had it. */
+		int keep_audio = !is_answer && pvt->udptl && pvt->t38_state == SOFIA_T38_ENABLED && !pvt->t38_ending;
 
 		if (buf[sect_start]) {
-			/* the live T.38 section waits for its slot */
+			/* the T.38 section waits for its line */
 			if (sofia_sdp_set_aside(image_m_buf, sizeof(image_m_buf), buf + sect_start)) {
 				overflow = 1;
 			}
 			buf[sect_start] = '\0';
 		}
-		/* One line per offered line, in order: our section where we took the line, else the offered line at port 0
-		 * with its media type, transport and first format (RFC 3264 sections 6 and 8.2). */
+		image_live = image_m_buf[0] && strncmp(image_m_buf, "m=image 0 ", 10);
+		/* Each section goes on the line whose role it holds (the line it answers, or held in the last SDP). An
+		 * offer with no such line reuses the first line of its type (a stream at port 0, RFC 3264 section 8.1), puts
+		 * the audio given back at the end of an image-only fax on the image line (section 8.3.3), or adds the
+		 * stream at the end (section 8.1); while a fax runs the audio stays only on a line where it was live. */
+		for (slot = 0; slot < lay_n; slot++) {
+			if (lay[slot].role == SOFIA_ML_AUDIO) {
+				line_audio = slot;
+			} else if (lay[slot].role == SOFIA_ML_VIDEO) {
+				line_video = slot;
+			} else if (lay[slot].role == SOFIA_ML_IMAGE) {
+				line_image = slot;
+			}
+			if (!strcasecmp(lay[slot].type_name, "audio")) {
+				has_audio_line = 1;
+			}
+		}
+		if (!video_m_buf[0]) {
+			line_video = -1;
+		}
+		if (!image_m_buf[0]) {
+			line_image = -1;
+		}
+		if (!is_answer) {
+			for (slot = 0; slot < lay_n; slot++) {
+				if (line_audio < 0 && !keep_audio && !strcasecmp(lay[slot].type_name, "audio")) {
+					line_audio = slot;
+				}
+				if (line_video < 0 && video_m_buf[0] && !strcasecmp(lay[slot].type_name, "video")) {
+					line_video = slot;
+				}
+				if (line_image < 0 && image_m_buf[0] && !strcasecmp(lay[slot].type_name, "image")) {
+					line_image = slot;
+				}
+			}
+			if (line_audio < 0 && !has_audio_line && pvt->t38_state == SOFIA_T38_ENABLED && pvt->t38_ending) {
+				for (slot = 0; slot < lay_n && line_audio < 0; slot++) {
+					if (!strcasecmp(lay[slot].type_name, "image")) {
+						line_audio = slot;	/* the audio back in place of the image */
+						swap_audio = 1;
+					}
+				}
+				if (line_image == line_audio) {
+					line_image = -1;
+				}
+			}
+		}
 		audio_line = audio_port0 = image_line = 0;
-		for (i = 0; i < pvt->offer_mline_count; i++) {
-			const struct sofia_offer_mline *ml = &pvt->offer_mline[i];
+		for (slot = 0; slot < lay_n; slot++) {
+			const struct sofia_offer_mline *ml = &lay[slot];
 			const char *section = NULL;
+			const char *type = ml->type_name;
+			int role = SOFIA_ML_DECLINE;
 			int blen = strlen(buf);
 
-			if (ml->role == SOFIA_ML_AUDIO) {
+			if (slot == line_audio) {
 				section = audio_m_buf;
-			} else if (ml->role == SOFIA_ML_VIDEO && video_m_buf[0]) {
+				role = SOFIA_ML_AUDIO;
+				if (swap_audio) {
+					type = "audio";
+				}
+			} else if (slot == line_video) {
 				section = video_m_buf;
-			} else if (ml->role == SOFIA_ML_IMAGE && image_m_buf[0]) {
+				role = SOFIA_ML_VIDEO;
+			} else if (slot == line_image) {
 				section = image_m_buf;
+				role = image_live ? SOFIA_ML_IMAGE : SOFIA_ML_DECLINE;
 			}
 			if (section) {
 				if (snprintf(buf + blen, len - blen, "%s", section) >= (int)(len - blen)) {
@@ -1660,13 +1752,73 @@ webrtc_m_lines_done:
 					>= (int)(len - blen)) {
 				overflow = 1;
 			}
+			if (nn < SOFIA_OFFER_MLINES_MAX) {
+				nl[nn] = *ml;
+				if (section) {
+					sofia_sdp_mline_of_section(section, &nl[nn]);
+				}
+				nl[nn++].role = role;
+			}
 			/* RFC 3264 section 8 bookkeeping (image_mline, audio_line_last), as for the fixed layout */
-			if (!strcasecmp(ml->type_name, "audio") && !seen_audio) {
+			if (!strcasecmp(type, "audio") && !seen_audio) {
 				seen_audio = 1;
 				audio_line = 1;
 				audio_port0 = (section == NULL);
-			} else if (!strcasecmp(ml->type_name, "image") && seen_audio) {
+			} else if (!strcasecmp(type, "image") && seen_audio) {
 				image_line = 1;
+			}
+		}
+		if (!is_answer) {
+			/* New streams of this offer go after the session's lines (RFC 3264 section 8.1). */
+			const char *add[3];
+			int add_role[3], k, na = 0;
+
+			if (line_audio < 0 && !keep_audio) {
+				add[na] = audio_m_buf;
+				add_role[na++] = SOFIA_ML_AUDIO;
+			}
+			if (line_video < 0 && video_m_buf[0]) {
+				add[na] = video_m_buf;
+				add_role[na++] = SOFIA_ML_VIDEO;
+			}
+			if (line_image < 0 && image_live) {
+				add[na] = image_m_buf;
+				add_role[na++] = SOFIA_ML_IMAGE;
+			}
+			for (k = 0; k < na; k++) {
+				int blen = strlen(buf);
+
+				if (snprintf(buf + blen, len - blen, "%s", add[k]) >= (int)(len - blen)) {
+					overflow = 1;
+				}
+				if (nn < SOFIA_OFFER_MLINES_MAX) {
+					memset(&nl[nn], 0, sizeof(nl[nn]));
+					sofia_sdp_mline_of_section(add[k], &nl[nn]);
+					nl[nn++].role = add_role[k];
+				} else {
+					overflow = 1;	/* more lines than the session record holds: fail closed */
+				}
+				if (add_role[k] == SOFIA_ML_AUDIO && !seen_audio) {
+					seen_audio = 1;
+					audio_line = 1;
+				} else if (add_role[k] == SOFIA_ML_IMAGE && seen_audio) {
+					image_line = 1;
+				}
+			}
+		}
+		if (!overflow) {
+			if (!is_answer) {
+				/* This offer's lines become the session's when its 2xx comes (sofia_sdp_offer_answered). */
+				memcpy(pvt->offer_mline_pending, nl, sizeof(nl[0]) * nn);
+				pvt->offer_mline_pending_count = nn;
+				pvt->offer_mline_pending_valid = 1;
+			} else if (answer_fresh) {
+				/* The answer to a new offer: its lines are the session's now (a 183 then the 200 follow them). An
+				 * answer that could not be built leaves the offer waiting for the next one. */
+				memcpy(pvt->session_mline, nl, sizeof(nl[0]) * nn);
+				pvt->session_mline_count = nn;
+				pvt->session_mline_valid = 1;
+				pvt->offer_mline_fresh = 0;
 			}
 		}
 	}
@@ -1702,6 +1854,18 @@ void sofia_sdp_offer_answered(struct sofia_pvt *pvt)
 {
 	pvt->image_mline = pvt->image_mline_offer;
 	pvt->audio_line_last = pvt->audio_line_last_offer;
+	/* The session's lines are now those of our offer (RFC 3264 section 8): when it was built from the session's
+	 * lines they are committed, the next offers keep them; a fixed-layout offer drops the record, so a 200 we build
+	 * without an offer to answer (to an INVITE that carried none) uses the same fixed layout. */
+	if (pvt->offer_mline_pending_valid) {
+		memcpy(pvt->session_mline, pvt->offer_mline_pending,
+			sizeof(pvt->session_mline[0]) * pvt->offer_mline_pending_count);
+		pvt->session_mline_count = pvt->offer_mline_pending_count;
+		pvt->session_mline_valid = 1;
+	} else {
+		pvt->session_mline_valid = 0;
+	}
+	pvt->offer_mline_pending_valid = 0;
 }
 
 static int sofia_process_crypto(struct sofia_pvt *pvt, struct ast_rtp_instance *rtp,
@@ -4122,6 +4286,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 		ast_copy_string(pvt->offer_audio0_fmt, m_audio0_fmt, sizeof(pvt->offer_audio0_fmt));
 		/* The answer's m= lines (RFC 3264 section 6), for a plain-SIP offer: a WebRTC one has its own mirror. */
 		pvt->offer_mline_valid = !audio_webrtc_offered && !pvt->is_webrtc;
+		pvt->offer_mline_fresh = pvt->offer_mline_valid;
 		pvt->offer_mline_count = 0;
 		if (pvt->offer_mline_valid) {
 			int i;

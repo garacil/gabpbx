@@ -754,7 +754,8 @@ struct sofia_pvt {
 	int offered_video_mode;
 	unsigned int offer_had_audio:1;  /* the last parsed offer carried an m=audio line (ANY port). RFC 3264 §6:
 	                                  * an image-only T.38 re-INVITE (m=image, no m=audio) must be answered
-	                                  * m=image-only — sofia_generate_sdp suppresses the m=audio then. */
+	                                  * m=image-only — sofia_generate_sdp suppresses the m=audio then, when the
+	                                  * answer is not built from the recorded offer lines (offer_mline). */
 	unsigned int progress_sent:1;    /* a 183 Session Progress was emitted on this call (chan_sip SIP_PROGRESS_SENT
 	                                  * parity): lets progressinband=no degrade RINGING to in-band ringback once
 	                                  * early media exists, instead of collapsing onto NEVER. */
@@ -818,12 +819,26 @@ struct sofia_pvt {
 	int offer_audio_port0;
 	char offer_audio0_proto[24];
 	char offer_audio0_fmt[16];
-	/* The m= lines of the last plain-SIP offer answered (sofia_parse_sdp, current offers only): the answer mirrors
-	 * them in order (sofia_generate_sdp). offer_mline_valid is 0 for a WebRTC offer (its own mirror,
-	 * webrtc_reject_m) and before any offer. Under pvt->lock. */
+	/* The m= lines of the last plain-SIP offer parsed (sofia_parse_sdp, current offers only; role = the line each
+	 * of our sections answers): the answer to it mirrors them in order (RFC 3264 §6). offer_mline_fresh: that
+	 * offer still waits for its answer (cleared by the answer's build, or when it is refused unanswered: a held
+	 * T.38 offer's 488, its CANCEL). offer_mline_valid is 0 for a WebRTC offer (its own mirror, webrtc_reject_m).
+	 * Under pvt->lock. */
 	int offer_mline_valid;
+	int offer_mline_fresh;
 	int offer_mline_count;
 	struct sofia_offer_mline offer_mline[SOFIA_OFFER_MLINES_MAX];
+	/* The session's m= lines (RFC 3264 §8): those of the last answer we built, or of our last offer once its 2xx
+	 * came (sofia_sdp_offer_answered, from offer_mline_pending); role = which of our sections is on each line. Our
+	 * offers keep them in place and add new streams at the end; a 200 to an INVITE without an offer mirrors them.
+	 * 0 until a peer offer has been answered (our offers then use the fixed layout). Under pvt->lock. */
+	int session_mline_valid;
+	int session_mline_count;
+	struct sofia_offer_mline session_mline[SOFIA_OFFER_MLINES_MAX];
+	/* The lines of the last offer we built from session_mline, committed on its 2xx. */
+	int offer_mline_pending_valid;
+	int offer_mline_pending_count;
+	struct sofia_offer_mline offer_mline_pending[SOFIA_OFFER_MLINES_MAX];
 	/* The audio m= line of the last SDP we sent (SOFIA_AUDIO_LINE_*): a re-offer while a fax runs keeps it as it was
 	 * (RFC 3264 §8: absent in an image-only session, at port 0 when declined). Same writer as image_mline. */
 	int audio_line_last;

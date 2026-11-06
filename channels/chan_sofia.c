@@ -10835,6 +10835,7 @@ static void sofia_process_cancel(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		up = (op->state == SOFIA_DIALOG_STATE_UP);
 		if (up && op->t38_answer_pending) {
 			op->t38_answer_pending = 0;
+			op->offer_mline_fresh = 0;	/* cancelled unanswered: its lines never become the session's */
 			dropped_t38 = 1;
 			saved[0] = op->t38_saved[0];
 			op->t38_saved[0] = NULL;
