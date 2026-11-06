@@ -1,3 +1,59 @@
+## 1.9.20 — several phones on one BLF, T.38 negotiated like chan_sip, directmedia never loses a move
+
+Only `chan_sofia.so` changes.
+
+### Deployment note
+
+A peer without `t38pt_udptl=yes` now gets `488 Not Acceptable Here` for any re-INVITE that offers a live T.38 image
+stream, as with `chan_sip`. Before, `chan_sofia` accepted it and the fax failed a few seconds later. To receive T.38
+from a peer, set `t38pt_udptl=yes` on it.
+
+### Fixed
+
+- **Two devices of one account can watch the same extension (BLF / presence).**
+  - Before, a second device subscribing to an extension the first already watched dropped the first subscription
+    without a NOTIFY. Each refresh of one dropped the other, and an `Expires: 0` from one ended both.
+  - Subscriptions are now kept per account, extension, event package and device. A device is identified by its
+    `+sip.instance`, or else by its transport, source address and Contact.
+  - A device that restarts and subscribes in a new dialog still replaces its own subscription. A refresh is matched
+    by its dialog first, so a NAT port change keeps it. An `Expires: 0` ends only that device's subscription.
+  - At most 32 subscriptions per account, extension and event; the oldest is ended with a terminated NOTIFY.
+  - A NOTIFY answered with one of the codes RFC 6665 §4.2.2 says MUST remove the subscription (404, 405, 410, 416,
+    480-485, 489, 501, 604) ends it. A NOTIFY with no answer keeps it, as in `chan_sip`; a subscription whose WebSocket connection the stack found
+    closed is ended.
+  - The dialog-info `version` continues when a refresh of the same dialog replaces the subscription (RFC 4235).
+- **A peer's T.38 offer is answered when someone takes the fax.**
+  - Before, an image-only re-INVITE got `200` with `m=image` at once, even with `t38pt_udptl=no` or with nobody in
+    the PBX to take the fax. Five seconds later the T.38 attempt was dropped with no signalling, and the two ends
+    disagreed on the media.
+  - Now, as in `chan_sip`, the offer waits for the fax application or the other leg. It gets `200` with the image
+    answer when they accept, and `488` on a refusal or after 5 s.
+  - `AST_T38_REQUEST_PARMS` returns the far end's parameters the way `res_fax` expects.
+  - A CANCEL of that re-INVITE gets `487` and the call goes on. A CANCEL on an established call never hangs it up,
+    as in `chan_sip`.
+  - An UPDATE with an offer while the T.38 offer waits gets `500` with `Retry-After` (RFC 3311 §5.2).
+- **The audio comes back when a T.38 fax ends.** Before, the call stayed image-only and the fax application waited
+  for an answer that never came. As in `chan_sip`, the PBX now offers the audio back. The SDP follows RFC 3264:
+  - **A session that also had audio:** the image stream stays in the offer at port 0 (§8.2).
+  - **An image-only session:** the audio takes the image stream's place (§8.3.3).
+  - **Later offers:** they keep the image stream's line at port 0 (§8).
+  - **An answer to an offer with a T.38 image the PBX does not take** (for example `[audio, image 0]`): the answer
+    declines it at port 0 (§6), as `chan_sip` does.
+  - **An offer with its audio at port 0:** the answer marks it at port 0 too (§8.2).
+  - **If the far end answers that offer:**
+    - `491`: it is sent again after the RFC 3261 §14.1 delay;
+    - `415`, `488` or `606`: the call is hung up, as `chan_sip` does, since it cannot leave T.38.
+- **A directmedia move asked for while a re-INVITE is in flight is no longer lost.** The bridge asks the channel to
+  move the media once per change. When a re-INVITE was already in flight (a hold, a session refresh, a T.38 offer, a
+  previous move), the new destination was dropped or folded into the offer already sent, and the media stayed where
+  that offer had put them. As `chan_sip` does, it is now kept and offered as soon as the re-INVITE in flight
+  completes.
+- **A re-INVITE that gets `491 Request Pending` is retried, as in `chan_sip`.** This covers a directmedia move or a
+  T.38 offer that crosses the far end's own re-INVITE (glare).
+  - The delay follows RFC 3261 §14.1: 2.1-4 s when the PBX placed the call, 0-2 s otherwise.
+  - At most three consecutive retries.
+  - Whatever waited for that re-INVITE also waits for the delay.
+
 ## 1.9.19 — static trunks are qualified, and a multihomed host sends from the right address
 
 Only `chan_sofia.so` changes, and the Sofia-SIP library it is built against moves to `v2.0.5` (below); the packages
