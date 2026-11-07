@@ -513,7 +513,8 @@ struct sofia_fork {
 	time_t fork_start;                /* timestamp when fork was initiated */
 	char fork_id[SOFIA_FORK_ID_LEN]; /* unique ID for debug logging */
 	ast_mutex_t lock;                 /* guards winner_picked, winner, child_count, children, state, posting_done, early_media_child,
-	                                   * best_status, best_q850, push_hold, ended, cancel_6xx */
+	                                   * best_status, best_q850, push_hold, push_hold_live_only, live_wait,
+	                                   * answered_inst, ended, cancel_6xx */
 	int child_count;                  /* live children remaining */
 	int posting_done;                 /* 1 once the INVITE posting loop has forked every contact — child_count is only
 	                                   * authoritative after this (a 18x can arrive before all branches are posted), and
@@ -527,6 +528,16 @@ struct sofia_fork {
 	int push_hold;                    /* 1 while a push assist may still bring a woken device (a late-appended
 	                                   * branch): an empty fork then waits instead of ending the call. Cleared by
 	                                   * sofia_fork_push_hold_release. Guarded by lock. */
+	int push_hold_live_only;          /* the hold waits only for devices pushed while they had a live binding (an iOS
+	                                   * app suspended behind an open socket may come back on a new connection, a late
+	                                   * append): it no longer holds once every one of them (live_wait) answered its
+	                                   * branch itself (sofia_fork_push_hold_live_only). Guarded by lock. */
+	char live_wait[SOFIA_PUSH_MAX_DEVICES][128];	/* their +sip.instance */
+	int n_live_wait;
+	char answered_inst[SOFIA_PUSH_MAX_DEVICES][128];	/* devices whose branch got a final response from the device
+	                                   * itself (not one the stack made up: a dead flow's 503, a timeout), recorded for
+	                                   * every fork from the start. Guarded by lock. */
+	int n_answered;
 	int ended;                        /* 1 once the end of the master's call has been decided: no branch may be
 	                                   * appended after it. Guarded by lock. */
 	int cancel_6xx;                   /* 1 once a 6xx made the fork cancel its pending branches (RFC 3261 §16.7
@@ -2250,11 +2261,41 @@ static void sofia_queue_invite_failure(struct ast_channel *owner, int status, in
 
 /* Keep the final response the caller is told about when every branch fails, per RFC 3261 §16.7
  * step 6: a 6xx if there is one, else one of the lowest class (here the first received in that
- * class). status is already sofia_invite_failure_status() (300..699). sofia_thread only; takes
- * fork->lock. */
-static void sofia_fork_note_failure(struct sofia_fork *fork, int status, int q850)
+ * class). status is already sofia_invite_failure_status() (300..699); received: the far end sent it
+ * (not made up by the stack). sofia_thread only; takes fork->lock. */
+/* Under fork->lock: the device of a branch (its +sip.instance) answered that branch itself. */
+static void sofia_fork_note_answered_locked(struct sofia_fork *fork, const char *inst)
+{
+	int i;
+
+	if (!inst || !inst[0]) {
+		return;
+	}
+	for (i = 0; i < fork->n_answered; i++) {
+		if (!strcasecmp(fork->answered_inst[i], inst)) {
+			return;
+		}
+	}
+	if (fork->n_answered < SOFIA_PUSH_MAX_DEVICES) {
+		ast_copy_string(fork->answered_inst[fork->n_answered++], inst, sizeof(fork->answered_inst[0]));
+	}
+}
+
+/* sofia_fork_note_answered_locked for a branch whose 2xx the fork could not take (sofia_fork_pick_winner refused it):
+ * the device answered, so the live-only hold does not wait for it. sofia_thread only; takes fork->lock. */
+static void sofia_fork_note_answered(struct sofia_fork *fork, struct sofia_pvt *child)
 {
 	ast_mutex_lock(&fork->lock);
+	sofia_fork_note_answered_locked(fork, child->fork_instance);
+	ast_mutex_unlock(&fork->lock);
+}
+
+static void sofia_fork_note_failure(struct sofia_fork *fork, struct sofia_pvt *child, int status, int q850, int received)
+{
+	ast_mutex_lock(&fork->lock);
+	if (received) {
+		sofia_fork_note_answered_locked(fork, child->fork_instance);
+	}
 	if (!fork->best_status
 			|| (status >= 600 && fork->best_status < 600)
 			|| (status < 600 && fork->best_status < 600 && status / 100 < fork->best_status / 100)) {
@@ -2291,6 +2332,28 @@ static void sofia_fork_end_master(struct sofia_pvt *m, int best_status, int best
 	}
 }
 
+/* Under fork->lock: the hold waits only for devices pushed while live (push_hold_live_only) and every one of
+ * them has answered its branch itself, so nobody is left to come back on a new connection. */
+static int sofia_fork_live_wait_answered_locked(struct sofia_fork *fork)
+{
+	int i, k;
+
+	if (!fork->push_hold_live_only || fork->n_live_wait < 1) {
+		return 0;
+	}
+	for (i = 0; i < fork->n_live_wait; i++) {
+		for (k = 0; k < fork->n_answered; k++) {
+			if (!strcasecmp(fork->live_wait[i], fork->answered_inst[k])) {
+				break;
+			}
+		}
+		if (k == fork->n_answered) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
 /* Decide, under fork->lock, whether the master's call ends now: every posted branch has failed
  * (posting_done, child_count 0), none won, the end was not decided already, and no push assist
  * holds the fork open for a device being woken. A received 6xx overrides the hold: RFC 3261 §16.7
@@ -2300,7 +2363,7 @@ static int sofia_fork_should_end_locked(struct sofia_fork *fork)
 	if (fork->ended || fork->winner_picked || !fork->posting_done || fork->child_count > 0) {
 		return 0;
 	}
-	if (fork->push_hold && fork->best_status < 600) {
+	if (fork->push_hold && fork->best_status < 600 && !sofia_fork_live_wait_answered_locked(fork)) {
 		return 0;
 	}
 	fork->ended = 1;
@@ -2446,6 +2509,42 @@ static void sofia_fork_cancel_on_6xx(struct sofia_fork *fork, int status, int q8
 	r.sip = sip_reason;
 	r.q850 = q850_reason;
 	ao2_callback(fork->children, OBJ_NODATA | OBJ_MULTIPLE, sofia_fork_cancel_6xx_cb, &r);
+}
+
+/* The push assist's hold waits only for the devices that were pushed while they had a live binding (inst, n:
+ * their +sip.instance): once every one of them has answered its branch itself (a 486 from the iPhone) the
+ * branches decide, as without the push, while a branch failure the stack made up (the dead flow of a suspended
+ * app) keeps waiting for that device to come back on a new connection (late append) until push_wait. Takes
+ * pvt->lock, then fork->lock; the channel lock may be held (channel -> pvt order). */
+void sofia_fork_push_hold_live_only(struct sofia_pvt *pvt, char inst[][128], int n)
+{
+	int i;
+
+	struct sofia_fork *fork;
+	int end_now, best_status, best_q850;
+
+	ast_mutex_lock(&pvt->lock);
+	fork = pvt->is_fork_master ? pvt->fork : NULL;
+	if (fork) {
+		ao2_ref(fork, +1);
+	}
+	ast_mutex_unlock(&pvt->lock);
+	if (!fork) {
+		return;
+	}
+	ast_mutex_lock(&fork->lock);
+	fork->push_hold_live_only = 1;
+	for (i = 0; i < n && fork->n_live_wait < SOFIA_PUSH_MAX_DEVICES; i++) {
+		ast_copy_string(fork->live_wait[fork->n_live_wait++], inst[i], sizeof(fork->live_wait[0]));
+	}
+	end_now = sofia_fork_should_end_locked(fork);	/* they may have answered before the push went out */
+	best_status = fork->best_status;
+	best_q850 = fork->best_q850;
+	ast_mutex_unlock(&fork->lock);
+	if (end_now) {
+		sofia_fork_end_master(pvt, best_status, best_q850);
+	}
+	ao2_ref(fork, -1);
 }
 
 /* A push assist no longer holds the fork open (no wake push went out, or push_wait expired):
@@ -7349,6 +7448,9 @@ static int sofia_fork_dial_one(struct sofia_pvt *pvt, struct sofia_fork *fork,
 	if (!child) {
 		return 0;
 	}
+	ao2_lock(c);
+	ast_copy_string(child->fork_instance, c->instance_id, sizeof(child->fork_instance));
+	ao2_unlock(c);
 
 	child->fork = fork;
 	ao2_ref(fork, +1);
@@ -20185,6 +20287,7 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					 * won). CANCEL is invalid once >= 200, so tear the answered branch
 					 * down with BYE, then run the shared dead-child accounting. */
 					nua_bye(pvt->nh, TAG_END());
+					sofia_fork_note_answered(fork, pvt);	/* the device answered: not waited for */
 					sofia_fork_child_failed(fork, pvt);
 				}
 			} else if (status >= 300) {
@@ -20192,7 +20295,9 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				int fstatus = sofia_invite_failure_status(status, sip);
 				int q850 = (sofia_cfg.use_q850_reason && sip) ? sofia_reason_parse_cause(sip->sip_reason) : 0;
 
-				sofia_fork_note_failure(fork, fstatus, q850);
+				/* received: the far end sent it, not the stack (transport error, timeout: SOFIA_NTA_INTERNAL_MSG) */
+				sofia_fork_note_failure(fork, pvt, fstatus, q850,
+					status < 700 && sip && !(sip->sip_flags & SOFIA_NTA_INTERNAL_MSG));
 				remaining = sofia_fork_child_failed(fork, pvt);
 				if (sofia_debug)
 					ast_verbose("Sofia: Fork child %s failed %d %s (remaining=%d)\n",
@@ -22877,6 +22982,9 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 				g = g < 0 ? 0 : 5;
 			}
 			sofia_cfg.push_resume_window = g;
+		} else if (!strcasecmp(v->name, "push_voip_live")) {
+			/* an iOS (APNs VoIP) device is pushed even with a live binding (sofia_push.c) */
+			sofia_cfg.push_voip_live = ast_true(v->value) ? 1 : 0;
 		} else if (!strcasecmp(v->name, "push_reregister")) {
 			sofia_cfg.push_reregister = ast_true(v->value) ? 1 : 0;
 		} else if (!strcasecmp(v->name, "push_reregister_lead")) {
@@ -24125,6 +24233,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.push_min_interval = 5;
 	sofia_cfg.push_noresponse = 4;	/* P2 guard; 0 disables */
 	sofia_cfg.push_resume_window = 2;	/* multi-ring collect window; 0 = first-registrant-wins */
+	sofia_cfg.push_voip_live = 0;	/* push an iOS (APNs VoIP) device with a live binding too: off until the app handles it */
 	sofia_cfg.push_sender_native = 1;	/* native in-process sender by default; script = fallback */
 	sofia_cfg.push_reregister = 1;	/* silent re-register push before a registration ends (native only) */
 	sofia_cfg.push_reregister_lead = 120;

@@ -370,6 +370,17 @@ static int sofia_push_device_stale(const struct sofia_push_device *d, time_t now
  * purge (both rows carry the same LIVE token, so no error ever comes back). Last write
  * wins: the newest REGISTER is the installation's authoritative row. DB deletes + log
  * rows are queued OUTSIDE the entry lock (leaf-lock discipline). */
+/* A device that is pushed even when it has a live binding: an APNs VoIP token (iOS PushKit) with push_voip_live on.
+ * iOS suspends an app in the background and its open socket can stay up meanwhile, so a live binding is no
+ * knowledge that the app is awake (RFC 8599 §1, §5.6.2: a proxy skips the push only with "knowledge that the UA is
+ * awake"); a VoIP push makes the app report the call to CallKit (Apple PushKit: every VoIP push must be reported),
+ * with the push uuid = the Call-ID of the INVITE the binding gets, so the app keeps one call. Android (FCM) devices
+ * with a live binding are not pushed: their app runs with the binding. Cache entry lock held (or a snapshot). */
+static int sofia_push_device_pushed_when_live(const struct sofia_push_device *d)
+{
+	return sofia_cfg.push_voip_live && !strcasecmp(d->push_type, "voip");
+}
+
 static void sofia_push_cache_upsert(struct sofia_push_tokens *e, const struct sofia_push_device *nd)
 {
 	int i, slot = -1, oldest = 0;
@@ -890,6 +901,10 @@ struct sofia_push_park {
 	int inflight;			/* P2: an INVITE is ALREADY on the wire (no-provisional guard fired); resume swaps the leg instead of creating the first one */
 	time_t parked_at;
 	int npushed;			/* devices actually notified */
+	int npushed_live;		/* of them, devices that also had a live binding (push_voip_live): they got the INVITE
+					 * already, so they are not waited for as woken devices (all_joined) */
+	int njoined_asleep;		/* late appends of devices that had no live binding (all_joined) */
+	char pushed_live_inst[SOFIA_PUSH_MAX_DEVICES][128];	/* +sip.instance of the devices pushed while live */
 	char pushed_dev[SOFIA_PUSH_MAX_DEVICES][SOFIA_PUSH_DEVID_MAX];
 	int cancel_sent;		/* the call_cancel pushes went out (once per call; entry lock) */
 };
@@ -934,6 +949,7 @@ static int sofia_push_notify_devices(struct sofia_push_park *entry, int *rate_li
 {
 	struct sofia_push_tokens *e;
 	struct sofia_push_device snap[SOFIA_PUSH_MAX_DEVICES];
+	int snap_live[SOFIA_PUSH_MAX_DEVICES];	/* the device also has a live binding (pushed_when_live) */
 	char already[SOFIA_PUSH_MAX_DEVICES][SOFIA_PUSH_DEVID_MAX];
 	int nsnap = 0, nalready = 0, i, queued = 0;
 	time_t now = time(NULL);
@@ -958,6 +974,8 @@ static int sofia_push_notify_devices(struct sofia_push_park *entry, int *rate_li
 	}
 	ao2_lock(e);
 	for (i = 0; i < e->ndev && nsnap < cap; i++) {
+		int is_live = 0;	/* the device has a live binding forked to it (push-assist) */
+
 		if (sofia_push_device_stale(&e->dev[i], now)) {
 			continue;
 		}
@@ -985,26 +1003,30 @@ static int sofia_push_notify_devices(struct sofia_push_park *entry, int *rate_li
 			continue;
 		}
 		/* Hybrid push-assist: a device that is ALREADY ringing (a live binding was
-		 * forked to it) must not also be pushed — only the ASLEEP devices are woken. */
+		 * forked to it) is not also pushed — only the ASLEEP devices are woken — unless it
+		 * is pushed even when live (an iOS VoIP device, sofia_push_device_pushed_when_live). */
 		if (entry->n_live_inst && e->dev[i].instance[0]) {
-			int li, skip = 0;
+			int li;
 			for (li = 0; li < entry->n_live_inst; li++) {
 				if (!strcasecmp(e->dev[i].instance, entry->live_inst[li])) {
-					skip = 1;
+					is_live = 1;
 					break;
 				}
 			}
-			if (skip) {
+			if (is_live && !sofia_push_device_pushed_when_live(&e->dev[i])) {
 				continue;
 			}
 		}
 		if (sofia_cfg.push_min_interval > 0 && !e->dev[i].cancelled
 			&& e->dev[i].last_push_at > now - sofia_cfg.push_min_interval) {
-			(*rate_limited)++;
-			continue;
+			if (!is_live) {
+				(*rate_limited)++;	/* it is already waking: the call waits for it */
+			}
+			continue;	/* a live one rings on its binding: nothing to wait for */
 		}
 		e->dev[i].last_push_at = now;	/* stamp NOW so a racing second park rate-limits */
 		e->dev[i].cancelled = 0;
+		snap_live[nsnap] = is_live;
 		snap[nsnap++] = e->dev[i];
 	}
 	ao2_unlock(e);
@@ -1029,6 +1051,10 @@ static int sofia_push_notify_devices(struct sofia_push_park *entry, int *rate_li
 				if (entry->npushed < SOFIA_PUSH_MAX_DEVICES) {
 					ast_copy_string(entry->pushed_dev[entry->npushed++], snap[i].device_id,
 						sizeof(entry->pushed_dev[0]));
+					if (snap_live[i]) {
+						ast_copy_string(entry->pushed_live_inst[entry->npushed_live++], snap[i].instance,
+							sizeof(entry->pushed_live_inst[0]));
+					}
 				}
 				ao2_unlock(entry);
 				queued++;
@@ -1070,6 +1096,10 @@ static int sofia_push_notify_devices(struct sofia_push_park *entry, int *rate_li
 		if (entry->npushed < SOFIA_PUSH_MAX_DEVICES) {
 			ast_copy_string(entry->pushed_dev[entry->npushed++], snap[i].device_id,
 				sizeof(entry->pushed_dev[0]));
+			if (snap_live[i]) {
+				ast_copy_string(entry->pushed_live_inst[entry->npushed_live++], snap[i].instance,
+					sizeof(entry->pushed_live_inst[0]));
+			}
 		}
 		ao2_unlock(entry);
 		queued++;
@@ -1896,9 +1926,20 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 		}
 		ast_sockaddr_copy(&e->dialed[e->ndialed], &update->new_src);
 		slot = e->ndialed++;	/* reserve BEFORE posting: a racing re-REGISTER dedups here */
+		/* A device that had a live binding (pushed while live, back on a new connection) is not one of the
+		 * woken devices the fork waits for. */
+		for (i = 0; bound_inst[0] && i < e->n_live_inst; i++) {
+			if (!strcasecmp(bound_inst, e->live_inst[i])) {
+				break;
+			}
+		}
+		if (!bound_inst[0] || i == e->n_live_inst) {
+			e->njoined_asleep++;
+		}
 		/* Every pushed device has now joined: the fork no longer needs to be held open for a
-		 * woken device, so its own branches decide the outcome from here (released below). */
-		all_joined = (e->ndialed - e->n_live_inst) >= e->npushed;
+		 * woken device, so its own branches decide the outcome from here (released below). A
+		 * device pushed while it had a live binding already rings on it and is not waited for. */
+		all_joined = e->njoined_asleep >= e->npushed - e->npushed_live;
 		ao2_unlock(e);
 		ast_mutex_lock(&pvt->lock);
 		owner = pvt->owner;
@@ -2343,10 +2384,11 @@ done:
  * the account (with or without push headers — a desk phone binding delivers the call
  * too, Kamailio ts_append parity), and even if push= was just turned off: delivering an
  * already-parked call is strictly correct. */
-/* Hybrid push-assist: count the peer's ASLEEP push devices — those with a usable cached
- * token whose +sip.instance is neither the caller's (self-call) nor any of the devices
- * already ringing (a live binding was forked to them). Returns how many would be woken.
- * Any thread; takes only the cache entry lock. */
+/* Hybrid push-assist: count the peer's push targets — the ASLEEP devices (a usable cached token whose
+ * +sip.instance is neither the caller's (self-call) nor any of the devices already ringing, a live binding
+ * was forked to them) and the live devices that are pushed even when live (iOS VoIP,
+ * sofia_push_device_pushed_when_live). Returns how many would be pushed. Any thread; takes only the cache
+ * entry lock. */
 int sofia_push_count_asleep(struct sofia_peer *peer, const char *exclude_instance,
 	char live_inst[][128], int n_live)
 {
@@ -2373,8 +2415,8 @@ int sofia_push_count_asleep(struct sofia_peer *peer, const char *exclude_instanc
 				break;
 			}
 		}
-		if (!live) {
-			asleep++;	/* has a token, no live binding -> a wake target */
+		if (!live || sofia_push_device_pushed_when_live(&e->dev[i])) {
+			asleep++;	/* has a token, no live binding (a wake target), or pushed even when live */
 		}
 	}
 	ao2_unlock(e);
@@ -2456,9 +2498,27 @@ int sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_channel *ast,
 		ao2_ref(e, -1);
 		return 0;
 	}
-	ast_verb(2, "Sofia PUSH: push-assist %s peer='%s' - ringing %d live device(s), woke the asleep one(s)\n",
-		e->callid, e->peername, n_live);
-	sofia_push_log_event(e->peername, "", e->callid, "sent", "assist");
+	{
+		int pushed_live, pushed_asleep;
+		char live_insts[SOFIA_PUSH_MAX_DEVICES][128];
+
+		ao2_lock(e);
+		pushed_live = e->npushed_live;
+		pushed_asleep = e->npushed - e->npushed_live;
+		memcpy(live_insts, e->pushed_live_inst, sizeof(live_insts));
+		ao2_unlock(e);
+		ast_verb(2, "Sofia PUSH: push-assist %s peer='%s' - ringing %d live device(s)%s%s\n",
+			e->callid, e->peername, n_live, pushed_asleep || rate_limited ? ", woke the asleep one(s)" : "",
+			pushed_live ? ", pushed the live iOS one(s) too" : "");
+		sofia_push_log_event(e->peername, "", e->callid, "sent", "assist");
+		if (!pushed_asleep && !rate_limited) {
+			/* Every pushed device already rings on its live binding. The fork is held (below) only for one of
+			 * them coming back on a new connection after the stack failed its branch (the dead flow of an app iOS
+			 * suspended): a final response the device itself sends (486, 603...) ends the call at once, as
+			 * without the push (sofia_fork_push_hold_live_only). */
+			sofia_fork_push_hold_live_only(pvt, live_insts, pushed_live);
+		}
+	}
 	/* push_wait bounds the fork's hold (sofia_fork_dial push_hold): when it fires,
 	 * sofia_push_wait_cb releases the hold and the call ends if every branch has failed by
 	 * then. Armed under the entry lock (defer-BYE idiom, as sofia_push_park_create). With no
@@ -3260,12 +3320,12 @@ static char *sofia_push_cli_show(struct ast_cli_entry *e, int cmd, struct ast_cl
 	if (a->argc == 4) {
 		filter = a->argv[3];
 	}
-	ast_cli(a->fd, "Push wake-up: %s  sender=%s%s  scripts=%s  wait=%ds  noresponse=%ds  resume_window=%ds  ttl=%dd  max_devices=%d  min_interval=%ds  cache=%s  queue=%d  natq=%d\n",
+	ast_cli(a->fd, "Push wake-up: %s  sender=%s%s  scripts=%s  wait=%ds  noresponse=%ds  resume_window=%ds  voip_live=%s  ttl=%dd  max_devices=%d  min_interval=%ds  cache=%s  queue=%d  natq=%d\n",
 		sofia_cfg.push_enabled ? "ENABLED" : "disabled",
 		sofia_cfg.push_sender_native ? "native" : "script",
 		sofia_cfg.push_sender_native && !sofia_push_sender_available() ? "(lane DOWN: script fallback)" : "",
 		sofia_cfg.push_scripts, sofia_cfg.push_wait, sofia_cfg.push_noresponse,
-		sofia_cfg.push_resume_window,
+		sofia_cfg.push_resume_window, sofia_cfg.push_voip_live ? "yes" : "no",
 		sofia_cfg.push_token_ttl_days,
 		sofia_cfg.push_max_devices, sofia_cfg.push_min_interval,
 		sofia_push_cache_complete ? "complete" : "lazy", sofia_pushdb_depth,

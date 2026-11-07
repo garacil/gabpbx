@@ -62,6 +62,7 @@ int sofia_post_invite(struct sofia_pvt *pvt, struct ast_channel *ast, const char
 int sofia_fork_dial(struct sofia_pvt *pvt, int push_hold);
 /* End a push assist's hold on the fork; ends the call if every branch already failed. */
 void sofia_fork_push_hold_release(struct sofia_pvt *pvt);
+void sofia_fork_push_hold_live_only(struct sofia_pvt *pvt, char inst[][128], int n);
 /* Push multi-ring late append: add ONE branch to the still-unanswered fork for a device
  * whose wake REGISTER arrived after the fork was posted (channel lock held; refuses after
  * winner pick / answer / the decided end of the call / a 6xx). 0 = branch INVITE posted. */
@@ -706,6 +707,9 @@ struct sofia_pvt {
 	 * multi-device ring before anyone answers). Written and read under ao2_lock(pvt), used as a LEAF lock. */
 	char dev_contact[256];
 	char dev_instance[128];
+	char fork_instance[128];         /* fork child: the +sip.instance of the contact this branch was sent to ("" =
+	                                  * none); set once when the branch is built (sofia_fork_dial_one), read on
+	                                  * sofia_thread for its final response (the push assist's live-only hold) */
 	struct ast_sockaddr redirip;     /* directmedia: peer's RTP target; zero = relay through PBX */
 	struct ast_sockaddr offered_redirip;	/* the media target our last re-INVITE offered (redirip when sent); its 2xx moves the RTCP */
 	/* A media target the bridge asked for while a re-INVITE was in flight (chan_sip SIP_NEEDREINVITE): offered by
@@ -1457,6 +1461,11 @@ struct sofia_config {
 	int push_max_devices;      /* devices pushed per peer per call (clamp 1..10, Kamailio devlist parity) */
 	int push_min_interval;     /* seconds per-device push floor (the phone itself cancels a push <5 s after the previous); 0 = off */
 	int push_noresponse;       /* P2: seconds without ANY 1xx/2xx on a connection-oriented single-contact INVITE to a tokened peer before pushing with the same Call-ID (0 = off; clamp 2..10, must stay < push_wait); default 4 */
+	int push_voip_live;        /* push_voip_live=yes|no: an APNs VoIP (iOS) device is pushed even when it has a live binding (the
+	                            * INVITE also goes to that binding, with the push's Call-ID): an open socket does not tell that the iOS
+	                            * app is awake (RFC 8599 §5.6.2: skipping the push needs "knowledge that the UA is awake"). Default no:
+	                            * the app must take a push whose CallKit entry the INVITE already made, and never answer the INVITE of
+	                            * its old socket with a final response on a reconnect. */
 	int push_resume_window;    /* multi-ring: seconds the resume holds a parked call open after the FIRST wake REGISTER so every pushed device can bind; then ONE fork INVITE per live binding, all carrying the announced Call-ID (0 = legacy first-registrant-wins; clamp 0..5); default 2 */
 	int push_reregister;       /* push_reregister=yes|no: silent re-register push to every FCM-token device push_reregister_lead seconds before its registration ends, scheduled from the stored rows (survives a restart); native sender only. Default yes. */
 	int push_reregister_lead;  /* seconds before reg_expires the re-register push goes (clamp 30..600); default 120 */
