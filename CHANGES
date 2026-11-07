@@ -1,3 +1,31 @@
+## 1.9.23 — an iPhone is pushed even when its connection is up (push_voip_live)
+
+Only `chan_sofia.so` changes. The new behaviour is off by default.
+
+### Added
+
+- **`[general] push_voip_live = yes|no` (default `no`).** With `yes`, a device that registered an APNs VoIP (PushKit)
+  token is sent the VoIP push for an incoming call even when it has a live binding, besides its INVITE.
+  - Why: iOS suspends an app in the background while its socket can stay open, so the INVITE waits on a socket
+    nobody reads and the phone does not ring. RFC 8599 §5.6.2: the proxy pushes for every initial request to a UA
+    that registered with push; not pushing is an optimisation only "if the proxy has knowledge that the UA is awake".
+    Apple's PushKit: every VoIP push must be reported to CallKit.
+  - The call takes the push-assist path, so every branch carries the push's Call-ID (the uuid the app uses for
+    CallKit). Android (FCM) devices with a live binding are not pushed: their app runs while the binding is up.
+  - A device pushed while live is not waited for like a woken one: a refusal it sends (486, 603...) ends the call at
+    once; a failure the SIP stack makes up for it (the dead flow of a suspended app) keeps the call waiting, up to
+    `push_wait`, for the device to come back on a new connection, which then gets the INVITE with the same Call-ID.
+    A device inside `push_min_interval` is not pushed again and does not hold the call.
+  - `sip show push` shows `voip_live`.
+  - Turn it on only when the app in your users' hands handles a push whose CallKit entry the INVITE already created,
+    and never answers the INVITE of its old socket with a final response when it reconnects.
+
+### Changed
+
+- With push assist (live and asleep devices of one account), a live device that reconnects from a new socket while
+  the call rings no longer counts as the woken device the call waits for: the call keeps waiting for the device that
+  was woken by push, up to `push_wait`.
+
 ## 1.9.22 — 503 when the account database is down, SDP lines kept across re-INVITEs, re-INVITEs never lost
 
 `gabpbx` (the core), `res_config_pgsql.so`, `res_config_sqlite3.so` and `chan_sofia.so` change: install the four
