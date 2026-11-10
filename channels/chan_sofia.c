@@ -1114,7 +1114,20 @@ static int sofia_pvt_build_nat_target_url(struct sofia_pvt *pvt, char *buf, size
 		 * (192.0.2.x) never matched a registered contact by host, so active_contact stayed NULL. Fall back
 		 * to the peer-level src_addr proxy so an in-dialog ACK/BYE to a placeholder-Contact WSS UA still
 		 * routes over its real WSS connection (else the BYE hits the unroutable placeholder and the caller
-		 * stays "call in progress"). */
+		 * stays "call in progress"). An inbound dialog from a NAT/WebSocket caller kept the source its INVITE
+		 * came from (outbound_proxy, sofia_process_invite): that is the device of this call, where the peer's
+		 * registered source may be another of its devices, so it goes first. */
+		if (!pvt->outgoing && !pvt->is_fork_child) {
+			char ob[128];
+
+			ast_mutex_lock(&pvt->lock);
+			ast_copy_string(ob, S_OR(pvt->outbound_proxy, ""), sizeof(ob));
+			ast_mutex_unlock(&pvt->lock);
+			if (ob[0]) {
+				ast_copy_string(buf, ob, len);
+				return 1;
+			}
+		}
 		return pvt->peer ? sofia_build_nat_proxy_url_from_peer(pvt->peer, buf, len) : 0;
 	}
 	/* Snapshot contact's mutable src_addr + transport under its ao2 lock — a
@@ -7389,7 +7402,7 @@ int sofia_post_invite(struct sofia_pvt *pvt, struct ast_channel *ast, const char
 				TAG_IF(needs_manual_ack, NUTAG_AUTOACK(0)),
 				SIPTAG_CONTENT_TYPE_STR("application/sdp"),
 				SIPTAG_PAYLOAD_STR(sdp_buf),
-				TAG_IF(!ast_strlen_zero(pvt->outbound_proxy), NUTAG_PROXY(pvt->outbound_proxy)),	/* NAT: steer the INVITE packet to the learned public source (operation-level; a handle-level proxy is ineffective for the initial INVITE in this sofia-sip fork) */
+				TAG_IF(!ast_strlen_zero(pvt->outbound_proxy), NUTAG_PROXY(pvt->outbound_proxy)),	/* NAT: steer the INVITE packet to the learned public source (operation-level: nua_handle() keeps only nua/soa tags as handle parameters, so a proxy given there is dropped; passed with the INVITE it becomes the handle's proxy for the dialog) */
 				SIPTAG_MAX_FORWARDS_STR(mf_str_call),
 				TAG_END());
 		} else {
@@ -7404,7 +7417,7 @@ int sofia_post_invite(struct sofia_pvt *pvt, struct ast_channel *ast, const char
 				TAG_IF(st_min_se > 0, NUTAG_MIN_SE(st_min_se)),
 				TAG_IF(st_refresher >= 0, NUTAG_SESSION_REFRESHER(st_refresher)),
 				TAG_IF(needs_manual_ack, NUTAG_AUTOACK(0)),
-				TAG_IF(!ast_strlen_zero(pvt->outbound_proxy), NUTAG_PROXY(pvt->outbound_proxy)),	/* NAT: steer the INVITE packet to the learned public source (operation-level; a handle-level proxy is ineffective for the initial INVITE in this sofia-sip fork) */
+				TAG_IF(!ast_strlen_zero(pvt->outbound_proxy), NUTAG_PROXY(pvt->outbound_proxy)),	/* NAT: steer the INVITE packet to the learned public source (operation-level: nua_handle() keeps only nua/soa tags as handle parameters, so a proxy given there is dropped; passed with the INVITE it becomes the handle's proxy for the dialog) */
 				SIPTAG_MAX_FORWARDS_STR(mf_str_call),
 				TAG_END());
 		}
@@ -7510,7 +7523,7 @@ static int sofia_fork_dial_one(struct sofia_pvt *pvt, struct sofia_fork *fork,
 	char child_proxy_url[128] = "";
 	sofia_build_contact_proxy_url(child->peer, c, child_proxy_url, sizeof(child_proxy_url));
 	/* NAT: apply the next-hop proxy at the child nua_invite OPERATION level (below), not at
-	 * nua_handle (ineffective for the initial INVITE in this sofia-sip fork). Stash on the child;
+	 * nua_handle (nua_handle() keeps only nua/soa tags as handle parameters). Stash on the child;
 	 * sofia_fork_pick_winner copies it onto master so later master re-INVITEs keep routing here. */
 	ast_string_field_set(child, outbound_proxy, child_proxy_url);
 
@@ -9757,9 +9770,10 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 			sofia_build_nat_proxy_url_from_peer(peer, proxy_url, sizeof(proxy_url));
 			/* B: a contact-level proxy (single-live path) takes precedence over the peer-aggregate one. The
 			 * NAT next-hop proxy MUST be applied at the nua_invite OPERATION level (the call/re-INVITE below),
-			 * NOT at nua_handle creation: a handle-level NUTAG_PROXY does NOT steer the initial INVITE in this
-			 * sofia-sip fork (only the in-dialog ACK/BYE, which pass it per-operation, reach the public src).
-			 * Stash it on the pvt so sofia_call's nua_invite (and any re-INVITE) route to the public source. */
+			 * NOT at nua_handle creation: nua_handle() keeps only nua/soa tags as handle parameters and drops a
+			 * NUTAG_PROXY given there, while one passed with a request becomes the handle's proxy for the requests
+			 * that follow (the stack's own refresh and BYE included). Stash it on the pvt so sofia_call's
+			 * nua_invite (and any re-INVITE) route to the public source. */
 			const char *eff_proxy = contact_proxy_url[0] ? contact_proxy_url : proxy_url;
 			ast_string_field_set(pvt, outbound_proxy, eff_proxy);
 			/* push_parked: no handle now — the resume creates it against the freshly bound
@@ -10834,6 +10848,46 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 		if (contact) {
 			sofia_pvt_set_active_contact(pvt, contact);
 			ao2_ref(contact, -1);
+		}
+	}
+
+	/* A caller behind NAT (nat=force_rport/comedia) or on a WebSocket is reachable only at the source its INVITE
+	 * came from, over that transport, never at the Contact it advertised: chan_sip with nat= sends every request of
+	 * the dialog there (sip_real_dst). The stack sends a request to the handle's proxy (NUTAG_PROXY) when it has one
+	 * and to the remote target otherwise; a request that passes NUTAG_PROXY makes it the handle's proxy for the
+	 * requests that follow (nua_stack_init_handle runs on each request with its tags). An outbound handle gets one
+	 * from its INVITE; an inbound handle had none, so the requests the stack sends by itself (the session-refresh
+	 * UPDATE or re-INVITE, the BYE after a failed refresh, RFC 4028 §10, after a session or an ACK timeout) went to
+	 * the Contact and were lost, and the call ended at its first refresh. Set here as the handle's proxy;
+	 * outbound_proxy gives the same next hop to our own re-INVITEs and their ACK, and to our BYE when the calling
+	 * device is not one of the peer's bindings (sofia_pvt_build_nat_target_url).
+	 * Only for an INVITE straight from the device (one Via, no Record-Route): through a proxy the Contact, or the
+	 * route set the stack follows, is the right target (RFC 3261 §12.2.1.1). Nothing changes when the source is the
+	 * Contact's address: host and port, the host alone on TCP/TLS (the source port of a connection is not the port
+	 * the device listens on). pvt is not shared yet: no lock. */
+	if (pvt->peer && sip->sip_contact && sip->sip_contact->m_url->url_host
+			&& !sip->sip_record_route && sip->sip_via && !sip->sip_via->v_next) {
+		struct ast_sockaddr src;
+		char src_uri[128], tp[8];
+		url_t const *cu = sip->sip_contact->m_url;
+		int nat, same;
+
+		ast_mutex_lock(&pvt->peer->lock);
+		nat = pvt->peer->nat;
+		ast_mutex_unlock(&pvt->peer->lock);
+		sofia_request_source_uri(nua, sip, &src, src_uri, sizeof(src_uri), tp, sizeof(tp));
+		/* A WebSocket client is reachable only over its connection (RFC 7118 §5), whatever its Contact says. */
+		same = strcasecmp(tp, "ws") && strcasecmp(tp, "wss")
+			&& !strcasecmp(cu->url_host, ast_sockaddr_stringify_host(&src))
+			&& (!strcasecmp(tp, "tcp") || !strcasecmp(tp, "tls") || atoi(url_port(cu)) == ast_sockaddr_port(&src));
+		if (src_uri[0] && !same
+				&& ((nat & (SOFIA_NAT_FORCE_RPORT | SOFIA_NAT_COMEDIA)) || !strcasecmp(tp, "ws") || !strcasecmp(tp, "wss"))) {
+			ast_string_field_set(pvt, outbound_proxy, src_uri);
+			nua_set_hparams(nh, NUTAG_PROXY(src_uri), TAG_END());
+			if (sofia_debug_match(pvt->peer->name, ast_sockaddr_stringify_addr(&src))) {
+				ast_verbose("Sofia: inbound dialog %s: in-dialog requests go to %s (Contact host %s)\n",
+					S_OR(pvt->callid, "(no-callid)"), src_uri, cu->url_host);
+			}
 		}
 	}
 
