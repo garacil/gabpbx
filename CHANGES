@@ -1,3 +1,25 @@
+## 1.9.24 — an inbound call from a caller behind NAT is no longer cut at its first session refresh
+
+Only `chan_sofia.so` changes.
+
+### Fixed
+
+- **An inbound call from a phone behind NAT ended at the first session refresh**: half the Session-Expires interval
+  (30 minutes with the default 3600 s), when the phone does not do session timers and GABPBX refreshes the session.
+  - The refresh (an UPDATE, or a re-INVITE) and the BYE that follows a failed refresh (RFC 4028 §10) were sent by the
+    SIP stack to the phone's Contact, a private address behind NAT, instead of the address the INVITE came from. The
+    re-INVITEs of GABPBX itself on such a call (hold, T.38, a refresh without UPDATE) and their ACK went there too.
+  - Now, for an INVITE that comes straight from the device (one Via, no Record-Route) of a peer with
+    `nat=force_rport` or `comedia`, or over WS/WSS, whose source is not the Contact's address (the host alone on
+    TCP/TLS), every request of the dialog goes to that source, over the transport it came on, as `chan_sip` does with
+    `nat=`. The Request-URI keeps the Contact. A call that comes through a proxy is unchanged.
+  - A BYE to a calling device that is not one of the peer's registered bindings goes there too (before: the peer's
+    last registration source, which can be another device of the account).
+
+### Upgrading
+
+Replace `chan_sofia.so` (the core and the Sofia-SIP library are the same as 1.9.23).
+
 ## 1.9.23 — an iPhone is pushed even when its connection is up (push_voip_live)
 
 Only `chan_sofia.so` changes. The new behaviour is off by default.
