@@ -88,7 +88,7 @@ int sofia_push_peer_pushable(struct sofia_peer *peer);
 int sofia_push_count_asleep(struct sofia_peer *peer, const char *exclude_instance, char live_inst[][128], int n_live);
 /* push_fcm_live=hold / push_voip_live=hold: 1 when the live binding of this +sip.instance is a device (FCM / APNs VoIP)
  * that is pushed first and gets its INVITE only on the binding of the REGISTER the push makes (usable token of that
- * type, outside push_min_interval of its last push, not listed in push_hold_exclude). */
+ * type, outside push_min_interval of its last push). */
 int sofia_push_live_held(struct sofia_peer *peer, const char *instance);
 /* Returns 1 while the assist waits for a woken device (entry kept, push_wait armed), 0 otherwise. */
 int sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_channel *ast, struct ast_sockaddr *live_srcs, char live_inst[][128], int n_live);
@@ -1477,11 +1477,6 @@ struct sofia_config {
 	                            * app is awake (RFC 8599 §5.6.2: skipping the push needs "knowledge that the UA is awake"). Default no:
 	                            * the app must take a push whose CallKit entry the INVITE already made, and never answer the INVITE of
 	                            * its old socket with a final response on a reconnect. */
-	char push_hold_exclude[512]; /* push_hold_exclude=<X-Device-ID or +sip.instance>[,...] (additive, one or more lines;
-	                            * list it BEFORE push_*_live=hold so a reload never holds a listed device for an instant):
-	                            * devices never held by push_*_live=hold (their
-	                            * INVITE goes to their live binding at once, no push), e.g. an iOS app on a Mac, whose VoIP pushes
-	                            * macOS drops before the app sees them, so no REGISTER ever follows. Empty = none. */
 	int push_fcm_live;         /* push_fcm_live=no|yes|hold, an FCM (Android) device with a live binding: no = the INVITE only (no
 	                            * push); yes = pushed too, the INVITE also goes to that binding with the push's Call-ID (as
 	                            * push_voip_live); hold = pushed and the INVITE is held until the REGISTER the push makes, then sent to
