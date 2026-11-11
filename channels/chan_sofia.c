@@ -15424,6 +15424,60 @@ void sofia_resolve_ourip(struct sofia_pvt *pvt, const struct ast_sockaddr *targe
 	}
 }
 
+/* Cut a "host[:port]" as fromdomain= is written: a bracketed IPv6 literal keeps its colons and its closing
+ * bracket, a bare IPv6 literal (more than one colon) is all host. Returns the port, 0 when there is none or it
+ * is out of range. */
+static int sofia_split_hostport(char *host)
+{
+	char *portstr;
+	int port;
+
+	if (host[0] == '[') {
+		portstr = strstr(host, "]:");
+		if (portstr) {
+			portstr++;
+		}
+	} else {
+		portstr = strchr(host, ':');
+		if (portstr && strchr(portstr + 1, ':')) {
+			portstr = NULL;
+		}
+	}
+	if (!portstr) {
+		return 0;
+	}
+	*portstr++ = '\0';
+	port = atoi(portstr);
+	return (port > 0 && port <= 65535) ? port : 0;
+}
+
+/* The host[:port] of an outbound INVITE From, as chan_sip initreqprep writes it (chan_sip.c:13128-13132): the
+ * port is the one of fromdomain=host:port, else ours, and it is written only when it is not the standard port of
+ * the transport (5061 for TLS, 5060 otherwise). A PBX that identifies its provider by the From host and port
+ * (registered to a non-default port) does not recognise a From without it. */
+static void sofia_from_hostport(struct sofia_pvt *pvt, const char *domain, char *out, size_t outlen)
+{
+	char host[128], peer_domain[128], hbuf[136];
+	int port = 0;
+	int standard = (pvt && pvt->peer && (pvt->peer->transport & SOFIA_TRANSPORT_TLS)) ? 5061 : 5060;
+
+	ast_copy_string(host, S_OR(domain, ""), sizeof(host));
+	sofia_split_hostport(host);	/* a port written in fromdomain= is taken below, never left in the host */
+	if (pvt && pvt->peer && !ast_strlen_zero(pvt->peer->fromdomain)) {
+		ast_copy_string(peer_domain, pvt->peer->fromdomain, sizeof(peer_domain));
+		port = sofia_split_hostport(peer_domain);	/* chan_sip fromdomainport */
+	}
+	if (!port && pvt && !ast_sockaddr_isnull(&pvt->ourip)) {
+		port = ast_sockaddr_port(&pvt->ourip);
+	}
+	sofia_uri_format_host(host, hbuf, sizeof(hbuf));
+	if (port && port != standard) {
+		snprintf(out, outlen, "%s:%d", hbuf, port);
+	} else {
+		ast_copy_string(out, hbuf, outlen);
+	}
+}
+
 /* Build the outbound INVITE From URI (chan_sip parity). Identity + privacy + URI-encoding
  * come from sofia_resolve_identity. Never append ;tag= manually — nua emits the From-tag. */
 static void sofia_build_from(struct sofia_pvt *pvt, char *buf, size_t len)
@@ -15465,22 +15519,29 @@ static void sofia_build_from(struct sofia_pvt *pvt, char *buf, size_t len)
 
 	/* Privacy: a restricted presentation makes the From anonymous (chan_sip.c:12876-12881 parity):
 	 * display "Anonymous", domain "anonymous.invalid" (FROMDOMAIN_INVALID), URI user "anonymous" —
-	 * but a configured fromuser still overrides the user part (chan_sip.c:12900). */
+	 * but a configured fromuser still overrides the user part (chan_sip.c:12900). chan_sip writes the
+	 * port after that domain too. */
 	if ((lid_pres & AST_PRES_RESTRICTION) != AST_PRES_ALLOWED) {
-		snprintf(buf, len, "\"Anonymous\" <sip:%s@anonymous.invalid>",
-			have_fromuser ? final_user : "anonymous");
+		char anon_hostport[160];
+
+		sofia_from_hostport(pvt, "anonymous.invalid", anon_hostport, sizeof(anon_hostport));
+		snprintf(buf, len, "\"Anonymous\" <sip:%s@%s>",
+			have_fromuser ? final_user : "anonymous", anon_hostport);
 		return;
 	}
 
 	/* usereqphone (chan_sip parity): add RFC 3966 ;user=phone when set and the FINAL From user is
 	 * numeric (test the override result, not the stale callerid — a non-numeric fromuser must not
 	 * inherit ;user=phone from a numeric callerid). */
-	if (pvt && pvt->peer && pvt->peer->usereqphone && sofia_user_looks_like_phone(final_user)) {
-		snprintf(buf, len, "\"%s\" <sip:%s@%s;user=phone>", lid_name, final_user,
-			sofia_uri_format_host(fromdomain, fbuf, sizeof(fbuf)));
-	} else {
-		snprintf(buf, len, "\"%s\" <sip:%s@%s>", lid_name, final_user,
-			sofia_uri_format_host(fromdomain, fbuf, sizeof(fbuf)));
+	{
+		char hostport[160];
+
+		sofia_from_hostport(pvt, fromdomain, hostport, sizeof(hostport));
+		if (pvt && pvt->peer && pvt->peer->usereqphone && sofia_user_looks_like_phone(final_user)) {
+			snprintf(buf, len, "\"%s\" <sip:%s@%s;user=phone>", lid_name, final_user, hostport);
+		} else {
+			snprintf(buf, len, "\"%s\" <sip:%s@%s>", lid_name, final_user, hostport);
+		}
 	}
 }
 
