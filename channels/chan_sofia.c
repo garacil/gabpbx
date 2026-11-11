@@ -1298,6 +1298,55 @@ static int sofia_contact_is_unexpired(time_t expires, time_t now)
 	return expires > now;
 }
 
+/* =hold (push_fcm_live / push_voip_live): 1 when the peer has live bindings (the calling device's own excluded) and
+ * every one of them is a device pushed first (sofia_push_live_held): the call is parked for the push, as for a device with no live
+ * binding, and the INVITE goes to the binding of the REGISTER the push makes (RFC 8599 §5.6.2). held_inst/n_held get
+ * their +sip.instances (for the collect window's fork). Same iteration and lock order as
+ * sofia_peer_select_single_live_contact; the caller must NOT hold peer->lock. */
+static int sofia_peer_live_all_held(struct sofia_peer *peer, const struct ast_sockaddr *exclude_src,
+	const char *exclude_instance, char held_inst[][128], int *n_held)
+{
+	struct ao2_iterator ci;
+	struct sofia_contact *c;
+	int live = 0, held = 0;
+	time_t now = time(NULL);
+
+	if (!peer || !peer->contacts) {
+		return 0;
+	}
+	ci = ao2_iterator_init(peer->contacts, 0);
+	while ((c = ao2_iterator_next(&ci))) {
+		time_t c_exp;
+		struct ast_sockaddr c_src;
+		char c_inst[128];
+
+		ao2_lock(c);
+		c_exp = c->expires;
+		ast_sockaddr_copy(&c_src, &c->src_addr);
+		ast_copy_string(c_inst, c->instance_id, sizeof(c_inst));
+		ao2_unlock(c);
+		ao2_ref(c, -1);
+		if (sofia_selfcall_contact_excluded(&c_src, c_inst, exclude_src, exclude_instance)
+				|| !sofia_contact_is_unexpired(c_exp, now)) {
+			continue;
+		}
+		live++;
+		if (sofia_push_live_held(peer, c_inst)) {
+			if (held < SOFIA_PUSH_MAX_DEVICES) {
+				ast_copy_string(held_inst[held], c_inst, sizeof(held_inst[0]));
+			}
+			held++;
+		}
+	}
+	ao2_iterator_destroy(&ci);
+	if (!(live > 0 && held == live && held <= SOFIA_PUSH_MAX_DEVICES)) {
+		*n_held = 0;
+		return 0;
+	}
+	*n_held = held;
+	return 1;
+}
+
 struct sofia_contact *sofia_peer_select_single_live_contact(struct sofia_peer *peer,
 	int *unexpired_out, int *total_out, const struct ast_sockaddr *exclude_src,
 	const char *exclude_instance)
@@ -7784,6 +7833,26 @@ int sofia_fork_dial(struct sofia_pvt *pvt, int push_hold)
 				continue;
 			}
 		}
+		if (pvt->push_held_n) {
+			/* =hold (push_fcm_live / push_voip_live): this binding's device is pushed first and gets the INVITE on the
+			 * binding of the REGISTER the push makes (late append), never on this one (sofia_call). */
+			char h_inst[128];
+			int k, held = 0;
+
+			ao2_lock(c);
+			ast_copy_string(h_inst, c->instance_id, sizeof(h_inst));
+			ao2_unlock(c);
+			for (k = 0; h_inst[0] && k < pvt->push_held_n; k++) {
+				if (!strcasecmp(h_inst, pvt->push_held_inst[k])) {
+					held = 1;
+					break;
+				}
+			}
+			if (held) {
+				ao2_ref(c, -1);
+				continue;
+			}
+		}
 		posted_any |= sofia_fork_dial_one(pvt, fork, c, branch_idx);
 		branch_idx++;
 		ao2_ref(c, -1);
@@ -7939,7 +8008,26 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 	 * (wake REGISTER) with the pre-generated Call-ID, or the call times out NOANSWER.
 	 * Runs under the channel lock ast_call holds — the same serializer the resume takes. */
 	if (pvt->push_parked) {
-		return sofia_push_park_and_notify(pvt, ast);
+		int prc = sofia_push_park_and_notify(pvt, ast);
+
+		if (prc && pvt->push_park_held) {
+			/* =hold: the push could not be set up (park caps, no sender job, no timer): the devices pushed first
+			 * get their INVITE on their live bindings after all, never no call. The fork needs no handle. */
+			ast_log(LOG_NOTICE, "Sofia PUSH: peer '%s' - could not park for the push (push_*_live=hold): ringing the live binding(s)\n",
+				S_OR(pvt->peername, "unknown"));
+			ast_mutex_lock(&pvt->lock);
+			pvt->push_parked = 0;
+			pvt->push_park_held = 0;
+			pvt->push_held_n = 0;
+			ast_mutex_unlock(&pvt->lock);
+			if (!pvt->sip_callid[0]) {
+				su_guid_t g[1];
+				su_guid_generate(g);
+				su_guid_sprintf(pvt->sip_callid, sizeof(pvt->sip_callid), g);
+			}
+			return sofia_fork_dial(pvt, 0);
+		}
+		return prc;
 	}
 
 	/* Check if peer has multiple live contacts for forking */
@@ -7956,7 +8044,10 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		struct ast_sockaddr live_srcs[SOFIA_PUSH_MAX_DEVICES];
 		char live_inst[SOFIA_PUSH_MAX_DEVICES][128];
 		int n_live_ex = 0;
+		struct ast_sockaddr held_srcs[SOFIA_PUSH_MAX_DEVICES];	/* push_fcm_live=hold: the left-out bindings */
+		int k;
 
+		pvt->push_held_n = 0;
 		ci = ao2_iterator_init(pvt->peer->contacts, 0);
 		while ((c = ao2_iterator_next(&ci))) {
 			time_t c_exp;
@@ -7977,6 +8068,14 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 				continue;
 			}
 			if (sofia_contact_is_unexpired(c_exp, now)) {
+				if (pvt->push_held_n < SOFIA_PUSH_MAX_DEVICES && sofia_push_live_held(pvt->peer, c_inst)) {
+					/* =hold (push_fcm_live / push_voip_live): a device pushed first; the first fork leaves its binding
+					 * out and the wake push treats it as asleep (not in live_inst), RFC 8599 §5.6.2. */
+					ast_sockaddr_copy(&held_srcs[pvt->push_held_n], &c_src);
+					ast_copy_string(pvt->push_held_inst[pvt->push_held_n++], c_inst, sizeof(pvt->push_held_inst[0]));
+					ao2_ref(c, -1);
+					continue;
+				}
 				live++;
 				if (n_live_ex < SOFIA_PUSH_MAX_DEVICES) {
 					ast_sockaddr_copy(&live_srcs[n_live_ex], &c_src);
@@ -7987,6 +8086,19 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 			ao2_ref(c, -1);
 		}
 		ao2_iterator_destroy(&ci);
+		if (pvt->push_held_n && (live == 0 || !sofia_push_peer_pushable(pvt->peer))) {
+			/* Nothing else would ring now (sofia_request_call parks such a call; a binding changed since), or no
+			 * push can go out: the left-out bindings get their INVITE after all, never no call. */
+			for (k = 0; k < pvt->push_held_n; k++) {
+				live++;
+				if (n_live_ex < SOFIA_PUSH_MAX_DEVICES) {
+					ast_sockaddr_copy(&live_srcs[n_live_ex], &held_srcs[k]);
+					ast_copy_string(live_inst[n_live_ex], pvt->push_held_inst[k], sizeof(live_inst[n_live_ex]));
+					n_live_ex++;
+				}
+			}
+			pvt->push_held_n = 0;
+		}
 
 		ast_mutex_lock(&pvt->peer->lock);
 		peer_is_dynamic = !strcasecmp(pvt->peer->host, "dynamic");
@@ -8011,6 +8123,22 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 		 * push. Requires a pushable peer and >=1 live binding; forces a fork even for a
 		 * single live binding so a woken device can be late-appended as an extra branch.
 		 * A woken device rings a few seconds later and can still take the call. */
+		if (pvt->push_held_n && !(live >= 1 && sofia_push_peer_pushable(pvt->peer)
+				&& sofia_push_count_asleep(pvt->peer,
+					pvt->fork_exclude_valid ? pvt->push_exclude_instance : NULL,
+					live_inst, n_live_ex) > 0)) {
+			/* The token cache changed since the scan (no wake push would go out): the left-out bindings are
+			 * dialed with the others. */
+			for (k = 0; k < pvt->push_held_n; k++) {
+				live++;
+				if (n_live_ex < SOFIA_PUSH_MAX_DEVICES) {
+					ast_sockaddr_copy(&live_srcs[n_live_ex], &held_srcs[k]);
+					ast_copy_string(live_inst[n_live_ex], pvt->push_held_inst[k], sizeof(live_inst[n_live_ex]));
+					n_live_ex++;
+				}
+			}
+			pvt->push_held_n = 0;
+		}
 		if (live >= 1 && pvt->peer && sofia_push_peer_pushable(pvt->peer)
 				&& sofia_push_count_asleep(pvt->peer,
 					pvt->fork_exclude_valid ? pvt->push_exclude_instance : NULL,
@@ -8024,20 +8152,50 @@ static int sofia_call(struct ast_channel *ast, char *dest, int timeout)
 			/* ring the live devices now (fork of >=1), held open: a live binding that fails at once
 			 * (a dead ws/wss flow) must not end the call before the woken device can join */
 			rc = sofia_fork_dial(pvt, 1);
+			if (!rc && pvt->push_held_n) {
+				ast_verb(2, "Sofia PUSH: %s peer='%s' - %d device(s) with a live binding left out of the fork, pushed first (push_*_live=hold)\n",
+					pvt->sip_callid, S_OR(pvt->peername, "unknown"), pvt->push_held_n);
+			}
 			/* No wake push once the fork takes no more branches (a branch already won or answered
 			 * 6xx while the others were posted, RFC 3261 §16.7 step 5): nothing to wait for. A win
 			 * or 6xx that lands after this check, or after the push, creates no branch either: the
 			 * woken device's late append is refused (sofia_fork_closed_locked). */
 			if (!rc && (sofia_fork_closed(pvt)
 					|| !sofia_push_assist_wake(pvt, ast, live_srcs, live_inst, n_live_ex))) {
+				if (pvt->push_held_n && !sofia_fork_closed(pvt)) {
+					/* =hold and no push could go out: the devices left out get their INVITE on their live
+					 * bindings after all, never no call; appended while the fork is still held open, so the
+					 * release below cannot end a fork whose other branches have all failed. */
+					struct ao2_iterator hi = ao2_iterator_init(pvt->peer->contacts, 0);
+					struct sofia_contact *hc;
+
+					while ((hc = ao2_iterator_next(&hi))) {
+						char h_inst[128];
+
+						ao2_lock(hc);
+						ast_copy_string(h_inst, hc->instance_id, sizeof(h_inst));
+						ao2_unlock(hc);
+						for (k = 0; h_inst[0] && k < pvt->push_held_n; k++) {
+							if (!strcasecmp(h_inst, pvt->push_held_inst[k])) {
+								sofia_fork_append_contact(pvt, hc);
+								break;
+							}
+						}
+						ao2_ref(hc, -1);
+					}
+					ao2_iterator_destroy(&hi);
+				}
 				sofia_fork_push_hold_release(pvt);	/* no wake push went out: nothing to wait for */
 			}
+			pvt->push_held_n = 0;	/* only this first fork leaves them out: the wake path dials their new binding */
 			return rc;
 		}
 
 		if (live > 1) {
+			pvt->push_held_n = 0;	/* no wake push on this path: every live binding is dialed */
 			return sofia_fork_dial(pvt, 0);	/* forking engine (extracted): one child per live contact */
 		}
+		pvt->push_held_n = 0;
 	}
 
 	/* Single-contact path (original behavior). */
@@ -9663,6 +9821,25 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 				single = sofia_peer_select_single_live_contact(peer, &n_unexpired, &n_total,
 					pvt->fork_exclude_valid ? &pvt->fork_exclude_src : NULL,
 					pvt->fork_exclude_valid ? pvt->push_exclude_instance : NULL);
+				if (n_unexpired > 0 && (sofia_cfg.push_fcm_live == 2 || sofia_cfg.push_voip_live == 2)
+						&& sofia_push_peer_pushable(peer)
+						&& sofia_peer_live_all_held(peer,
+							pvt->fork_exclude_valid ? &pvt->fork_exclude_src : NULL,
+							pvt->fork_exclude_valid ? pvt->push_exclude_instance : NULL,
+							pvt->push_held_inst, &pvt->push_held_n)) {
+					/* =hold, every live binding a device pushed first (push_fcm_live / push_voip_live): park the call
+					 * for the push (RFC 8599 §5.6.2), as when no binding is live; a wake REGISTER resumes it and
+					 * the collect window dials the woken devices' bindings, never the old ones of the devices still
+					 * waking (push_held_inst), which join by late append; push_wait bounds the wait. */
+					if (single) {
+						ao2_ref(single, -1);
+						single = NULL;
+					}
+					pvt->push_parked = 1;	/* pre-channel: pvt not shared yet, no lock needed */
+					pvt->push_park_held = 1;
+					ast_log(LOG_NOTICE, "Sofia PUSH: peer '%s' - %d live binding(s), every one a device pushed first (push_*_live=hold) - will park for push\n",
+						peername, n_unexpired);
+				}
 				if (single && sofia_qualify_refuses(peer, single)) {
 					/* chan_sip parity (create_addr_from_peer refuses a peer its qualify found unreachable,
 					 * sip_request_call returns AST_CAUSE_UNREGISTERED): the INVITE would only time out at a
@@ -23037,8 +23214,11 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			}
 			sofia_cfg.push_resume_window = g;
 		} else if (!strcasecmp(v->name, "push_voip_live")) {
-			/* an iOS (APNs VoIP) device is pushed even with a live binding (sofia_push.c) */
-			sofia_cfg.push_voip_live = ast_true(v->value) ? 1 : 0;
+			/* an iOS (APNs VoIP) device with a live binding: no / yes (pushed too) / hold (RFC 8599 push bucket) */
+			sofia_cfg.push_voip_live = !strcasecmp(v->value, "hold") ? 2 : ast_true(v->value) ? 1 : 0;
+		} else if (!strcasecmp(v->name, "push_fcm_live")) {
+			/* an FCM (Android) device with a live binding: no / yes (pushed too) / hold (RFC 8599 push bucket) */
+			sofia_cfg.push_fcm_live = !strcasecmp(v->value, "hold") ? 2 : ast_true(v->value) ? 1 : 0;
 		} else if (!strcasecmp(v->name, "push_reregister")) {
 			sofia_cfg.push_reregister = ast_true(v->value) ? 1 : 0;
 		} else if (!strcasecmp(v->name, "push_reregister_lead")) {
@@ -24288,6 +24468,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.push_noresponse = 4;	/* P2 guard; 0 disables */
 	sofia_cfg.push_resume_window = 2;	/* multi-ring collect window; 0 = first-registrant-wins */
 	sofia_cfg.push_voip_live = 0;	/* push an iOS (APNs VoIP) device with a live binding too: off until the app handles it */
+	sofia_cfg.push_fcm_live = 0;	/* an Android (FCM) device with a live binding: INVITE only, not pushed (yes / hold: sofia_push.c) */
 	sofia_cfg.push_sender_native = 1;	/* native in-process sender by default; script = fallback */
 	sofia_cfg.push_reregister = 1;	/* silent re-register push before a registration ends (native only) */
 	sofia_cfg.push_reregister_lead = 120;

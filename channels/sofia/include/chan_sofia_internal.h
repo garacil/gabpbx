@@ -86,6 +86,10 @@ int sofia_push_peer_pushable(struct sofia_peer *peer);
  * (usable token, instance not the caller's nor any already-ringing live binding), and wake
  * them alongside the fork to the live ones. */
 int sofia_push_count_asleep(struct sofia_peer *peer, const char *exclude_instance, char live_inst[][128], int n_live);
+/* push_fcm_live=hold / push_voip_live=hold: 1 when the live binding of this +sip.instance is a device (FCM / APNs VoIP)
+ * that is pushed first and gets its INVITE only on the binding of the REGISTER the push makes (usable token of that
+ * type, outside push_min_interval of its last push). */
+int sofia_push_live_held(struct sofia_peer *peer, const char *instance);
 /* Returns 1 while the assist waits for a woken device (entry kept, push_wait armed), 0 otherwise. */
 int sofia_push_assist_wake(struct sofia_pvt *pvt, struct ast_channel *ast, struct ast_sockaddr *live_srcs, char live_inst[][128], int n_live);
 /* Park a push_parked pvt (called from sofia_call under the CHANNEL lock): registry entry +
@@ -754,6 +758,13 @@ struct sofia_pvt {
 	struct ast_sockaddr fork_exclude_src;
 	int fork_exclude_valid;
 	char push_exclude_instance[128];
+	/* push_fcm_live=hold / push_voip_live=hold: the +sip.instance of each live binding the first fork of this call leaves
+	 * out (a device pushed first, which gets its INVITE on the binding of the REGISTER the push makes, RFC 8599 §5.6.2):
+	 * set by sofia_call for its first fork (channel lock), or by sofia_request_call for a call parked for them and then
+	 * narrowed by the collect window (sofia_push_collect_cb) to the devices not woken yet; read by sofia_fork_dial. */
+	char push_held_inst[SOFIA_PUSH_MAX_DEVICES][128];
+	int push_held_n;
+	int push_park_held;	/* parked because every live binding is a device pushed first (sofia_request_call, pre-channel) */
 	time_t lastrtprx;                /* last inbound audio RTP read (sofia_read fdno 0). 0 = nothing received yet -> the RTP-inactivity teardown stays UNARMED (chan_sip parity: a call whose media never started is not killed by rtptimeout). */
 	time_t lastrtptx;                /* last outbound write (sofia_write) - rtpkeepalive CNG reference (chan_sip parity) */
 	int local_hold_mode;             /* WE are holding the peer (hold_reinvite): 0 = not held (offers a=sendrecv); 1 = sendonly; 2 = inactive. Drives the OFFER direction in sofia_generate_sdp; guarded by pvt->lock. */
@@ -1461,11 +1472,17 @@ struct sofia_config {
 	int push_max_devices;      /* devices pushed per peer per call (clamp 1..10, Kamailio devlist parity) */
 	int push_min_interval;     /* seconds per-device push floor (the phone itself cancels a push <5 s after the previous); 0 = off */
 	int push_noresponse;       /* P2: seconds without ANY 1xx/2xx on a connection-oriented single-contact INVITE to a tokened peer before pushing with the same Call-ID (0 = off; clamp 2..10, must stay < push_wait); default 4 */
-	int push_voip_live;        /* push_voip_live=yes|no: an APNs VoIP (iOS) device is pushed even when it has a live binding (the
+	int push_voip_live;        /* push_voip_live=no|yes|hold (1 = yes, 2 = hold, as push_fcm_live): an APNs VoIP (iOS) device is pushed even when it has a live binding (the
 	                            * INVITE also goes to that binding, with the push's Call-ID): an open socket does not tell that the iOS
 	                            * app is awake (RFC 8599 §5.6.2: skipping the push needs "knowledge that the UA is awake"). Default no:
 	                            * the app must take a push whose CallKit entry the INVITE already made, and never answer the INVITE of
 	                            * its old socket with a final response on a reconnect. */
+	int push_fcm_live;         /* push_fcm_live=no|yes|hold, an FCM (Android) device with a live binding: no = the INVITE only (no
+	                            * push); yes = pushed too, the INVITE also goes to that binding with the push's Call-ID (as
+	                            * push_voip_live); hold = pushed and the INVITE is held until the REGISTER the push makes, then sent to
+	                            * that REGISTER's binding (RFC 8599 §5.6.2, the push bucket): nothing goes to the old binding, unless no
+	                            * push can go out (then the binding gets it after all). A device without a usable token or within
+	                            * push_min_interval of its last push gets the INVITE on its binding. Default no. */
 	int push_resume_window;    /* multi-ring: seconds the resume holds a parked call open after the FIRST wake REGISTER so every pushed device can bind; then ONE fork INVITE per live binding, all carrying the announced Call-ID (0 = legacy first-registrant-wins; clamp 0..5); default 2 */
 	int push_reregister;       /* push_reregister=yes|no: silent re-register push to every FCM-token device push_reregister_lead seconds before its registration ends, scheduled from the stored rows (survives a restart); native sender only. Default yes. */
 	int push_reregister_lead;  /* seconds before reg_expires the re-register push goes (clamp 30..600); default 120 */
