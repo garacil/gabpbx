@@ -17177,44 +17177,47 @@ static void sofia_mwi_reject_reap(nua_handle_t *nh)
 	sofia_subscribe_reject_reap(nh);
 }
 
-/* MWI SUBSCRIBE handler (Event:message-summary). Identifies the mailbox-owner peer
- * via the To user-part, enforces a 1-subscription-per-peer cap, binds nh as a
+/* MWI SUBSCRIBE handler (Event:message-summary). Identifies the subscribing peer
+ * via the From user-part, enforces a 1-subscription-per-peer cap, binds nh as a
  * nua_notifier. Runs on sofia_thread; holds peer->lock only while mutating peer
  * fields, never across nua_* ops. */
 static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 		struct sofia_pvt *op, sip_t const *sip, tagi_t tags[])
 {
 	struct sofia_peer *peer;
-	const char *to_user;
+	const char *from_user;
 	nua_handle_t *old_nh = NULL;
 	struct ast_sockaddr sub_src;
 	char sub_proxy[128] = "";
 	char expires_buf[16];
 	int requested = 0, granted = 0, terminating = 0, same_device = 0;
 
-	/* To URI user-part identifies the mailbox-owning peer */
-	if (!sip || !sip->sip_to || !sip->sip_to->a_url || !sip->sip_to->a_url->url_user) {
+	/* The From user-part names the subscriber, authenticated below, and the subscription reports that peer's
+	 * mailboxes, as chan_sip does (check_peer_ok matches a SUBSCRIBE on the From name). The Request-URI and the
+	 * To may name an alias the messaging system knows, such as the voicemail access number (RFC 3842 §3.12), or
+	 * carry no user part at all; the NOTIFY body names the account in Message-Account (§3.1). */
+	if (!sip || !sip->sip_from || !sip->sip_from->a_url || !sip->sip_from->a_url->url_user) {
 		nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
 		sofia_mwi_reject_reap(nh);	/* reap the challenge handle */
 		return;
 	}
-	to_user = sip->sip_to->a_url->url_user;
+	from_user = sip->sip_from->a_url->url_user;
 
-	peer = sofia_find_peer(to_user);
+	peer = sofia_find_peer(from_user);
 	if (!peer && sofia_peer_lookup_failed()) {
-		sofia_reject_backend_unavailable(nua, nh, "SUBSCRIBE", to_user);
+		sofia_reject_backend_unavailable(nua, nh, "SUBSCRIBE", from_user);
 		sofia_mwi_reject_reap(nh);
 		return;
 	}
 	if (!peer) {
 		if (sofia_cfg.alwaysauthreject) {
-			ast_log(LOG_NOTICE, "Sofia MWI: SUBSCRIBE for unknown peer '%s' — answered as a wrong password\n", to_user);
+			ast_log(LOG_NOTICE, "Sofia MWI: SUBSCRIBE from unknown peer '%s' — answered as a wrong password\n", from_user);
 			/* The answers a real account with a wrong password gets (401, then 403 for credentials, not a
 			 * second 401), synchronously like the credentialed-peer path, which reaps the same way. */
 			sofia_reject_as_unknown(nua, nh, sip, "SUBSCRIBE", NULL, 1);
 			sofia_mwi_reject_reap(nh);
 		} else {
-			ast_log(LOG_NOTICE, "Sofia MWI: SUBSCRIBE for unknown peer '%s' — 404\n", to_user);
+			ast_log(LOG_NOTICE, "Sofia MWI: SUBSCRIBE from unknown peer '%s' — 404\n", from_user);
 			nua_respond(nh, SIP_404_NOT_FOUND, NUTAG_WITH_THIS(nua), TAG_END());
 			sofia_mwi_reject_reap(nh);	/* immediate reap — 404 branch (no deferred 401) */
 		}
@@ -17224,7 +17227,7 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 	/* Per-peer source-IP ACL, BEFORE the allowsubscribe/digest gates (chan_sip parity, chan_sip.c
 	 * :17020 applies peer->ha unconditionally before auth). REGISTER (peer->ha @8084) and INVITE
 	 * (caller_peer->ha @5549) apply the same gate; without it a credential-less peer is watchable by
-	 * spoofing the To/From user-part from a denied IP. RFC 6665. */
+	 * spoofing the From user-part from a denied IP. RFC 6665. */
 	if (peer->ha) {
 		struct ast_sockaddr src;
 		sofia_get_source_addr(sip, &src);
