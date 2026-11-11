@@ -276,13 +276,13 @@ static int sofia_pushdb_exe(void *data)
 
 /* Queue a DB job (by-value snapshot). Failure = log + drop, cache stays correct
  * (regpool doctrine: never block, never reorder; the next REGISTER heals the row). */
-static void sofia_pushdb_queue(const struct sofia_pushdb_job *src)
+static int sofia_pushdb_queue(const struct sofia_pushdb_job *src)
 {
 	struct sofia_pushdb_job *j;
 	static time_t last_warn;
 
 	if (!sofia_pushdb_tps) {
-		return;
+		return -1;
 	}
 	if (ast_atomic_fetchadd_int(&sofia_pushdb_depth, +1) >= SOFIA_PUSH_DBQ_MAX) {
 		ast_atomic_fetchadd_int(&sofia_pushdb_depth, -1);
@@ -291,17 +291,19 @@ static void sofia_pushdb_queue(const struct sofia_pushdb_job *src)
 			ast_log(LOG_WARNING, "Sofia PUSH: pushdb queue cap (%d) hit - dropping DB write (cache stays authoritative)\n",
 				SOFIA_PUSH_DBQ_MAX);
 		}
-		return;
+		return -1;
 	}
 	if (!(j = ast_calloc(1, sizeof(*j)))) {
 		ast_atomic_fetchadd_int(&sofia_pushdb_depth, -1);
-		return;
+		return -1;
 	}
 	*j = *src;
 	if (ast_taskprocessor_push(sofia_pushdb_tps, sofia_pushdb_exe, j) < 0) {
 		ast_atomic_fetchadd_int(&sofia_pushdb_depth, -1);
 		ast_free(j);
+		return -1;
 	}
+	return 0;
 }
 
 void sofia_push_log_event(const char *peer, const char *device_id, const char *callid,
@@ -386,6 +388,57 @@ static int sofia_push_device_pushed_when_live(const struct sofia_push_device *d)
 		|| (sofia_cfg.push_fcm_live == 1 && !strcasecmp(d->push_type, "fcm"));
 }
 
+/* push_hold_exclude: 1 when the device's X-Device-ID or +sip.instance is in the [general] list (comma or blank
+ * separated, case-insensitive; an instance matches with or without its "urn:uuid:" prefix, angle brackets and double
+ * quotes, as copied from a Contact). Such a device is never held: its
+ * VoIP pushes never make it REGISTER (an iOS app on a Mac: macOS drops them), so holding its INVITE would lose every
+ * call to it. Reads sofia_cfg only (set at load/reload). */
+static int sofia_push_hold_excluded(const struct sofia_push_device *d)
+{
+	char list[sizeof(sofia_cfg.push_hold_exclude)];
+	char *cur, *tok;
+	const char *inst = d->instance;
+
+	if (!sofia_cfg.push_hold_exclude[0]) {
+		return 0;
+	}
+	if (!strncasecmp(inst, "<urn:uuid:", 10)) {
+		inst += 10;
+	} else if (!strncasecmp(inst, "urn:uuid:", 9)) {
+		inst += 9;
+	}
+	ast_copy_string(list, sofia_cfg.push_hold_exclude, sizeof(list));
+	cur = list;
+	while ((tok = strsep(&cur, ", \t"))) {
+		size_t n;
+
+		if (*tok == '"') {
+			tok++;
+		}
+		if (*tok == '<') {
+			tok++;
+		}
+		if (!strncasecmp(tok, "urn:uuid:", 9)) {
+			tok += 9;
+		}
+		n = strlen(tok);
+		if (n && tok[n - 1] == '"') {
+			tok[--n] = '\0';
+		}
+		if (n && tok[n - 1] == '>') {
+			tok[--n] = '\0';
+		}
+		if (!n) {
+			continue;
+		}
+		if (!strcasecmp(tok, d->device_id)
+				|| (inst[0] && (!strcasecmp(tok, inst) || (!strncasecmp(inst, tok, n) && inst[n] == '>')))) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
 /* push_fcm_live=hold / push_voip_live=hold (RFC 8599 §5.6.2, the push bucket): the proxy pushes for every initial
  * request and forwards it only after the 2xx to the REGISTER the push triggers, to that REGISTER's binding. A live
  * binding is no proof that the app reads its socket (an iOS app may be frozen on a socket the NAT dropped long ago, an
@@ -421,7 +474,8 @@ int sofia_push_live_held(struct sofia_peer *peer, const char *instance)
 				|| (sofia_cfg.push_voip_live == 2 && !strcasecmp(d->push_type, "voip")))
 			&& d->token[0] && !sofia_push_device_stale(d, now)
 			&& (sofia_cfg.push_min_interval <= 0 || d->hold_cancelled
-				|| d->hold_push_at <= now - sofia_cfg.push_min_interval);
+				|| d->hold_push_at <= now - sofia_cfg.push_min_interval)
+			&& !sofia_push_hold_excluded(d);
 		break;
 	}
 	ao2_unlock(e);
@@ -688,10 +742,14 @@ static int sofia_push_result_is_dead_token(const char *out)
 	return 0;
 }
 
-static void sofia_push_purge_device(const char *peername, const char *device_id, const char *reason)
+/* Forget one device's token: cache delete + queued DB delete + push_log event. -1 when the DB delete was not queued
+ * (queue cap, no database). */
+static int sofia_push_forget_device(const char *peername, const char *device_id, const char *event,
+	const char *what, const char *reason)
 {
 	struct sofia_push_tokens *e = sofia_push_entry_get(peername, 0);
 	struct sofia_pushdb_job dj = { .kind = PUSHDB_DELETE };
+	int res;
 
 	if (e) {
 		sofia_push_cache_delete(e, device_id);
@@ -699,10 +757,15 @@ static void sofia_push_purge_device(const char *peername, const char *device_id,
 	}
 	ast_copy_string(dj.peer, peername, sizeof(dj.peer));
 	ast_copy_string(dj.device_id, device_id, sizeof(dj.device_id));
-	sofia_pushdb_queue(&dj);
-	sofia_push_log_event(peername, device_id, "", "dead_token", reason);
-	ast_log(LOG_NOTICE, "Sofia PUSH: purged dead token peer='%s' dev='%s' (%s)\n",
-		peername, device_id, reason);
+	res = sofia_pushdb_queue(&dj);
+	sofia_push_log_event(peername, device_id, "", event, reason);
+	ast_log(LOG_NOTICE, "Sofia PUSH: purged %s peer='%s' dev='%s' (%s)\n", what, peername, device_id, reason);
+	return res;
+}
+
+static void sofia_push_purge_device(const char *peername, const char *device_id, const char *reason)
+{
+	sofia_push_forget_device(peername, device_id, "dead_token", "dead token", reason);
 }
 
 /* Update last_result (+ last_push_at) in cache + DB after a sender run. */
@@ -3490,6 +3553,64 @@ void sofia_push_rereg_start(void)
 
 /* ---------- CLI: sip show push [peer] (tokens ALWAYS redacted) ---------- */
 
+/* sip push purge <peer> <device-id>: forget a stored push token (cache + database), as a dead token is purged. For a
+ * token left behind by an app that has stopped sending push headers but never un-registers it (an iOS app on a Mac
+ * once it no longer asks for VoIP pushes); a device still sending them stores its token again at its next REGISTER. */
+static char *sofia_push_cli_purge(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct sofia_push_tokens *te;
+	char peer[128] = "", dev[SOFIA_PUSH_DEVID_MAX] = "";
+	int i;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "sip push purge";
+		e->usage = "Usage: sip push purge <peer> <device-id>\n"
+			"       Forget the push token stored for that device of that peer (cache and database).\n"
+			"       The next REGISTER with push headers stores it again.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+	if (a->argc != 5) {
+		return CLI_SHOWUSAGE;
+	}
+	if (!sofia_push_cache) {
+		ast_cli(a->fd, "Push wake-up is not running\n");
+		return CLI_SUCCESS;
+	}
+	/* the stored spelling: the cache matches case-insensitively, the database key is exact */
+	if ((te = sofia_push_entry_get(a->argv[3], 0))) {
+		ao2_lock(te);
+		for (i = 0; i < te->ndev; i++) {
+			if (!strcasecmp(te->dev[i].device_id, a->argv[4])) {
+				ast_copy_string(peer, te->peername, sizeof(peer));
+				ast_copy_string(dev, te->dev[i].device_id, sizeof(dev));
+				break;
+			}
+		}
+		ao2_unlock(te);
+		ao2_ref(te, -1);
+	}
+	if (!dev[0]) {
+		if (sofia_push_cache_complete) {
+			ast_cli(a->fd, "Peer '%s' has no push token for device '%s'\n", a->argv[3], a->argv[4]);
+			return CLI_SUCCESS;
+		}
+		/* lazy cache: the row may be in the database only; delete it as typed */
+		ast_copy_string(peer, a->argv[3], sizeof(peer));
+		ast_copy_string(dev, a->argv[4], sizeof(dev));
+		ast_cli(a->fd, "Not in the cache (lazy mode): deleting '%s' '%s' from the database as typed\n", peer, dev);
+	}
+	if (sofia_push_forget_device(peer, dev, "purged", "token", "cli") < 0) {
+		ast_cli(a->fd, "Removed from the cache, but the database delete was NOT queued (queue full or no database): "
+			"run it again\n");
+		return CLI_SUCCESS;
+	}
+	ast_cli(a->fd, "Purged the push token of peer '%s' device '%s'\n", peer, dev);
+	return CLI_SUCCESS;
+}
+
 static char *sofia_push_cli_show(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
 	const char *filter = NULL;
@@ -3512,13 +3633,14 @@ static char *sofia_push_cli_show(struct ast_cli_entry *e, int cmd, struct ast_cl
 	if (a->argc == 4) {
 		filter = a->argv[3];
 	}
-	ast_cli(a->fd, "Push wake-up: %s  sender=%s%s  scripts=%s  wait=%ds  noresponse=%ds  resume_window=%ds  voip_live=%s  fcm_live=%s  ttl=%dd  max_devices=%d  min_interval=%ds  cache=%s  queue=%d  natq=%d\n",
+	ast_cli(a->fd, "Push wake-up: %s  sender=%s%s  scripts=%s  wait=%ds  noresponse=%ds  resume_window=%ds  voip_live=%s  fcm_live=%s  hold_exclude=%s  ttl=%dd  max_devices=%d  min_interval=%ds  cache=%s  queue=%d  natq=%d\n",
 		sofia_cfg.push_enabled ? "ENABLED" : "disabled",
 		sofia_cfg.push_sender_native ? "native" : "script",
 		sofia_cfg.push_sender_native && !sofia_push_sender_available() ? "(lane DOWN: script fallback)" : "",
 		sofia_cfg.push_scripts, sofia_cfg.push_wait, sofia_cfg.push_noresponse,
 		sofia_cfg.push_resume_window, sofia_cfg.push_voip_live == 2 ? "hold" : sofia_cfg.push_voip_live ? "yes" : "no",
 		sofia_cfg.push_fcm_live == 2 ? "hold" : sofia_cfg.push_fcm_live ? "yes" : "no",
+		S_OR(sofia_cfg.push_hold_exclude, "-"),
 		sofia_cfg.push_token_ttl_days,
 		sofia_cfg.push_max_devices, sofia_cfg.push_min_interval,
 		sofia_push_cache_complete ? "complete" : "lazy", sofia_pushdb_depth,
@@ -3618,6 +3740,7 @@ static char *sofia_push_cli_show(struct ast_cli_entry *e, int cmd, struct ast_cl
 
 static struct ast_cli_entry sofia_push_cli[] = {
 	AST_CLI_DEFINE(sofia_push_cli_show, "Show push wake-up tokens and parked calls"),
+	AST_CLI_DEFINE(sofia_push_cli_purge, "Forget the push token of one device"),
 };
 
 /* ---------- init (called from load_module, before the channel tech registers) ---------- */

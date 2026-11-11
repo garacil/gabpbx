@@ -23219,6 +23219,18 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 		} else if (!strcasecmp(v->name, "push_fcm_live")) {
 			/* an FCM (Android) device with a live binding: no / yes (pushed too) / hold (RFC 8599 push bucket) */
 			sofia_cfg.push_fcm_live = !strcasecmp(v->value, "hold") ? 2 : ast_true(v->value) ? 1 : 0;
+		} else if (!strcasecmp(v->name, "push_hold_exclude")) {
+			/* devices (X-Device-ID or +sip.instance) never held: the INVITE goes to their live binding at once.
+			 * Additive: every line adds to the list. */
+			size_t have = strlen(sofia_cfg.push_hold_exclude);
+
+			if (have + (have ? 1 : 0) + strlen(v->value) >= sizeof(sofia_cfg.push_hold_exclude)) {
+				ast_log(LOG_WARNING, "Sofia: push_hold_exclude list full (%d chars), '%s' at line %d ignored\n",
+					(int) sizeof(sofia_cfg.push_hold_exclude) - 1, v->value, v->lineno);
+			} else if (!ast_strlen_zero(v->value)) {
+				snprintf(sofia_cfg.push_hold_exclude + have, sizeof(sofia_cfg.push_hold_exclude) - have, "%s%s",
+					have ? "," : "", v->value);
+			}
 		} else if (!strcasecmp(v->name, "push_reregister")) {
 			sofia_cfg.push_reregister = ast_true(v->value) ? 1 : 0;
 		} else if (!strcasecmp(v->name, "push_reregister_lead")) {
@@ -24469,6 +24481,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.push_resume_window = 2;	/* multi-ring collect window; 0 = first-registrant-wins */
 	sofia_cfg.push_voip_live = 0;	/* push an iOS (APNs VoIP) device with a live binding too: off until the app handles it */
 	sofia_cfg.push_fcm_live = 0;	/* an Android (FCM) device with a live binding: INVITE only, not pushed (yes / hold: sofia_push.c) */
+	sofia_cfg.push_hold_exclude[0] = '\0';	/* no device excluded from the hold */
 	sofia_cfg.push_sender_native = 1;	/* native in-process sender by default; script = fallback */
 	sofia_cfg.push_reregister = 1;	/* silent re-register push before a registration ends (native only) */
 	sofia_cfg.push_reregister_lead = 120;
