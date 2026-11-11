@@ -1981,6 +1981,7 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 	struct sofia_contact *c = NULL;
 	nua_handle_t *nh = NULL;
 	char url[256] = "", path_buf[1024] = "", route_buf[256] = "", sr_buf[1024] = "";
+	char to_buf[sizeof(url) + 2];
 	char contact_proxy_url[128] = "";
 	int peer_gruu = 0, rc = -1;
 	struct ast_sockaddr target;
@@ -2236,9 +2237,10 @@ static void sofia_push_resume_one(struct sofia_push_park *e, struct sofia_peer *
 		sofia_resolve_ourip(pvt, &target);
 	}
 
+	snprintf(to_buf, sizeof(to_buf), "<%s>", url);	/* the URI in angle brackets: its ;params stay URI params (RFC 3261 §20.10) */
 	nh = nua_handle(sofia_nua, pvt,
 		NUTAG_URL(url),
-		SIPTAG_TO_STR(url),
+		SIPTAG_TO_STR(to_buf),
 		TAG_IF(route_buf[0], NUTAG_INITIAL_ROUTE_STR(route_buf)),
 		TAG_IF(sr_buf[0], NUTAG_INITIAL_ROUTE_STR(sr_buf)),
 		TAG_IF(path_buf[0], NUTAG_INITIAL_ROUTE_STR(path_buf)),

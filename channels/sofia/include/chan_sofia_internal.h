@@ -267,6 +267,7 @@ static inline const char *sofia_allowoverlap_str(int mode)
 /* Per-registration contact (one peer can hold several). */
 struct sofia_contact {
 	char contact_uri[256];
+	char contact_params[256];  /* URI parameters of the registered Contact as the device sent them, without the leading ';' (RFC 3261 §16.6 step 2: a request to this binding carries them). Refreshed on every REGISTER. "" = none. contact_uri stays the parameter-free binding key. */
 	char host[64];
 	int port;
 	char transport[8];

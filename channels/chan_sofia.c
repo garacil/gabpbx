@@ -1248,18 +1248,53 @@ void sofia_resolve_peer_target(struct sofia_peer *peer, const char *user,
  * stored RFC 3327 Path (ready "<uri;lr>,..." Route value) for pre-loading on the
  * INVITE. Lock order: takes ONLY the contact ao2 lock (the caller must not hold it).
  */
+/* Append a registered Contact's URI parameters to a Request-URI built for that binding (RFC 3261 §16.6 step 2):
+ * each ";name[=value]" as the device sent it, except transport (already appended from the transport the device
+ * really uses) and maddr (it would route the request away from the binding). A parameter that does not fit is
+ * left out whole. */
+static void sofia_uri_append_contact_params(char *out, size_t outlen, const char *params)
+{
+	char copy[sizeof(((struct sofia_contact *) 0)->contact_params)];
+	char *rest, *param;
+
+	if (ast_strlen_zero(params)) {
+		return;
+	}
+	ast_copy_string(copy, params, sizeof(copy));
+	rest = copy;
+	while ((param = strsep(&rest, ";"))) {
+		size_t nlen = strcspn(param, "=");
+		size_t cur = strlen(out);
+
+		if (!*param || (nlen == 9 && !strncasecmp(param, "transport", 9))
+				|| (nlen == 5 && !strncasecmp(param, "maddr", 5))) {
+			continue;
+		}
+		if (cur + 1 + strlen(param) < outlen) {
+			snprintf(out + cur, outlen - cur, ";%s", param);
+		}
+	}
+}
+
 void sofia_build_contact_ruri(struct sofia_contact *c, const char *user,
 	char *out, size_t outlen, int path_support, char *path_out, size_t path_outlen)
 {
 	char hbuf[80];
 	char c_transport[8];
 	char c_host[128];
+	char c_user[128];
+	char c_params[sizeof(c->contact_params)];
 	int c_port;
 
 	if (!c || !out || !outlen)
 		return;
 
 	ao2_lock(c);
+	/* The binding's own user and URI parameters: a request to that user is a request to the registered Contact
+	 * and carries its parameters, as chan_sip sent the full Contact to SIP/<peer>; a request to another user
+	 * (SIP/<exten>@<peer>) is not, and chan_sip dropped the Contact for it. */
+	sofia_uri_user_from_contact(c->contact_uri, NULL, c_user, sizeof(c_user));
+	ast_copy_string(c_params, c->contact_params, sizeof(c_params));
 	ast_copy_string(c_transport, c->transport, sizeof(c_transport));
 	if ((!strcasecmp(c_transport, "ws") || !strcasecmp(c_transport, "wss"))
 			&& !ast_sockaddr_isnull(&c->src_addr)) {
@@ -1278,6 +1313,9 @@ void sofia_build_contact_ruri(struct sofia_contact *c, const char *user,
 		sofia_uri_format_host(c_host, hbuf, sizeof(hbuf)),
 		c_port);
 	sofia_uri_append_transport(out, outlen, c_transport);
+	if (user && c_user[0] && !strcmp(user, c_user)) {
+		sofia_uri_append_contact_params(out, outlen, c_params);
+	}
 }
 
 /*
@@ -1534,7 +1572,7 @@ static struct sofia_contact *sofia_peer_find_contact_nat_fallback(struct sofia_p
  * the relink fails (OOM) - fail-closed: the stale binding is gone, but NO duplicate is created (better than the
  * fork-to-stale-port bug). */
 static int sofia_contact_rebind(struct sofia_peer *peer, struct sofia_contact *c,
-	const char *new_uri, const char *host, int port, const char *transport,
+	const char *new_uri, const char *new_params, const char *host, int port, const char *transport,
 	const char *user_agent, const struct ast_sockaddr *src, const char *pathstr,
 	const char *instance_id, int reg_id, const char *call_id, time_t expires_at,
 	struct ast_sockaddr *old_src_out)
@@ -1545,6 +1583,7 @@ static int sofia_contact_rebind(struct sofia_peer *peer, struct sofia_contact *c
 		ast_sockaddr_copy(old_src_out, &c->src_addr);
 	}
 	ast_copy_string(c->contact_uri, new_uri, sizeof(c->contact_uri));	/* the re-key, safe while unlinked */
+	ast_copy_string(c->contact_params, new_params ? new_params : "", sizeof(c->contact_params));
 	if (host) {
 		ast_copy_string(c->host, host, sizeof(c->host));
 	}
@@ -4321,16 +4360,18 @@ static void sofia_append_reg_contacts(struct sofia_peer *peer, struct ast_str **
 	ci = ao2_iterator_init(peer->contacts, 0);
 	while ((c = ao2_iterator_next(&ci))) {
 		char uri[256];
+		char params[sizeof(c->contact_params)];
 		long ttl;
 		ao2_lock(c);	/* expires refreshed concurrently — read under the contact lock */
 		ast_copy_string(uri, c->contact_uri, sizeof(uri));
+		ast_copy_string(params, c->contact_params, sizeof(params));	/* the binding as registered */
 		ttl = (long)(c->expires - now);
 		ao2_unlock(c);
 		if (ttl < 0) {
 			ttl = 0;
 		}
-		ast_str_append(contacts, 0, "%s<%s>;expires=%ld",
-			ast_str_strlen(*contacts) ? ", " : "", uri, ttl);
+		ast_str_append(contacts, 0, "%s<%s%s%s>;expires=%ld",
+			ast_str_strlen(*contacts) ? ", " : "", uri, params[0] ? ";" : "", params, ttl);
 		ao2_ref(c, -1);
 	}
 	ao2_iterator_destroy(&ci);
@@ -7576,11 +7617,15 @@ static int sofia_fork_dial_one(struct sofia_pvt *pvt, struct sofia_fork *fork,
 	 * sofia_fork_pick_winner copies it onto master so later master re-INVITEs keep routing here. */
 	ast_string_field_set(child, outbound_proxy, child_proxy_url);
 
-	/* Create handle auto-bound to child. */
+	/* Create handle auto-bound to child. The To names the same URI in angle brackets: without them its
+	 * ;parameters would be header parameters of the To, not of the URI (RFC 3261 §20.10). */
 	if (sofia_nua) {
+		char child_to[sizeof(ruri) + 2];
+
+		snprintf(child_to, sizeof(child_to), "<%s>", ruri);
 		child->nh = nua_handle(sofia_nua, child,
 			NUTAG_URL(ruri),
-			SIPTAG_TO_STR(ruri),
+			SIPTAG_TO_STR(child_to),
 			TAG_IF(child_path[0], NUTAG_INITIAL_ROUTE_STR(child_path)),	/* RFC 3327 Path as Route */
 			TAG_IF(child->peer && child->peer->gruu, NUTAG_SUPPORTED("gruu")),	/* RFC 5627 §4.4 */
 			TAG_END());
@@ -9956,9 +10001,12 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 			/* push_parked: no handle now — the resume creates it against the freshly bound
 			 * contact (sofia_hangup with nh==NULL is silent; destructor is NULL-guarded). */
 			if (sofia_nua && !pvt->push_parked) {
+				char to_buf[sizeof(url) + 2];	/* the URI in angle brackets: its ;params stay URI params (RFC 3261 §20.10) */
+
+				snprintf(to_buf, sizeof(to_buf), "<%s>", url);
 				pvt->nh = nua_handle(sofia_nua, pvt,
 					NUTAG_URL(url),
-					SIPTAG_TO_STR(url),
+					SIPTAG_TO_STR(to_buf),
 					TAG_IF(route_buf[0], NUTAG_INITIAL_ROUTE_STR(route_buf)),
 					TAG_IF(sr_buf[0], NUTAG_INITIAL_ROUTE_STR(sr_buf)),	/* RFC 3608 Service-Route, after outboundproxy */
 					TAG_IF(path_buf[0], NUTAG_INITIAL_ROUTE_STR(path_buf)),	/* RFC 3327 Path of the registered contact */
@@ -11968,6 +12016,16 @@ static void sofia_contact_uri_from_url(char *buf, size_t len, const url_t *url)
 		sofia_contact_url_port(url->url_port));
 }
 
+/* The URI parameters of a Contact as the device sent them, without the leading ';' (the binding keeps them
+ * apart from its parameter-free key). "" when there are none, or when they do not fit: never a cut list. */
+static void sofia_contact_params_from_url(char *buf, size_t len, const url_t *url)
+{
+	buf[0] = '\0';
+	if (url && url->url_params && strlen(url->url_params) < len) {
+		ast_copy_string(buf, url->url_params, len);
+	}
+}
+
 /* Registration expiry timing, used by the active expiry sweep (sofia_peer_expire_sweep, further down). */
 #define SOFIA_REGEXPIRE_SWEEP_SECS 10	/* how often the sweep runs */
 #define SOFIA_REGEXPIRE_MAX 6		/* the max_contacts ceiling (sofia_clamp_max_contacts) */
@@ -12499,6 +12557,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 		/* Apply loop. */
 		for (m = sip->sip_contact; m; m = m->m_next) {
 			char uri[256];
+			char params[sizeof(((struct sofia_contact *) 0)->contact_params)];
 			struct sofia_contact *c;
 			char in_instance[128];
 			int in_reg_id;
@@ -12521,6 +12580,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 			}
 
 			sofia_contact_uri_from_url(uri, sizeof(uri), m->m_url);
+			sofia_contact_params_from_url(params, sizeof(params), m->m_url);
 
 			/* Device identity for rebind-on-renewal: RFC 5626 +sip.instance/reg-id (if present), the
 			 * REGISTER Call-ID (RFC 3261 10.2, stable per UA boot cycle), and the Contact user. */
@@ -12563,6 +12623,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				memcpy(&c->src_addr, &src, sizeof(src));
 				/* Refresh transport too: a same-URI re-REGISTER may switch it. */
 				ast_copy_string(c->transport, reg_transport, sizeof(c->transport));
+				ast_copy_string(c->contact_params, params, sizeof(c->contact_params));	/* a refresh may change them */
 				if (sip->sip_user_agent && sip->sip_user_agent->g_string)
 					ast_copy_string(c->user_agent, sip->sip_user_agent->g_string,
 						sizeof(c->user_agent));
@@ -12601,7 +12662,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 				}
 				if (match) {
 					struct ast_sockaddr old_src;
-					int rc = sofia_contact_rebind(peer, match, uri, m->m_url->url_host,
+					int rc = sofia_contact_rebind(peer, match, uri, params, m->m_url->url_host,
 						sofia_contact_url_port(m->m_url->url_port), reg_transport,
 						(sip->sip_user_agent ? sip->sip_user_agent->g_string : NULL),
 						&src, pathstr, in_instance, in_reg_id, in_call_id, now + contact_expires, &old_src);
@@ -12634,6 +12695,7 @@ static int sofia_update_peer_contacts(struct sofia_peer *peer, sip_t const *sip,
 					ast_sockaddr_copy(&update->new_src, &src);
 				}
 				ast_copy_string(c->contact_uri, uri, sizeof(c->contact_uri));
+				ast_copy_string(c->contact_params, params, sizeof(c->contact_params));
 				if (m->m_url->url_host)
 					ast_copy_string(c->host, m->m_url->url_host, sizeof(c->host));
 				c->port = sofia_contact_url_port(m->m_url->url_port);
