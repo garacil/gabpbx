@@ -13481,11 +13481,22 @@ static enum sofia_auth_result sofia_verify_digest_auth_ex(struct sofia_peer *pee
 	 * cannot be replayed at another only if the SERVER also verifies the binding. Compare
 	 * the client's uri= against the actual Request-URI structurally (scheme/user/host/port,
 	 * default-port + case aware via url_cmp) — tolerant of URI params/ordering the proxy may
-	 * have rewritten, strict on the identity that binds the credential to the target. */
+	 * have rewritten, strict on the identity that binds the credential to the target.
+	 * A REGISTER's Request-URI names only the registrar's domain (RFC 3261 §10.2), and some UACs drop a
+	 * non-default port from the Request-URI of the REGISTER that answers a challenge while the uri= keeps
+	 * it. In SIP the two need not be equivalent (RFC 3261 §22.4, item 6), and chan_sip never compared them:
+	 * for REGISTER, a port on one side only is no mismatch. Scheme, user and host still have to agree, and
+	 * two different ports still disagree. */
 	if (sip && sip->sip_request && sip->sip_request->rq_url) {
 		su_home_t uhome[1] = { SU_HOME_INIT(uhome) };
 		url_t *client_uri = url_make(uhome, auth_uri);
 		int uri_mismatch = (!client_uri || url_cmp(client_uri, sip->sip_request->rq_url) != 0);
+		if (uri_mismatch && client_uri && register_method
+				&& (client_uri->url_port == NULL) != (sip->sip_request->rq_url->url_port == NULL)) {
+			url_t a = *client_uri, b = *sip->sip_request->rq_url;
+			a.url_port = b.url_port = NULL;
+			uri_mismatch = (url_cmp(&a, &b) != 0);
+		}
 		su_home_deinit(uhome);
 		if (uri_mismatch) {
 			char ruri_str[256] = "";
