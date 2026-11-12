@@ -1,3 +1,59 @@
+## 1.9.25 — listening on every address as the network changes, IPv6, push hold, and five interop fixes
+
+`chan_sofia.so` and the core (`gabpbx`) change, and the Sofia-SIP library moves to `v2.1.1` (below).
+
+### New
+
+- **The listeners follow the network as it changes (Sofia-SIP 2.1.x).** With `bindaddr=0.0.0.0` the stack opens one
+  socket per transport, bound to the wildcard address, instead of one per local address from a list taken at start.
+  - An interface created later, a second address on an interface, an address that changes, tunnels that share a local
+    address: all are served as soon as they are there, with no restart.
+  - A response leaves from the address its request was sent to (RFC 3581 §4); a request to a registered device leaves
+    from the address the device registered to, and its `Via` names it.
+  - `bindaddr=<one address>` is bound even if the host does not have the address yet.
+- **`bindinterface=`** (`[general]`): only what arrives on the named network interfaces is taken, one name or several
+  separated by commas, matched by name each time (an interface that does not exist yet, or is destroyed and created
+  again, is served when it is there). `tlsbindinterface`, `wsbindinterface` and `wssbindinterface` set one listener
+  apart; `any` lifts the restriction. A change needs a restart (`sip reload` refuses it). `sip show settings` shows
+  "Bind Interface". With a Sofia-SIP older than 2.1.0 an ERROR says the listeners are not restricted.
+- **IPv6.** `bindaddr=::` (also `[::]`, `*` or an empty value) serves IPv4 and IPv6 together, as in `chan_sip`; the same
+  for `tlsbindaddr`, `wsbindaddr` and `wssbindaddr`. UDP, TCP, TLS, WS and WSS work over IPv6; peers with a fixed IPv6
+  `host=` are qualified and called over IPv6; each leg of a call gets the SDP of its own family and the PBX relays
+  media between an IPv4 leg and an IPv6 leg. `externaddr` is not applied to IPv6 peers. With `bindaddr=0.0.0.0`
+  nothing changes. See the "IPv6" section of `configs/sofia.conf.sample`, and its access-list warning: as in
+  `chan_sip`, IPv4 rules never apply to IPv6 sources, so add `deny=::/0` to a list that must stay closed.
+- **`push_fcm_live` / `push_voip_live = hold`** (RFC 8599 §5.6.2): a device with a live binding is pushed and its
+  INVITE is held until the REGISTER the push triggers. Both default to `no`. A device that registers with `X-Device-ID`
+  but without a push token asks for no push (RFC 8599 §5.6.1): its stored token is forgotten. New CLI
+  `sip push purge <peer> <device-id>`.
+
+### Fixed
+
+- **Core, access lists (`ast_apply_ha`)**: in a list that mixed IPv4 and IPv6 rules, the family of the first rule was
+  tested for every rule, so the rules of the other family were never applied.
+- **An MWI SUBSCRIBE to the voicemail number** (`sip:*97@…`) was answered as a wrong password and counted toward the
+  blacklist; the account is now the `From` user, as in `chan_sip` (RFC 3842 §3.7, §3.12).
+- **A REGISTER whose digest `uri=` and Request-URI differ only by a port** got `400` and a blacklist count; for a
+  REGISTER a port on one side only is no longer a mismatch (RFC 3261 §10.2, §22.4).
+- **A call to a registered device carries the URI parameters of its Contact** (`rinstance`, `line`, …) in the
+  Request-URI and the `To`, as `chan_sip` does; the `To` URI goes in angle brackets (RFC 3261 §16.6, §20.10).
+- **The `From` of an outgoing INVITE carries our port** when it is not the transport's standard one, as `chan_sip`
+  does; `fromdomain=host:port` no longer comes out as `[host:port]`.
+- IPv6 details: the SDP connection address is written without brackets (RFC 4566 §5.7); a `Via` with an IPv6 sent-by
+  is no longer bracketed twice (the source address of an IPv6 device was unknown); the realtime `ipaddr` column gets
+  the address without brackets.
+
+### Build — Sofia-SIP `v2.1.1`
+
+`chan_sofia` is built and tested against Sofia-SIP `v2.1.1` (https://github.com/garacil/sofia-sip/releases/tag/v2.1.1).
+The header directory (`sofia-sip-1.13`) and the soname (`libsofia-sip-ua.so.0.6.0`) are unchanged. `bindinterface=`
+needs 2.1.0 or later; a request to an IPv6 destination with both families bound needs 2.1.1.
+
+### Upgrading
+
+Install Sofia-SIP `v2.1.1`, then replace `chan_sofia.so` and `gabpbx`, and restart. Without new keys in `sofia.conf`
+the configuration means what it meant before.
+
 ## 1.9.24 — an inbound call from a caller behind NAT is no longer cut at its first session refresh
 
 Only `chan_sofia.so` changes.
