@@ -91,12 +91,14 @@ bindport=5080
 ; Three choices, and each one follows the network as it changes (sofia-sip
 ; 2.1.0 or later; no restart when an interface or an address comes or goes):
 ;
-; - bindaddr=0.0.0.0 (or :: for IPv6, or empty for both): every address of
-;   the host. One socket per transport, bound to the wildcard address. An
-;   interface created later, a second address on an interface, an address
-;   that changes: all are served as soon as they are there. A response
-;   leaves from the address its request was sent to, and a request to a
-;   registered device leaves from the address the device registered to.
+; - bindaddr=0.0.0.0: every IPv4 address of the host. bindaddr=:: (also
+;   [::], * or an empty value): every IPv4 and IPv6 address, see "IPv6"
+;   below. One socket per transport and address family, bound to the
+;   wildcard address. An interface created later, a second address on an
+;   interface, an address that changes: all are served as soon as they are
+;   there. A response leaves from the address its request was sent to, and
+;   a request to a registered device leaves from the address the device
+;   registered to.
 ;
 ; - bindaddr=<one address>: that address only. The listener is made even
 ;   if the host does not have the address yet, and it keeps working after
@@ -122,6 +124,56 @@ bindport=5080
 ;bindinterface=eth0
 ;bindinterface=eth0,lo
 ;tlsbindinterface=any
+
+;
+; IPv6
+; ---------------------------------------------------------------------
+; bindaddr=:: serves IPv4 and IPv6 together, as in chan_sip (sip.conf:
+; "Listen on the IPv4 and IPv6 wildcards. Example: bindaddr=::"). The
+; values, for bindaddr and for tlsbindaddr, wsbindaddr and wssbindaddr
+; (each sets its own listener):
+;
+;   0.0.0.0              IPv4 only
+;   ::  [::]  *  (empty) IPv4 and IPv6
+;   192.0.2.1            that IPv4 address only
+;   2001:db8::1          that IPv6 address only (brackets are accepted)
+;
+; With bindaddr=0.0.0.0 nothing of what follows applies: the box does not
+; talk IPv6.
+;
+; - Signalling: UDP, TCP, TLS, WS and WSS work over IPv6. A device is
+;   answered from the address it wrote to. A peer with a fixed IPv6 host
+;   (host=2001:db8::5) is qualified and called over IPv6, and its calls
+;   are matched by that address.
+; - Media follows bindaddr, as in chan_sip: with bindaddr=:: the RTP, video
+;   and T.38 sockets take both families, and each leg of a call gets the
+;   SDP of its own family ("c=IN IP6 2001:db8::1" to an IPv6 device,
+;   "c=IN IP4 192.0.2.1" to an IPv4 one). The PBX relays the media between
+;   an IPv4 leg and an IPv6 leg.
+; - externaddr / externip / externhost are for IPv4 address translation
+;   and are not applied to an IPv6 device. media_address is one address
+;   for every call, whatever its family: leave it unset on a box that
+;   serves both.
+; - ACCESS LISTS: as in chan_sip, "IPv6 ACLs apply only to IPv6 addresses,
+;   and IPv4 ACLs apply only to IPv4 addresses". An account whose only
+;   rules are IPv4 (deny=0.0.0.0/0.0.0.0 + permit=...) accepts ANY IPv6
+;   source. Before giving a box an IPv6 listener, add an IPv6 rule to each
+;   list that must stay closed (deny/permit of a peer; contactdeny/
+;   contactpermit of a peer and of [general]):
+;       deny=0.0.0.0/0.0.0.0
+;       deny=::/0
+;       permit=192.0.2.0/24
+;       permit=2001:db8:5::/48
+; - The blacklist counts an IPv6 source under its own address.
+; - With several IPv6 addresses on one interface, the signalling of a call
+;   uses the address the device talks to, and the SDP names the address
+;   the routing table picks for that device. Both are addresses of this
+;   host and both are served.
+;
+;bindaddr=::
+;tlsbindaddr=::
+;wsbindaddr=::
+;wssbindaddr=::
 
 ;
 ; Realtime sipregs separate-table (sipregs parity)

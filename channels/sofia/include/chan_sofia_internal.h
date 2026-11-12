@@ -1287,6 +1287,13 @@ struct sofia_peer {
 
 /* True when the loaded sofia-sip can restrict a listener to named interfaces (2.1.0 and later). */
 int sofia_stack_has_interfaces(void);
+/* The host of a listener's bind URL: "*" (IPv4 and IPv6) for bindaddr "::", "[::]", "*" or empty, as chan_sip
+ * listens on both families with bindaddr=::; any other value as written. */
+const char *sofia_bind_host(const char *bindaddr);
+/* True when bindaddr asks for IPv4 and IPv6 together. */
+int sofia_bind_is_dual(const char *bindaddr);
+/* The address the media sockets (RTP, video, UDPTL) of a call are bound to. Always sets addr. */
+void sofia_media_bindaddr(struct ast_sockaddr *addr);
 /* The interfaces a listener is restricted to: its own key (may be NULL), else bindinterface=. NULL = any. */
 const char *sofia_listener_interfaces(const char *own);
 

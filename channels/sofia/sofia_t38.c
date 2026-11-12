@@ -267,7 +267,7 @@ int sofia_interpret_t38_parameters(struct sofia_pvt *pvt, const struct ast_contr
 			if (!pvt->udptl) {
 				struct ast_channel *chan = pvt->owner;	/* channel lock held by tech->indicate */
 				struct ast_sockaddr bindaddr;
-				ast_sockaddr_parse(&bindaddr, sofia_cfg.bindaddr, 0);
+				sofia_media_bindaddr(&bindaddr);
 				pvt->udptl = ast_udptl_new_with_bindaddr(NULL, NULL, 0, &bindaddr);
 				if (!pvt->udptl) {
 					ast_log(LOG_WARNING, "Sofia: failed to allocate UDPTL session for outbound T.38 on '%s' — refusing\n",

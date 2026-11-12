@@ -546,7 +546,10 @@ int ast_apply_ha(const struct ast_ha *ha, const struct ast_sockaddr *addr)
 		ast_copy_string(iabuf2, ast_inet_ntoa(ha->netaddr), sizeof(iabuf2));
 		ast_debug(1, "##### Testing %s with %s\n", iabuf, iabuf2);
 #endif
-		if (ast_sockaddr_is_ipv4(&ha->addr)) {
+		/* The family of THIS rule. Testing the first rule of the list (ha) made every rule of a mixed
+		 * list share its family: with an IPv4 rule first, no IPv6 rule was ever applied and any IPv6
+		 * address was allowed; with an IPv6 rule first, no IPv4 rule was. */
+		if (ast_sockaddr_is_ipv4(&current_ha->addr)) {
 			if (ast_sockaddr_is_ipv6(addr)) {
 				if (ast_sockaddr_is_ipv4_mapped(addr)) {
 					/* IPv4 ACLs apply to IPv4-mapped addresses */

@@ -310,6 +310,43 @@ const char *sofia_listener_interfaces(const char *own)
 	return ifs;
 }
 
+/* bindaddr=:: (also "[::]", "*" and an empty value) means IPv4 and IPv6 together, as in chan_sip
+ * (configs/sip.conf.sample: "Listen on the IPv4 and IPv6 wildcards. Example: bindaddr=::"). chan_sip gets there
+ * with one dual-stack socket; sofia-sip binds one socket per family for the host "*", and takes "::" as IPv6
+ * only. */
+int sofia_bind_is_dual(const char *bindaddr)
+{
+	return ast_strlen_zero(bindaddr) || !strcmp(bindaddr, "*") || !strcmp(bindaddr, "::") || !strcmp(bindaddr, "[::]");
+}
+
+const char *sofia_bind_host(const char *bindaddr)
+{
+	return sofia_bind_is_dual(bindaddr) ? "*" : bindaddr;
+}
+
+/* The address the media sockets of a call are bound to: the SIP bind address, as chan_sip binds its RTP to
+ * bindaddr. When the listener is on both families the socket is bound to "::": a dual-stack socket serves an
+ * IPv6 peer, and an IPv4 peer through IPv4-mapped addresses (what chan_sip's bindaddr=:: does). An address that
+ * cannot be parsed never leaves addr unset: it falls back to "::" too. */
+void sofia_media_bindaddr(struct ast_sockaddr *addr)
+{
+	memset(addr, 0, sizeof(*addr));
+	if (sofia_bind_is_dual(sofia_cfg.bindaddr) || !ast_sockaddr_parse(addr, sofia_cfg.bindaddr, 0)) {
+		ast_sockaddr_parse(addr, "::", 0);
+	}
+}
+
+/* The host written when no local address could be worked out for a destination (the route lookup failed): the
+ * bind address as it is, the IPv6 wildcard for a listener on both families ("*" is not a host), and the loopback
+ * address when there is none. */
+static const char *sofia_bind_fallback_host(void)
+{
+	if (ast_strlen_zero(sofia_cfg.bindaddr)) {
+		return "127.0.0.1";
+	}
+	return sofia_bind_is_dual(sofia_cfg.bindaddr) ? "::" : sofia_cfg.bindaddr;
+}
+
 /* Store the value of bindinterface= (or of a per-listener key): interface names separated by commas, blanks
  * dropped. The value goes into the bind URL as a parameter, so a name may only have the characters interface
  * names are made of here (letters, digits, '_', '-', '.', '@'). Anything else leaves the key unset; warn says
@@ -1729,6 +1766,10 @@ int sofia_should_use_externaddr(const struct ast_sockaddr *peer_addr)
 {
 	int res;
 	if (ast_strlen_zero(sofia_cfg.externaddr))
+		return 0;
+	/* An IPv6 peer reaches us at our IPv6 address: there is no address translation to undo, and externaddr is
+	 * an IPv4 address (chan_sip ast_sip_ouraddrfor skips the remapping for IPv6, chan_sip.c:4035-4045). */
+	if (peer_addr && ast_sockaddr_is_ipv6(peer_addr) && !ast_sockaddr_is_ipv4_mapped(peer_addr))
 		return 0;
 	/* sofia_cfg.localha is a freeable global rebuilt by reload on sofia_thread;
 	 * this runs on the channel thread. rdlock the NULL-check + walk together (leaf). */
@@ -3286,7 +3327,7 @@ static int sofia_rtp_init(struct sofia_pvt *pvt)
 		return 0;
 	}
 
-	ast_sockaddr_parse(&addr, sofia_cfg.bindaddr, 0);
+	sofia_media_bindaddr(&addr);
 	/* Crash fix: ALWAYS give the RTP instance the module-global sofia_sched context when
 	 * it exists — NOT gated on pvt->peer->webrtc. Inbound INVITEs create the RTP instance BEFORE the peer
 	 * is resolved (sofia_rtp_init precedes the pvt->peer assignment), so a peer->webrtc gate here is
@@ -12005,32 +12046,27 @@ void sofia_get_source_addr(sip_t const *sip, struct ast_sockaddr *addr)
 
 	if (via->v_received) {
 		const char *src_port = via->v_rport ? via->v_rport : via->v_port;
-		char addr_str[256];
+		char addr_str[256], hbuf[128];
 		/* IPv6 literals MUST be bracketed before ast_sockaddr_parse (RFC 3261 §19.1.2 /
 		 * RFC 5952): an unbracketed "fe80::1:5060" is ambiguous (the colons run together),
-		 * yielding a wrong/empty addr that corrupts the blacklist key + host= ACL match. */
-		if (strchr(via->v_received, ':')) {
-			snprintf(addr_str, sizeof(addr_str), "[%s]:%s",
-				via->v_received, src_port ? src_port : "5060");
-		} else {
-			snprintf(addr_str, sizeof(addr_str), "%s:%s",
-				via->v_received, src_port ? src_port : "5060");
-		}
+		 * yielding a wrong/empty addr that corrupts the blacklist key + host= ACL match.
+		 * sofia_uri_format_host brackets a bare literal and leaves a bracketed one as it is. */
+		snprintf(addr_str, sizeof(addr_str), "%s:%s",
+			sofia_uri_format_host(via->v_received, hbuf, sizeof(hbuf)), src_port ? src_port : "5060");
 		ast_sockaddr_parse(addr, addr_str, 0);
 		if (sofia_debug)
 			ast_verbose("Sofia: source addr (via received): %s\n", addr_str);
 	} else {
 		const char *host = via->v_host;
 		const char *port = via->v_rport ? via->v_rport : via->v_port;
-		char addr_str[256];
+		char addr_str[256], hbuf[128];
 		if (!host)
 			return;
-		/* Same IPv6 bracketing for the Via host branch. */
-		if (strchr(host, ':')) {
-			snprintf(addr_str, sizeof(addr_str), "[%s]:%s", host, port ? port : "5060");
-		} else {
-			snprintf(addr_str, sizeof(addr_str), "%s:%s", host, port ? port : "5060");
-		}
+		/* The sent-by of a Via carries an IPv6 literal in brackets already (RFC 3261 section 25.1); wrapping it
+		 * again gave "[[2001:db8::1]]:5060", which does not parse: the source address of every IPv6 device
+		 * that is not behind NAT (no "received" parameter) was unknown. */
+		snprintf(addr_str, sizeof(addr_str), "%s:%s",
+			sofia_uri_format_host(host, hbuf, sizeof(hbuf)), port ? port : "5060");
 		ast_sockaddr_parse(addr, addr_str, 0);
 		if (sofia_debug)
 			ast_verbose("Sofia: source addr (via host): %s\n", addr_str);
@@ -12136,7 +12172,7 @@ static int sofia_expire_contacts_cb(void *obj, void *arg, int flags)
 static int sofia_contact_acl_check(struct sofia_peer *peer, const url_t *url, const char *uri)
 {
 	struct ast_sockaddr contact_addr;
-	char addr_buf[128];
+	char addr_buf[160], hbuf[128];
 	const char *chost;
 	int cport;
 
@@ -12145,11 +12181,8 @@ static int sofia_contact_acl_check(struct sofia_peer *peer, const url_t *url, co
 	}
 	chost = url->url_host ? url->url_host : "0.0.0.0";
 	cport = sofia_contact_url_port(url->url_port);
-	if (strchr(chost, ':')) {
-		snprintf(addr_buf, sizeof(addr_buf), "[%s]:%d", chost, cport);
-	} else {
-		snprintf(addr_buf, sizeof(addr_buf), "%s:%d", chost, cport);
-	}
+	/* An IPv6 literal goes in brackets before the port, once: bare or already bracketed, either parses. */
+	snprintf(addr_buf, sizeof(addr_buf), "%s:%d", sofia_uri_format_host(chost, hbuf, sizeof(hbuf)), cport);
 	if (ast_sockaddr_parse(&contact_addr, addr_buf, 0)) {
 		if ((sofia_cfg.contact_ha && ast_apply_ha(sofia_cfg.contact_ha, &contact_addr) != AST_SENSE_ALLOW) ||
 		    (peer->contactha && ast_apply_ha(peer->contactha, &contact_addr) != AST_SENSE_ALLOW)) {
@@ -14635,7 +14668,10 @@ static void sofia_rtupdate_row(struct sofia_peer *peer, sip_t const *sip, int fo
 
 	host[0] = '\0';
 	ast_mutex_lock(&peer->lock);
-	ast_copy_string(ip, ast_sockaddr_stringify_host(&peer->src_addr), iplen);
+	/* The address as it is, an IPv6 one without brackets: the column is an address, not a URI host, and the
+	 * lookup of a peer by its address asks for it in this form (sofia_find_peer_realtime_by_addr). Written
+	 * with brackets, a device registered over IPv6 was never found by address. Same text as before for IPv4. */
+	ast_copy_string(ip, ast_sockaddr_stringify_addr(&peer->src_addr), iplen);
 	snprintf(port, portlen, "%d", ast_sockaddr_port(&peer->src_addr));
 	if (follow) {
 		c = sofia_peer_find_contact_by_addr(peer, &peer->src_addr);
@@ -15645,8 +15681,11 @@ static void sofia_build_contact(struct sofia_pvt *pvt, char *buf, size_t len)
 		ast_copy_string(host_port, ast_sockaddr_stringify(&pvt->ourip),
 			sizeof(host_port));
 	} else {
+		char hbuf[80];
+		/* An IPv6 literal goes in brackets before the port (RFC 3261 section 19.1.2); a listener on both
+		 * families ("*", "::") is written as the IPv6 wildcard. */
 		snprintf(host_port, sizeof(host_port), "%s:%d",
-			!ast_strlen_zero(sofia_cfg.bindaddr) ? sofia_cfg.bindaddr : "127.0.0.1",
+			sofia_uri_format_host(sofia_bind_fallback_host(), hbuf, sizeof(hbuf)),
 			sofia_cfg.bindport ? sofia_cfg.bindport : 5060);
 	}
 
@@ -16809,7 +16848,7 @@ static void sofia_mwi_local_addr(const char *target_uri, const struct ast_sockad
 	loc->port = port;
 	/* _remote: no IPv6 %scope suffix in a URI (chan_sip build_contact). */
 	sofia_uri_format_host(ast_sockaddr_isnull(&ours)
-			? S_OR(sofia_cfg.bindaddr, "127.0.0.1") : ast_sockaddr_stringify_host_remote(&ours),
+			? sofia_bind_fallback_host() : ast_sockaddr_stringify_host_remote(&ours),
 		loc->host, sizeof(loc->host));
 }
 
@@ -21744,7 +21783,7 @@ static void *sofia_thread_func(void *data)
 		}
 		snprintf(udp_url, sizeof(udp_url), "sip:%s:%d;transport=udp,tcp%s%s",
 			sofia_uri_format_host(
-				ast_strlen_zero(sofia_cfg.bindaddr) ? "*" : sofia_cfg.bindaddr,
+				sofia_bind_host(sofia_cfg.bindaddr),
 				hbuf_udp, sizeof(hbuf_udp)),
 			sofia_cfg.bindport, udp_ifs ? ";interface=" : "", S_OR(udp_ifs, ""));
 		if (sofia_cfg.tls_enable && sofia_cfg.tlsbindport > 0) {
@@ -21752,21 +21791,21 @@ static void *sofia_thread_func(void *data)
 			 * both TLS+WSS on the same port and the WSS bind fails. */
 			snprintf(tls_url, sizeof(tls_url), "sips:%s:%d;transport=tls%s%s",
 				sofia_uri_format_host(
-					ast_strlen_zero(sofia_cfg.tlsbindaddr) ? "*" : sofia_cfg.tlsbindaddr,
+					sofia_bind_host(sofia_cfg.tlsbindaddr),
 					hbuf_tls, sizeof(hbuf_tls)),
 				sofia_cfg.tlsbindport, tls_ifs ? ";interface=" : "", S_OR(tls_ifs, ""));
 		}
 		if (sofia_cfg.ws_enable && sofia_cfg.wsbindport > 0) {
 			snprintf(ws_url, sizeof(ws_url), "sip:%s:%d;transport=ws%s%s",
 				sofia_uri_format_host(
-					ast_strlen_zero(sofia_cfg.wsbindaddr) ? "*" : sofia_cfg.wsbindaddr,
+					sofia_bind_host(sofia_cfg.wsbindaddr),
 					hbuf_ws, sizeof(hbuf_ws)),
 				sofia_cfg.wsbindport, ws_ifs ? ";interface=" : "", S_OR(ws_ifs, ""));
 		}
 		if (sofia_cfg.wss_enable && sofia_cfg.wssbindport > 0) {
 			snprintf(wss_url, sizeof(wss_url), "sips:%s:%d;transport=wss%s%s",
 				sofia_uri_format_host(
-					ast_strlen_zero(sofia_cfg.wssbindaddr) ? "*" : sofia_cfg.wssbindaddr,
+					sofia_bind_host(sofia_cfg.wssbindaddr),
 					hbuf_wss, sizeof(hbuf_wss)),
 				sofia_cfg.wssbindport, wss_ifs ? ";interface=" : "", S_OR(wss_ifs, ""));
 		}
@@ -24788,15 +24827,15 @@ static int sofia_apply_config(struct ast_config *cfg)
 	 * BEFORE the allowexternaldomains special-case so it sees domain_list as non-empty. */
 	if (sofia_cfg.autodomain) {
 		char temp[MAXHOSTNAMELEN];
-		if (!ast_strlen_zero(sofia_cfg.bindaddr)
+		if (!sofia_bind_is_dual(sofia_cfg.bindaddr)
 		    && strcmp(sofia_cfg.bindaddr, "0.0.0.0") != 0) {
 			sofia_domain_list_add(sofia_cfg.bindaddr);
 		}
-		if (!ast_strlen_zero(sofia_cfg.tlsbindaddr)
+		if (!sofia_bind_is_dual(sofia_cfg.tlsbindaddr)
 		    && strcmp(sofia_cfg.tlsbindaddr, "0.0.0.0") != 0) {
 			sofia_domain_list_add(sofia_cfg.tlsbindaddr);
 		}
-		if (!ast_strlen_zero(sofia_cfg.wsbindaddr)
+		if (!sofia_bind_is_dual(sofia_cfg.wsbindaddr)
 		    && strcmp(sofia_cfg.wsbindaddr, "0.0.0.0") != 0) {
 			sofia_domain_list_add(sofia_cfg.wsbindaddr);
 		}

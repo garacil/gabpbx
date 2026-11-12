@@ -790,7 +790,7 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 		}
 	} else {
 		ast_rtp_instance_get_local_address(pvt->rtp, &rtp_addr);
-		ast_copy_string(host, ast_sockaddr_stringify_host(&rtp_addr), sizeof(host));
+		ast_copy_string(host, ast_sockaddr_stringify_addr_remote(&rtp_addr), sizeof(host));
 		/* getsockname() failed: use the bound port (port=0 would emit "m=audio 0" =
 		 * no media, RFC 4566 §5.14). */
 		port = ast_sockaddr_port(&rtp_addr);
@@ -799,8 +799,11 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 	/* SDP c= host chain, lowest-to-highest priority (later clauses override):
 	 * (1) local RTP addr above, (2) pvt->ourip (outbound kernel-routed source),
 	 * (3) externaddr, (4) media_address, (5) directmedia redirip. Inbound: ourip zero → falls to (1). */
+	/* An SDP connection address is a bare address: an IPv6 one has no brackets and no zone (RFC 4566 section
+	 * 5.7; chan_sip add_sdp writes it with ast_sockaddr_stringify_addr_remote too). With brackets the far end
+	 * cannot parse "c=IN IP6 [2001:db8::1]" and sends its media nowhere. */
 	if (pvt && !ast_sockaddr_isnull(&pvt->ourip)) {
-		ast_copy_string(host, ast_sockaddr_stringify_host(&pvt->ourip), sizeof(host));
+		ast_copy_string(host, ast_sockaddr_stringify_addr_remote(&pvt->ourip), sizeof(host));
 	}
 
 	/* NAT: substitute externaddr when target is outside localnet (no registered gate). */
@@ -821,7 +824,7 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 	/* Direct media: redirect c=/port to the bridged peer's RTP target (set by
 	 * sofia_set_rtp_peer); wins over all of the above. */
 	if (!ast_sockaddr_isnull(&pvt->redirip)) {
-		ast_copy_string(host, ast_sockaddr_stringify_host(&pvt->redirip), sizeof(host));
+		ast_copy_string(host, ast_sockaddr_stringify_addr_remote(&pvt->redirip), sizeof(host));
 		port = ast_sockaddr_port(&pvt->redirip);
 	}
 
@@ -1430,7 +1433,7 @@ webrtc_m_lines_done:
 			}
 		} else {
 			ast_rtp_instance_get_local_address(pvt->vrtp, &vrtp_addr);
-			ast_copy_string(vhost, ast_sockaddr_stringify_host(&vrtp_addr), sizeof(vhost));
+			ast_copy_string(vhost, ast_sockaddr_stringify_addr_remote(&vrtp_addr), sizeof(vhost));
 			/* getsockname() failed: use the bound port (0 → "m=video 0" = no media). */
 			vport = ast_sockaddr_port(&vrtp_addr);
 		}
@@ -2856,7 +2859,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 				}
 				if (!pvt->vrtp) {
 					struct ast_sockaddr vbind;
-					ast_sockaddr_parse(&vbind, sofia_cfg.bindaddr, 0);
+					sofia_media_bindaddr(&vbind);
 					pvt->vrtp = ast_rtp_instance_new("gabpbx",
 						sofia_sched ? ast_sched_thread_get_context(sofia_sched) : NULL, &vbind, NULL);
 					if (pvt->vrtp) {
@@ -2939,7 +2942,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 			/* Allocate vrtp on demand when we see m=video */
 			if (!pvt->vrtp) {
 				struct ast_sockaddr bindaddr;
-				ast_sockaddr_parse(&bindaddr, sofia_cfg.bindaddr, 0);
+				sofia_media_bindaddr(&bindaddr);
 				/* MUST pass the sofia_sched context (like sofia_rtp_init + the WebRTC video path at :2178):
 				 * we enable RTCP just below, and res_rtp schedules RTCP TX/RR via ast_sched_add(rtp->sched,..)
 				 * (res_rtp_gabpbx.c:3146/4447). ast_sched_add_variable() locks con->lock with NO NULL guard
@@ -3059,7 +3062,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 			 * port); reused across re-INVITEs, destroyed in the destructor. */
 			if (!pvt->udptl) {
 				struct ast_sockaddr bindaddr;
-				ast_sockaddr_parse(&bindaddr, sofia_cfg.bindaddr, 0);
+				sofia_media_bindaddr(&bindaddr);
 				pvt->udptl = ast_udptl_new_with_bindaddr(NULL, NULL, 0, &bindaddr);
 				if (!pvt->udptl) {
 					ast_log(LOG_WARNING, "Sofia: failed to allocate UDPTL session for T.38 (peer offer ignored)\n");
