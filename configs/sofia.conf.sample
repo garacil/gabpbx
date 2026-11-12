@@ -59,7 +59,8 @@
 ; restart required" and aborts without mutating live state if any of these
 ; differs from the running value:
 ;
-;   bindaddr, bindport, tlsbindaddr, tlsbindport, tlsenable, tlscertfile,
+;   bindaddr, bindport, bindinterface, tlsbindinterface, wsbindinterface,
+;   wssbindinterface, tlsbindaddr, tlsbindport, tlsenable, tlscertfile,
 ;   tlscafile, wsbindaddr, wsbindport, wsenable, wssbindaddr, wssbindport,
 ;   wssenable, tcp_keepalive, tcp_pingpong, timert1, timerb, tlsverify,
 ;   tlsverifyclient, tls_ciphers, tls_min_version, tls_verify_depth
@@ -83,6 +84,44 @@ context=default
 ;
 bindaddr=0.0.0.0
 bindport=5080
+
+;
+; What the listeners listen on
+; ---------------------------------------------------------------------
+; Three choices, and each one follows the network as it changes (sofia-sip
+; 2.1.0 or later; no restart when an interface or an address comes or goes):
+;
+; - bindaddr=0.0.0.0 (or :: for IPv6, or empty for both): every address of
+;   the host. One socket per transport, bound to the wildcard address. An
+;   interface created later, a second address on an interface, an address
+;   that changes: all are served as soon as they are there. A response
+;   leaves from the address its request was sent to, and a request to a
+;   registered device leaves from the address the device registered to.
+;
+; - bindaddr=<one address>: that address only. The listener is made even
+;   if the host does not have the address yet, and it keeps working after
+;   the address, or its interface, is removed and created again.
+;
+; - bindinterface=<names>: only what ARRIVES on these network interfaces,
+;   one name or several separated by commas. The interfaces are matched by
+;   name each time, so one that does not exist yet, or is destroyed and
+;   created again (a tunnel), is served as soon as it is there.
+;     * bindinterface is for the UDP+TCP listener and is the default of the
+;       TLS, WS and WSS listeners. tlsbindinterface, wsbindinterface and
+;       wssbindinterface set one listener apart; the value "any" lifts the
+;       restriction for that listener.
+;     * What this host sends to itself arrives on "lo", also when it is
+;       addressed to one of its public addresses. Add lo if something on
+;       the box talks SIP to the box.
+;     * Sending is not restricted: the routing table chooses the interface.
+;     * Use it together with bindaddr=0.0.0.0. Default: empty, any interface.
+;     * `sip show settings` shows it as "Bind Interface". With a sofia-sip
+;       older than 2.1.0 the key cannot be applied: an ERROR says so at
+;       start and the listeners take traffic from every interface.
+;
+;bindinterface=eth0
+;bindinterface=eth0,lo
+;tlsbindinterface=any
 
 ;
 ; Realtime sipregs separate-table (sipregs parity)

@@ -849,6 +849,27 @@ char *sofia_cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 	ast_cli(a->fd, "  Realm:                  %s\n", sofia_cfg.realm);
 	ast_cli(a->fd, "  Bind Address:           %s\n", sofia_cfg.bindaddr);
 	ast_cli(a->fd, "  Bind Port:              %d\n", sofia_cfg.bindport);
+	/* bindinterface= and the per-listener keys: the interfaces the listeners take traffic from */
+	{
+		const char *note = sofia_stack_has_interfaces() ? "" : "  (NOT applied: needs sofia-sip 2.1.0 or later)";
+		ast_cli(a->fd, "  Bind Interface:         %s%s\n", S_OR(sofia_listener_interfaces(NULL), "any"),
+			sofia_listener_interfaces(NULL) ? note : "");
+		if (!ast_strlen_zero(sofia_cfg.tlsbindinterface)) {
+			ast_cli(a->fd, "  TLS Bind Interface:     %s%s\n",
+				S_OR(sofia_listener_interfaces(sofia_cfg.tlsbindinterface), "any"),
+				sofia_listener_interfaces(sofia_cfg.tlsbindinterface) ? note : "");
+		}
+		if (!ast_strlen_zero(sofia_cfg.wsbindinterface)) {
+			ast_cli(a->fd, "  WS Bind Interface:      %s%s\n",
+				S_OR(sofia_listener_interfaces(sofia_cfg.wsbindinterface), "any"),
+				sofia_listener_interfaces(sofia_cfg.wsbindinterface) ? note : "");
+		}
+		if (!ast_strlen_zero(sofia_cfg.wssbindinterface)) {
+			ast_cli(a->fd, "  WSS Bind Interface:     %s%s\n",
+				S_OR(sofia_listener_interfaces(sofia_cfg.wssbindinterface), "any"),
+				sofia_listener_interfaces(sofia_cfg.wssbindinterface) ? note : "");
+		}
+	}
 	/* TLS/WS/WSS bind ports: "(disabled)" when 0. */
 	if (sofia_cfg.tlsbindport > 0) {
 		ast_cli(a->fd, "  TLS Bind Port:          %d\n", sofia_cfg.tlsbindport);

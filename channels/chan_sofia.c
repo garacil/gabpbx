@@ -198,6 +198,7 @@
 #include <sofia-sip/tport.h>
 #include <sofia-sip/nta_tport.h>
 #include <sofia-sip/tport_tag.h>	/* TPTAG_TOS for SIP-listener-side TOS */
+#include <sofia-sip/sofia_features.h>	/* sofia_sip_name_version: the library that is loaded */
 
 /*** DOCUMENTATION
 	<manager name="SofiaMessageSend" language="en_US">
@@ -285,6 +286,58 @@
 
 
 struct sofia_config sofia_cfg = { .auth_algorithms = SOFIA_AUTH_ALG_MD5 };	/* also with no sofia.conf */
+
+/* sofia-sip 2.1.0 and later can restrict a listener to named network interfaces (TPTAG_INTERFACE, set here with
+ * the bind URL parameter "interface"). An older library ignores the parameter and would listen on every
+ * interface, so the driver has to know which one is loaded: the weak reference is NULL when the library does
+ * not have the tag. */
+extern tag_typedef_t tptag_interface __attribute__((weak));
+
+int sofia_stack_has_interfaces(void)
+{
+	return tptag_interface != NULL;
+}
+
+/* The interfaces a listener is restricted to: its own key, else bindinterface=. "any" lifts the restriction.
+ * Returns NULL when the listener takes traffic from any interface. */
+const char *sofia_listener_interfaces(const char *own)
+{
+	const char *ifs = !ast_strlen_zero(own) ? own : sofia_cfg.bindinterface;
+
+	if (ast_strlen_zero(ifs) || !strcasecmp(ifs, "any")) {
+		return NULL;
+	}
+	return ifs;
+}
+
+/* Store the value of bindinterface= (or of a per-listener key): interface names separated by commas, blanks
+ * dropped. The value goes into the bind URL as a parameter, so a name may only have the characters interface
+ * names are made of here (letters, digits, '_', '-', '.', '@'). Anything else leaves the key unset; warn says
+ * so in the log (the reload check parses the file a second time and stays quiet). */
+static void sofia_cfg_interfaces(const char *key, const char *value, char *dst, size_t len, int warn)
+{
+	size_t n = 0;
+	const char *c;
+
+	dst[0] = '\0';
+	for (c = value; c && *c; c++) {
+		if (*c == ' ' || *c == '\t') {
+			continue;
+		}
+		if (!(isalnum((unsigned char)*c) || *c == '_' || *c == '-' || *c == '.' || *c == '@' || *c == ',')
+				|| n + 1 >= len) {
+			if (warn) {
+				ast_log(LOG_WARNING, "Sofia: %s=%s is not a list of interface names (letters, digits, "
+					"'_', '-', '.', '@', separated by commas, at most %d characters); ignored\n",
+					key, value, (int)len - 1);
+			}
+			dst[0] = '\0';
+			return;
+		}
+		dst[n++] = *c;
+	}
+	dst[n] = '\0';
+}
 
 	su_root_t *sofia_root;
 	nua_t *sofia_nua;
@@ -21661,10 +21714,15 @@ static void *sofia_thread_func(void *data)
 	/* Per-transport URLs as separate tags (NUTAG_URL/SIPS_URL/WS_URL/WSS_URL) — the
 	 * URL parser rejects comma-concatenation into NUTAG_URL. */
 	{
-		char udp_url[128];
-		char tls_url[128] = "";
-		char ws_url[128]  = "";
-		char wss_url[128] = "";
+		char udp_url[320];
+		char tls_url[320] = "";
+		char ws_url[320]  = "";
+		char wss_url[320] = "";
+		/* bindinterface= and the per-listener keys: the interfaces each listener takes traffic from */
+		const char *udp_ifs = sofia_listener_interfaces(NULL);
+		const char *tls_ifs = sofia_listener_interfaces(sofia_cfg.tlsbindinterface);
+		const char *ws_ifs = sofia_listener_interfaces(sofia_cfg.wsbindinterface);
+		const char *wss_ifs = sofia_listener_interfaces(sofia_cfg.wssbindinterface);
 		char cert_dir[256] = "";	/* the DIRECTORY handed to sofia-sip (NUTAG_CERTIFICATE_DIR); derived
 						 * from tlscertfile (its dirname when tlscertfile names a file). */
 		int needs_cert;
@@ -21678,33 +21736,39 @@ static void *sofia_thread_func(void *data)
 		 * plain SIP-over-TCP client landing on the ws one got "HTTP/1.1 400 Bad Request" (1 in 4 on a
 		 * production box). Same trap already handled below for sips: (;transport=tls); FreeSWITCH binds
 		 * ";transport=udp,tcp" for the same reason. ws stays on wsbindport, wss on wssbindport. */
-		snprintf(udp_url, sizeof(udp_url), "sip:%s:%d;transport=udp,tcp",
+		if ((udp_ifs || tls_ifs || ws_ifs || wss_ifs) && !sofia_stack_has_interfaces()) {
+			/* The library would ignore the parameter and listen on every interface without a word. */
+			ast_log(LOG_ERROR, "Sofia: bindinterface needs sofia-sip 2.1.0 or later and this one is %s: "
+				"the listeners are NOT restricted to interfaces\n", sofia_sip_name_version);
+			udp_ifs = tls_ifs = ws_ifs = wss_ifs = NULL;
+		}
+		snprintf(udp_url, sizeof(udp_url), "sip:%s:%d;transport=udp,tcp%s%s",
 			sofia_uri_format_host(
 				ast_strlen_zero(sofia_cfg.bindaddr) ? "*" : sofia_cfg.bindaddr,
 				hbuf_udp, sizeof(hbuf_udp)),
-			sofia_cfg.bindport);
+			sofia_cfg.bindport, udp_ifs ? ";interface=" : "", S_OR(udp_ifs, ""));
 		if (sofia_cfg.tls_enable && sofia_cfg.tlsbindport > 0) {
 			/* Explicit transport=tls forces TLS-only: without it, sips: enumerates
 			 * both TLS+WSS on the same port and the WSS bind fails. */
-			snprintf(tls_url, sizeof(tls_url), "sips:%s:%d;transport=tls",
+			snprintf(tls_url, sizeof(tls_url), "sips:%s:%d;transport=tls%s%s",
 				sofia_uri_format_host(
 					ast_strlen_zero(sofia_cfg.tlsbindaddr) ? "*" : sofia_cfg.tlsbindaddr,
 					hbuf_tls, sizeof(hbuf_tls)),
-				sofia_cfg.tlsbindport);
+				sofia_cfg.tlsbindport, tls_ifs ? ";interface=" : "", S_OR(tls_ifs, ""));
 		}
 		if (sofia_cfg.ws_enable && sofia_cfg.wsbindport > 0) {
-			snprintf(ws_url, sizeof(ws_url), "sip:%s:%d;transport=ws",
+			snprintf(ws_url, sizeof(ws_url), "sip:%s:%d;transport=ws%s%s",
 				sofia_uri_format_host(
 					ast_strlen_zero(sofia_cfg.wsbindaddr) ? "*" : sofia_cfg.wsbindaddr,
 					hbuf_ws, sizeof(hbuf_ws)),
-				sofia_cfg.wsbindport);
+				sofia_cfg.wsbindport, ws_ifs ? ";interface=" : "", S_OR(ws_ifs, ""));
 		}
 		if (sofia_cfg.wss_enable && sofia_cfg.wssbindport > 0) {
-			snprintf(wss_url, sizeof(wss_url), "sips:%s:%d;transport=wss",
+			snprintf(wss_url, sizeof(wss_url), "sips:%s:%d;transport=wss%s%s",
 				sofia_uri_format_host(
 					ast_strlen_zero(sofia_cfg.wssbindaddr) ? "*" : sofia_cfg.wssbindaddr,
 					hbuf_wss, sizeof(hbuf_wss)),
-				sofia_cfg.wssbindport);
+				sofia_cfg.wssbindport, wss_ifs ? ";interface=" : "", S_OR(wss_ifs, ""));
 		}
 
 		/* Cert-dir resolution + sofia-name aliasing (external cert-manager integration).
@@ -21855,6 +21919,12 @@ static void *sofia_thread_func(void *data)
 		/* Recompute AFTER any degrade so NUTAG_CERTIFICATE_DIR + the TLS hardening tags are only
 		 * applied when a cert-bearing listener actually survives. */
 		needs_cert = (tls_url[0] || wss_url[0]);
+
+		if (udp_ifs || tls_ifs || ws_ifs || wss_ifs) {
+			ast_log(LOG_NOTICE, "Sofia: listeners take traffic from these interfaces only: sip=%s tls=%s ws=%s wss=%s\n",
+				S_OR(udp_ifs, "any"), tls_url[0] ? S_OR(tls_ifs, "any") : "(off)",
+				ws_url[0] ? S_OR(ws_ifs, "any") : "(off)", wss_url[0] ? S_OR(wss_ifs, "any") : "(off)");
+		}
 
 		ast_debug(1, "Creating NUA: udp=%s tls=%s ws=%s wss=%s cert_dir=%s\n",
 			udp_url, tls_url[0] ? tls_url : "(none)",
@@ -22739,6 +22809,15 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 	for (v = ast_variable_browse(cfg, "general"); v; v = v->next) {
 		if (!strcasecmp(v->name, "bindaddr")) {
 			ast_copy_string(sofia_cfg.bindaddr, v->value, sizeof(sofia_cfg.bindaddr));
+		} else if (!strcasecmp(v->name, "bindinterface")) {
+			/* The interfaces the listeners take traffic from; see struct sofia_config. */
+			sofia_cfg_interfaces(v->name, v->value, sofia_cfg.bindinterface, sizeof(sofia_cfg.bindinterface), 1);
+		} else if (!strcasecmp(v->name, "tlsbindinterface")) {
+			sofia_cfg_interfaces(v->name, v->value, sofia_cfg.tlsbindinterface, sizeof(sofia_cfg.tlsbindinterface), 1);
+		} else if (!strcasecmp(v->name, "wsbindinterface")) {
+			sofia_cfg_interfaces(v->name, v->value, sofia_cfg.wsbindinterface, sizeof(sofia_cfg.wsbindinterface), 1);
+		} else if (!strcasecmp(v->name, "wssbindinterface")) {
+			sofia_cfg_interfaces(v->name, v->value, sofia_cfg.wssbindinterface, sizeof(sofia_cfg.wssbindinterface), 1);
 		} else if (!strcasecmp(v->name, "bindport") || !strcasecmp(v->name, "udpbindaddr")) {
 			/* IPv6-aware host:port split on a LOCAL copy — never mutate v->value, don't truncate
 			 * a bracketed [2001:db8::1]:5060 at its first colon. */
@@ -25093,6 +25172,10 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 	struct {
 		char bindaddr[128];
 		int bindport;
+		char bindinterface[128];	/* a change forces a listener recreate (bind URL parameter) */
+		char tlsbindinterface[128];
+		char wsbindinterface[128];
+		char wssbindinterface[128];
 		char tlsbindaddr[64];
 		int tlsbindport;
 		int tls_enable;		/* tlsenable=; a change forces a listener recreate (gate baked into nua_create) */
@@ -25127,6 +25210,10 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 	 * sofia_cfg is exactly what lets a removed key be detected. */
 	ast_copy_string(s.bindaddr, DEFAULT_BINDADDR, sizeof(s.bindaddr));
 	s.bindport = DEFAULT_SIP_PORT;
+	s.bindinterface[0] = '\0';
+	s.tlsbindinterface[0] = '\0';
+	s.wsbindinterface[0] = '\0';
+	s.wssbindinterface[0] = '\0';
 	s.tlsbindaddr[0] = '\0';
 	s.tlsbindport = 0;
 	s.tls_enable = 1;
@@ -25159,6 +25246,14 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 	for (v = ast_variable_browse(cfg, "general"); v; v = v->next) {
 		if (!strcasecmp(v->name, "bindaddr")) {
 			ast_copy_string(s.bindaddr, v->value, sizeof(s.bindaddr));
+		} else if (!strcasecmp(v->name, "bindinterface")) {
+			sofia_cfg_interfaces(v->name, v->value, s.bindinterface, sizeof(s.bindinterface), 0);
+		} else if (!strcasecmp(v->name, "tlsbindinterface")) {
+			sofia_cfg_interfaces(v->name, v->value, s.tlsbindinterface, sizeof(s.tlsbindinterface), 0);
+		} else if (!strcasecmp(v->name, "wsbindinterface")) {
+			sofia_cfg_interfaces(v->name, v->value, s.wsbindinterface, sizeof(s.wsbindinterface), 0);
+		} else if (!strcasecmp(v->name, "wssbindinterface")) {
+			sofia_cfg_interfaces(v->name, v->value, s.wssbindinterface, sizeof(s.wssbindinterface), 0);
 		} else if (!strcasecmp(v->name, "bindport") || !strcasecmp(v->name, "udpbindaddr")) {
 			/* IPv6-aware host:port split (mirrors sofia_parse_general_config). */
 			char hpbuf[128];
@@ -25289,6 +25384,10 @@ static int sofia_reload_listener_changed(struct ast_config *cfg,
 
 	SOFIA_LISTENER_CMP_STR(bindaddr, "bindaddr");
 	SOFIA_LISTENER_CMP_INT(bindport, "bindport");
+	SOFIA_LISTENER_CMP_STR(bindinterface, "bindinterface");
+	SOFIA_LISTENER_CMP_STR(tlsbindinterface, "tlsbindinterface");
+	SOFIA_LISTENER_CMP_STR(wsbindinterface, "wsbindinterface");
+	SOFIA_LISTENER_CMP_STR(wssbindinterface, "wssbindinterface");
 	SOFIA_LISTENER_CMP_STR(tlsbindaddr, "tlsbindaddr");
 	SOFIA_LISTENER_CMP_INT(tlsbindport, "tlsbindport");
 	SOFIA_LISTENER_CMP_INT(tls_enable, "tlsenable");

@@ -1285,11 +1285,25 @@ struct sofia_peer {
 };
 
 
+/* True when the loaded sofia-sip can restrict a listener to named interfaces (2.1.0 and later). */
+int sofia_stack_has_interfaces(void);
+/* The interfaces a listener is restricted to: its own key (may be NULL), else bindinterface=. NULL = any. */
+const char *sofia_listener_interfaces(const char *own);
+
 /* The [general] configuration block. Defined once in chan_sofia.c (static sofia_cfg);
  * the named type lets split modules reference it. */
 struct sofia_config {
 	char bindaddr[128];
 	int bindport;
+	/* The network interfaces, by name and separated by commas, the listeners take traffic from ("" = any).
+	 * bindinterface= is for the SIP listener (UDP and TCP) and the default of the other three;
+	 * tlsbindinterface= / wsbindinterface= / wssbindinterface= are for their listener only, and "any" lifts
+	 * the restriction. The stack matches the interfaces by name each time (sofia-sip 2.1.0, bind URL parameter
+	 * "interface"): one that does not exist yet, or is destroyed and created again, is served when it is there. */
+	char bindinterface[128];
+	char tlsbindinterface[128];
+	char wsbindinterface[128];
+	char wssbindinterface[128];
 	char context[AST_MAX_CONTEXT];
 	char default_user[80];
 	char default_secret[80];
