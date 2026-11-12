@@ -1,3 +1,43 @@
+## 1.9.26 — one audio codec per inbound leg: no more audio dropped in a codec the caller did not choose; less transcoding
+
+`chan_sofia.so` changes; the core (`gabpbx`) only gets the new version string. Sofia-SIP stays at `v2.1.1`.
+
+### Fixed
+
+- **An inbound leg could send audio in a codec the caller had not chosen.** Its channel had every negotiated codec as
+  native and the answer listed them all, so the core sent in any of them: a prompt stored in Opus went out as Opus to
+  a caller that had chosen G.711 A-law, which dropped it and heard nothing. On an inbound leg that is not WebRTC:
+  - the codec is the first one of the caller's offer that the account allows (RFC 3264 §6.1);
+  - every SDP sent on that leg (183, 200, answers to re-INVITE/UPDATE, our own re-INVITEs) names that one codec and
+    `telephone-event` (RFC 3264 §6.1 and §10.2: the answerer must be prepared to receive every format it lists);
+  - a later offer that still lists the codec keeps it (a hold, a session refresh, a re-INVITE in another order).
+- **The codecs of an inbound call are the calling account's** `allow=` / `disallow=`, as in `chan_sip`
+  (`check_peer_ok`), not those of `[general]`. An account without them has the list of `[general]`, and so has a call
+  that matches no account. An INVITE from an account that offers none of its codecs gets `488`.
+
+### New
+
+- **The caller follows the called leg, so that the call is not transcoded.** When the called leg answers on another
+  codec that the caller also offered and its account allows:
+  - a caller that has not been answered yet is answered with that codec;
+  - a caller that was already answered (an IVR, a queue, a `183` with SDP) gets one re-INVITE that offers it (RFC 3264
+    §8.3.2). If it refuses, the call goes on transcoded and that codec is not offered again; a `491` is retried after
+    the RFC 3261 §14.1 delay.
+  Only a caller follows a called leg (two inbound legs bridged together do not), and not during T.38 nor while the
+  media go direct. The core's RTP bridge joins two legs only when they use the same codec, and after a codec change
+  the bridge recomputes both legs.
+- **WebRTC legs are not part of this**: they are answered as before, with every common codec in the order of
+  `allow=`, and the PBX transcodes when the other leg uses another codec.
+
+See the section "Which audio codec a call uses" of `configs/sofia.conf.sample`.
+
+### Upgrading
+
+Replace `chan_sofia.so` and `gabpbx`, and restart. Check the `allow=` of accounts whose devices offer a codec that
+their `allow=` does not have: until now `[general]`'s list let those calls through; now they get `488`
+("no common audio codec" in the log). `preferred_codec_only` now only narrows the offers the PBX sends and the
+answers of WebRTC legs.
+
 ## 1.9.25 — listening on every address as the network changes, IPv6, push hold, and five interop fixes
 
 `chan_sofia.so` and the core (`gabpbx`) change, and the Sofia-SIP library moves to `v2.1.1` (below).
