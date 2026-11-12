@@ -4119,9 +4119,7 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 			}
 			ast_mutex_unlock(&pvt->lock);
 			if (was != staged_audio_fmt) {
-				ast_verb(3, "Sofia: call '%s' uses %s on its inbound leg%s\n", S_OR(pvt->callid, "(no-callid)"),
-					ast_getformatname(staged_audio_fmt),
-					!was ? " (the first codec of the offer that the account allows)" : " (renegotiated)");
+				/* Recorded in the call's SIP history only (sip show history): no line in the log for every call. */
 				sofia_append_history(pvt, "SDP", "audio codec: %s", ast_getformatname(staged_audio_fmt));
 			}
 		}
