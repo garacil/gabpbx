@@ -3452,9 +3452,20 @@ static struct ast_channel *sofia_new(struct sofia_pvt *pvt, int state, const cha
 	}
 
 	chan->tech = &sofia_tech;
-	chan->nativeformats = pvt->capability;
-	chan->readformat = AST_FORMAT_ULAW;
-	chan->writeformat = AST_FORMAT_ULAW;
+	if (pvt->audio_fmt) {
+		/* An inbound leg whose offer is answered with one codec (sofia_parse_sdp stored it before this channel
+		 * existed): the channel has that codec alone, so the core translates anything else it is given to send
+		 * (a prompt in another format, the other leg's audio) and never sends a codec the answer does not name.
+		 * With every negotiated codec native, as before, a file in one of them went out untranslated. Formats set
+		 * as chan_sip sip_new does (chan_sip.c:7899-7925). */
+		chan->nativeformats = (pvt->capability & ~AST_FORMAT_AUDIO_MASK) | pvt->audio_fmt;
+		chan->readformat = chan->rawreadformat = pvt->audio_fmt;
+		chan->writeformat = chan->rawwriteformat = pvt->audio_fmt;
+	} else {
+		chan->nativeformats = pvt->capability;
+		chan->readformat = AST_FORMAT_ULAW;
+		chan->writeformat = AST_FORMAT_ULAW;
+	}
 
 	if (pvt->rtp) {
 		chan->fds[0] = ast_rtp_instance_fd(pvt->rtp, 0);
@@ -6280,10 +6291,27 @@ static enum ast_rtp_glue_result sofia_get_vrtp_peer(struct ast_channel *chan,
 	return AST_RTP_GLUE_RESULT_FORBID;
 }
 
+/* The codecs of the leg for the core's RTP bridge, which bridges two legs natively (packets forwarded as they are)
+ * only when these have a codec in common. The channel's native formats: the one codec in use once a leg has it, so
+ * a leg answered with one codec is never forwarded packets of another; before that they are the negotiable set, as
+ * before. A WebRTC leg reports its negotiated set, as before. The core calls this with the channel locked. */
 static format_t sofia_get_codec(struct ast_channel *chan)
 {
 	struct sofia_pvt *pvt = chan ? chan->tech_pvt : NULL;
-	return pvt ? pvt->capability : 0;
+
+	if (!pvt) {
+		return 0;
+	}
+	if (pvt->is_webrtc) {
+		return pvt->capability;
+	}
+	if (pvt->audio_fmt_recompat) {
+		/* The codec changed and the two legs have not been made compatible since: no audio codec the RTP
+		 * bridge can match (signed linear never travels on these legs), so the core goes on to
+		 * ast_channel_make_compatible, which clears this (sofia_follow_called_codec). */
+		return (chan->nativeformats & ~AST_FORMAT_AUDIO_MASK) | AST_FORMAT_SLINEAR;
+	}
+	return chan->nativeformats;
 }
 
 /* Compute config-derived session-timer (RFC 4028) NUTAG values; sofia-sip handles
@@ -6344,6 +6372,7 @@ static const char *sofia_reinvite_purpose_str(int purpose)
 	case SOFIA_REINVITE_LOCAL_HOLD:     return "local-hold";
 	case SOFIA_REINVITE_CONNECTED_LINE: return "connected-line";
 	case SOFIA_REINVITE_SESSION_REFRESH: return "session-refresh";
+	case SOFIA_REINVITE_CODEC:          return "codec";
 	default:                            return "in-dialog";
 	}
 }
@@ -6410,10 +6439,29 @@ static void sofia_send_reinvite(struct sofia_pvt *pvt)
 		}
 		pvt->reinvite_purpose = SOFIA_REINVITE_T38;
 	}
+	/* The audio codec this offer names on a one-codec leg (sofia_generate_sdp): the called leg's when this is the
+	 * re-INVITE that moves the caller to it (sofia_follow_called_codec) and no T.38 offer took its place above;
+	 * for every other purpose 0, the codec in use. */
+	if (pvt && pvt->nh) {
+		pvt->audio_fmt_offered = pvt->reinvite_purpose == SOFIA_REINVITE_CODEC ? sofia_leg_codec_due(pvt) : 0;
+		if (pvt->reinvite_purpose == SOFIA_REINVITE_CODEC && !pvt->audio_fmt_offered) {
+			/* Not due any more (the leg got that codec meanwhile, or the far end no longer has it): send
+			 * nothing and let what waits go. */
+			pvt->reinvite_pending = 0;
+			pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
+			sofia_reinvite_followup_locked(pvt);
+			return;
+		}
+	}
 	if (!pvt || !pvt->nh || !sofia_generate_sdp(pvt, sdp_buf, sizeof(sdp_buf), 0 /* offer */)) {
 		/* Nothing sent — release the reinvite gate (pre-set by the directmedia
 		 * marshal) so a guard-fail doesn't leave it stuck. */
 		if (pvt) {
+			if (pvt->audio_fmt_offered) {
+				/* given up: no loop on an SDP that cannot be built */
+				pvt->audio_fmt_refused |= pvt->audio_fmt_offered;
+				pvt->audio_fmt_offered = 0;
+			}
 			if (folded) {
 				ast_sockaddr_copy(&pvt->redirip, &prev_redirip);
 				pvt->need_reinvite = 1;	/* the target was not offered */
@@ -6547,6 +6595,15 @@ static void sofia_reinvite_followup_locked(struct sofia_pvt *pvt)
 			return;
 		}
 	}
+	/* The codec of the called leg, asked for meanwhile or before this call came up (sofia_follow_called_codec):
+	 * the caller is offered it now. Not during a fax, nor while the media go direct. */
+	if (sofia_leg_codec_due(pvt) && pvt->t38_state == SOFIA_T38_DISABLED && ast_sockaddr_isnull(&pvt->redirip)) {
+		pvt->reinvite_purpose = SOFIA_REINVITE_CODEC;
+		sofia_send_reinvite(pvt);
+		if (pvt->reinvite_pending) {
+			return;
+		}
+	}
 	/* A connected-line update asked for meanwhile: the latest identity (cl_rpid). */
 	if (pvt->need_cl_reinvite) {
 		pvt->need_cl_reinvite = 0;
@@ -6571,7 +6628,7 @@ static void sofia_reinvite_followup_locked(struct sofia_pvt *pvt)
 static int sofia_reinvite_any_due_locked(struct sofia_pvt *pvt)
 {
 	return pvt->need_t38_reinvite || pvt->need_reinvite || pvt->local_hold_want != pvt->local_hold_mode
-		|| pvt->need_cl_reinvite || pvt->need_session_refresh;
+		|| pvt->need_cl_reinvite || pvt->need_session_refresh || sofia_leg_codec_due(pvt);
 }
 
 /* The re-INVITE slot can be claimed now: nothing of ours in flight, no 491 wait, no T.38 offer waiting, no peer T.38
@@ -6711,6 +6768,8 @@ static int sofia_reinvite_491_retry_locked(struct sofia_pvt *pvt, int purpose)
 		pvt->need_session_refresh = 1;
 	} else if (purpose == SOFIA_REINVITE_LOCAL_HOLD) {
 		/* due again while local_hold_want differs from the rolled-back local_hold_mode */
+	} else if (purpose == SOFIA_REINVITE_CODEC) {
+		/* due again while audio_fmt_want is (sofia_leg_codec_due) */
 	} else if (!pvt->need_reinvite) {
 		ast_sockaddr_copy(&pvt->redirip_next, &pvt->offered_redirip);
 		pvt->need_reinvite = 1;
@@ -9462,6 +9521,111 @@ static int sofia_queryoption(struct ast_channel *chan, int option, void *data, i
  * unresolved AUTO). The override sets pvt->dtmf_detect_off and is applied via the fax-safe
  * sofia_dtmf_reconfigure (never frees the shared DSP under a live owner; fax-CNG preserved) and
  * persists across a later re-INVITE reconfigure. Default rfc2833 short-circuits to -1 (ENOSYS). */
+/* The caller follows the codec of the called leg, so the call needs no transcoding. The core calls this on `chan`
+ * (locked, ast_channel_setoption) each time it is about to make it compatible with `peer`: in Dial and Queue once
+ * the called leg has answered and before the caller is answered (app_dial.c -> ast_bridge_call -> ast_raw_answer),
+ * and in the bridge whenever a leg's formats change (ast_channel_bridge).
+ *
+ * `chan` must be a one-codec leg (an inbound leg that is not WebRTC) and `peer` a called leg (placed by ast_call:
+ * AST_FLAG_OUTGOING) that has answered and uses a single audio codec Y. Only that direction: two inbound legs
+ * bridged together never chase each other's codec. Y must be one the caller offered and its account allows
+ * (pvt->capability), must not have been refused in this call, and neither leg is WebRTC (those stay as they are). Not
+ * during a fax, nor while the media go direct.
+ *  - No SDP sent to the caller yet (no 183 with SDP, no 200): its codec becomes Y here, and its answer names Y.
+ *    Nothing else to send.
+ *  - The caller has its answer already (RFC 3261 section 13.2.1: the answer is the same in the 183 and in the
+ *    200, so it cannot change now): it is offered Y in a re-INVITE (RFC 3264 section 8.3.2), at once when the
+ *    re-INVITE slot is free, else when it frees or when our 200 is ACKed (sofia_reinvite_followup_locked). Until
+ *    its answer the core translates between the two codecs; a refusal leaves it so (sofia_handle_event).
+ * `peer` belongs to the calling thread (the dialling application or the bridge), which is the one that hangs it
+ * up: its fields and its tech_pvt are read without its lock, as the core does around this call. */
+static void sofia_follow_called_codec(struct ast_channel *chan, struct sofia_pvt *pvt, struct ast_channel *peer)
+{
+	format_t y, mine = 0;
+	int now = 0, dispatch = 0;
+
+	if (!peer) {
+		return;
+	}
+	/* The codec of this leg changed while its channel was up (a re-INVITE answered on sofia_thread) and this is
+	 * the first time since that its bridge makes the legs compatible. The channel kept the formats it was read
+	 * and written in, translated to the new codec, and the other leg still translates to the old one: each
+	 * pair of formats matches, so the core would find them "already compatible" and leave both translations
+	 * in place. Start again from the codec in use, and when the other leg has that same single codec take its
+	 * translations away too: nothing is left to translate. The other channel is locked with a trylock (this
+	 * one is held by the core): missing it only leaves the translations, the call is not affected. */
+	ast_mutex_lock(&pvt->lock);
+	if (pvt->audio_fmt_recompat) {
+		pvt->audio_fmt_recompat = 0;
+		mine = pvt->audio_fmt;
+	}
+	ast_mutex_unlock(&pvt->lock);
+	if (mine) {
+		ast_set_read_format(chan, mine);
+		ast_set_write_format(chan, mine);
+		if ((peer->nativeformats & AST_FORMAT_AUDIO_MASK) == mine
+		    && (peer->readformat != mine || peer->writeformat != mine) && !ast_channel_trylock(peer)) {
+			ast_set_read_format(peer, mine);
+			ast_set_write_format(peer, mine);
+			ast_channel_unlock(peer);
+		}
+	}
+	if (!ast_test_flag(peer, AST_FLAG_OUTGOING) || peer->_state != AST_STATE_UP) {
+		return;
+	}
+	y = peer->nativeformats & AST_FORMAT_AUDIO_MASK;
+	if (!y || (y & (y - 1))) {
+		return;	/* no audio, or more than one codec */
+	}
+	if (peer->tech == &sofia_tech) {
+		struct sofia_pvt *ppvt = peer->tech_pvt;
+
+		if (!ppvt || ppvt->is_webrtc) {
+			return;
+		}
+	}
+	ast_mutex_lock(&pvt->lock);
+	if (!sofia_leg_one_codec(pvt, 0) || !pvt->audio_fmt || pvt->audio_fmt == y || pvt->audio_fmt_want == y
+	    || !(y & pvt->capability) || (y & pvt->audio_fmt_refused) || pvt->alreadygone || !pvt->rtp
+	    || pvt->t38_state != SOFIA_T38_DISABLED || !ast_sockaddr_isnull(&pvt->redirip)
+	    || ast_rtp_codecs_payload_code(ast_rtp_instance_get_codecs(pvt->rtp), 1, y) < 0) {
+		ast_mutex_unlock(&pvt->lock);
+		return;
+	}
+	if (chan->_state != AST_STATE_UP && !pvt->progress_sent) {
+		pvt->audio_fmt = y;
+		pvt->audio_fmt_want = 0;
+		now = 1;
+	} else {
+		pvt->audio_fmt_want = y;
+		if (sofia_reinvite_slot_free_locked(pvt)) {
+			pvt->reinvite_pending = 1;
+			pvt->reinvite_purpose = SOFIA_REINVITE_CODEC;
+			ao2_ref(pvt, +1);
+			dispatch = 1;
+		}
+	}
+	ast_mutex_unlock(&pvt->lock);
+	if (now) {
+		/* The channel is locked by the core (channel -> pvt order; pvt->lock is released above). */
+		chan->nativeformats = (chan->nativeformats & ~AST_FORMAT_AUDIO_MASK) | y;
+		ast_set_read_format(chan, y);
+		ast_set_write_format(chan, y);
+		ast_verb(3, "Sofia: %s will be answered with %s, the codec of %s: no transcoding\n",
+			chan->name, ast_getformatname(y), peer->name);
+	} else {
+		ast_verb(3, "Sofia: %s is offered %s, the codec of %s, in a re-INVITE%s\n",
+			chan->name, ast_getformatname(y), peer->name, dispatch ? "" : " (when its dialog is free)");
+	}
+	if (dispatch && sofia_dispatch_to_root_thread(sofia_reinvite_root, pvt) < 0) {
+		ast_mutex_lock(&pvt->lock);
+		pvt->reinvite_pending = 0;	/* the codec stays due: the next follow-up offers it */
+		pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
+		ast_mutex_unlock(&pvt->lock);
+		ao2_ref(pvt, -1);
+	}
+}
+
 static int sofia_setoption(struct ast_channel *chan, int option, void *data, int datalen)
 {
 	int res = -1;
@@ -9488,6 +9652,13 @@ static int sofia_setoption(struct ast_channel *chan, int option, void *data, int
 			res = 0;
 		}
 		ast_mutex_unlock(&pvt->lock);
+		break;
+	case AST_OPTION_MAKE_COMPATIBLE:
+		/* ast_channel_make_compatible_helper: `data` is the other channel. Never "done" (-1 stays): the core
+		 * goes on to set both channels' formats, with this one's codec changed or not. */
+		if (data && datalen == (int) sizeof(struct ast_channel *)) {
+			sofia_follow_called_codec(chan, pvt, (struct ast_channel *) data);
+		}
 		break;
 	default:
 		break;
@@ -10735,6 +10906,34 @@ static int sofia_pickup(struct ast_channel *chan)
 	return 0;
 }
 
+/* 1 when the SDP of a request offers audio over a DTLS media profile ("m=audio <port> UDP/TLS/..."): the profiles
+ * sofia_parse_sdp takes for a WebRTC leg when the account has webrtc=yes. A plain look at the m=audio lines, for a
+ * decision that is needed before the SDP is parsed. */
+static int sofia_invite_offers_dtls_audio(sip_t const *sip)
+{
+	const char *p, *end;
+
+	if (!sip || !sip->sip_payload || !sip->sip_payload->pl_data) {
+		return 0;
+	}
+	p = sip->sip_payload->pl_data;
+	end = p + sip->sip_payload->pl_len;
+	while (p < end) {
+		const char *eol = memchr(p, '\n', end - p);
+		const char *stop = eol ? eol : end;
+
+		if (stop - p > 8 && !strncasecmp(p, "m=audio ", 8)) {
+			const char *proto = memchr(p + 8, ' ', stop - (p + 8));	/* after the port */
+
+			if (proto && stop - (proto + 1) >= 8 && !strncasecmp(proto + 1, "UDP/TLS/", 8)) {
+				return 1;
+			}
+		}
+		p = eol ? eol + 1 : end;
+	}
+	return 0;
+}
+
 static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt *op,
 		sip_t const *sip, tagi_t tags[])
 {
@@ -10985,6 +11184,18 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 			pvt->dtmf_effective = pvt->dtmfmode;	/* runtime = configured until AUTO resolves at SDP */
 			sofia_dtmf_apply_property(pvt);		/* g3: rtp exists (rtp_init ran above); re-apply now the peer mode is bound */
 			pvt->prefs = caller_peer->prefs;
+			/* The audio codecs of the call are the calling account's, like its order of preference above, not
+			 * [general]'s (chan_sip check_peer_ok: p->capability = peer->capability, chan_sip.c:17380): the
+			 * allow= and disallow= of an account limit the calls it places. An account without them has
+			 * [general]'s list (sofia_peer_set_defaults), and a call that matches no account keeps it too.
+			 * Audio only: the video list, and the media instances sofia_rtp_init made from it above, stay as
+			 * they were. A WebRTC offer keeps [general]'s list as before: nothing changes on WebRTC legs, which
+			 * keep every negotiated codec. */
+			if ((caller_peer->capability & AST_FORMAT_AUDIO_MASK)
+			    && !(caller_peer->webrtc && sofia_invite_offers_dtls_audio(sip))) {
+				pvt->capability = (pvt->capability & ~AST_FORMAT_AUDIO_MASK)
+					| (caller_peer->capability & AST_FORMAT_AUDIO_MASK);
+			}
 			if (!ast_strlen_zero(caller_peer->context)) {
 				ast_string_field_set(pvt, context, caller_peer->context);
 			}
@@ -20871,6 +21082,81 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				}
 				break;
 				}
+			if (reinvite_purpose == SOFIA_REINVITE_CODEC) {
+				/* The re-INVITE that offered this caller the codec of the called leg (sofia_follow_called_codec)
+				 * got its final response. A 2xx with that codec in its answer: the parse stores it and sets the
+				 * channel's formats, and the bridge, seeing the native format changed, drops its translators
+				 * (ast_channel_bridge -> ast_channel_make_compatible). A 491 offers it again after the RFC 3261
+				 * section 14.1 delay. Anything else leaves the session as it was (section 14.1: "the session
+				 * parameters MUST remain unchanged") and the codec is not offered again in this call, which goes
+				 * on translated. Like the hold one, this touches neither redirip nor the T.38 state. */
+				int rejected = (status >= 300);
+				int has_sdp = (!rejected && sip && sip->sip_payload && sip->sip_payload->pl_data);
+				int sdp_rc = 0;
+				int moved = 0;
+				int retried = 0;	/* a 491 offered again after the RFC 3261 section 14.1 delay */
+				format_t offered;
+				struct ast_channel *owner = NULL;
+				ast_mutex_lock(&pvt->lock);
+				for (;;) {	/* re-acquire channel->pvt order for a safe sofia_parse_sdp (set_format) */
+					owner = pvt->owner;
+					if (!owner) {
+						break;
+					}
+					ast_channel_ref(owner);
+					ast_mutex_unlock(&pvt->lock);
+					ast_channel_lock(owner);
+					ast_mutex_lock(&pvt->lock);
+					if (pvt->owner == owner) {
+						break;
+					}
+					ast_channel_unlock(owner);
+					ast_channel_unref(owner);
+					owner = NULL;
+				}
+				pvt->reinvite_pending = 0;
+				pvt->reinvite_purpose = SOFIA_REINVITE_NONE;
+				offered = pvt->audio_fmt_offered;
+				if (has_sdp) {
+					sdp_rc = sofia_parse_sdp(pvt, sip, 0 /* answer: codec re-INVITE 2xx */);
+				}
+				pvt->audio_fmt_offered = 0;
+				moved = !rejected && has_sdp && sdp_rc >= 0 && offered && pvt->audio_fmt == offered;
+				if (!moved) {
+					retried = status == 491 && sofia_reinvite_491_retry_locked(pvt, SOFIA_REINVITE_CODEC);
+					if (!retried) {
+						pvt->audio_fmt_refused |= offered;
+						if (pvt->audio_fmt_want == offered) {
+							pvt->audio_fmt_want = 0;
+						}
+					}
+				}
+				if (owner) {
+					ast_channel_unlock(owner);
+				}
+				pvt->t38_offer_out = SOFIA_T38_OUT_NONE;	/* never a T.38 offer: sofia_send_reinvite retags those T38 */
+				if (!rejected || !sofia_reinvite_failure_ends_session(status, sip_method_invite)) {
+					sofia_reinvite_done_locked(pvt, status, SOFIA_REINVITE_CODEC);	/* what waited for this re-INVITE */
+				}
+				ast_mutex_unlock(&pvt->lock);
+				if (owner) {
+					ast_channel_unref(owner);
+				}
+				if (moved) {
+					ast_verb(3, "Sofia: codec re-INVITE accepted on '%s': the caller uses %s now, no transcoding\n",
+						pvt->callid ? pvt->callid : "(no-callid)", ast_getformatname(offered));
+				} else {
+					ast_log(LOG_NOTICE, "Sofia: codec re-INVITE (%s) not accepted on '%s' (%d %s%s) - %s\n",
+						ast_getformatname(offered), pvt->callid ? pvt->callid : "(no-callid)", status,
+						phrase ? phrase : "", rejected ? "" : ", no usable answer",
+						retried ? "offered again after the RFC 3261 section 14.1 delay"
+							: "the call goes on with transcoding");
+				}
+				if (rejected && sofia_reinvite_failure_ends_session(status, sip_method_invite)) {
+					sofia_reinvite_failure_end_call(pvt, status, sip, "re-INVITE");	/* the stack is sending BYE */
+				}
+				break;
+			}
 			if (reinvite_purpose == SOFIA_REINVITE_SESSION_REFRESH) {
 				/* Our session-refresh re-INVITE was answered. Its offer was the current session,
 				 * unchanged, so a 2xx only brings the peer's answer to apply; the session timer was

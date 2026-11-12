@@ -606,6 +606,7 @@ enum sofia_reinvite_purpose {
 	SOFIA_REINVITE_LOCAL_HOLD,
 	SOFIA_REINVITE_CONNECTED_LINE,
 	SOFIA_REINVITE_SESSION_REFRESH,	/* RFC 4028 session refresh sent by chan_sofia with the current SDP */
+	SOFIA_REINVITE_CODEC,		/* offers the caller the audio codec of the called leg (audio_fmt_want) */
 };
 
 /* One m= line of the offer being answered (plain SIP): the answer has one m= line per offered one, in the same order
@@ -670,6 +671,28 @@ struct sofia_pvt {
 	struct ast_rtp_instance *rtp;
 	struct ast_rtp_instance *vrtp;
 	format_t capability;
+	/* The audio codec of an inbound leg that is not WebRTC: one format bit, 0 until the first offer is
+	 * answered. An outbound leg and a WebRTC leg never set it and keep every negotiated codec, as before.
+	 * A channel reads one format at a time, so such a leg is "one of N" (RFC 3264 section 10.2): the codec is
+	 * the first one of the offer that the account allows (section 6.1), every SDP sent on the leg names only
+	 * that codec (section 6.1: the answerer must be prepared to receive every format it lists), and a later
+	 * offer that still lists it keeps it. Full words, not bits: the channel thread (sofia_setoption) and
+	 * sofia_thread (the SDP parse, the re-INVITE answers) both write them, always under pvt->lock.
+	 *   audio_fmt          the codec in use;
+	 *   audio_fmt_want     the codec of the called leg this caller is to be moved to with a re-INVITE (0 = none):
+	 *                      due while it differs from audio_fmt, like local_hold_want;
+	 *   audio_fmt_offered  the codec the re-INVITE in flight carries, like offered_redirip;
+	 *   audio_fmt_refused  the codecs the far end refused in a re-INVITE: not offered again in this call;
+	 *   audio_fmt_recompat 1 = the codec changed on a live channel (sofia_thread) and the thread that bridges it
+	 *                      has not made the two legs compatible since. Until it does (sofia_follow_called_codec),
+	 *                      the leg reports no codec the core's RTP bridge can match (sofia_get_codec): that bridge
+	 *                      is tried before the formats are recomputed, and would otherwise keep the translators
+	 *                      of the previous codec on both channels for the rest of the call. */
+	format_t audio_fmt;
+	format_t audio_fmt_want;
+	format_t audio_fmt_offered;
+	format_t audio_fmt_refused;
+	int audio_fmt_recompat;
 	/* MicroSIP(SIP-video)<->WebRTC bridge: effective video-answer filter for THIS (inbound caller) leg.
 	 * 0 = unset (no constraint). When non-zero, the answer SDP video is emitted as
 	 * (capability & VIDEO_MASK & video_answer_mask) so the caller is only offered the codec(s) the far
@@ -1024,6 +1047,28 @@ struct sofia_pvt {
 	unsigned int dc_offerer:1;
 	unsigned int dc_answer_applied:1;
 };
+
+/* A leg that uses one audio codec at a time (pvt->audio_fmt): an inbound leg, of which we are the UAS, that is not
+ * WebRTC. A fork child is an outbound leg whose `outgoing` stays 0. WebRTC legs are left as they were, with every
+ * negotiated codec (their endpoints take any of them); is_webrtc is set by the parse of the first offer, so that
+ * parse also passes what the offer says. */
+static inline int sofia_leg_one_codec(const struct sofia_pvt *pvt, int webrtc_offered)
+{
+	return !pvt->outgoing && !pvt->is_fork_child && !pvt->is_webrtc && !webrtc_offered;
+}
+
+/* The codec a re-INVITE is due for on a one-codec leg, 0 when none: the called leg's codec this caller was asked
+ * to move to (audio_fmt_want), while it is not the one in use, the far end still has it among the negotiated
+ * codecs, and it did not refuse it earlier in the call. */
+static inline format_t sofia_leg_codec_due(const struct sofia_pvt *pvt)
+{
+	format_t want = pvt->audio_fmt_want;
+
+	if (!want || want == pvt->audio_fmt || !(want & pvt->capability) || (want & pvt->audio_fmt_refused)) {
+		return 0;
+	}
+	return want;
+}
 
 struct sofia_peer {
 	AST_DECLARE_STRING_FIELDS(

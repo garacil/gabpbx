@@ -756,6 +756,7 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 	int i;
 	format_t fmt;
 	format_t emitted = 0;
+	format_t audio_only = 0;	/* a one-codec leg: the single audio codec this SDP names */
 	int overflow = 0;	/* set if any SDP fragment would overrun its fixed buffer */
 
 	if (!pvt || !pvt->rtp) {
@@ -828,6 +829,21 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 		port = ast_sockaddr_port(&pvt->redirip);
 	}
 
+	/* A one-codec leg (an inbound leg that is not WebRTC, once its codec is chosen) names that codec alone in every
+	 * SDP: RFC 3264 section 6.1 has the answerer "prepared to receive media ... using any media formats listed", and
+	 * the channel takes one (section 10.2, the one-of-N answerer). The re-INVITE that moves the caller to the called
+	 * leg's codec names that one (audio_fmt_offered); any other SDP names the one in use. With no codec chosen yet
+	 * (the offer of the 200 to an INVITE without SDP) and on every other leg the whole list goes, as before. */
+	if (sofia_leg_one_codec(pvt, 0) && pvt->audio_fmt) {
+		format_t due = is_answer ? 0 : pvt->audio_fmt_offered;	/* set by sofia_send_reinvite for this offer */
+
+		audio_only = due ? due : pvt->audio_fmt;
+		if (!(audio_only & pvt->capability)
+		    || ast_rtp_codecs_payload_code(ast_rtp_instance_get_codecs(pvt->rtp), 1, audio_only) < 0) {
+			audio_only = 0;	/* never an m=audio line without a format */
+		}
+	}
+
 	/* Iterate codecs in preference order */
 	for (i = 0; (fmt = ast_codec_pref_index(&pvt->prefs, i)); i++) {
 		int pt;
@@ -835,6 +851,8 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 		unsigned int rate;
 		int channels = 0;
 		if (!(fmt & pvt->capability) || !(fmt & AST_FORMAT_AUDIO_MASK))
+			continue;
+		if (audio_only && fmt != audio_only)
 			continue;
 		pt = ast_rtp_codecs_payload_code(ast_rtp_instance_get_codecs(pvt->rtp), 1, fmt);
 		if (pt < 0)
@@ -878,6 +896,8 @@ char *sofia_generate_sdp(struct sofia_pvt *pvt, char *buf, size_t len, int is_an
 		unsigned int rate;
 		int channels = 0;
 		if (!(fmt & pvt->capability) || !(fmt & AST_FORMAT_AUDIO_MASK) || (fmt & emitted))
+			continue;
+		if (audio_only && fmt != audio_only)
 			continue;
 		pt = ast_rtp_codecs_payload_code(ast_rtp_instance_get_codecs(pvt->rtp), 1, fmt);
 		if (pt < 0)
@@ -2400,6 +2420,10 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 	 * never reformats an established channel. */
 	format_t staged_chosen_audio = 0;
 	int staged_chosen_audio_valid = 0;
+	/* The codec of a one-codec leg (pvt->audio_fmt), staged like the rest: stored at the commit whether the channel
+	 * exists yet or not (the first offer of a call is parsed before sofia_new). */
+	format_t staged_audio_fmt = 0;
+	int staged_audio_fmt_valid = 0;
 
 	/* T.38 irreversible side-effects are staged here and fired at commit. The udptl
 	 * INSTANCE is still created+configured in-loop (was_new-rollback on reject), but
@@ -2719,7 +2743,14 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 				/* Narrow audio to the negotiated set but PRESERVE this-SDP video.
 				 * (local_cap & VIDEO_MASK) is only video a preceding m=video block
 				 * added (config video was pre-cleared), never stale config video. */
-				pvt->capability = (local_cap & offered) | (local_cap & AST_FORMAT_VIDEO_MASK);
+				if (!current_offer && pvt->audio_fmt && sofia_leg_one_codec(pvt, audio_webrtc_offered)) {
+					/* The answer to a re-INVITE of ours on a one-codec leg. That offer named one codec, so its
+					 * answer says nothing about the others the far end offered at first: they stay negotiable
+					 * (the caller can still be moved to the called leg's codec later, and back). */
+					pvt->capability = local_cap & (AST_FORMAT_AUDIO_MASK | AST_FORMAT_VIDEO_MASK);
+				} else {
+					pvt->capability = (local_cap & offered) | (local_cap & AST_FORMAT_VIDEO_MASK);
+				}
 				if (pvt->capability == 0) {
 					ast_log(LOG_WARNING, "Sofia: No common codec with peer; falling back to local capability\n");
 					pvt->capability = local_cap;
@@ -2728,13 +2759,47 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 				/* Map built; install into pvt->rtp deferred to commit. */
 				staged_audio_valid = 1;
 
-				if (pvt->owner && (pvt->capability & AST_FORMAT_AUDIO_MASK)) {
-					format_t chosen = ast_codec_choose(&pvt->prefs,
-						pvt->capability & AST_FORMAT_AUDIO_MASK, 1);
-					if (!chosen) {
-						chosen = ast_best_codec(pvt->capability & AST_FORMAT_AUDIO_MASK);
+				if (pvt->capability & AST_FORMAT_AUDIO_MASK) {
+					format_t joint = pvt->capability & AST_FORMAT_AUDIO_MASK;
+					int one_codec = sofia_leg_one_codec(pvt, audio_webrtc_offered);
+					format_t chosen = 0;
+
+					if (one_codec) {
+						/* The codec of an inbound leg that is not WebRTC, among the negotiated ones:
+						 *  - the answer to our own re-INVITE: the codec it offered (audio_fmt_offered);
+						 *  - else the codec in use while the far end still lists it, so a hold, a refresh or a
+						 *    re-INVITE in another order never changes it;
+						 *  - else, answering an offer, its first format, in its order, that the account allows
+						 *    (RFC 3264 section 6.1: the answerer "SHOULD send using the most preferred media format
+						 *    in the offer that is also listed in the answer"). sofia-sip keeps m_rtpmaps in the
+						 *    order of the m= line; the staged map is read directly, as ast_rtp_codecs_payload_lookup
+						 *    falls back to the static table for a payload type this SDP did not define. */
+						if (!current_offer && (pvt->audio_fmt_offered & joint)) {
+							chosen = pvt->audio_fmt_offered;
+						} else if (pvt->audio_fmt & joint) {
+							chosen = pvt->audio_fmt;
+						} else if (current_offer) {
+							for (rm = media->m_rtpmaps; rm && !chosen; rm = rm->rm_next) {
+								if (staged_audio_codecs.payloads[rm->rm_pt].gabpbx_format
+								    && (staged_audio_codecs.payloads[rm->rm_pt].code & joint)) {
+									chosen = staged_audio_codecs.payloads[rm->rm_pt].code;
+								}
+							}
+						}
 					}
-					if (chosen) {
+					if (!chosen) {
+						/* Outbound and WebRTC legs, and the answer to the offer of our 200 (INVITE without SDP):
+						 * the first of our preferences. */
+						chosen = ast_codec_choose(&pvt->prefs, joint, 1);
+						if (!chosen) {
+							chosen = ast_best_codec(joint);
+						}
+					}
+					if (chosen && one_codec) {
+						staged_audio_fmt = chosen;
+						staged_audio_fmt_valid = 1;
+					}
+					if (chosen && pvt->owner) {
 						/* Applying the channel native format is deferred to commit
 						 * (irreversible) so a reject never reformats the channel. */
 						staged_chosen_audio = chosen;
@@ -4037,6 +4102,29 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 			sofia_append_history(pvt, "SDP", "dtmf auto -> %s",
 				audio_te ? "rfc2833" : "inband");
 		}
+		if (staged_audio_fmt_valid) {
+			/* The codec of a one-codec leg, stored whether or not the channel exists yet (sofia_new reads it; with
+			 * a channel, the commit below sets its formats). The channel thread writes these too
+			 * (sofia_setoption), hence the lock. */
+			format_t was;
+
+			ast_mutex_lock(&pvt->lock);
+			was = pvt->audio_fmt;
+			pvt->audio_fmt = staged_audio_fmt;
+			if (pvt->audio_fmt_want == staged_audio_fmt) {
+				pvt->audio_fmt_want = 0;	/* the codec asked for is the one in use now */
+			}
+			if (was && was != staged_audio_fmt && pvt->owner) {
+				pvt->audio_fmt_recompat = 1;	/* a live channel changed codec: see the field */
+			}
+			ast_mutex_unlock(&pvt->lock);
+			if (was != staged_audio_fmt) {
+				ast_verb(3, "Sofia: call '%s' uses %s on its inbound leg%s\n", S_OR(pvt->callid, "(no-callid)"),
+					ast_getformatname(staged_audio_fmt),
+					!was ? " (the first codec of the offer that the account allows)" : " (renegotiated)");
+				sofia_append_history(pvt, "SDP", "audio codec: %s", ast_getformatname(staged_audio_fmt));
+			}
+		}
 	}
 	if (staged_video_valid && (video_is_bundled || pvt->webrtc_video_bundled) && pvt->rtp) {
 		/* BUNDLE (RFC 8843 §9): merge the negotiated video PTs into the AUDIO instance's codec map (one shared
@@ -4122,7 +4210,20 @@ int sofia_parse_sdp(struct sofia_pvt *pvt, sip_t const *sip, int current_offer)
 			ast_channel_ref(o);
 			ast_channel_lock(o);
 			if (pvt->owner == o) {
-				if (staged_chosen_audio_valid) {
+				if (staged_chosen_audio_valid && staged_audio_fmt_valid) {
+					/* A one-codec leg. The same codec again (a hold, a refresh): the channel is not touched,
+					 * whatever formats its application or its bridge set stay. A new codec: it becomes the
+					 * native one and the formats the channel is being read and written in are kept, now
+					 * translated from and to it (chan_sip process_sdp, chan_sip.c:10294-10296), so the audio
+					 * of a bridge or of a prompt goes on without a gap; the bridge then recomputes both legs
+					 * (audio_fmt_recompat). */
+					if ((o->nativeformats & AST_FORMAT_AUDIO_MASK) != staged_chosen_audio) {
+						o->nativeformats =
+							(o->nativeformats & ~AST_FORMAT_AUDIO_MASK) | staged_chosen_audio;
+						ast_set_read_format(o, o->readformat);
+						ast_set_write_format(o, o->writeformat);
+					}
+				} else if (staged_chosen_audio_valid) {
 					o->nativeformats =
 						(o->nativeformats & ~AST_FORMAT_AUDIO_MASK) | staged_chosen_audio;
 					ast_set_read_format(o, staged_chosen_audio);
