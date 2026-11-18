@@ -947,6 +947,12 @@ char *sofia_cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 		: sofia_cfg.auth_algorithms == SOFIA_AUTH_ALG_SHA256 ? "SHA-256" : "MD5");
 	/* auth_qop: yes = RFC 2617/7616 qop="auth" MD5 challenge; no = chan_sip legacy no-qop (RFC 2069). */
 	ast_cli(a->fd, "  Auth qop:               %s\n", AST_CLI_YESNO(sofia_cfg.auth_qop));
+	/* No options: a request enters without a password only from a valid address of its account, and a digest
+	 * is good once. The counts are since the module loaded. */
+	ast_cli(a->fd, "  Source check:           always (%u request(s) refused or given to the account of the address)\n",
+		sofia_source_check_count());
+	ast_cli(a->fd, "  Digest replay:          refused (%u request(s) challenged again for a nonce already used)\n",
+		sofia_auth_replay_count());
 	/* apply_peer_callerid: yes = force matched-peer callerid on inbound (chan_sip parity); no = keep From. */
 	ast_cli(a->fd, "  Apply peer callerid:    %s\n", AST_CLI_YESNO(sofia_cfg.apply_peer_callerid));
 	/* [general] callerid: fallback From identity when nothing else resolves (chan_sip default_callerid). */

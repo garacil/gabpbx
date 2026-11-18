@@ -217,6 +217,10 @@ void *sofia_dc_pair_bridged(struct sofia_pvt *self_pvt, void *self_dc);
 #define SOFIA_DTMF_SHORTINFO 4	/* chan_sip "shortinfo": SIP INFO, Content-Type application/dtmf, numeric body */
 #define SOFIA_INSECURE_PORT    (1 << 0)
 #define SOFIA_INSECURE_INVITE  (1 << 1)
+
+/* Counters of `sip show settings`. */
+unsigned int sofia_auth_replay_count(void);	/* requests challenged again for a nonce already used */
+unsigned int sofia_source_check_count(void);	/* requests the source check refused or gave to another account */
 #define SOFIA_TRANSPORT_UDP 1
 #define SOFIA_TRANSPORT_TCP 2
 #define SOFIA_TRANSPORT_TLS 4
@@ -1173,6 +1177,7 @@ struct sofia_peer {
 	char last_cnonce[128];          /* RESERVED. The nc-replay check is now strict per-nonce monotonic and cnonce-INDEPENDENT (RFC 2617 §3.2.2; a valid-but-replayed nc rotates the nonce verify-first, see sofia_verify_digest_auth), so this field is no longer consulted by the auth path; retained to avoid a struct-layout change. Cleared on nonce regen. */
 	time_t nonce_issued_at;
 	int insecure;
+	time_t nosecret_noted;		/* when its REGISTER refused for having no secret was last reported (once an hour) */
 	int transport;
 	nua_handle_t *nh;
 	struct ast_sockaddr addr;
@@ -1321,6 +1326,7 @@ struct sofia_peer {
 	 * be current (regseconds + maxexpiry + the grace); 0 = none. The expiry sweep unregisters it then (it has no
 	 * binding to lapse); any REGISTER clears it. Written under peer->lock, or before the peer is linked. */
 	time_t seed_until;
+	int seed_restart;	/* that registration was made before this run of the module began (a restart) */
 	/* MWI per-peer mailbox list (NOLOCK; peer->lock guards). */
 	struct sofia_mailbox_list mailboxes;
 	nua_handle_t *mwi_subscription_handle; /* NULL until first SUBSCRIBE */

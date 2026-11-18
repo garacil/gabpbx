@@ -232,23 +232,70 @@ auth_algorithms = md5
 ;   yes  - modern challenge (RFC 2617/7616): "Digest realm=..., nonce=..., qop=\"auth\",
 ;          algorithm=MD5", enabling nc/cnonce replay protection.
 ;
-; ****************************  SECURITY WARNING  ****************************
-; auth_qop=no (the default) uses RFC 2069 digest, which has NO REPLAY PROTECTION:
-; there is no nc/cnonce and the per-nonce replay gate is bypassed, so a captured
-; Authorization header can be replayed. This matches chan_sip (which is also no-qop).
-; It is only truly confidential when the SIP signaling is itself protected (TLS/WSS/VPN).
-; Set auth_qop=yes if your handsets support it and you want replay protection.
-; With auth_algorithms=md5 + auth_qop=no the challenge is byte-for-byte chan_sip's.
-; ***************************************************************************
+; A captured Authorization header cannot be replayed with either form: a nonce
+; is good once (see "A digest is good once" below). With auth_algorithms=md5 +
+; auth_qop=no the challenge is byte-for-byte chan_sip's.
 ;
-;auth_qop = no      ; (built-in default) chan_sip legacy, no replay protection
-;auth_qop = yes     ; RFC 2617/7616 qop="auth" (replay-protected) — needs handset support
+;auth_qop = no      ; (built-in default) the challenge of chan_sip, without qop
+;auth_qop = yes     ; the challenge offers qop="auth" (RFC 2617/7616) — needs handset support
+;
+; Both forms of an answer are accepted from every account, whatever this key
+; says: without qop (RFC 2069) and with qop="auth" (the count of the nonce must
+; then grow). A request whose credentials use qop gets its new challenges with
+; qop too. It is not a setting of an account.
+;
+; --- A digest is good once (no option) ---
+;
+; A nonce answers one request (RFC 7616 section 5.5, "one-time nonce values";
+; chan_sip gave a nonce to each dialog). A captured INVITE or REGISTER sent
+; again is not accepted:
+;   - any method but REGISTER: the next request that brings a nonce already
+;     used gets 401 with stale=true and a new nonce, and the device answers
+;     again without asking its user (RFC 7616 section 3.3). With qop the same
+;     nonce is good again while its count (nc) grows;
+;   - REGISTER: a nonce already used is good only for the same REGISTER again
+;     (same source address and port, Call-ID, Contact and its parameters,
+;     Expires, Path, User-Agent and extension headers) and while it only
+;     refreshes a binding that is there: the refresh a device sends, which
+;     costs it no extra message. Anything else gets 401 stale=true: another
+;     Contact (the digest does not cover it, RFC 3261 section 26.4.1), a copy
+;     sent after the device left, a copy of the REGISTER that removed it;
+;   - the nonce is bound to the address it was given to (not the port); from
+;     another address it is stale.
+; `sip show settings` shows how many requests were challenged again for it.
+;
+; --- REGISTER: never without a secret (no option) ---
+;
+; A host=dynamic account registers only by answering the digest of its secret
+; (or md5secret). One that has neither can prove nothing: anybody would
+; register as it by its name and receive its calls (RFC 3261 section 26.1.1).
+; Its REGISTER always gets the answers of a name that is not an account (401,
+; and 403 to credentials), whatever insecure= or any other key says, and it is
+; counted by the blacklist as any failed registration. Only an account found by
+; its address (host=<address>) needs no secret, and that one never registers.
+; The refusal is reported once an hour per account: WARNING "REGISTER as
+; '<account>' from <address> refused: the account has no secret ..." and the
+; manager event RegisterNoSecret (Peer, Address, Action: refused).
+; Such an account has no address: a registration stored for it by an earlier
+; build is not restored and identifies nobody.
+;
+; A REGISTER that passed its authentication from an address none of the live
+; bindings of the account has is reported too (it may be a device that moved,
+; a second device, or somebody else with the password): NOTICE "REGISTER as
+; '<account>' from a new address ..." and the manager event RegisterNewAddress
+; (Peer, Address, KnownAddress, LiveBindings, UserAgent).
+;
+; permit= / deny= of an account read from the realtime database: the rules of
+; the row are applied from the widest network to the most specific one, whatever
+; the order of the columns: "deny=0.0.0.0/0.0.0.0" with "permit=<address>" is
+; only that address, and "permit=0.0.0.0/0.0.0.0" with "deny=<address>" is
+; every address but that one. In this file the rules apply as they are written.
 
 ;
 ; allowguest: kept for old configs, with no effect on a request from a name that is not an
 ; account: it always gets the answers of a wrong password (see alwaysauthreject), so a guest call
-; or MESSAGE is never accepted. A device or trunk trusted by its address (host=<ip> with
-; insecure=invite) is a matched peer, not a guest.
+; or MESSAGE is never accepted. A device or trunk found at a valid address of its account (its
+; static host, or its registration) is a matched peer, not a guest.
 ;
 allowguest=no
 
@@ -256,8 +303,8 @@ allowguest=no
 ; Local anti-abuse blacklist (fail2ban-style). Repeated authentication / registration / routing
 ; failures from the same source IP are counted; once the threshold is reached the IP is blocked at
 ; the gate. Inspect/manage it with the `sip show blacklist` / `sip blacklist ...` CLI.
-; A call reaches the dialplan only from a matched peer (it passed its ACL and digest auth, or is
-; trusted by address with insecure=invite): a name that is not an account is challenged like a wrong
+; A call reaches the dialplan only from a matched peer (it passed its ACL and comes from a valid
+; address of its account, or answered its digest): a name that is not an account is challenged like a wrong
 ; password. A call from a matched peer to a missing extension is never counted, so a trunk gets its
 ; 404 without banning its own address.
 ; A blocked address is not silent-dropped: its new requests never reach authentication, routing or
@@ -2859,35 +2906,82 @@ tos_video = af41
 ;srtp_per_suite_keys = yes   ; forensic-grade per-suite-fresh-key mode
 
 ;
-; Force INVITE digest auth global lockdown override (chan_sofia extension
-; — operator-policy-global-security-override;
-; no chan_sip equivalent — chan_sip has only per-peer insecure=invite, no
-; global override mechanism).
+; force_invite_auth: ask for the digest on every INVITE.
 ;
-; Default 0 = drop-in chan_sip parity baseline. Per-peer `insecure=invite`
-; configurations bypass INVITE digest auth for trusted-IP trunks (chan_sip
-; semantic preserved). Per-call LOG_NOTICE + AMI InsecureInviteBypass event
-; fire on every bypass traversal (chan_sofia extension over chan_sip silent
-; bypass — operators see ongoing usage in logs/NMS, not just config-load).
+; no (default): a call from a valid address of its account enters without a
+;     digest (see "Who enters without a password: a valid address"); from any
+;     other address the digest is asked.
+; yes: every account that has a secret answers its digest on every INVITE,
+;     also from its own address. An address can be forged over UDP by somebody
+;     who knows it (RFC 7616 section 3.3); this closes that, at the price of a
+;     401 on every call. An account with no secret (found by its static host)
+;     has nothing to answer with and is still taken by its address.
 ;
-; When set 1 = global lockdown override. ALL inbound INVITEs require digest
-; auth regardless of per-peer insecure=invite config. When triggered for a
-; peer with insecure=invite, LOG_NOTICE fires "force_invite_auth=yes overrides
-; per-peer insecure=invite for peer X — auth required" so operator sees
-; policy taking effect.
+; Read at load and at `sip reload`.
 ;
-; Use cases:
-;   * Compliance audit: temporarily disable bypass during scheduled review
-;   * Incident response: lock down auth in response to detected attack
-;   * Default-deny posture: progressive operator hardening (audit insecure=
-;     usage via LOG_NOTICE/AMI events; provision proper SIP auth credentials;
-;     replace insecure=invite with secret= over time; final state: no insecure=
-;     peers + force_invite_auth=yes for default-deny)
+;force_invite_auth = no     ; (built-in default) a valid address stands for the password
+;force_invite_auth = yes    ; a digest on every INVITE
 ;
-; Reload-required: changes take effect at module reload chan_sofia.so.
+; --- Who enters without a password: a valid address (no option) ---
 ;
-;force_invite_auth = no     ; default: drop-in chan_sip parity (per-peer bypass active)
-;force_invite_auth = yes    ; global lockdown (all INVITEs require auth)
+; An INVITE names its caller in From, and From "can be modified arbitrarily by
+; the owner of a UA" (RFC 3261 section 26.1.1). So a name is believed only
+; with its password, or from a VALID ADDRESS of the account (the real source
+; of the packet, never what the request says):
+;   - its static host and its port (host=<address>; port=, 5060 when not
+;     set). For a host given by name, the address it resolves to, and for a
+;     call that names the account any other address the name has;
+;   - a registration of a host=dynamic account that has not lapsed: the
+;     address AND the port its REGISTER came from (every registered device
+;     counts; a request over the connection it registered on has that port);
+;   - any port of that address only with insecure=port; and, for a static
+;     account set to transport=tcp, tls, ws or wss, a request that arrives
+;     over a connection (its source port is never the listening one);
+;   - or such an address of another account with the same accountcode.
+;   - after a restart, the registration the row of a host=dynamic account
+;     kept, when it was made before the restart, until the device registers
+;     again (or it can no longer be current: its instant + maxexpiry): a
+;     device is not asked for a digest because the PBX restarted. A row read
+;     again later (the account was pruned) is not that: the device answers
+;     its digest once.
+; Not an address of the account: defaultip of a host=dynamic account.
+; From a valid address the request enters and no digest is asked, whether the
+; account has a secret or not: a device that registered (with its secret)
+; calls from where it registered, a trunk from its host. Nothing else lets a
+; request in without a password, and no key changes this:
+;   - from exactly the address of another account (a trunk, another PBX): the
+;     call is that account's, as when the From names no account;
+;   - from any other address (the device moved, its NAT port changed, its
+;     registration lapsed): an account with a secret answers its digest and
+;     enters; one with no secret can prove nothing and gets the answers of a
+;     name that is not an account (401, 403);
+;   - 503 when the database cannot tell whose address it is.
+; A call whose From names no account that is asked by name (a caller ID, or a
+; type=peer account) is taken by its address: the account From names, when it
+; is at that address (a phone that registers several accounts from one address
+; and port says which one it calls as); else the account that has exactly that
+; address; else, when an account takes every port of the address
+; (insecure=port) and the request does not claim to be an account that is at
+; that address too, that account; else the account named in the credentials
+; or in From, if it has a secret and with its digest; else the caller is
+; unknown (401, 403). No account is taken for another one behind the same
+; address.
+; SUBSCRIBE and MESSAGE: an account with a secret answers its digest; one with
+; no secret is taken only from a valid address.
+; With insecure=port every port of the account's address is its address, so a
+; call from there that names another account is the insecure=port account's.
+; An account with no accountcode has no "same accountcode" accounts.
+;
+; insecure=invite is read and decides nothing: the address decides.
+; force_invite_auth=yes asks every account that has a secret for its digest on
+; every INVITE, also from its address.
+;
+; A request that is refused, or given to the account whose address it is, is
+; reported: NOTICE "source check: INVITE as '<account>' from <address>,
+; <other account|foreign|unknown> address: <what was done>" and the manager
+; event SourceCheck (Peer, Method, Address, Transport, Verdict, Owner, Action,
+; UserAgent); at most a burst of 30 and then one a second. An account that is
+; asked for its digest is no report. `sip show settings` shows the count.
 
 ;
 ; Nonce TTL window for digest auth. Default is 3600s so normal long REGISTER
@@ -2924,8 +3018,8 @@ tos_video = af41
 ;   2. /dev/urandom 128-bit nonce (sofia_secure_nonce_gen helper with
 ;      EINTR retry; chan_sip ast_random 32-bit + PRNG fallback ~weaker)
 ;   3. RFC 7616 SHA-256 dual-algorithm offer (chan_sip MD5-only)
-;   4. SOFIA_INSECURE_INVITE bypass visibility (per-call LOG_NOTICE + AMI
-;      InsecureInviteBypass event; chan_sip silent post-config)
+;   4. No digest only from a valid address of the account (chan_sip:
+;      insecure=invite takes the name from any address)
 ;   5. force_invite_auth global lockdown override (no chan_sip equivalent)
 ;   6. Realm validation (byte-exact strcmp; chan_sip skips this check =
 ;      multi-tenant cross-realm replay vulnerability)
@@ -2944,9 +3038,9 @@ tos_video = af41
 ;  14. Configurable nonce TTL (operator-policy alignment)
 ;
 ; Operator action items for production deployment:
-;   * Review existing trunk peer configs + add `insecure=invite` for IP-
-;     trusted trunks BEFORE deploying this build (auth-required becomes
-;     default; trunks without insecure=invite get 401 challenges)
+;   * Review existing trunk peer configs: a trunk is found by its address
+;     (host=<address> and port=, or insecure=port when it sends from another
+;     port); from any other address it is asked for a digest or refused
 ;   * Audit sip show settings post-reload — verify expected operator-policy
 ;     fields (force_invite_auth, nonce_ttl_seconds, srtp_per_suite_keys)
 ;   * For high-volume rejection scenarios (DDoS / brute-force probing),
@@ -3322,14 +3416,16 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;                 restricted (anonymous) presentation the From stays anonymized but the
 ;                 user part still becomes fromuser: "Anonymous" <sip:fromuser@anonymous.invalid>.
 ; fromdomain    - domain to put in From header
-; insecure      - port, invite, port,invite (or "very")
-;                 NOTE: insecure flag is PARSED but NOT ENFORCED
-;                 at runtime — chan_sofia INVITE auth is not implemented today
-;                 (REGISTER auth IS implemented; INVITE auth is a separate gap
-;                 queued as "INVITE digest auth implementation" task).
-;                 Use ACL (permit/deny per-peer) + frontend SIP proxy (Kamailio)
-;                 + TLS for inbound INVITE protection. See
-;                 doc/realtime_sippeers.txt Known Limitations.
+; insecure      - port: every port of the account's address is its address (a
+;                 device or PBX that sends from another port than the one of
+;                 its host or of its registration). Without it the port must
+;                 be that one.
+;                 invite: read for old configurations; it decides nothing
+;                 ("very" is port and invite: it is insecure=port). No digest
+;                 is asked from a valid address of the
+;                 account, with or without it, and from any other address the
+;                 digest is asked, with or without it: see "Who enters without
+;                 a password" in [general].
 ;
 ; --- Codecs ---
 ; disallow      - codecs to disallow (use "all" first, then allow selectively)
@@ -3579,7 +3675,7 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ; and N, so the phones of an outage do not all come back at once. 0 sends no Retry-After (the client then acts
 ; as for a 500). While the backend is failing: a request that cannot be matched to a peer in memory gets the 503,
 ; so with allowguest=yes a guest call is refused too; an INVITE matched only by its source address to a peer that
-; is not a trunk (insecure=port/invite) and not the exact address and port gets it when its credentials are not
+; is not a trunk (insecure=port) and not the exact address and port gets it when its credentials are not
 ; that peer's; after a failure chan_sofia's peer lookups do not query the backend again for 2 s (or as long as
 ; the failed lookup took, up to 60 s); accounts already in memory keep their normal answers (401 challenge...), so
 ; during the outage a 401 and a 503 tell an account in memory from any other name.
