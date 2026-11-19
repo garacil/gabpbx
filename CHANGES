@@ -1,3 +1,74 @@
+## 1.9.27 — a request enters by a valid address of its account or by its digest; calls go only to declared peers
+
+`chan_sofia.so` changes; the core (`gabpbx`) only gets the new version string. Sofia-SIP stays at `v2.1.1`. Access no
+longer depends on options: there is one behaviour and nothing to configure.
+
+### Security
+
+- **A request enters without a password only from a valid address of its account.** The `From` of a request names its
+  caller, and whoever sends the request writes it (RFC 3261 §26.1.1). An account with `insecure=invite`, or with no
+  `secret`, was taken by that name alone, from any address, as in `chan_sip`. Now:
+  - a valid address is the address and port of the account's static host (a host by name: every address it resolves
+    to) or of a registration that has not lapsed (every registered device counts, not only the last one);
+  - any port of that address only with `insecure=port`, or over a connection for an account set to a connection
+    transport (TCP, TLS, WS, WSS);
+  - for a `host=dynamic` account, such an address of an account with the same `accountcode` counts too;
+  - from the exact address of another account the call is that account's;
+  - from any other address a `host=dynamic` account that has a `secret` answers its digest and enters (a device that
+    moved, or whose NAT port changed); one without a `secret` gets the answers of a name that is not an account;
+  - `503` when the realtime database cannot tell.
+  A call whose `From` is a caller ID is taken by its address: the account that has exactly that address, never an
+  account that merely shares the IP. A phone that registers several accounts from one address and port is the account
+  its `From` names. After a restart, the registration stored for an account counts until the device registers again.
+- **An account with a static host enters only from its host.** The `secret` of an account whose host is not `dynamic`
+  is never used for what reaches the PBX: from anywhere else even the right password is refused. Such an account never
+  counts as the address of another account, `defaultip` is the address of no account, and `force_invite_auth` does
+  not ask it for a digest. Its secret still answers the challenge of its host when the PBX calls it.
+- **A `host=dynamic` account registers only with its secret.** An account with neither `secret` nor `md5secret`
+  registered with its name alone, as in `chan_sip`: anybody could register as it and receive its calls. Its REGISTER
+  now gets the answers of a name that is not an account and counts for the blacklist.
+- **A digest is good once.** A nonce was good for `nonce_ttl_seconds` for any number of requests: a captured REGISTER
+  or INVITE could be sent again, the REGISTER with another `Contact` (the digest does not cover it, RFC 3261 §26.4.1).
+  A nonce now answers one request and is bound to the address it was given to (RFC 7616 §3.3, §5.5); the next request
+  gets `401` with `stale=true` and the device answers again by itself. The refresh a phone sends (the same REGISTER
+  again, while its binding is there) is accepted with no extra message. Answers with `qop` and without it are both
+  accepted.
+- **SUBSCRIBE and MESSAGE** of an account with no secret are taken only from a valid address.
+- **A call goes only to a declared peer.** A dial target that names no peer of `sofia.conf` or of the realtime table (a
+  host name, an address, `user:secret@host`) is refused and no INVITE leaves: cause 20 (`CHANUNAVAIL`), or 34
+  (`CONGESTION`) when the realtime database does not answer. `chan_sip` calls such a target as a host.
+
+### Fixed
+
+- **A `sip reload` with `sip_capture_address` set could abort the process.** The capture, dump and log settings of the
+  transports were applied from two threads at once; they now go to the SIP stack's own thread only.
+- The `permit`/`deny` rules of a realtime row are applied from the widest network to the most specific one, whatever
+  the order of the columns.
+- The verbose line with the codec of every inbound leg is gone; the codec stays in the call's SIP history
+  (`sip show history`).
+
+### Log lines and manager events
+
+- `Sofia: source check: ...` and the event `SourceCheck`: a request that is not taken as the account it names.
+- `REGISTER as '<account>' from <address> refused: the account has no secret ...` and `RegisterNoSecret`.
+- `REGISTER as '<account>' from a new address ...` and `RegisterNewAddress`: a REGISTER that passes its
+  authentication from an address that none of the account's live registrations has.
+- `Sofia: call to '<target>' refused: it is not a declared peer` (or `... the peer database did not answer`).
+- `InsecureInviteBypass` is gone.
+
+See the sections "Who enters without a password: a valid address" and `force_invite_auth` of
+`configs/sofia.conf.sample`.
+
+### Upgrading
+
+Replace `chan_sofia.so` and `gabpbx`, and restart. `insecure=invite` is read and decides nothing;
+`force_invite_auth=yes` still asks every INVITE for a digest. Before upgrading, check:
+- `host=dynamic` accounts with no `secret`: they no longer register;
+- devices of an account with a static host that call from another address, or from another port without
+  `insecure=port`: they are refused;
+- devices that call from somewhere other than where they registered and do not answer a `401`;
+- dial strings that name a host or an address instead of a peer: declare a peer for that destination.
+
 ## 1.9.26 — one audio codec per inbound leg: no more audio dropped in a codec the caller did not choose; less transcoding
 
 `chan_sofia.so` changes; the core (`gabpbx`) only gets the new version string. Sofia-SIP stays at `v2.1.1`.
