@@ -6325,7 +6325,8 @@ static int sofia_transport_name_is_conn(const char *t)
 /* The best match of src among the VALID ADDRESSES of the account (SOFIA_SRC_IP or more = valid):
  *  - a static host: its literal address, or the one its name resolved to, with the port of the account (port=, 5060
  *    when not set). Any port only with insecure=port, or when the account is configured for a connection-oriented
- *    transport and the request arrives over one (the source port of a connection is never the listening one);
+ *    transport and the request arrives over one (the source port of a connection is never the listening one).
+ *    Nothing else: not defaultip, which is not its host;
  *  - host=dynamic: each binding that has not lapsed (the lapse of the expiry sweep: expiry +
  *    SOFIA_REGEXPIRE_GRACE_SECS; ignoreregexpire keeps lapsed ones in the container), with the port its REGISTER came
  *    from. Any port only with insecure=port. A request over the connection it registered on has that very port.
@@ -6337,7 +6338,7 @@ static int sofia_transport_name_is_conn(const char *t)
  * req_conn: the request arrived over a connection-oriented transport. The caller must not hold peer->lock. */
 static int sofia_peer_source_match(struct sofia_peer *peer, const struct ast_sockaddr *src, int req_conn)
 {
-	struct ast_sockaddr snap_src, snap_defaddr, parsed;
+	struct ast_sockaddr snap_src, parsed;
 	char snap_host[MAXHOSTNAMELEN];
 	int snap_port, dynamic, any_port, bindings, best, m, no_secret, insecure_port, conn_account, seed_ok;
 
@@ -6347,7 +6348,6 @@ static int sofia_peer_source_match(struct sofia_peer *peer, const struct ast_soc
 	bindings = peer->contacts ? ao2_container_count(peer->contacts) : 0;
 	ast_mutex_lock(&peer->lock);
 	snap_src = peer->src_addr;
-	snap_defaddr = peer->defaddr;
 	ast_copy_string(snap_host, S_OR(peer->host, ""), sizeof(snap_host));
 	insecure_port = (peer->insecure & SOFIA_INSECURE_PORT) ? 1 : 0;
 	snap_port = peer->port ? peer->port : DEFAULT_SIP_PORT;
@@ -6364,10 +6364,6 @@ static int sofia_peer_source_match(struct sofia_peer *peer, const struct ast_soc
 		best = sofia_src_match_addr(&snap_src, snap_port, any_port, src);	/* the address its name resolved to */
 		if (best < SOFIA_SRC_EXACT && ast_sockaddr_parse(&parsed, snap_host, PARSE_PORT_FORBID)) {
 			m = sofia_src_match_addr(&parsed, snap_port, any_port, src);
-			best = m > best ? m : best;
-		}
-		if (best < SOFIA_SRC_EXACT) {
-			m = sofia_src_match_addr(&snap_defaddr, snap_port, any_port, src);
 			best = m > best ? m : best;
 		}
 		return best;
@@ -6587,15 +6583,16 @@ static int sofia_host_resolves_to(const char *host, const struct ast_sockaddr *s
  * port, or a registration that has not lapsed with the port it came from; any port of that address when the account
  * has insecure=port or the transport is connection-oriented (sofia_peer_source_match); and, for a host given by name,
  * any address the name resolves to, with the same rule for the port. *owner_out gets the other account (+1 ref) for
- * SOFIA_SRCV_SIBLING and SOFIA_SRCV_OTHER, else NULL. An account with no accountcode has no siblings. Not under any
- * peer lock (the lookups take them, and the realtime one queries). */
+ * SOFIA_SRCV_SIBLING and SOFIA_SRCV_OTHER, else NULL. An account with no accountcode has no siblings, and neither has
+ * an account that is not host=dynamic: it is only ever at its own host. Not under any peer lock (the lookups take
+ * them, and the realtime one queries). */
 static int sofia_source_verdict(struct sofia_peer *named, const struct ast_sockaddr *src, int req_conn,
 	struct sofia_peer **owner_out)
 {
 	char acc_named[256], acc_owner[256], host[MAXHOSTNAMELEN];
 	struct ast_sockaddr parsed;
 	struct sofia_peer *owner;
-	int strength, port, any_port;
+	int strength, port, any_port, dynamic;
 
 	*owner_out = NULL;
 	if (sofia_peer_source_match(named, src, req_conn) >= SOFIA_SRC_IP) {
@@ -6608,9 +6605,13 @@ static int sofia_source_verdict(struct sofia_peer *named, const struct ast_socka
 	any_port = (named->insecure & SOFIA_INSECURE_PORT) || (req_conn && (named->transport
 		& (SOFIA_TRANSPORT_TCP | SOFIA_TRANSPORT_TLS | SOFIA_TRANSPORT_WS | SOFIA_TRANSPORT_WSS)));
 	ast_mutex_unlock(&named->lock);
-	if (!ast_strlen_zero(host) && strcasecmp(host, "dynamic") && !ast_sockaddr_parse(&parsed, host, PARSE_PORT_FORBID)
+	dynamic = ast_strlen_zero(host) || !strcasecmp(host, "dynamic");
+	if (!dynamic && !ast_sockaddr_parse(&parsed, host, PARSE_PORT_FORBID)
 			&& (any_port || port == ast_sockaddr_port(src)) && sofia_host_resolves_to(host, src)) {
 		return SOFIA_SRCV_OWN;	/* another address of its host name */
+	}
+	if (!dynamic) {
+		acc_named[0] = '\0';	/* a static account is only at its own host: no sibling stands for it */
 	}
 	if (!ast_strlen_zero(acc_named) && (owner = sofia_find_sibling_at(named, acc_named, src, req_conn))) {
 		*owner_out = owner;
@@ -6647,10 +6648,9 @@ static int sofia_source_verdict(struct sofia_peer *named, const struct ast_socka
 }
 
 /* What the source check does with a request that names an account. */
-/* What source_check=enforce does with a request that names an account. */
 #define SOFIA_SRCACT_KEEP        0	/* the request is the account's: it comes from a valid address, no digest is asked */
 #define SOFIA_SRCACT_OWNER       1	/* the request is the account's whose address it comes from (*owner_out) */
-#define SOFIA_SRCACT_DIGEST      2	/* not from a valid address: the account must answer its digest */
+#define SOFIA_SRCACT_DIGEST      2	/* not from a valid address: the host=dynamic account must answer its digest */
 #define SOFIA_SRCACT_REFUSE      3	/* the answers a name that is not an account gets */
 #define SOFIA_SRCACT_UNAVAILABLE 4	/* 503: the backend could not tell whose address it is */
 
@@ -6757,12 +6757,14 @@ static void sofia_source_report(sip_t const *sip, const char *method, const char
 }
 
 /* The source check of a request that names the account `named` (sofia_thread). No option changes it. The request is
- * the account's without a password only from a valid address of the account (sofia_source_verdict), or from a valid
- * address of an account with its accountcode: that address stands for the password, whatever insecure= says and
- * whether the account has a secret or not. From the address of another account the request is that account's, as it
- * is when no account is named. From any other address the account answers its digest if it has a secret (a device
- * that moved, whose port changed or whose registration lapsed still calls, with its password); one with no secret
- * can prove nothing and gets the answers of an unknown name. *owner_out holds a +1 ref only with SOFIA_SRCACT_OWNER. */
+ * the account's without a password only from a valid address of the account (sofia_source_verdict), or, for a
+ * host=dynamic account, from a valid address of an account with its accountcode: that address stands for the
+ * password, whatever insecure= says and whether the account has a secret or not. From the address of another account
+ * the request is that account's, as it is when no account is named. From any other address a host=dynamic account
+ * answers its digest if it has a secret (a device that moved, whose port changed or whose registration lapsed still
+ * calls, with its password). An account that is not host=dynamic is only ever at its host: its secret is ignored for
+ * what reaches us (sofia_peer_can_prove), and from anywhere else it gets the answers of an unknown name, as an account
+ * with no secret does. *owner_out holds a +1 ref only with SOFIA_SRCACT_OWNER. */
 static int sofia_source_check(nua_t *nua, struct sofia_peer *named, sip_t const *sip, const char *method,
 	struct sofia_peer **owner_out)
 {
@@ -6770,7 +6772,7 @@ static int sofia_source_check(nua_t *nua, struct sofia_peer *named, sip_t const 
 	struct ast_sockaddr src;
 	struct sofia_peer *owner = NULL;
 	char name[80], owner_name[80] = "", action[128], transport[8];
-	int verdict, act, has_secret, req_conn;
+	int verdict, act, has_secret, dynamic, req_conn;
 
 	*owner_out = NULL;
 	sofia_get_source_addr(sip, &src);
@@ -6786,7 +6788,9 @@ static int sofia_source_check(nua_t *nua, struct sofia_peer *named, sip_t const 
 
 	ast_mutex_lock(&named->lock);
 	ast_copy_string(name, named->name, sizeof(name));
-	has_secret = !ast_strlen_zero(named->secret) || !ast_strlen_zero(named->md5secret);
+	dynamic = ast_strlen_zero(named->host) || !strcasecmp(named->host, "dynamic");
+	/* the same test as sofia_peer_can_prove, under the one lock that also gives the name */
+	has_secret = dynamic && (!ast_strlen_zero(named->secret) || !ast_strlen_zero(named->md5secret));
 	ast_mutex_unlock(&named->lock);
 
 	if (verdict == SOFIA_SRCV_OTHER && has_secret && sofia_peer_owns_source(owner, &src, req_conn) != SOFIA_SRC_EXACT
@@ -6816,7 +6820,9 @@ static int sofia_source_check(nua_t *nua, struct sofia_peer *named, sip_t const 
 		ast_copy_string(action, "503, the address could not be looked up", sizeof(action));
 	} else {
 		act = SOFIA_SRCACT_REFUSE;
-		ast_copy_string(action, "refused as an unknown name (not an address of the account, which has no secret)",
+		ast_copy_string(action, dynamic
+			? "refused as an unknown name (not an address of the account, which has no secret)"
+			: "refused as an unknown name (not the address of the account, a static host: its secret is not used)",
 			sizeof(action));
 	}
 	sofia_source_report(sip, method, name, &src, transport, verdicts[verdict], owner_name, action);
@@ -6828,13 +6834,18 @@ static int sofia_source_check(nua_t *nua, struct sofia_peer *named, sip_t const 
 	return act;
 }
 
-/* Whether the account can prove a request is its own: it has a secret to answer a digest with. */
+/* Whether the account can prove with its digest that a request that reaches us is its own: a host=dynamic account
+ * that has a secret (or md5secret). The secret of any other account (a static host, by address or by name) is
+ * ignored for every request that reaches us: such an account is only ever at its host, and its address is the only
+ * thing that stands for it. Its secret still answers the challenge of its host when we call it (and a register=>
+ * line still registers with its own), which lets nobody into this PBX. Takes peer->lock. */
 static int sofia_peer_can_prove(struct sofia_peer *peer)
 {
 	int ok;
 
 	ast_mutex_lock(&peer->lock);
-	ok = !ast_strlen_zero(peer->secret) || !ast_strlen_zero(peer->md5secret);
+	ok = (ast_strlen_zero(peer->host) || !strcasecmp(peer->host, "dynamic"))
+		&& (!ast_strlen_zero(peer->secret) || !ast_strlen_zero(peer->md5secret));
 	ast_mutex_unlock(&peer->lock);
 	return ok;
 }
@@ -10663,6 +10674,21 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 	}
 
 	peer = sofia_find_peer(peername);
+	if (!peer) {
+		/* A call always goes through a peer declared beforehand (sofia.conf or the realtime table): a dial target
+		 * that names none is refused, whatever it looks like (a host name, an address, user:secret@host), and no
+		 * INVITE leaves. Unlike chan_sip, which calls such a target as a host. Only the peer part is logged: what
+		 * comes before it may carry a password. Congestion when the realtime backend did not answer, so that the
+		 * dialplan can try again or elsewhere. */
+		if (sofia_peer_lookup_failed()) {
+			ast_log(LOG_WARNING, "Sofia: call to '%s' refused: the peer database did not answer\n", peername);
+			*cause = AST_CAUSE_CONGESTION;
+		} else {
+			ast_log(LOG_WARNING, "Sofia: call to '%s' refused: it is not a declared peer\n", peername);
+			*cause = AST_CAUSE_UNREGISTERED;
+		}
+		return NULL;
+	}
 
 	pvt = sofia_pvt_alloc();
 	if (!pvt) {
@@ -11057,11 +11083,6 @@ static struct ast_channel *sofia_request_call(const char *type, format_t format,
 		}
 
 		ao2_ref(peer, -1);
-	} else {
-		ast_string_field_set(pvt, context, sofia_cfg.context);
-		ast_string_field_set(pvt, ruri, dest);
-		pvt->capability = sofia_cfg.capability ? sofia_cfg.capability : (AST_FORMAT_ULAW | AST_FORMAT_ALAW);
-		pvt->prefs = sofia_cfg.prefs;
 	}
 
 	snprintf(tmp, sizeof(tmp), "%lx", (unsigned long)pvt);
@@ -12036,24 +12057,22 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 	/* INVITE authentication (the ACL came first; nothing of the peer is changed before it). The caller is at a valid
 	 * address of its account (sofia_source_check, or found by its address): that address stands for its password,
 	 * and no digest is asked. It answers its digest when the source check asked for it (the address is not a valid
-	 * one of the account, which has a secret), and always with [general] force_invite_auth=yes. insecure=invite is
-	 * read for old configurations and decides nothing. Unknown peer (NULL): the unknown-caller answers below. */
+	 * one of the account, a host=dynamic one with a secret), and with [general] force_invite_auth=yes when it is a
+	 * host=dynamic account with a secret: the secret of any other account is never used (sofia_peer_can_prove).
+	 * insecure=invite is read for old configurations and decides nothing. Unknown peer (NULL): the unknown-caller
+	 * answers below. */
 	if (pvt->peer) {
 		int auth_required = src_must_auth || sofia_cfg.force_invite_auth;
-		int no_secret;
 
-		ast_mutex_lock(&pvt->peer->lock);	/* a reload rewrites them under it */
-		no_secret = ast_strlen_zero(pvt->peer->secret) && ast_strlen_zero(pvt->peer->md5secret);
-		ast_mutex_unlock(&pvt->peer->lock);
-		if (auth_required && no_secret) {
+		if (auth_required && !sofia_peer_can_prove(pvt->peer)) {
 			if (src_must_auth) {
-				/* Its secret went (a reload) after the source check asked for its digest: it cannot give it,
-				 * and the request is not from a valid address of the account. */
+				/* It can no longer prove it (a reload took its secret, or made it a static host) after the
+				 * source check asked for its digest, and the request is not from a valid address of it. */
 				sofia_reject_as_unknown(nua, nh, sip, "INVITE", NULL, 1);
 				ao2_ref(pvt, -1);
 				return;
 			}
-			auth_required = 0;	/* force_invite_auth: at its address, and with no secret there is nothing to ask */
+			auth_required = 0;	/* force_invite_auth: at its address, and nothing it could answer counts */
 		}
 		if (auth_required) {
 			char realm_buf[MAXHOSTNAMELEN];
@@ -14488,8 +14507,9 @@ static int sofia_nonce_replay_check(const char *nonce, unsigned int nc, time_t i
 	return 0;
 }
 
-/* A request other than INVITE that names an account with no secret (nothing to ask it): it is the account's only
- * from one of its addresses, or of an account with its accountcode ([general] source_check, sofia_source_check).
+/* A request other than INVITE that names an account that cannot prove it with a digest (no secret, or not
+ * host=dynamic: sofia_peer_can_prove): it is the account's only from one of its addresses, or, for a host=dynamic
+ * account, of an account with its accountcode (sofia_source_check).
  * Returns 0 to go on, 1 when it was answered (the answers of an unknown name, or 503): the caller releases what it
  * holds. */
 static int sofia_source_gate_nosecret(nua_t *nua, nua_handle_t *nh, sip_t const *sip, struct sofia_peer *peer,
@@ -14502,7 +14522,7 @@ static int sofia_source_gate_nosecret(nua_t *nua, nua_handle_t *nh, sip_t const 
 	case SOFIA_SRCACT_OWNER:
 		ao2_ref(owner, -1);	/* another account's address: not a request of this one */
 		/* fall through */
-	case SOFIA_SRCACT_DIGEST:	/* it got a secret since the caller looked (a reload): nothing has proved it yet */
+	case SOFIA_SRCACT_DIGEST:	/* it can prove it since the caller looked (a reload): nothing has proved it yet */
 	case SOFIA_SRCACT_REFUSE:
 		sofia_reject_as_unknown(nua, nh, sip, method, NULL, 1);
 		return 1;
@@ -15014,9 +15034,11 @@ static enum sofia_auth_result sofia_verify_digest_auth_ex(struct sofia_peer *pee
 	 * password); force the 403 here so an unknown user can never authenticate even if its response
 	 * somehow collided with the impossible-secret hash. */
 	/* An account with neither secret nor md5secret has no answer that could be right (the hash above is the one of
-	 * an empty password): the 403 of a wrong password, whatever the response says. The callers never ask such an
-	 * account for its digest; this holds if its secret goes (a reload) between their test and this one. */
-	if (!is_bogus && ast_strlen_zero(peer->secret) && ast_strlen_zero(peer->md5secret)) {
+	 * an empty password), and the secret of an account that is not host=dynamic is never used for a request that
+	 * reaches us (sofia_peer_can_prove): the 403 of a wrong password, whatever the response says. The callers never
+	 * ask such an account for its digest; this holds if a reload changes it between their test and this one. */
+	if (!is_bogus && ((ast_strlen_zero(peer->secret) && ast_strlen_zero(peer->md5secret))
+			|| (!ast_strlen_zero(peer->host) && strcasecmp(peer->host, "dynamic")))) {
 		auth_response = NULL;
 	}
 	if (is_bogus || !auth_response || sofia_ct_memcmp(auth_response, expected_hash, hash_len_hex) != 0) {
@@ -15127,12 +15149,10 @@ int sofia_message_authenticate(struct sofia_peer *peer, nua_t *nua, nua_handle_t
 		return 0;	/* guest: caller's allowguest policy decides */
 	}
 
-	ast_mutex_lock(&peer->lock);
-	has_creds = !ast_strlen_zero(peer->secret) || !ast_strlen_zero(peer->md5secret);
-	ast_mutex_unlock(&peer->lock);
+	has_creds = sofia_peer_can_prove(peer);
 
 	if (!has_creds) {
-		/* No shared secret to verify against: the message is the account's only from one of its addresses. */
+		/* No secret that counts (none, or a static host): the message is the account's only from its address. */
 		return sofia_source_gate_nosecret(nua, nh, sip, peer, "MESSAGE");
 	}
 
@@ -18598,9 +18618,10 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 		}
 	}
 
-	/* Digest-auth a credentialed peer's MWI SUBSCRIBE (else anyone could subscribe its
-	 * mailbox). Credential-less peers stay open; the verifier emits the 401/4xx itself. */
-	if (!ast_strlen_zero(peer->secret) || !ast_strlen_zero(peer->md5secret)) {
+	/* Digest-auth the MWI SUBSCRIBE of a host=dynamic peer with a secret (else anyone could subscribe its mailbox);
+	 * any other peer only from its address (the secret of a static host is never used). The verifier emits the
+	 * 401/4xx itself. */
+	if (sofia_peer_can_prove(peer)) {
 		char realm_buf[MAXHOSTNAMELEN];
 		const char *realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
 		enum sofia_auth_result auth_res = sofia_verify_digest_auth(peer,
@@ -18611,7 +18632,7 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 			return;
 		}
 	} else if (sofia_source_gate_nosecret(nua, nh, sip, peer, "SUBSCRIBE")) {
-		/* No secret to ask for: only from an address of the account. */
+		/* No secret that counts: only from an address of the account. */
 		ao2_ref(peer, -1);
 		sofia_mwi_reject_reap(nh);
 		return;
@@ -18912,9 +18933,9 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		}
 	}
 
-	/* Digest-authenticate the SUBSCRIBE for a credentialed peer (MWI-path rationale):
-	 * else anyone could watch any extension's state. Verifier emits the 401/4xx. */
-	if (!ast_strlen_zero(peer->secret) || !ast_strlen_zero(peer->md5secret)) {
+	/* Digest-authenticate the SUBSCRIBE of a host=dynamic peer with a secret (MWI-path rationale): else anyone could
+	 * watch any extension's state; any other peer only from its address. Verifier emits the 401/4xx. */
+	if (sofia_peer_can_prove(peer)) {
 		char realm_buf[MAXHOSTNAMELEN];
 		const char *realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
 		enum sofia_auth_result auth_res = sofia_verify_digest_auth(peer,
@@ -18925,7 +18946,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 			return;
 		}
 	} else if (sofia_source_gate_nosecret(nua, nh, sip, peer, "SUBSCRIBE")) {
-		/* No secret to ask for: only from an address of the account. */
+		/* No secret that counts: only from an address of the account. */
 		ao2_ref(peer, -1);
 		sofia_subscribe_reject_reap(nh);
 		return;
@@ -23306,10 +23327,9 @@ static void *sofia_thread_func(void *data)
 	nua_set_params(sofia_nua, NUTAG_ALLOW_EVENTS("refer"), TAG_END());
 	nua_set_params(sofia_nua, NUTAG_ALLOW_EVENTS("presence.winfo"), TAG_END());
 
-	/* Apply initial debug state to transport layer */
+	/* Apply initial debug state to transport layer (through the stack thread: see sofia_apply_capture) */
 	if (sofia_debug && sofia_nua) {
-		tport_set_params(nta_agent_tports(nua_get_agent(sofia_nua)),
-			TPTAG_LOG(1), TAG_END());
+		nua_set_params(sofia_nua, TPTAG_LOG(1), TAG_END());
 	}
 
 	/* Apply the SIP-capture config (HEP stream + file dump). MUST be DEFERRED into the running su_root loop:
@@ -25600,16 +25620,18 @@ static int sofia_dump_on;	/* file dump (TPTAG_DUMP) currently applied to the tpo
  * sofia-sip's capture socket is non-blocking (tport_logging.c), so this never stalls the stack thread.
  * Empty = OFF, and we only actively disable when it was previously on, so the default-off path never opens
  * a socket/file (zero overhead). No-op before the NUA agent exists. Invoked at startup (after nua_create)
- * and at the end of sofia_apply_config (covers `sip reload`); also driven by the CLI subcommands. */
+ * and at the end of sofia_apply_config (covers `sip reload`); also driven by the CLI subcommands.
+ *
+ * The tags are sent with nua_set_params(), never with tport_set_params(): the transports belong to the
+ * stack's own thread (the clone nua_create() starts), which is not the thread this function runs on.
+ * nua_set_params() is a message to that thread (its tags are copied), where nua_stack_set_params ->
+ * nta_agent_set_params -> tport_set_params -> tport_open_log applies them. tport_open_log has no lock and
+ * runs there for EVERY nua_set_params (it starts from the capture name it already has): a direct
+ * tport_set_params here ran it on two threads at once, both freeing the same capture name, and the
+ * process aborted in su_free during a reload. The messages are handled in the order sent. */
 void sofia_apply_capture(void)
 {
-	tport_t *tports;
-
 	if (!sofia_nua) {
-		return;
-	}
-	tports = nta_agent_tports(nua_get_agent(sofia_nua));
-	if (!tports) {
 		return;
 	}
 
@@ -25623,15 +25645,15 @@ void sofia_apply_capture(void)
 	if (!ast_strlen_zero(sofia_cfg.sip_capture_file)) {
 		/* /dev/null reset: sofia-sip's dump same-name check compares only the NAME, so re-applying the
 		 * same path would skip fopen(); the name change forces the real path to (re)open. */
-		tport_set_params(tports, TPTAG_CAPT(NULL), TPTAG_DUMP("/dev/null"), TAG_END());
-		tport_set_params(tports, TPTAG_CAPT(NULL), TPTAG_DUMP(sofia_cfg.sip_capture_file), TAG_END());
+		nua_set_params(sofia_nua, TPTAG_CAPT(NULL), TPTAG_DUMP("/dev/null"), TAG_END());
+		nua_set_params(sofia_nua, TPTAG_CAPT(NULL), TPTAG_DUMP(sofia_cfg.sip_capture_file), TAG_END());
 		sofia_dump_on = 1;
 		sofia_capture_on = 0;	/* the CAPT(NULL) above closed the capture socket; re-applied below if configured */
 		ast_log(LOG_NOTICE, "Sofia: SIP message dump -> file %s\n", sofia_cfg.sip_capture_file);
 	} else if (sofia_dump_on) {
 		/* sofia-sip has no dump-off tag; redirecting to /dev/null closes (flushes) the operator's file.
 		 * CAPT(NULL) here too so the dump closes regardless of capture state; capture re-applied below. */
-		tport_set_params(tports, TPTAG_CAPT(NULL), TPTAG_DUMP("/dev/null"), TAG_END());
+		nua_set_params(sofia_nua, TPTAG_CAPT(NULL), TPTAG_DUMP("/dev/null"), TAG_END());
 		sofia_dump_on = 0;
 		sofia_capture_on = 0;
 		ast_log(LOG_NOTICE, "Sofia: SIP message dump disabled\n");
@@ -25649,27 +25671,24 @@ void sofia_apply_capture(void)
 		/* Reset first: sofia-sip's tport_open_log short-circuits when the CAPT url is unchanged AND a
 		 * socket already exists, so an earlier apply that set the name but failed to open the socket
 		 * would block every retry. TPTAG_CAPT(NULL) zeroes mr_capt_sock -> the next set always reopens. */
-		tport_set_params(tports, TPTAG_CAPT(NULL), TAG_END());
-		tport_set_params(tports, TPTAG_CAPT(url), TAG_END());
+		nua_set_params(sofia_nua, TPTAG_CAPT(NULL), TAG_END());
+		nua_set_params(sofia_nua, TPTAG_CAPT(url), TAG_END());
 		sofia_capture_on = 1;
 		ast_log(LOG_NOTICE, "Sofia: SIP capture -> HEPv%d UDP %s (capture_id=%d)\n",
 			hep, sofia_cfg.sip_capture_address, id);
 	} else if (sofia_capture_on) {
-		tport_set_params(tports, TPTAG_CAPT(NULL), TAG_END());	/* NULL closes the capture socket */
+		nua_set_params(sofia_nua, TPTAG_CAPT(NULL), TAG_END());	/* NULL closes the capture socket */
 		sofia_capture_on = 0;
 		ast_log(LOG_NOTICE, "Sofia: SIP capture disabled\n");
 	}
 }
 
-/* CLI-thread-safe SIP-capture change: MARSHAL the apply onto sofia_thread.
- * sofia_apply_capture() runs tport_set_params(TPTAG_DUMP/CAPT), which closes/reopens the SHARED tport
- * mr_dump_file (FILE*) + mr_capt_sock (sofia-sip tport_logging.c) that sofia_thread writes to per message
- * with NO locking — applying it from the CLI thread races that write (FILE* use-after-free / wrong-fd
- * capture / tport corruption), and violates the doctrine (sofia_thread owns mutable signaling state).
- * FreeSWITCH routes siptrace/capture through nua_set_params, which sofia marshals onto the stack thread
- * the same way. The startup su_timer + `sofia reload` already run on sofia_thread and keep the direct call.
- * The task carries a COPY of the new value; the root callback commits sofia_cfg + applies, all on
- * sofia_thread. Returns 0 on dispatch, -1 on failure (caller reports the CLI error). */
+/* CLI-thread-safe SIP-capture change: MARSHAL the apply onto sofia_thread, which owns sofia_cfg (the
+ * task carries a COPY of the new value; the root callback commits it there and calls
+ * sofia_apply_capture()). The transport side is not touched on sofia_thread either: sofia_apply_capture()
+ * sends the TPTAG_DUMP/CAPT tags to the stack thread with nua_set_params(), the only thread that may
+ * close/reopen the tport mr_dump_file (FILE*) + mr_capt_sock it writes to per message with NO locking.
+ * Returns 0 on dispatch, -1 on failure (caller reports the CLI error). */
 struct sofia_capture_task {
 	int is_hep;		/* 1 = HEP capture address, 0 = file dump path */
 	char value[512];	/* new path / host:port; "" = disable */
@@ -25702,15 +25721,16 @@ int sofia_apply_capture_from_cli(int is_hep, const char *value)
 	return 0;
 }
 
-/* Apply the tport TPTAG_LOG toggle on the sofia_thread. tport_set_params mutates the SHARED
- * nta/tport stack state, so — like the capture toggle above — it must NOT be called from the CLI
- * thread; sofia_apply_log_from_cli marshals here. */
+/* Apply the tport TPTAG_LOG toggle. It changes the SHARED nta/tport stack state, so — like the capture
+ * toggle above — it goes to the stack thread with nua_set_params(), never through a direct
+ * tport_set_params() (which also runs tport_open_log: see sofia_apply_capture).
+ * sofia_apply_log_from_cli marshals here. */
 static void sofia_apply_log_root(void *data)
 {
 	int on = *(int *)data;
 	ast_free(data);
 	if (sofia_nua) {
-		tport_set_params(nta_agent_tports(nua_get_agent(sofia_nua)), TPTAG_LOG(on), TAG_END());
+		nua_set_params(sofia_nua, TPTAG_LOG(on), TAG_END());
 	}
 }
 

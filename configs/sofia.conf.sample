@@ -322,8 +322,16 @@ allowguest=no
 ;blacklist_ban = 1440     ; minutes; default 1440 = 24h; 0 = disable banning
 
 ;
-; SRV lookup for outbound calls
+; srvlookup: read for old configurations; it decides nothing.
 ; Default: yes
+;
+; A call always goes through a peer declared beforehand, in this file or in the realtime table:
+;   Dial(SIP/<peer>)  Dial(SIP/<peer>/<number>)  Dial(SIP/<number>@<peer>)
+; A dial target that names no declared peer is refused, whatever it looks like (a host name, an
+; address, user:secret@host): no INVITE leaves, the log says "Sofia: call to '<target>' refused: it
+; is not a declared peer" and DIALSTATUS is CHANUNAVAIL (cause 20); when the realtime database did
+; not answer, CONGESTION (cause 34). Unlike chan_sip, which calls such a target as a host. A peer
+; with host=<name> is reached at its port= with address records.
 ;
 srvlookup=yes
 
@@ -2911,11 +2919,12 @@ tos_video = af41
 ; no (default): a call from a valid address of its account enters without a
 ;     digest (see "Who enters without a password: a valid address"); from any
 ;     other address the digest is asked.
-; yes: every account that has a secret answers its digest on every INVITE,
-;     also from its own address. An address can be forged over UDP by somebody
-;     who knows it (RFC 7616 section 3.3); this closes that, at the price of a
-;     401 on every call. An account with no secret (found by its static host)
-;     has nothing to answer with and is still taken by its address.
+; yes: every host=dynamic account that has a secret answers its digest on
+;     every INVITE, also from its own address. An address can be forged over
+;     UDP by somebody who knows it (RFC 7616 section 3.3); this closes that, at
+;     the price of a 401 on every call. A static account (host=<address> or
+;     host=<name>) is never asked: its secret is not used for anything that
+;     reaches us, and it is taken by its address only.
 ;
 ; Read at load and at `sip reload`.
 ;
@@ -2937,14 +2946,15 @@ tos_video = af41
 ;   - any port of that address only with insecure=port; and, for a static
 ;     account set to transport=tcp, tls, ws or wss, a request that arrives
 ;     over a connection (its source port is never the listening one);
-;   - or such an address of another account with the same accountcode.
+;   - or, for a host=dynamic account, such an address of another account with
+;     the same accountcode (a static account is only ever at its own host);
 ;   - after a restart, the registration the row of a host=dynamic account
 ;     kept, when it was made before the restart, until the device registers
 ;     again (or it can no longer be current: its instant + maxexpiry): a
 ;     device is not asked for a digest because the PBX restarted. A row read
 ;     again later (the account was pruned) is not that: the device answers
 ;     its digest once.
-; Not an address of the account: defaultip of a host=dynamic account.
+; Not an address of the account: defaultip, of any account.
 ; From a valid address the request enters and no digest is asked, whether the
 ; account has a secret or not: a device that registered (with its secret)
 ; calls from where it registered, a trunk from its host. Nothing else lets a
@@ -2952,9 +2962,15 @@ tos_video = af41
 ;   - from exactly the address of another account (a trunk, another PBX): the
 ;     call is that account's, as when the From names no account;
 ;   - from any other address (the device moved, its NAT port changed, its
-;     registration lapsed): an account with a secret answers its digest and
-;     enters; one with no secret can prove nothing and gets the answers of a
-;     name that is not an account (401, 403);
+;     registration lapsed): a host=dynamic account with a secret answers its
+;     digest and enters; one with no secret can prove nothing and gets the
+;     answers of a name that is not an account (401, 403);
+;   - a static account (host=<address> or host=<name>) never enters from
+;     anywhere but its host: its secret is not used for anything that reaches
+;     us, so even the right password gets the answers of a name that is not
+;     an account (401, 403). Its secret still answers the challenge of its
+;     host when this PBX calls it (and a register=> line registers with its
+;     own credentials): that lets nobody in;
 ;   - 503 when the database cannot tell whose address it is.
 ; A call whose From names no account that is asked by name (a caller ID, or a
 ; type=peer account) is taken by its address: the account From names, when it
@@ -2963,18 +2979,18 @@ tos_video = af41
 ; address; else, when an account takes every port of the address
 ; (insecure=port) and the request does not claim to be an account that is at
 ; that address too, that account; else the account named in the credentials
-; or in From, if it has a secret and with its digest; else the caller is
-; unknown (401, 403). No account is taken for another one behind the same
-; address.
-; SUBSCRIBE and MESSAGE: an account with a secret answers its digest; one with
-; no secret is taken only from a valid address.
+; or in From, if it is a host=dynamic account with a secret and with its
+; digest; else the caller is unknown (401, 403). No account is taken for
+; another one behind the same address.
+; SUBSCRIBE and MESSAGE: a host=dynamic account with a secret answers its
+; digest; any other account is taken only from a valid address.
 ; With insecure=port every port of the account's address is its address, so a
 ; call from there that names another account is the insecure=port account's.
 ; An account with no accountcode has no "same accountcode" accounts.
 ;
 ; insecure=invite is read and decides nothing: the address decides.
-; force_invite_auth=yes asks every account that has a secret for its digest on
-; every INVITE, also from its address.
+; force_invite_auth=yes asks every host=dynamic account that has a secret for
+; its digest on every INVITE, also from its address.
 ;
 ; A request that is refused, or given to the account whose address it is, is
 ; reported: NOTICE "source check: INVITE as '<account>' from <address>,
@@ -3040,7 +3056,7 @@ tos_video = af41
 ; Operator action items for production deployment:
 ;   * Review existing trunk peer configs: a trunk is found by its address
 ;     (host=<address> and port=, or insecure=port when it sends from another
-;     port); from any other address it is asked for a digest or refused
+;     port); from any other address it is refused, whatever its secret
 ;   * Audit sip show settings post-reload — verify expected operator-policy
 ;     fields (force_invite_auth, nonce_ttl_seconds, srtp_per_suite_keys)
 ;   * For high-volume rejection scenarios (DDoS / brute-force probing),
@@ -3384,7 +3400,12 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;
 ; --- Identity ---
 ; type          - peer, user, or friend (friend = both peer and user)
-; secret        - authentication password
+; secret        - the password of a host=dynamic account (it registers with
+;                 it, and answers its digest from an address that is not a
+;                 valid one). On a static account (host=<address> or
+;                 host=<name>) it is used only to answer the challenge of that
+;                 host when this PBX calls it, never for a request that
+;                 reaches us: such an account enters only from its host.
 ; defaultuser   - username for outbound auth (defaults to peer name)
 ; username      - alias for defaultuser
 ; user          - alias for defaultuser
@@ -3422,10 +3443,11 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;                 be that one.
 ;                 invite: read for old configurations; it decides nothing
 ;                 ("very" is port and invite: it is insecure=port). No digest
-;                 is asked from a valid address of the
-;                 account, with or without it, and from any other address the
-;                 digest is asked, with or without it: see "Who enters without
-;                 a password" in [general].
+;                 is asked from a valid address of the account, with or
+;                 without it; from any other address a host=dynamic account
+;                 is asked for its digest and a static one is refused, with or
+;                 without it: see "Who enters without a password" in
+;                 [general].
 ;
 ; --- Codecs ---
 ; disallow      - codecs to disallow (use "all" first, then allow selectively)
