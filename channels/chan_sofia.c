@@ -596,6 +596,18 @@ enum sofia_fork_state {
 	FORK_DEAD,
 };
 
+/* What a 300/301/302 to our INVITE says about the called party (RFC 3261 section 8.1.3.4 and
+ * sections 21.3.1 to 21.3.3): the destination to call instead and who redirected the call. Filled by
+ * sofia_redirect_parse, put on the calling channel by sofia_redirect_apply. */
+struct sofia_redirect {
+	char number[AST_MAX_EXTENSION];       /* user part of the chosen Contact URI, unescaped: the new destination */
+	char name[80];                        /* display name of that Contact, or "" */
+	char host[160];                       /* its host[:port], for the log */
+	char diversion[256];                  /* value of the response's Diversion header (RFC 5806), or "" */
+	char from_number[AST_MAX_EXTENSION];  /* user part of the response's To: who redirected, when no Diversion says */
+	char from_name[80];                   /* display name of that To, or "" */
+};
+
 struct sofia_fork {
 	struct ao2_container *children;   /* child sofia_pvt objects keyed by fork_branch_id */
 	struct sofia_pvt *master;         /* pvt that owns the ast_channel (never changes) */
@@ -606,7 +618,7 @@ struct sofia_fork {
 	char fork_id[SOFIA_FORK_ID_LEN]; /* unique ID for debug logging */
 	ast_mutex_t lock;                 /* guards winner_picked, winner, child_count, children, state, posting_done, early_media_child,
 	                                   * best_status, best_q850, push_hold, push_hold_live_only, live_wait,
-	                                   * answered_inst, ended, cancel_6xx */
+	                                   * answered_inst, ended, cancel_6xx, has_redirect, redirect */
 	int child_count;                  /* live children remaining */
 	int posting_done;                 /* 1 once the INVITE posting loop has forked every contact — child_count is only
 	                                   * authoritative after this (a 18x can arrive before all branches are posted), and
@@ -634,6 +646,11 @@ struct sofia_fork {
 	                                   * appended after it. Guarded by lock. */
 	int cancel_6xx;                   /* 1 once a 6xx made the fork cancel its pending branches (RFC 3261 §16.7
 	                                   * step 5, sofia_fork_cancel_on_6xx): claimed once. Guarded by lock. */
+	int has_redirect;                 /* 1 once a branch answered 300/301/302 with a destination that can be
+	                                   * followed (redirect, the first one received). It is followed only if the
+	                                   * fork ends with a 3xx as its best response (RFC 3261 §16.7 step 6).
+	                                   * Guarded by lock. */
+	struct sofia_redirect redirect;
 };
 
 /* MWI per-peer mailbox node; defined before struct sofia_peer (which embeds the
@@ -2406,8 +2423,9 @@ static int sofia_invite_failure_status(int status, sip_t const *sip)
  * (handle_response, chan_sip.c:22482-22500 and :22727-22797; handle_response_invite):
  * - the channel's hangupcause is the Q.850 cause of a Reason header (use_q850_reason), else
  *   hangup_sip2cause() of the status (sofia_reason_status2cause is the same table);
- * - 486/600/603 and 300/301/302/305 queue BUSY (chan_sip also follows a 3xx Contact as a call
- *   forward; not done here);
+ * - 486/600/603 and 300/301/302/305 queue BUSY. A 300/301/302 whose Contact names a destination has
+ *   been put on the channel as a call forward before this (sofia_redirect_apply), and the BUSY frame
+ *   is then what makes the dialing application look at it;
  * - 400/410/480/482/500/502/503/504 queue CONGESTION, and so does a 401/407 left unanswered
  *   (no usable credential, or the retries are spent);
  * - 484 hangs up with INVALID_NUMBER_FORMAT when allowoverlap is yes, else UNALLOCATED (404);
@@ -2487,6 +2505,208 @@ static void sofia_fork_note_answered(struct sofia_fork *fork, struct sofia_pvt *
 	ast_mutex_unlock(&fork->lock);
 }
 
+/* The value of the first Diversion header (RFC 5806) of a message, or NULL. */
+static const char *sofia_diversion_value(sip_t const *sip)
+{
+	sip_unknown_t const *u;
+
+	for (u = sip ? sip->sip_unknown : NULL; u; u = u->un_next) {
+		if (u->un_name && !strcasecmp(u->un_name, "Diversion")) {
+			return ast_strlen_zero(u->un_value) ? NULL : u->un_value;
+		}
+	}
+	return NULL;
+}
+
+/* Copy a display name without its enclosing double quotes (the stack keeps them). */
+static void sofia_copy_display(char *dst, size_t len, const char *display)
+{
+	size_t n;
+
+	dst[0] = '\0';
+	if (ast_strlen_zero(display)) {
+		return;
+	}
+	if (display[0] == '"') {
+		display++;
+	}
+	ast_copy_string(dst, display, len);
+	n = strlen(dst);
+	if (n && dst[n - 1] == '"') {
+		dst[n - 1] = '\0';
+	}
+}
+
+/* The user part of a SIP or SIPS URI as a destination to dial: without its parameters (a
+ * telephone-subscriber's, RFC 3261 section 19.1.6) and unescaped (section 19.1.2). Returns 0 with dst
+ * filled, -1 when there is none or it cannot be dialed: empty, too long for an extension, or with a
+ * character that is not printable ASCII, a '/' or a '@' (the dialing application would read
+ * "technology/resource" or "extension@context" in it and call something the dialplan of the redirecting
+ * account does not decide). */
+static int sofia_redirect_user(const char *user, char *dst, size_t len)
+{
+	char buf[256];
+	char *semi;
+	size_t n, i;
+
+	dst[0] = '\0';
+	if (ast_strlen_zero(user) || strlen(user) >= sizeof(buf)) {
+		return -1;
+	}
+	ast_copy_string(buf, user, sizeof(buf));
+	if ((semi = strchr(buf, ';'))) {
+		*semi = '\0';
+	}
+	n = url_unescape_to(buf, buf, strlen(buf));
+	if (!n || n >= len) {
+		return -1;
+	}
+	for (i = 0; i < n; i++) {
+		unsigned char c = (unsigned char) buf[i];
+
+		if (c <= 0x20 || c >= 0x7f || c == '/' || c == '@') {
+			return -1;
+		}
+	}
+	memcpy(dst, buf, n);
+	dst[n] = '\0';
+	return 0;
+}
+
+/* Read from a 300 (Multiple Choices), 301 (Moved Permanently) or 302 (Moved Temporarily) to our INVITE
+ * where the called party says it is (RFC 3261 sections 21.3.1 to 21.3.3: the Contact header field gives
+ * the new address) and who redirected the call. Returns 1 with rd filled when there is a destination to
+ * call, 0 otherwise.
+ * - The destination is the user part of a Contact that is a SIP or SIPS URI. It is called through the
+ *   dialplan, in the context of the account that redirected, never at the host of that URI: a call only
+ *   goes to a declared peer. "A client can choose which Contact URIs it places into the target set"
+ *   (section 8.1.3.4); other URI schemes are not followed.
+ * - With several Contacts, the one with the highest q, the first one among equals (section 8.1.3.4: "a
+ *   common mechanism is to order the set by the q parameter value").
+ * - A 305 (Use Proxy) is not followed: its Contact is the URI of a proxy to send the same request
+ *   through (section 21.3.4), not another destination. Nor is a response the stack made up itself.
+ * Only reads the message: no lock needed. */
+static int sofia_redirect_parse(int status, sip_t const *sip, struct sofia_redirect *rd)
+{
+	sip_contact_t const *m, *best = NULL;
+	unsigned best_q = 0;
+	char number[AST_MAX_EXTENSION];
+	const char *diversion;
+
+	if (status != 300 && status != 301 && status != 302) {
+		return 0;
+	}
+	if (!sip || (sip->sip_flags & SOFIA_NTA_INTERNAL_MSG)) {
+		return 0;
+	}
+	for (m = sip->sip_contact; m; m = m->m_next) {
+		unsigned q;
+
+		if (m->m_url->url_type != url_sip && m->m_url->url_type != url_sips) {
+			continue;
+		}
+		if (sofia_redirect_user(m->m_url->url_user, number, sizeof(number))) {
+			continue;
+		}
+		q = sip_q_value(m->m_q);
+		if (!best || q > best_q) {
+			best = m;
+			best_q = q;
+		}
+	}
+	if (!best) {
+		return 0;
+	}
+
+	memset(rd, 0, sizeof(*rd));
+	sofia_redirect_user(best->m_url->url_user, rd->number, sizeof(rd->number));
+	sofia_copy_display(rd->name, sizeof(rd->name), best->m_display);
+	snprintf(rd->host, sizeof(rd->host), "%s%s%s", S_OR(best->m_url->url_host, ""),
+		ast_strlen_zero(best->m_url->url_port) ? "" : ":", S_OR(best->m_url->url_port, ""));
+	if ((diversion = sofia_diversion_value(sip))) {
+		ast_copy_string(rd->diversion, diversion, sizeof(rd->diversion));
+	}
+	if (sip->sip_to) {
+		/* May fail (no user, or one that cannot be dialed): from_number is then "". */
+		sofia_redirect_user(sip->sip_to->a_url->url_user, rd->from_number, sizeof(rd->from_number));
+		sofia_copy_display(rd->from_name, sizeof(rd->from_name), sip->sip_to->a_display);
+	}
+	return 1;
+}
+
+static int sofia_diversion_apply(struct ast_channel *owner, const char *div_value);
+
+/* Put a redirection on the channel of the redirected call, as chan_sip does (handle_response,
+ * change_redirecting_information and parse_moved_contact): the dialing application then calls
+ * rd->number in the context of this channel, which is the context of the account that redirected
+ * (app_dial: Local/<number>@<context>, unless Dial has the option i), and tells the caller.
+ * - redirecting "from": the Diversion of the response when it has one, else its To (the address we
+ *   called); the reason is the Diversion's, else unconditional.
+ * - redirecting "to": the Contact that was chosen.
+ * - call_forward: its user part.
+ * The caller must queue the frame that wakes the dialing application (BUSY) after this, and should hold
+ * the channel lock across both so that the application sees them together. Takes the channel lock (it is
+ * recursive); no pvt or peer lock may be held. */
+static void sofia_redirect_apply(struct ast_channel *owner, const struct sofia_redirect *rd)
+{
+	ast_channel_lock(owner);
+	if (!rd->diversion[0] || !sofia_diversion_apply(owner, rd->diversion)) {
+		if (rd->from_number[0]) {
+			ast_free(owner->redirecting.from.number.str);
+			owner->redirecting.from.number.str = ast_strdup(rd->from_number);
+			owner->redirecting.from.number.valid = 1;
+		}
+		if (rd->from_name[0]) {
+			ast_free(owner->redirecting.from.name.str);
+			owner->redirecting.from.name.str = ast_strdup(rd->from_name);
+			owner->redirecting.from.name.valid = 1;
+		}
+		owner->redirecting.reason = AST_REDIRECTING_REASON_UNCONDITIONAL;
+	}
+	ast_free(owner->redirecting.to.number.str);
+	owner->redirecting.to.number.str = ast_strdup(rd->number);
+	owner->redirecting.to.number.valid = 1;
+	if (rd->name[0]) {
+		ast_free(owner->redirecting.to.name.str);
+		owner->redirecting.to.name.str = ast_strdup(rd->name);
+		owner->redirecting.to.name.valid = 1;
+	}
+	ast_string_field_set(owner, call_forward, rd->number);
+	ast_channel_unlock(owner);
+}
+
+/* A final non-2xx to our initial INVITE on a call not answered: what the dialplan sees
+ * (sofia_queue_invite_failure), after putting the redirection rd on the channel when there is one.
+ * The channel lock is held across both, so the dialing application, woken by the frame, finds the call
+ * forward in place. No pvt or peer lock may be held. */
+static void sofia_queue_invite_failure_redirect(struct ast_channel *owner, int status, int q850,
+	int overlap_yes, const struct sofia_redirect *rd, const char *peername)
+{
+	if (!rd) {
+		sofia_queue_invite_failure(owner, status, q850, overlap_yes, 0);
+		return;
+	}
+	ast_channel_lock(owner);
+	sofia_redirect_apply(owner, rd);
+	sofia_queue_invite_failure(owner, status, q850, overlap_yes, 0);
+	ast_channel_unlock(owner);
+	ast_verb(3, "Sofia: '%s' answered %d: the call is forwarded to '%s' (Contact host %s)\n",
+		S_OR(peername, "unknown"), status, rd->number, S_OR(rd->host, "?"));
+}
+
+/* A fork branch answered 300/301/302 with a destination: keep the first one. The other branches go on
+ * (only a 2xx or a 6xx acts at once, RFC 3261 section 16.7 step 5); the redirection is followed if the
+ * fork ends with a 3xx as its best response (step 6, sofia_fork_end_master). */
+static void sofia_fork_note_redirect(struct sofia_fork *fork, const struct sofia_redirect *rd)
+{
+	ast_mutex_lock(&fork->lock);
+	if (!fork->has_redirect) {
+		fork->redirect = *rd;
+		fork->has_redirect = 1;
+	}
+	ast_mutex_unlock(&fork->lock);
+}
+
 static void sofia_fork_note_failure(struct sofia_fork *fork, struct sofia_pvt *child, int status, int q850, int received)
 {
 	ast_mutex_lock(&fork->lock);
@@ -2503,13 +2723,20 @@ static void sofia_fork_note_failure(struct sofia_fork *fork, struct sofia_pvt *c
 }
 
 /* End the master's call once every branch of its fork has failed: the best final response kept
- * by sofia_fork_note_failure, or a bare HANGUP when no branch gave one. Snapshots+refs m->owner
- * under m->lock and queues outside it (never m->lock across the channel lock); callers may hold
- * the channel lock (channel -> pvt order). */
+ * by sofia_fork_note_failure, or a bare HANGUP when no branch gave one. When that best response is
+ * a 3xx and a branch gave a destination to call instead (sofia_fork_note_redirect), the call is
+ * forwarded there: of the responses of the chosen class any may be selected (RFC 3261 §16.7 step 6),
+ * and the client that gets a 3xx retries at its Contact (§8.1.3.4). Snapshots+refs m->owner
+ * under m->lock and queues outside it (never m->lock across the channel lock); takes fork->lock on
+ * its own, after m->lock is released. Callers may hold the channel lock (channel -> pvt order). */
 static void sofia_fork_end_master(struct sofia_pvt *m, int best_status, int best_q850)
 {
 	struct ast_channel *m_owner;
+	struct sofia_fork *fork = NULL;
+	struct sofia_redirect rd;
+	char peername[80];
 	int overlap_yes;
+	int follow = 0;
 
 	ast_mutex_lock(&m->lock);
 	m_owner = m->owner;
@@ -2518,10 +2745,25 @@ static void sofia_fork_end_master(struct sofia_pvt *m, int best_status, int best
 	}
 	overlap_yes = ((m->peer ? m->peer->allowoverlap_mode : sofia_cfg.default_allowoverlap_mode)
 		== SOFIA_OVERLAP_YES);
+	if (best_status >= 300 && best_status < 400 && m->is_fork_master && m->fork) {
+		fork = m->fork;
+		ao2_ref(fork, +1);
+	}
+	ast_copy_string(peername, S_OR(m->peername, ""), sizeof(peername));
 	ast_mutex_unlock(&m->lock);
+	if (fork) {
+		ast_mutex_lock(&fork->lock);
+		if (fork->has_redirect) {
+			rd = fork->redirect;
+			follow = 1;
+		}
+		ast_mutex_unlock(&fork->lock);
+		ao2_ref(fork, -1);
+	}
 	if (m_owner) {
 		if (best_status) {
-			sofia_queue_invite_failure(m_owner, best_status, best_q850, overlap_yes, 0);
+			sofia_queue_invite_failure_redirect(m_owner, best_status, best_q850, overlap_yes,
+				follow ? &rd : NULL, peername);
 		} else {
 			ast_queue_control(m_owner, AST_CONTROL_HANGUP);
 		}
@@ -17481,8 +17723,23 @@ static int sofia_get_rpid(struct sofia_pvt *pvt, sip_t const *sip)
  * operator dialplan decides trust). Returns 1 on update, 0 on no-header. */
 static int sofia_change_redirecting_info(struct sofia_pvt *pvt, struct ast_channel *owner, sip_t const *sip)
 {
-	sip_unknown_t const *u;
-	const char *div_value = NULL;
+	const char *div_value;
+
+	if (!pvt || !owner || !sip) {
+		return 0;
+	}
+	div_value = sofia_diversion_value(sip);
+	if (!div_value) {
+		return 0;
+	}
+	return sofia_diversion_apply(owner, div_value);
+}
+
+/* The value of a Diversion header (RFC 5806) -> owner->redirecting "from" (name, number, reason) and
+ * the dialplan vars __SIPREDIRECTREASON / __SIPRDNISDOMAIN. Returns 1 on update, 0 when the value
+ * holds no SIP or SIPS URI in angle brackets. Takes the channel lock. */
+static int sofia_diversion_apply(struct ast_channel *owner, const char *div_value)
+{
 	char tmp[256];
 	char *uri;
 	char *user;
@@ -17493,20 +17750,6 @@ static int sofia_change_redirecting_info(struct sofia_pvt *pvt, struct ast_chann
 	char *redir_num = NULL;
 	char *reason_str = NULL;
 	int reason = AST_REDIRECTING_REASON_UNCONDITIONAL;
-
-	if (!pvt || !owner || !sip) {
-		return 0;
-	}
-
-	for (u = sip->sip_unknown; u; u = u->un_next) {
-		if (u->un_name && !strcasecmp(u->un_name, "Diversion")) {
-			div_value = u->un_value;
-			break;
-		}
-	}
-	if (!div_value || ast_strlen_zero(div_value)) {
-		return 0;
-	}
 
 	ast_copy_string(tmp, div_value, sizeof(tmp));
 
@@ -21915,6 +22158,13 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 				int fstatus = sofia_invite_failure_status(status, sip);
 				int q850 = (sofia_cfg.use_q850_reason && sip) ? sofia_reason_parse_cause(sip->sip_reason) : 0;
 
+				struct sofia_redirect rd;
+
+				/* A 300/301/302 naming where to call instead: kept, and followed if the fork ends on it
+				 * (before the accounting below, which may end the fork). */
+				if (sofia_redirect_parse(fstatus, sip, &rd)) {
+					sofia_fork_note_redirect(fork, &rd);
+				}
 				/* received: the far end sent it, not the stack (transport error, timeout: SOFIA_NTA_INTERNAL_MSG) */
 				sofia_fork_note_failure(fork, pvt, fstatus, q850,
 					status < 700 && sip && !(sip->sip_flags & SOFIA_NTA_INTERNAL_MSG));
@@ -22573,10 +22823,18 @@ static void sofia_event_callback(nua_event_t event, int status, char const *phra
 					 * HANGUP left DIALSTATUS at CHANUNAVAIL even for a 486). allowoverlap for a
 					 * 484: the peer's mode, else the default. */
 					int overlap_mode = pvt->peer ? pvt->peer->allowoverlap_mode : sofia_cfg.default_allowoverlap_mode;
+					int fstatus = sofia_invite_failure_status(status, sip);
+					int q850 = (sofia_cfg.use_q850_reason && sip) ? sofia_reason_parse_cause(sip->sip_reason) : 0;
+					struct sofia_redirect rd;
 
-					sofia_queue_invite_failure(owner, sofia_invite_failure_status(status, sip),
-						(sofia_cfg.use_q850_reason && sip) ? sofia_reason_parse_cause(sip->sip_reason) : 0,
-						overlap_mode == SOFIA_OVERLAP_YES, answered);
+					if (answered) {
+						sofia_queue_invite_failure(owner, fstatus, q850, overlap_mode == SOFIA_OVERLAP_YES, 1);
+					} else {
+						/* A 300/301/302 naming where to call instead is followed as a call forward
+						 * (RFC 3261 §8.1.3.4), as chan_sip does. */
+						sofia_queue_invite_failure_redirect(owner, fstatus, q850, overlap_mode == SOFIA_OVERLAP_YES,
+							sofia_redirect_parse(fstatus, sip, &rd) ? &rd : NULL, pvt->peername);
+					}
 					ast_channel_unref(owner);
 					owner = NULL;
 				}

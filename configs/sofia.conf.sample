@@ -2068,51 +2068,57 @@ tos_video = af41
 ;autodomain = yes
 
 ;
-; --- promiscredir (chan_sip parity, parse-compatibility only) ---
-; chan_sip semantic: when set + outbound INVITE returns 3xx Moved Temporarily
-; → ast_string_field_build call_forward to "SIP/contact_number@host" format
-; (allows remote peer to redirect outbound call via dialplan call-forward
-; mechanism). When clear (default), chan_sip IGNORES 3xx Contact (security
-; default; prevents un-trusted 3xx from hijacking outbound call routing).
+; --- Call forwarding set on the phone: a 300/301/302 answer to our INVITE ---
+; A phone with call forwarding answers the INVITE with a redirection (usually
+; "302 Moved Temporarily") whose Contact header is the new destination, for
+; example Contact: <sip:600123456@pbx.example.com>. The call is then forwarded
+; there, as with chan_sip (RFC 3261 sections 8.1.3.4 and 21.3.1 to 21.3.3).
+; There is nothing to configure.
 ;
-; chan_sip parity citations: chan_sip.c:28173-28175 verbatim parser
-; ast_set2_flag SIP_PROMISCREDIR via handle_common_options indirection
-; (per-peer L28671 + [general] L29544 share single parser branch) +
-; sip.h:251 verbatim flag bit (1<<11) + sip.h:295 SIP_FLAGS_TO_COPY mask
-; peer→dialog inheritance + chan_sip.c:20907-20925 verbatim use site at
-; 3xx Contact handler + 4 display sites L18681 sip show peer + L18801 AMI
-; SIPshowpeer + L19274 sip show settings + L19817 sip show channel
-; (chan_sofia 4th display DEFERRED — sip show channel
-; infrastructure verification needed; future ship).
+; How the forwarded call is made:
+;   * The destination is the USER PART of the Contact (600123456 above). It
+;     is called through the dialplan, as Local/<user part>@<context>, where
+;     <context> is the context= of the account that answered the redirection
+;     (or the channel variable FORWARD_CONTEXT when the dialplan sets it).
+;     The host of the Contact is never called: a call only goes to a declared
+;     peer. What the phone may reach is what that context allows.
+;   * The log shows  Sofia: '<account>' answered 302: the call is forwarded to
+;     '<number>' (Contact host <host>)  and then app_dial's "Now forwarding".
+;   * Dial's option i ("ignore forwarding") keeps the old result: the call
+;     ends as busy and nothing is forwarded.
+;   * The caller gets a "181 Call is being forwarded" and the forwarded call
+;     carries a Diversion header: the Diversion of the redirection when the
+;     phone sent one (number and reason), else the account that redirected,
+;     reason unconditional.
+;   * An extension already dialed in the same call is not dialed again
+;     (app_dial: "Skipping dialing interface ... already been dialed"), so
+;     two phones forwarding to each other do not loop.
 ;
-; chan_sofia design rationale: sofia-sip exposes nua_r_redirect event
-; (nua.h:151) but chan_sofia does NOT currently handle it — no infrastructure
-; to gate. **sofia-sip NUTAG_AUTO_TARGET verified ABSENT** in sofia-sip-1.13
-; (grep zero-hits across nua_tag.h+sip_tag.h+nta_tag.h+tport_tag.h+sdp.h);
-; sofia-sip's 3xx semantic is event-based (nua_r_redirect fires to
-; application) NOT auto-follow tag-based. parse-compatibility only: parse +
-; store + display but NO behavioral implementation.
+; What is followed and what is not:
+;   * 300, 301 and 302 are followed. 305 (Use Proxy) is not: its Contact is a
+;     proxy to send the same call through, not another destination.
+;   * Only a Contact that is a sip: or sips: URI with a user part. With
+;     several Contacts, the one with the highest q, the first among equals.
+;     Parameters of the user part (;phone-context=...) are dropped and
+;     %-escapes are decoded.
+;   * A user part that is empty, longer than an extension (79), or that holds
+;     a '/', a '@' or a character that is not printable ASCII is NOT followed
+;     (the call ends as busy): the dialing application would read it as
+;     "technology/resource" or "extension@context".
+;   * A tel: URI or a redirection without Contact is not followed.
+;   * A redirection to a re-INVITE of a call already answered is not followed.
 ;
-; KNOWN LIMITATION: promiscredir=yes operators get parse-clean migration but
-; chan_sofia continues to ignore 3xx redirects regardless of flag value.
-; Future-fix path: implement nua_r_redirect handler + 3xx Contact parser +
-; ast_channel.call_forward setter (~80-120 LoC follow-up if operator demand
-; surfaces).
+; An account with several phones registered (all ring at once): a redirection
+; from one phone does not stop the others (RFC 3261 section 16.7 step 5: only
+; an answer or a 6xx acts at once). The call is forwarded when no phone
+; answered, none rejected with a 6xx, and every other phone has given its own
+; final answer; while another phone is still ringing nothing is forwarded.
 ;
-; Operator action items:
-;   * operators with chan_sip [general or per-peer] promiscredir= migrate
-;     verbatim zero-rewrite — parse-clean migration; effective behavior
-;     deferred (chan_sofia continues to ignore 3xx redirects regardless of
-;     flag value)
-;   * operators wanting chan_sip 3xx-honor semantic for call-forward
-;     dialplan routing: KNOWN LIMITATION (chan_sofia infrastructure ABSENT;
-;     future-fix path documented above)
-;   * operators NOT setting promiscredir get default 0 (FALSE) = chan_sip
-;     drop-in baseline preserved (3xx ignored uniformly)
-;
-; Reload-required note: changing promiscredir= requires
-; `module reload chan_sofia.so` to update parsed value (no behavioral
-; effect — chan_sofia continues to ignore 3xx regardless).
+; --- promiscredir (read and unused) ---
+; chan_sip, with promiscredir=yes, calls the Contact of a redirection as it
+; is, at the host it names. chan_sofia never does: a call only goes to a
+; declared peer. The key is read (in [general] and in an account) so that a
+; chan_sip configuration loads unchanged, and decides nothing.
 ;
 ;promiscredir = yes
 
@@ -3380,7 +3386,7 @@ session-refresher  = uac       ; auto (sofia-sip nua_any_refresher) / uac (we re
 ;subscribe_event=presence        ; GENERIC OUTBOUND SUBSCRIBE (RFC 6665) — chan_sofia as a SUBSCRIBER for an ARBITRARY event package (DISTINCT from mwi_subscribe above, which is message-summary-only). Format: <event>[;<accept-mime>][;<expires-seconds>]. After this trunk's REGISTER 200 (or at load for static-host peers) chan_sofia SUBSCRIBEs this peer for the named Event package (presence, dialog, reg, conference, presence.winfo, ...) and surfaces each received NOTIFY as the AMI event SofiaEventNotify (fields: SubId = peername:event stable correlation key, Peer, Event, ContentType, SubscriptionState, Reason, Expires, Truncated, BodyBase64 — the raw NOTIFY body base64-encoded, capped at 8KB) plus a LOG NOTICE, WITHOUT interpreting the body. Accept auto-fills the package default (presence→application/pidf+xml, dialog→application/dialog-info+xml, reg→application/reginfo+xml, ...) when omitted; Expires defaults to 3600 (7200 for dialog, RFC 4235). Same lifecycle as mwi_subscribe (outboundproxy Route, reactive auth, failed-initial 30s→300s backoff, sofia-sip-owned refresh, terminated-teardown). Empty = off. v1: peer-only target, one event package per peer, observability surface only (no dialplan/devstate injection yet). Example: subscribe_event=dialog;application/dialog-info+xml;1800
 ;preferred_codec_only=yes       ; preferred_codec_only per-peer parity (chan_sip drop-in): SDP codec-list narrowing — outbound m=audio offers/answers contain ONLY single most-preferred codec instead of full list. Default no. chan_sip parity chan_sip.c:28922-28923 verbatim ast_set2_flag SIP_PAGE2_PREFERRED_CODEC + sip.h:313 flag bit + L10076 use site. chan_sofia extension: applies narrowing to BOTH initial-INVITE-offer AND response (chan_sip narrows RESPONSE-direction only).
 ;ignoresdpversion=yes            ; per-peer RFC 3264 §8 o= version handling (chan_sip process_sdp_o parity); overrides the [general] default. no (default) = HONOR the o= version: a re-offer with the same origin + unchanged (<=) session-version is a no-op, preserving the learned media/RTP remote (so a NATed peer's symmetric-RTP public address survives a keepalive re-offer that re-sends the private c=). yes = IGNORE the version and reprocess every inbound SDP unconditionally (escape hatch for UAs that change media without bumping o=). chan_sip parity SIP_PAGE2_IGNORESDPVERSION.
-;promiscredir=yes                ; promiscredir per-peer parity (chan_sip drop-in parse-compatibility only). chan_sip semantic: when set + outbound INVITE returns 3xx Moved Temporarily → ast_string_field_build call_forward to "SIP/contact_number@host" format (allows remote peer to redirect outbound call via dialplan call-forward mechanism). Default no = chan_sip IGNORES 3xx Contact (security default; prevents un-trusted 3xx hijacking). chan_sofia nua_r_redirect handler ABSENT (sofia-sip exposes nua_r_redirect event in nua.h:151 but chan_sofia doesn't currently handle it); KNOWN LIMITATION promiscredir=yes operators get parse-clean migration but chan_sofia continues to ignore 3xx regardless. Future-fix path: implement nua_r_redirect handler + 3xx Contact parser + ast_channel.call_forward setter (~80-120 LoC). chan_sip parity chan_sip.c:28173-28175 verbatim parser via handle_common_options + sip.h:251 SIP_PROMISCREDIR (1<<11) flag bit + chan_sip.c:20907-20925 use site at 3xx Contact handler.
+;promiscredir=yes                ; Read and unused: a 300/301/302 is always followed through the dialplan with the user part of its Contact, never at the host it names (see "Call forwarding set on the phone" in [general]).
 ;autoframing=yes                 ; autoframing per-peer parity (chan_sip drop-in parse-compatibility only). chan_sip semantic: when set, honor peer-advertised ptime in SDP via ast_codec_pref_setsize for codec packetization size. Default no = chan_sip uses fixed ptime from format prefs. chan_sofia sofia_parse_sdp infrastructure PRESENT but autoframing not implemented today; KNOWN LIMITATION autoframing=yes operators get parse-clean migration but chan_sofia continues to use sofia-sip default ptime negotiation regardless. Future-fix path ~50-70 LoC follow-up. chan_sip parity chan_sip.c:28924-28925 verbatim per-peer parser (DIRECT build_peer NOT handle_common_options) + chan_sip.c:10415 use site at SDP parse + chan_sip.c:12663 use site at SDP generate.
 ;faxdetect=yes                   ; faxdetect per-peer multi-mode parity (chan_sip drop-in parse-compatibility only). 4-state values: no (default; NONE) / cng (1; CNG tone only) / t38 (2; T.38 reinvite only) / yes or cng,t38 (3; BOTH). chan_sip semantic: detect inband fax CNG via ast_dsp DSP_FEATURE_FAX_DETECT + T.38 reinvite from peer; auto-switch to fax handling. chan_sofia DSP infrastructure PRESENT (inband DTMF) but fax-CNG detection is not yet implemented; T.38 infrastructure ABSENT (a future T.38 enhancement). KNOWN LIMITATION faxdetect=yes/cng/t38 operators get parse-clean migration but chan_sofia continues to ignore CNG + T.38 reinvites regardless. Future-fix ~150-200+ LoC within a future T.38 enhancement. chan_sip parity chan_sip.c:28202-28221 verbatim multi-mode parser via handle_common_options + sip.h:341-344 verbatim 2-bit flag encoding + 5+ use sites L4945+L6282+L8186-8288+L10196.
 ;timert1=500                     ; timert1 per-peer parity (chan_sip drop-in, implemented at [general] via NTATAG_SIP_T1). RFC 3261 §17.1.1.1 T1 retransmission interval (default 500ms; ≥ 200ms minimum + ≥ t1min floor per chan_sip parity). Per-peer sscanf %30d + triple-clamp + LOG_WARNING + fallback peer->timer_t1 = sofia_cfg.t1min (chan_sip-faithful floor semantic). chan_sip parity chan_sip.c:28941-28946 verbatim DIRECT build_peer parser. Per-peer dynamic override deferred (future item).
