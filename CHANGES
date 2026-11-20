@@ -1,3 +1,42 @@
+## 1.9.28 — call forwarding set on the phone works: a 300/301/302 is followed as a call forward
+
+`chan_sofia.so` changes; the core (`gabpbx`) only gets the new version string. Sofia-SIP stays at `v2.1.1`.
+
+### Fixed
+
+- **A phone with call forwarding now forwards the call.** Such a phone answers the INVITE with a redirection (usually
+  `302 Moved Temporarily`) whose `Contact` is the new destination. `chan_sofia` ended the call as busy, so the
+  forwarded call never happened; `chan_sip` follows it. Now it is followed too (RFC 3261 §8.1.3.4, §21.3.1-§21.3.3):
+  - the user part of the `Contact` is called through the dialplan, in the context of the account that redirected
+    (`Local/<user part>@<context>`, or `FORWARD_CONTEXT` when the dialplan sets it). The host of the `Contact` is
+    never called: a call only goes to a declared peer, and what a phone may reach is what its context allows;
+  - only a `sip:` or `sips:` `Contact` with a user part; with several, the one with the highest `q`. Parameters of
+    the user part are dropped and `%`-escapes decoded. A user part that is empty, longer than an extension, or that
+    holds `/`, `@` or a character that is not printable ASCII is not followed;
+  - `305 Use Proxy`, a `tel:` URI, a redirection without `Contact`, a redirection of a re-INVITE and `Dial`'s option
+    `i` keep the old result (busy);
+  - the caller gets `181 Call is being forwarded` and the forwarded call a `Diversion`: the one of the redirection
+    when the phone sent it, else the account that redirected, reason `unconditional`;
+  - an extension already dialed in the call is not dialed again, so two phones forwarding to each other do not loop;
+  - an account with several phones ringing at once: a redirection from one does not stop the others (only an answer
+    or a `6xx` acts at once, RFC 3261 §16.7); it is followed when the call ends with a `3xx` as its best response.
+- **The `Diversion` header is read with its display name and its reason.** A `Diversion` with a quoted display name
+  (`"Desk" <sip:...>`) was ignored whole, and `reason=` was never read, so every redirection came out as
+  `unconditional`. Both are read now (RFC 5806 §4), on an incoming call and on a redirection.
+
+### Log lines
+
+- `Sofia: '<account>' answered 302: the call is forwarded to '<number>' (Contact host <host>)`, then the dialing
+  application's `Now forwarding ...`.
+
+See "Call forwarding set on the phone" in `configs/sofia.conf.sample`. `promiscredir` is read and unused.
+
+### Upgrading
+
+Replace `chan_sofia.so` and `gabpbx`, and restart; there is nothing to configure. Phones with call forwarding set
+start forwarding again: the destination is dialed in the context of the account that redirected, as with
+`chan_sip`, so a context that lets a phone call external numbers lets its forwards reach them too.
+
 ## 1.9.27 — a request enters by a valid address of its account or by its digest; calls go only to declared peers
 
 `chan_sofia.so` changes; the core (`gabpbx`) only gets the new version string. Sofia-SIP stays at `v2.1.1`. Access no
