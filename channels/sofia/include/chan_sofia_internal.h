@@ -1252,10 +1252,10 @@ struct sofia_peer {
 	 * public source (no audio). =yes = the old always-reprocess behavior (escape hatch for RFC-violating
 	 * UAs that change media without bumping the version). Default 0 (=no). */
 	int ignoresdpversion;
-	/* flag to honor 3xx Moved-Temporarily redirects via ast_channel.call_forward
-	 * (chan_sip parity). Parse-compatibility only: chan_sofia has no nua_r_redirect handler
-	 * yet, so 3xx is not followed regardless of this flag (LIMITATION in sample.conf).
-	 * Default 0; inherits default_promiscredir. */
+	/* promiscredir= (chan_sip: call the Contact of a 3xx at the host it names). Read and
+	 * unused: a 300/301/302 is always followed through the dialplan with the user part of
+	 * its Contact (sofia_redirect_parse), never at its host. Kept so that a chan_sip
+	 * configuration loads unchanged. Default 0; inherits default_promiscredir. */
 	int promiscredir;
 	/* flag for SDP codec-ptime auto-detection (chan_sip parity). Parse-compatibility only:
 	 * the sofia_parse_sdp autoframing gate is not implemented yet, so this has no behavioral
@@ -1521,7 +1521,7 @@ struct sofia_config {
 	int autocreatepeer;        /* parse-compatibility only: chan_sofia refuses to auto-create unknown peers (stronger via alwaysauthreject default). Default 0 (chan_sip). */
 	int default_preferred_codec_only; /* codec-offer-list narrowing inherited by peers; default 0 (full list) */
 	int default_ignoresdpversion; /* [general] default for peer ignoresdpversion (implemented: o= version stickiness, RFC 3264 §8); default 0 (=honor version) */
-	int default_promiscredir;  /* parse-compatibility only (no nua_r_redirect 3xx-honor handler); default 0 */
+	int default_promiscredir;  /* read and unused: a 3xx is followed through the dialplan (promiscredir); default 0 */
 	int default_autoframing;   /* parse-compatibility only (ptime auto-detect not implemented); default 0 */
 	int default_faxdetect_mode; /* fax CNG/T.38 detection mode inherited by peers; default NONE(0). Handles DSP CNG + T.38 reINVITE detect when set. */
 	int default_t38_maxdatagram; /* T38FaxMaxDatagram override inherited by peers; sentinel -1 = use SOFIA_T38_MAXDATAGRAM_BUILTIN (200) */

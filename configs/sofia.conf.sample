@@ -2700,7 +2700,8 @@ tos_video = af41
 
 ; --- Outbound call failures (always on, chan_sip parity) ---
 ; A final error response to an outbound INVITE reaches the dialplan as it does with chan_sip:
-; 486/600/603 (and a 3xx, which is not followed) give DIALSTATUS=BUSY; 400/410/480/482/500/502/503/504
+; 486/600/603 and a 3xx give DIALSTATUS=BUSY (a 300/301/302 whose Contact names a destination is put
+; on the channel first as a call forward, see "Call forwarding set on the phone"); 400/410/480/482/500/502/503/504
 ; and a 401/407 that could not be answered give CONGESTION; any other error gives CHANUNAVAIL.
 ; ${HANGUPCAUSE} is the status mapped to Q.850 (486 -> 17, 603 -> 21, 503 -> 34, 480 -> 19, 404 -> 1,
 ; 488 -> 58), or, for BUSY/CONGESTION with use_q850_reason=yes, the cause of a received "Reason: Q.850".

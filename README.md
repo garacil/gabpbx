@@ -87,7 +87,8 @@ Every capability is enumerated below, grouped for scanning. Each is real and liv
 | **Path (RFC 3327)** | As a registrar, records and honors the edge-proxy route a phone registered through, rejecting forged Path with `420 Bad Extension`. |
 | **Service-Route (RFC 3608)** | On outbound registration, remembers the provider-mandated route and pre-loads it on outgoing calls. |
 | **SIP Outbound / reg-id + Flow-Timer (RFC 5626)** | Advertises outbound support and a registration ID and honors the provider's flow-keepalive timer, for reliable connectivity behind firewalls. |
-| **Diversion (RFC 5806)** | Carries forwarding history outbound and parses it inbound into redirecting info, with a per-trunk forced-Diversion override. |
+| **Diversion (RFC 5806)** | Carries forwarding history outbound and parses it inbound into redirecting info (number, name and reason), with a per-trunk forced-Diversion override. |
+| **Call forwarding set on the phone (300/301/302)** | A phone that answers with a redirection has the call forwarded, as with `chan_sip`: the user part of its `Contact` is dialed through the dialplan of the account that redirected, never at the host it names. |
 | **SIP history / call-event recording** | A per-call timeline of every SIP request and response for diagnostics, viewable while a call is traced. |
 | **Local anti-abuse SIP blacklist** | Counts and bans abusive source IPs (failed-auth probes, malformed requests, unknown-peer REGISTERs) to blunt brute-force and scanning. |
 

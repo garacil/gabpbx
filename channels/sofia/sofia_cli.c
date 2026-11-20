@@ -445,7 +445,7 @@ char *sofia_cli_show_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 	sofia_cli_peer_line(&buf, "Preferred codec", "%s", AST_CLI_YESNO(peer->preferred_codec_only));
 	/* ignoresdpversion: parse-compatibility only (every SDP is processed). */
 	sofia_cli_peer_line(&buf, "Ignore SDP ver", "%s", AST_CLI_YESNO(peer->ignoresdpversion));
-	/* promiscredir: parse-compatibility only (no nua_r_redirect handler). */
+	/* promiscredir: read and unused (a 300/301/302 is followed through the dialplan). */
 	sofia_cli_peer_line(&buf, "Promisc redir", "%s", AST_CLI_YESNO(peer->promiscredir));
 	/* autoframing: parse-compatibility only (ptime gate not wired). */
 	sofia_cli_peer_line(&buf, "Auto framing", "%s", AST_CLI_YESNO(peer->autoframing));
@@ -909,7 +909,7 @@ char *sofia_cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 	ast_cli(a->fd, "  Use domains as realms:  %s\n", AST_CLI_YESNO(sofia_cfg.domainsasrealm));
 	ast_cli(a->fd, "  Call to non-local dom.: %s\n", AST_CLI_YESNO(sofia_cfg.allow_external_domains));
 	ast_cli(a->fd, "  Auto Domain:            %s\n", AST_CLI_YESNO(sofia_cfg.autodomain));
-	/* promiscredir: parse-compatibility only (no nua_r_redirect handler). */
+	/* promiscredir: read and unused (a 300/301/302 is followed through the dialplan). */
 	ast_cli(a->fd, "  Allow promisc. redir.:  %s\n", AST_CLI_YESNO(sofia_cfg.default_promiscredir));
 	/* matchexternaddrlocally: parse-compatibility only. */
 	ast_cli(a->fd, "  Match extern locally:   %s\n", AST_CLI_YESNO(sofia_cfg.matchexternaddrlocally));

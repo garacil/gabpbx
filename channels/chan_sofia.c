@@ -5399,7 +5399,7 @@ static void sofia_apply_peer_variables(struct sofia_peer *peer, struct ast_varia
 			/* Parse-compat only — chan_sofia processes every SDP unconditionally. */
 			peer->ignoresdpversion = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "promiscredir")) {
-			/* Parse-compat only — chan_sofia has no nua_r_redirect handler. */
+			/* Read and unused: a 300/301/302 is followed through the dialplan (sofia_redirect_parse). */
 			peer->promiscredir = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "autoframing")) {
 			/* Parse-compatibility only — the sofia_parse_sdp ptime gate is not implemented yet. */
@@ -24830,7 +24830,7 @@ static void sofia_parse_general_config(struct ast_config *cfg)
 			 * learned media/NAT remote); yes forces reprocessing of every inbound SDP. */
 			sofia_cfg.default_ignoresdpversion = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "promiscredir")) {
-			/* parse-compatibility only: nua_r_redirect handler ABSENT. */
+			/* Read and unused: a 300/301/302 is followed through the dialplan (sofia_redirect_parse). */
 			sofia_cfg.default_promiscredir = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "autoframing")) {
 			/* parse-compatibility only: sofia_parse_sdp ptime gate not implemented. */
@@ -25568,7 +25568,7 @@ static void sofia_parse_peer_config(const char *cat, struct ast_config *cfg)
 			 * yes forces reprocessing of every inbound SDP. Overrides the [general] default. */
 			peer->ignoresdpversion = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "promiscredir")) {
-			/* parse-compatibility only: nua_r_redirect handler ABSENT. */
+			/* Read and unused: a 300/301/302 is followed through the dialplan (sofia_redirect_parse). */
 			peer->promiscredir = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "autoframing")) {
 			/* parse-compatibility only: sofia_parse_sdp ptime gate not implemented. */
@@ -26198,7 +26198,7 @@ static int sofia_apply_config(struct ast_config *cfg)
 	sofia_cfg.default_preferred_codec_only = 0;
 	/* default NEVER. Partial implementation at sofia_indicate AST_CONTROL_RINGING (YES state). */
 	sofia_cfg.default_progressinband = SOFIA_PROG_INBAND_NEVER;
-	/* parse-compatibility only — nua_r_redirect handler absent. */
+	/* Read and unused: a 300/301/302 is followed through the dialplan (sofia_redirect_parse). */
 	sofia_cfg.default_promiscredir = 0;
 	/* parse-compatibility only — sofia_parse_sdp ptime gate not implemented. */
 	sofia_cfg.default_autoframing = 0;
