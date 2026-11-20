@@ -17737,15 +17737,19 @@ static int sofia_change_redirecting_info(struct sofia_pvt *pvt, struct ast_chann
 
 /* The value of a Diversion header (RFC 5806) -> owner->redirecting "from" (name, number, reason) and
  * the dialplan vars __SIPREDIRECTREASON / __SIPRDNISDOMAIN. Returns 1 on update, 0 when the value
- * holds no SIP or SIPS URI in angle brackets. Takes the channel lock. */
+ * holds no SIP or SIPS URI in angle brackets. Only the first value of the header is read (the latest
+ * diversion). Syntax, RFC 5806 section 4: 1# (name-addr *( ";" diversion_params )): the parameters, the
+ * reason among them, follow the name-addr. Takes the channel lock. */
 static int sofia_diversion_apply(struct ast_channel *owner, const char *div_value)
 {
 	char tmp[256];
+	char *scan = tmp;	/* where the '<' of the name-addr is looked for: after a quoted display name */
 	char *uri;
 	char *user;
 	char *domain = NULL;
-	char *params;
+	char *params = NULL;
 	char *end;
+	char *p;
 	char *redir_name = NULL;
 	char *redir_num = NULL;
 	char *reason_str = NULL;
@@ -17760,23 +17764,39 @@ static int sofia_diversion_apply(struct ast_channel *owner, const char *div_valu
 		end_q = strchr(redir_name, '"');
 		if (end_q) {
 			*end_q = '\0';
+			scan = end_q + 1;
 		}
 	}
 
-	uri = strchr(tmp, '<');
+	uri = strchr(scan, '<');
 	if (!uri) {
 		return 0;
 	}
 	uri++;
 	end = strchr(uri, '>');
 	if (end) {
-		*end = '\0';
+		int quoted = 0;
+
+		*end++ = '\0';
+		/* The parameters of this value end at the comma that starts the next value; a comma inside a
+		 * quoted-string is not one. */
+		for (p = end; *p; p++) {
+			if (*p == '"') {
+				quoted = !quoted;
+			} else if (*p == ',' && !quoted) {
+				*p = '\0';
+				break;
+			}
+		}
+		params = strchr(end, ';');
+		if (params) {
+			params++;
+		}
 	}
 
-	/* Split off ;params before scheme strip + user@domain split. */
-	params = strchr(uri, ';');
-	if (params) {
-		*params++ = '\0';
+	/* The parameters of the URI itself are not part of the number. */
+	if ((p = strchr(uri, ';'))) {
+		*p = '\0';
 	}
 
 	if (!strncasecmp(uri, "sip:", 4)) {
@@ -17810,6 +17830,8 @@ static int sofia_diversion_apply(struct ast_channel *owner, const char *div_valu
 				if (end_q) {
 					*end_q = '\0';
 				}
+			} else {
+				ast_trim_blanks(reason_str);
 			}
 			reason = sofia_reason_str_to_code(reason_str);
 		}
