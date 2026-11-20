@@ -3839,6 +3839,42 @@ static inline int calc_monitor_jump(int samples, int sample_rate, int seek_rate)
 	return samples;
 }
 
+/*!
+ * \brief Rebuild the read translation path of a channel from the format of the voice frame just read.
+ *
+ * A channel may have several native audio formats (a WebRTC leg is answered with every codec both sides
+ * have, and RFC 3264 section 6.1 requires us to receive any of them). ast_set_read_format() picks ONE of
+ * them as the raw read format, the cheapest to translate (A-law when the reader wants signed linear), while
+ * the far end may send another one (Opus). A translator only decodes its own source format: an Opus frame
+ * given to the A-law decoder comes out as noise, six times longer than the audio it carried. Same rule as
+ * ast_set_read_format_path() in later Asterisk versions, keeping the format the reader asked for.
+ *
+ * \note The channel is locked.
+ * \retval 0 the frame can be read
+ * \retval -1 no translation path from that format: drop the frame
+ */
+static int read_path_from_frame(struct ast_channel *chan, format_t raw)
+{
+	format_t core = chan->readformat & AST_FORMAT_AUDIO_MASK;
+	struct ast_trans_pvt *trans = NULL;
+
+	if (!core) {
+		core = raw;	/* nobody asked for a read format: the frame goes up as it came */
+	}
+	if (raw != core && !(trans = ast_translator_build_path(core, raw))) {
+		return -1;
+	}
+	ast_debug(1, "Channel %s reads %s now: read path %s -> %s\n", chan->name, ast_getformatname(raw),
+		ast_getformatname(raw), ast_getformatname(core));
+	if (chan->readtrans) {
+		ast_translator_free_path(chan->readtrans);
+	}
+	chan->readtrans = trans;
+	chan->rawreadformat = raw;
+	chan->readformat = core;
+	return 0;
+}
+
 static struct ast_frame *__ast_read(struct ast_channel *chan, int dropaudio)
 {
 	struct ast_frame *f = NULL;	/* the return value */
@@ -4272,11 +4308,21 @@ static struct ast_frame *__ast_read(struct ast_channel *chan, int dropaudio)
 					ast_frfree(f);
 					f = &ast_null_frame;
 				}
-			} else if ((f->frametype == AST_FRAME_VOICE) && !(f->subclass.codec & chan->nativeformats)) {
-				/* This frame is not one of the current native formats -- drop it on the floor */
+			} else if ((f->frametype == AST_FRAME_VOICE) && !(f->subclass.codec & chan->nativeformats)
+				   && f->subclass.codec != chan->readformat) {
+				/* This frame is not one of the current native formats -- drop it on the floor. A frame
+				 * already in the read format is kept: it was translated before and put back in the read
+				 * queue (__ast_answer() does so with the frames it read while waiting for media). */
 				char to[200];
 				ast_log(LOG_NOTICE, "Dropping incompatible voice frame on %s of format %s since our native format has changed to %s\n",
 					chan->name, ast_getformatname(f->subclass.codec), ast_getformatname_multiple(to, sizeof(to), chan->nativeformats));
+				ast_frfree(f);
+				f = &ast_null_frame;
+			} else if ((f->frametype == AST_FRAME_VOICE) && f->subclass.codec != chan->rawreadformat
+				   && f->subclass.codec != chan->readformat && read_path_from_frame(chan, f->subclass.codec)) {
+				/* A native format the read translation path did not start from, and no path from it to the
+				 * read format: drop the frame (read_path_from_frame() rebuilt the path whenever it could, and
+				 * then the frame goes on below). */
 				ast_frfree(f);
 				f = &ast_null_frame;
 			} else if ((f->frametype == AST_FRAME_VOICE)) {
@@ -4313,7 +4359,10 @@ static struct ast_frame *__ast_read(struct ast_channel *chan, int dropaudio)
 					}
 				}
 
-				if (chan->readtrans && (f = ast_translate(chan->readtrans, f, 1)) == NULL) {
+				/* Only a frame in the raw read format goes through the translator: one already in the read
+				 * format is not translated again. */
+				if (chan->readtrans && f->subclass.codec == chan->rawreadformat
+				    && (f = ast_translate(chan->readtrans, f, 1)) == NULL) {
 					f = &ast_null_frame;
 				}
 
