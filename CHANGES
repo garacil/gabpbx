@@ -1,3 +1,29 @@
+## 1.9.29 — recordings made from a WebRTC phone sending Opus are no longer noise
+
+The core (`gabpbx`) changes; the modules do not. Sofia-SIP stays at `v2.1.1`.
+
+### Fixed
+
+- **A greeting or a message recorded from a WebRTC phone sounded like a machine gun.** A WebRTC leg is answered with
+  every codec both sides have (Opus, A-law, G.722), and RFC 3264 §6.1 requires us to receive any of them. When an
+  application records (voicemail messages and greetings, `Record` with a silence limit, anything that reads signed
+  linear), the core picked A-law, the cheapest source, for the channel's read translator, while the phone sends Opus.
+  Every Opus frame went into the A-law decoder, which read 960 bytes for a 20 ms frame: the packet plus whatever was
+  left in the RTP buffer. The file came out as noise about six times longer than the recording. Playing a file back
+  was never affected: it plays what the file holds.
+  Now a voice frame in one of the channel's codecs that its read translator does not start from rebuilds the read
+  path, from that codec to the format the reader asked for (as `ast_set_read_format_path()` in later Asterisk
+  versions); only a frame in the translator's own codec is translated; and a frame already in the read format (one
+  that `Answer` read while waiting for media and put back) is no longer dropped as an incompatible voice frame.
+- In a call between a WebRTC phone and another phone, the WebRTC leg's Opus now reaches the bridge already in the
+  bridge's format, instead of making the other leg change its write format (`Codec mismatch on channel … setting
+  write format`).
+
+### Upgrading
+
+Replace `gabpbx` and restart; there is nothing to configure. A greeting or a message recorded from a WebRTC phone
+before the upgrade is still noise in its file: record it again.
+
 ## 1.9.28 — call forwarding set on the phone works: a 300/301/302 is followed as a call forward
 
 `chan_sofia.so` changes; the core (`gabpbx`) only gets the new version string. Sofia-SIP stays at `v2.1.1`.
