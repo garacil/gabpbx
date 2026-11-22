@@ -1,3 +1,36 @@
+## 1.9.30 — one recording per call: the one-touch record code only stops what it started
+
+The core (`gabpbx`) changes; the modules do not. Sofia-SIP stays at `v2.1.1`.
+
+### Changed
+
+- **The one-touch record code (`automon`, `*1` in `features.conf`) only stops a recording it started.** The code
+  records the leg of the other party, while a recording the dialplan starts with `Monitor()` lives on the leg that
+  runs the dialplan. So the called party pressing it stopped the dialplan's recording, and the calling party pressing
+  it started a second recording of the same call on the other leg. Now:
+  - when the call is already being recorded on either leg by anything other than the code, pressing it does nothing;
+  - a recording the code starts is marked on its leg with the channel variable `TOUCH_MONITOR_ACTIVE`, and it is
+    stopped when the same party presses the code again;
+  - `automixmon` (`MixMonitor`) is not affected.
+
+### New
+
+- **`BRIDGE_START_APP`: an application run when the call is answered.** Set on the calling leg before it dials
+  (`Set(BRIDGE_START_APP=Application|arguments)` before `Dial()` or `Queue()`), it names an application that runs on
+  that leg once, when somebody has answered and the two legs are about to be joined. `BRIDGEPEER` already names the
+  leg that answered, and the application runs before `AUTO_MONITOR` is read, so it can still ask for the call to be
+  recorded. The variable is cleared before the application runs: a later bridge of the same leg (a consultation call,
+  a transfer) does not run it again. Arguments are separated with `|`; an application that does not exist is ignored.
+
+### Log lines
+
+- `User hit '<code>' but the call is already being recorded on <channel>: nothing to do.` (verbose 4).
+
+### Upgrading
+
+Replace `gabpbx` and restart; there is nothing to configure. A recording the dialplan starts with `Monitor()` can no
+longer be stopped with the one-touch record code by either party.
+
 ## 1.9.29 — recordings made from a WebRTC phone sending Opus are no longer noise
 
 The core (`gabpbx`) changes; the modules do not. Sofia-SIP stays at `v2.1.1`.
