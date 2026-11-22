@@ -2126,6 +2126,33 @@ static int builtin_automonitor(struct ast_channel *chan, struct ast_channel *pee
 
 	set_peers(&caller_chan, &callee_chan, peer, chan, sense);
 
+	/* One recording per call, and the one-touch code only undoes what it did.
+	 *
+	 * The code acts on the leg of the OTHER party (callee_chan here is whoever did not press
+	 * it). A recording the dialplan asked for lives on the leg that runs the dialplan, which is
+	 * this leg when the called party presses the code and the other one when the calling party
+	 * does. So, without this check, the called party pressing the code stopped a recording it
+	 * had not started, and the calling party pressing it started a second recording of the same
+	 * call on the other leg.
+	 *
+	 * A recording started from here is marked on its leg (TOUCH_MONITOR_ACTIVE): that one the
+	 * code may stop. Any other recording, on either leg, is the call's recording and is left
+	 * exactly as it is. */
+	{
+		const char *touch_active;
+		int started_here;
+
+		ast_channel_lock(callee_chan);
+		touch_active = pbx_builtin_getvar_helper(callee_chan, "TOUCH_MONITOR_ACTIVE");
+		started_here = callee_chan->monitor && !ast_strlen_zero(touch_active);
+		ast_channel_unlock(callee_chan);
+		if (!started_here && (callee_chan->monitor || caller_chan->monitor)) {
+			ast_verb(4, "User hit '%s' but the call is already being recorded on %s: nothing to do.\n",
+				code, callee_chan->monitor ? callee_chan->name : caller_chan->name);
+			return AST_FEATURE_RETURN_SUCCESS;
+		}
+	}
+
 	/* Find extra messages */
 	automon_message_start = pbx_builtin_getvar_helper(caller_chan, "TOUCH_MONITOR_MESSAGE_START");
 	automon_message_stop = pbx_builtin_getvar_helper(caller_chan, "TOUCH_MONITOR_MESSAGE_STOP");
@@ -2142,6 +2169,7 @@ static int builtin_automonitor(struct ast_channel *chan, struct ast_channel *pee
 			play_message_in_bridged_call(caller_chan, callee_chan, automon_message_stop);
 		}
 		callee_chan->monitor->stop(callee_chan, 1);
+		pbx_builtin_setvar_helper(callee_chan, "TOUCH_MONITOR_ACTIVE", NULL);
 		return AST_FEATURE_RETURN_SUCCESS;
 	}
 
@@ -2200,6 +2228,10 @@ static int builtin_automonitor(struct ast_channel *chan, struct ast_channel *pee
 	ast_verb(4, "User hit '%s' to record call. filename: %s\n", code, args);
 
 	pbx_exec(callee_chan, monitor_app, args);
+	/* Mark the recording as started from here: the only one the code may stop. */
+	if (callee_chan->monitor) {
+		pbx_builtin_setvar_helper(callee_chan, "TOUCH_MONITOR_ACTIVE", "1");
+	}
 	pbx_builtin_setvar_helper(callee_chan, "TOUCH_MONITOR_OUTPUT", touch_filename);
 	pbx_builtin_setvar_helper(caller_chan, "TOUCH_MONITOR_OUTPUT", touch_filename);
 
@@ -4112,6 +4144,36 @@ int ast_bridge_call(struct ast_channel *chan, struct ast_channel *peer, struct a
 	 * out of parking gets told that the channel it just got bridged to is still ringing. */
 	if (chan->_state == AST_STATE_RINGING && peer->visible_indication != AST_CONTROL_RINGING) {
 		ast_indicate(peer, AST_CONTROL_RINGING);
+	}
+
+	/* One-shot bridge-start application. Before it dials, the calling leg can name an
+	 * application to run on it once somebody has answered and the two legs are about to be
+	 * joined: BRIDGE_START_APP = "Application|arguments". BRIDGEPEER (set above) tells it who
+	 * answered. The variable is cleared before the application runs, so it runs once: a later
+	 * bridge of the same leg (a consultation call, a transfer) does not repeat it. It runs
+	 * before AUTO_MONITOR is looked at, so it can still ask for the call to be recorded. */
+	{
+		const char *start_app;
+		char *start_name = NULL;
+
+		ast_channel_lock(chan);
+		start_app = pbx_builtin_getvar_helper(chan, "BRIDGE_START_APP");
+		if (!ast_strlen_zero(start_app)) {
+			start_name = ast_strdupa(start_app);
+		}
+		ast_channel_unlock(chan);
+		if (start_name) {
+			struct ast_app *start_exec;
+			char *start_args = strchr(start_name, '|');
+
+			if (start_args) {
+				*start_args++ = '\0';
+			}
+			pbx_builtin_setvar_helper(chan, "BRIDGE_START_APP", NULL);
+			if ((start_exec = pbx_findapp(start_name))) {
+				pbx_exec(chan, start_exec, S_OR(start_args, ""));
+			}
+		}
 	}
 
 	if (monitor_ok) {
