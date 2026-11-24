@@ -19480,8 +19480,9 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		if (old) {
 			if (old->nh == nh) {
 				/* In-dialog refresh on the same handle. SUBSCRIBE is APPL_METHOD so
-				 * we MUST nua_respond(202) (else the watcher retransmits then drops
-				 * the sub). Extend lifetime, re-emit state. */
+				 * we MUST nua_respond a 2xx (else the watcher retransmits then drops
+				 * the sub): 200, as chan_sip (RFC 6665 §8.3.1: no 202 to a SUBSCRIBE;
+				 * see the initial accept below). Extend lifetime, re-emit state. */
 				char eb[16];
 				int st;
 				old->expires = expires;
@@ -19492,7 +19493,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 				}
 				snprintf(eb, sizeof(eb), "%d", expires);
 				/* routable Contact user = watched exten (see the initial-accept note below). */
-				nua_respond(nh, SIP_202_ACCEPTED, NUTAG_WITH_THIS(nua),
+				nua_respond(nh, SIP_200_OK, NUTAG_WITH_THIS(nua),
 					NUTAG_M_USERNAME(old->exten),
 					TAG_IF(old->contact[0], SIPTAG_CONTACT_STR(old->contact)),
 					SIPTAG_EXPIRES_STR(eb), TAG_END());
@@ -19610,7 +19611,11 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	/* Accept with 2xx (server idiom: nua_respond + NUTAG_WITH_THIS binds the response
 	 * to THIS pending transaction — nua_notifier does not answer it). Then push the
 	 * initial NOTIFY (RFC 6665 §4.4.1); NUTAG_SUBSTATE makes sofia-sip own
-	 * Subscription-State + expiry/refresh. */
+	 * Subscription-State + expiry/refresh. The 2xx is 200, as chan_sip answers a presence or
+	 * dialog SUBSCRIBE (handle_request_subscribe) and as this driver answers MWI and an unsubscribe:
+	 * RFC 6665 §8.3.1 deprecates 202 and an implementation MUST NOT send it to a SUBSCRIBE (nor to a
+	 * NOTIFY). sofia-sip treats every 2xx alike (nua_subscribe_server_respond). REFER and MESSAGE
+	 * keep their 202, as in chan_sip (RFC 3515 §2.4.2, RFC 3428 §7). */
 	{
 		char expires_buf[16];
 		snprintf(expires_buf, sizeof(expires_buf), "%d", expires);
@@ -19619,7 +19624,7 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		 * Contact:<sip:*@ourip> makes the watcher refresh in-dialog to SUBSCRIBE sip:* -> 404/481 ->
 		 * the sub dies at its first refresh (BLF watchers decay). The stack applies these tags before
 		 * Contact generation (nua_server.c:455/584); keep the correct host:port it fills. */
-		nua_respond(nh, SIP_202_ACCEPTED, NUTAG_WITH_THIS(nua),
+		nua_respond(nh, SIP_200_OK, NUTAG_WITH_THIS(nua),
 			NUTAG_M_USERNAME(l_exten),
 			TAG_IF(l_contact[0], SIPTAG_CONTACT_STR(l_contact)),
 			SIPTAG_EXPIRES_STR(expires_buf), TAG_END());
