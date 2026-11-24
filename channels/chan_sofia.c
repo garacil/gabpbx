@@ -19537,22 +19537,39 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	ast_copy_string(sub->watcher_addr, ast_sockaddr_stringify(&src), sizeof(sub->watcher_addr));
 
 	/* Event package -> body format + NOTIFY Event header. dialog -> dialog-info;
-	 * presence -> pidf/xpidf/cpim by Accept. */
+	 * presence -> by Accept, in chan_sip's order (handle_request_subscribe): application/pidf+xml whenever it is
+	 * listed, else dialog-info+xml, else cpim-pidf+xml, else xpidf+xml; no Accept, or none of these, -> pidf+xml
+	 * (RFC 3856 §6.5: the package default). RFC 3856 §6.5: every presence subscriber and notifier MUST support
+	 * pidf+xml, and the Accept of a presence SUBSCRIBE MUST include it; a watcher that also lists xpidf+xml
+	 * (Accept: application/pidf+xml, application/xpidf+xml) gets pidf+xml, as under chan_sip. Taking the first
+	 * other type listed instead sent such a watcher XPIDF, whose <status status="inuse"/> for an extension in a
+	 * call is shown as disconnected by softphones that read only "open" there; PIDF says <basic>open</basic> with
+	 * the activity "busy". One Accept list: several Accept header fields are one list (RFC 3261 §7.3.1), where
+	 * chan_sip decides on the first field naming one of the four. chan_sip's exception for a Polycom User-Agent
+	 * (XPIDF although it lists pidf+xml) is not copied: no rule for one make of device. */
 	if (!strcasecmp(event, "dialog") || !strcasecmp(event, "dialog-info")) {
 		sub->format = SOFIA_SUB_DIALOG_INFO;
 		ast_copy_string(sub->event, "dialog", sizeof(sub->event));
 	} else {
-		sip_accept_t *ac = sip->sip_accept;
-		sub->format = SOFIA_SUB_PIDF;
-		for (; ac; ac = ac->ac_next) {
-			if (ac->ac_type && !strcasecmp(ac->ac_type, "application/xpidf+xml")) {
-				sub->format = SOFIA_SUB_XPIDF; break;
-			} else if (ac->ac_type && !strcasecmp(ac->ac_type, "application/cpim-pidf+xml")) {
-				sub->format = SOFIA_SUB_CPIM_PIDF; break;
-			} else if (ac->ac_type && !strcasecmp(ac->ac_type, "application/dialog-info+xml")) {
-				sub->format = SOFIA_SUB_DIALOG_INFO; break;
+		sip_accept_t *ac;
+		int has_pidf = 0, has_dialog = 0, has_cpim = 0, has_xpidf = 0;
+
+		for (ac = sip->sip_accept; ac; ac = ac->ac_next) {
+			if (!ac->ac_type) {
+				continue;
+			}
+			if (!strcasecmp(ac->ac_type, "application/pidf+xml")) {
+				has_pidf = 1;
+			} else if (!strcasecmp(ac->ac_type, "application/dialog-info+xml")) {
+				has_dialog = 1;
+			} else if (!strcasecmp(ac->ac_type, "application/cpim-pidf+xml")) {
+				has_cpim = 1;
+			} else if (!strcasecmp(ac->ac_type, "application/xpidf+xml")) {
+				has_xpidf = 1;
 			}
 		}
+		sub->format = has_pidf ? SOFIA_SUB_PIDF : has_dialog ? SOFIA_SUB_DIALOG_INFO :
+			has_cpim ? SOFIA_SUB_CPIM_PIDF : has_xpidf ? SOFIA_SUB_XPIDF : SOFIA_SUB_PIDF;
 		ast_copy_string(sub->event,
 			sub->format == SOFIA_SUB_DIALOG_INFO ? "dialog" : "presence", sizeof(sub->event));
 	}
