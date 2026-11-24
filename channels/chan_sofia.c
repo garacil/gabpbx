@@ -463,6 +463,25 @@ static AST_LIST_HEAD_STATIC(domain_list, sofia_domain);
 static const char *sofia_pick_auth_username(sip_t const *sip,
 		const char *fallback_user, char *buf, size_t len);
 
+/* The account name a URI user part stands for, its %-escapes decoded. RFC 3261 §19.1.2: a character the
+ * user part may not carry as it is MUST be escaped (a phone sends the account año200 as sip:a%C3%B1o200@...,
+ * with username="año200" in its digest); §19.1.4: a character outside the reserved set is equivalent to its escaped
+ * form; §10.3 step 5: the registrar converts escaped characters to their unescaped form. chan_sip does the same with
+ * pedantic=yes, its default (SIP_PEDANTIC_DECODE of the name in register_verify,
+ * chan_sip.c:15963, and in check_user_full, :17444). Without it the account was «unknown peer» (403, the address
+ * banned at the fifth). sofia-sip leaves escaped only what may not appear unescaped (url.c), so every '%' left is one
+ * escape and one decode is exact. Returns user itself when it has no '%', else buf (an account name is far shorter
+ * than any buf passed here). */
+static const char *sofia_uri_user_decoded(const char *user, char *buf, size_t len)
+{
+	if (!user || !strchr(user, '%') || !buf || !len) {
+		return user;
+	}
+	ast_copy_string(buf, user, len);
+	ast_uri_decode(buf);
+	return buf;
+}
+
 struct sofia_peer;
 struct sofia_pvt; /* fwd decl — sofia_send_auth_challenge below threads a pvt* to pin (deferred-reject race fence) */
 enum sofia_auth_result {
@@ -12105,7 +12124,11 @@ static void sofia_process_invite(nua_t *nua, nua_handle_t *nh, struct sofia_pvt 
 
 	if (sip->sip_from) {
 		if (sip->sip_from->a_url->url_user) {
-			snprintf(cid_num, sizeof(cid_num), "%.79s", sip->sip_from->a_url->url_user);
+			char from_user_buf[256];
+
+			/* Decoded, as chan_sip sets cid_num and looks the caller up (check_user_full). */
+			snprintf(cid_num, sizeof(cid_num), "%.79s",
+				sofia_uri_user_decoded(sip->sip_from->a_url->url_user, from_user_buf, sizeof(from_user_buf)));
 			/* shrinkcallerid: strip before the username + cid_num assignments
 			 * below so both reflect it. Default TRUE. */
 			if (sofia_cfg.shrinkcallerid && ast_is_shrinkable_phonenumber(cid_num)) {
@@ -15419,6 +15442,7 @@ struct sofia_peer *sofia_message_authenticate_sender(nua_t *nua, nua_handle_t *n
 		int *challenged)
 {
 	const char *from_user = NULL;
+	char from_user_buf[256];
 	char auth_user_buf[128];
 	const char *auth_user;
 	struct sofia_peer *peer;
@@ -15427,7 +15451,8 @@ struct sofia_peer *sofia_message_authenticate_sender(nua_t *nua, nua_handle_t *n
 		*challenged = 0;
 	}
 	if (sip && sip->sip_from && sip->sip_from->a_url) {
-		from_user = sip->sip_from->a_url->url_user;
+		/* The account the From names, its %-escapes decoded. */
+		from_user = sofia_uri_user_decoded(sip->sip_from->a_url->url_user, from_user_buf, sizeof(from_user_buf));
 	}
 	auth_user = sofia_pick_auth_username(sip, from_user, auth_user_buf, sizeof(auth_user_buf));
 	peer = (!ast_strlen_zero(auth_user)) ? sofia_find_peer(auth_user) : NULL;
@@ -16533,7 +16558,9 @@ static enum sofia_register_nh_fate sofia_process_register_impl(nua_t *nua, nua_h
 	}
 	realm = sofia_get_realm_for_dialog(sip, realm_buf, sizeof(realm_buf));
 
-	user = sip->sip_from->a_url->url_user;
+	/* The account the REGISTER is for, its %-escapes decoded (RFC 3261 §10.3 step 5). */
+	char from_user_buf[256];
+	user = sofia_uri_user_decoded(sip->sip_from->a_url->url_user, from_user_buf, sizeof(from_user_buf));
 	domain = sip->sip_from->a_url->url_host;
 
 	if (sofia_debug) {
@@ -18847,7 +18874,9 @@ static void sofia_process_mwi_subscribe(nua_t *nua, nua_handle_t *nh,
 		sofia_mwi_reject_reap(nh);	/* reap the challenge handle */
 		return;
 	}
-	from_user = sip->sip_from->a_url->url_user;
+	/* Its %-escapes decoded, as chan_sip's check_user_full does. */
+	char from_user_buf[256];
+	from_user = sofia_uri_user_decoded(sip->sip_from->a_url->url_user, from_user_buf, sizeof(from_user_buf));
 
 	peer = sofia_find_peer(from_user);
 	if (!peer && sofia_peer_lookup_failed()) {
@@ -19153,7 +19182,9 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	}
 	to_user = sip->sip_to->a_url->url_user;
 	to_host = sip->sip_to->a_url->url_host;
-	from_user = sip->sip_from->a_url->url_user;
+	/* The subscriber account, its %-escapes decoded, as chan_sip's check_user_full does. */
+	char from_user_buf[256];
+	from_user = sofia_uri_user_decoded(sip->sip_from->a_url->url_user, from_user_buf, sizeof(from_user_buf));
 	/* The watched extension is the user part of the Request-URI, "s" when it has none: chan_sip looks the
 	 * hint up with it (get_destination, chan_sip.c:16595, 26221-26223), as the INVITE path here does. The
 	 * To keeps naming the entity of the NOTIFY body, as chan_sip's mto (chan_sip.c:13926-13932). */
