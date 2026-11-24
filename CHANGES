@@ -1,3 +1,54 @@
+## 1.9.32 — a PBX at a static address presents its extensions' calls under their own names
+
+`chan_sofia.so` changes; the core (`gabpbx`) only gets the new version string. Sofia-SIP stays at `v2.1.1`.
+
+### Changed
+
+- **An account with a static host named in `From` is taken from a valid address of an account of its
+  `accountcode`.** A PBX validated by its static address may present the calls of its extensions under their own
+  names, when each extension is an account of the same `accountcode` whose host is where the calls to it are sent
+  (for example a registrar the extensions register with). Until now only a `host=dynamic` account named in `From` was
+  taken from such an address; an account with a static host was taken as the account that owns the address, so every
+  call of the PBX came out with the PBX's own account: its extension, its name and its caller ID. Now a valid address
+  of another account with the same, non-empty `accountcode` (its static host and port, any port with `insecure=port`,
+  or a registration that has not lapsed) makes the request the named account's, whatever the host of that account.
+  Unchanged:
+  - the `secret` of an account with a static host is never used for what reaches the PBX;
+  - an address that belongs to no account is refused;
+  - from the exact address of an account of another `accountcode` the call is that account's;
+  - an empty `accountcode` groups nothing;
+  - a `type=peer` account is not identified by its name in `From`, as in `chan_sip`.
+
+### Fixed
+
+- **An account whose name has a character that must be escaped in a URI is found.** A phone sends such a name
+  `%`-escaped in its URIs (`sip:a%C3%B1o200@...` for the account `año200`, with the name unescaped in its digest).
+  `chan_sofia` looked the escaped text up and answered `403`, and the address was banned after the fifth failure. The
+  user part is now decoded before the account is looked up, in `REGISTER`, `INVITE` (the caller ID number too),
+  `MESSAGE` and `SUBSCRIBE` (RFC 3261 §19.1.2, §19.1.4, §10.3 step 5), as `chan_sip` does with `pedantic=yes`, its
+  default.
+- **A registration that binds clears its address from the blacklist, as in `chan_sip`.** With several devices behind
+  one address, the failures of one of them (an account that does not exist, a line with a wrong password) banned the
+  address, and the good accounts behind it got `500` to every `REGISTER`. A `REGISTER` that authenticates and binds at
+  least one `Contact` now deletes the failure count of its address. An address already banned stays banned until its
+  ban expires; a de-registration or a query clears nothing.
+
+### Log lines
+
+- `Sofia blacklist host <address> deleted (counter was <n>/<max>): an account registered from it` (debug).
+- `Sofia: source check: <method> as '<account>' from <address>, other account address: taken as '<owner>', whose
+  address it is` (and the event `SourceCheck`) is no longer written for an account with a static host named from a
+  valid address of an account of its `accountcode`.
+
+See "Who enters without a password: a valid address" in `configs/sofia.conf.sample`.
+
+### Upgrading
+
+Replace `chan_sofia.so` and `gabpbx`, and restart; there is nothing to configure. A PBX that presents its extensions'
+calls under their names from its static address gets each call as the extension's own (its context, caller ID and
+accountcode) instead of the PBX account's. To keep such calls on the PBX account, give the extensions' accounts
+another `accountcode`, or make them `type=peer`.
+
 ## 1.9.30 — one recording per call: the one-touch record code only stops what it started
 
 The core (`gabpbx`) changes; the modules do not. Sofia-SIP stays at `v2.1.1`.
