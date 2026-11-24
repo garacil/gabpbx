@@ -6844,9 +6844,12 @@ static int sofia_host_resolves_to(const char *host, const struct ast_sockaddr *s
  * port, or a registration that has not lapsed with the port it came from; any port of that address when the account
  * has insecure=port or the transport is connection-oriented (sofia_peer_source_match); and, for a host given by name,
  * any address the name resolves to, with the same rule for the port. *owner_out gets the other account (+1 ref) for
- * SOFIA_SRCV_SIBLING and SOFIA_SRCV_OTHER, else NULL. An account with no accountcode has no siblings, and neither has
- * an account that is not host=dynamic: it is only ever at its own host. Not under any peer lock (the lookups take
- * them, and the realtime one queries). */
+ * SOFIA_SRCV_SIBLING and SOFIA_SRCV_OTHER, else NULL. A SIBLING address is a valid address of another account with
+ * the same accountcode (its static host and port, or a live registration of it), whatever the host of the account
+ * named: a box validated by its address may present the calls of the other accounts of its accountcode under their
+ * own names (a PBX at a static address whose extensions are accounts whose host is where calls to them are sent).
+ * The root needs no check: the box only loads the rows of its own root. An account with no accountcode has no
+ * siblings. Not under any peer lock (the lookups take them, and the realtime one queries). */
 static int sofia_source_verdict(struct sofia_peer *named, const struct ast_sockaddr *src, int req_conn,
 	struct sofia_peer **owner_out)
 {
@@ -6870,9 +6873,6 @@ static int sofia_source_verdict(struct sofia_peer *named, const struct ast_socka
 	if (!dynamic && !ast_sockaddr_parse(&parsed, host, PARSE_PORT_FORBID)
 			&& (any_port || port == ast_sockaddr_port(src)) && sofia_host_resolves_to(host, src)) {
 		return SOFIA_SRCV_OWN;	/* another address of its host name */
-	}
-	if (!dynamic) {
-		acc_named[0] = '\0';	/* a static account is only at its own host: no sibling stands for it */
 	}
 	if (!ast_strlen_zero(acc_named) && (owner = sofia_find_sibling_at(named, acc_named, src, req_conn))) {
 		*owner_out = owner;
@@ -7018,14 +7018,14 @@ static void sofia_source_report(sip_t const *sip, const char *method, const char
 }
 
 /* The source check of a request that names the account `named` (sofia_thread). No option changes it. The request is
- * the account's without a password only from a valid address of the account (sofia_source_verdict), or, for a
- * host=dynamic account, from a valid address of an account with its accountcode: that address stands for the
- * password, whatever insecure= says and whether the account has a secret or not. From the address of another account
- * the request is that account's, as it is when no account is named. From any other address a host=dynamic account
- * answers its digest if it has a secret (a device that moved, whose port changed or whose registration lapsed still
- * calls, with its password). An account that is not host=dynamic is only ever at its host: its secret is ignored for
- * what reaches us (sofia_peer_can_prove), and from anywhere else it gets the answers of an unknown name, as an account
- * with no secret does. *owner_out holds a +1 ref only with SOFIA_SRCACT_OWNER. */
+ * the account's without a password only from a valid address of the account (sofia_source_verdict), or from a valid
+ * address of another account with its accountcode, host=dynamic or not: that address stands for the password,
+ * whatever insecure= says and whether the account has a secret or not. From the address of an account of another
+ * accountcode the request is that account's, as it is when no account is named. From any other address a host=dynamic
+ * account answers its digest if it has a secret (a device that moved, whose port changed or whose registration lapsed
+ * still calls, with its password). The secret of an account that is not host=dynamic is ignored for what reaches us
+ * (sofia_peer_can_prove): from an address that is neither its own nor one of its accountcode it gets the answers of an
+ * unknown name, as an account with no secret does. *owner_out holds a +1 ref only with SOFIA_SRCACT_OWNER. */
 static int sofia_source_check(nua_t *nua, struct sofia_peer *named, sip_t const *sip, const char *method,
 	struct sofia_peer **owner_out)
 {
@@ -14773,8 +14773,8 @@ static int sofia_nonce_replay_check(const char *nonce, unsigned int nc, time_t i
 }
 
 /* A request other than INVITE that names an account that cannot prove it with a digest (no secret, or not
- * host=dynamic: sofia_peer_can_prove): it is the account's only from one of its addresses, or, for a host=dynamic
- * account, of an account with its accountcode (sofia_source_check).
+ * host=dynamic: sofia_peer_can_prove): it is the account's only from one of its addresses, or from one of an account
+ * with its accountcode (sofia_source_check).
  * Returns 0 to go on, 1 when it was answered (the answers of an unknown name, or 503): the caller releases what it
  * holds. */
 static int sofia_source_gate_nosecret(nua_t *nua, nua_handle_t *nh, sip_t const *sip, struct sofia_peer *peer,

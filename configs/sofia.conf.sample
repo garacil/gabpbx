@@ -2953,8 +2953,10 @@ tos_video = af41
 ;   - any port of that address only with insecure=port; and, for a static
 ;     account set to transport=tcp, tls, ws or wss, a request that arrives
 ;     over a connection (its source port is never the listening one);
-;   - or, for a host=dynamic account, such an address of another account with
-;     the same accountcode (a static account is only ever at its own host);
+;   - or such an address of another account with the same accountcode,
+;     whatever the host of the account named: a PBX at a static address may
+;     present the calls of its extensions (accounts of its accountcode whose
+;     host is where calls to them are sent) under their own names;
 ;   - after a restart, the registration the row of a host=dynamic account
 ;     kept, when it was made before the restart, until the device registers
 ;     again (or it can no longer be current: its instant + maxexpiry): a
@@ -2973,7 +2975,8 @@ tos_video = af41
 ;     digest and enters; one with no secret can prove nothing and gets the
 ;     answers of a name that is not an account (401, 403);
 ;   - a static account (host=<address> or host=<name>) never enters from
-;     anywhere but its host: its secret is not used for anything that reaches
+;     anywhere but its host or a valid address of an account of its
+;     accountcode: its secret is not used for anything that reaches
 ;     us, so even the right password gets the answers of a name that is not
 ;     an account (401, 403). Its secret still answers the challenge of its
 ;     host when this PBX calls it (and a register=> line registers with its
