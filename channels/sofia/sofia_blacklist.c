@@ -227,6 +227,44 @@ int sofia_blacklist_check_sip(sip_t const *sip)
 
 	return 1;
 }
+/* Delete the source IP of sip from the blacklist: an account has just registered from it (chan_sip parity:
+ * parse_register_contact calls _sip_blacklist_delete on every registration that binds). Behind one NAT, the
+ * failures of a device that will never register (an account that does not exist, a wrong password on a second
+ * line) otherwise ban the address, and with it every good account behind it. Only an address that is not banned
+ * is deleted: a banned one stays banned until its ban expires, whatever registers. Its requests are dropped
+ * before the registrar anyway (the gate and the registrar both run on sofia_thread); the test here keeps the
+ * rule if that ever changes. */
+void sofia_blacklist_forgive_sip(sip_t const *sip)
+{
+	struct sofia_blacklist_entry key;
+	struct sofia_blacklist_entry *entry;
+	int counter = 0, deleted = 0;
+
+	memset(&key, 0, sizeof(key));
+	if (!sofia_blacklist_enabled || !sofia_blacklist
+			|| sofia_blacklist_ip_from_sip(sip, key.ip, sizeof(key.ip)) < 0) {
+		return;
+	}
+
+	ast_mutex_lock(&sofia_blacklist_lock);
+	entry = ao2_find(sofia_blacklist, &key, OBJ_POINTER);
+	if (entry) {
+		int expired = sofia_blacklist_ttl > 0 && entry->last_seen > 0
+			&& (time(NULL) - entry->last_seen) > sofia_blacklist_ttl;
+
+		counter = entry->counter;
+		if (expired || entry->counter < sofia_blacklist_count) {
+			ao2_unlink(sofia_blacklist, entry);
+			deleted = 1;
+		}
+		ao2_ref(entry, -1);
+	}
+	ast_mutex_unlock(&sofia_blacklist_lock);
+	if (deleted && option_debug > 3) {
+		ast_log(LOG_DEBUG, "Sofia blacklist host %s deleted (counter was %d/%d): an account registered from it\n",
+			key.ip, counter, sofia_blacklist_count);
+	}
+}
 /* CLI `sip show blacklist`. */
 char *sofia_cli_show_blacklist(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {

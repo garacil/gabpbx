@@ -16775,6 +16775,12 @@ static enum sofia_register_nh_fate sofia_process_register_impl(nua_t *nua, nua_h
 			NUTAG_WITH_THIS(nua),
 			TAG_END());
 		ast_free(rsp_contacts);
+		/* A registration that binds clears its address from the blacklist, as chan_sip does
+		 * (parse_register_contact): the failures of another device behind the same NAT must not ban the
+		 * accounts that register there. A de-registration or a query (granted_top 0) clears nothing. */
+		if (granted_top > 0) {
+			sofia_blacklist_forgive_sip(sip);
+		}
 		/* The Registered event's "Expire" must be the TTL this 200 OK GRANTS (granted_top: the primary
 		 * Contact's ;expires= param, else the Expires header, capped), because that is the value the phone
 		 * honours for its refresh and the value a consumer expires the account on. sofia_update_peer_contacts
