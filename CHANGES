@@ -1,3 +1,28 @@
+## 1.9.33 — presence as in `chan_sip`: PIDF for a watcher that lists it, and `200` to its `SUBSCRIBE`
+
+`chan_sofia.so` changes; the core (`gabpbx`) only gets the new version string. Sofia-SIP stays at `v2.1.1`.
+
+### Fixed
+
+- **A presence watcher that lists `application/pidf+xml` in its `Accept` gets PIDF, as in `chan_sip`.** Softphones
+  subscribe with `Accept: application/pidf+xml, application/xpidf+xml`. `chan_sofia` took the first of `xpidf+xml`,
+  `cpim-pidf+xml` and `dialog-info+xml` it found in the list and sent them XPIDF, where an extension in a call is
+  `<status status="inuse"/>`: softphones that read only `open` there showed the extension as disconnected while it was
+  in a call. The format is now chosen over the whole `Accept` list in `chan_sip`'s order: `pidf+xml`,
+  `dialog-info+xml`, `cpim-pidf+xml`, `xpidf+xml`; with no `Accept`, or none of these, `pidf+xml` (RFC 3856 §6.5: the
+  format every presence watcher and notifier must support). In PIDF an extension in a call is `<basic>open</basic>`
+  with the activity `busy`. A presence `SUBSCRIBE` that listed `dialog-info+xml` before `pidf+xml` got
+  `dialog-info+xml` with `Event: dialog`; it now gets PIDF with `Event: presence`. The body of each format does not
+  change. `chan_sip`'s exception for one make of phone (XPIDF although it lists `pidf+xml`) is not copied.
+- **A presence or dialog (BLF) `SUBSCRIBE` is answered `200 OK`, as in `chan_sip`.** The first `SUBSCRIBE` and its
+  in-dialog refresh were answered `202 Accepted`, which RFC 6665 §8.3.1 deprecates: an implementation must not send it
+  to a `SUBSCRIBE` or a `NOTIFY`. Message-waiting subscriptions and an unsubscribe were already answered `200`.
+  `REFER` and `MESSAGE` keep their `202` (RFC 3515 §2.4.2, RFC 3428 §7).
+
+### Upgrading
+
+Replace `chan_sofia.so` and `gabpbx`, and restart; there is nothing to configure.
+
 ## 1.9.32 — a PBX at a static address presents its extensions' calls under their own names
 
 `chan_sofia.so` changes; the core (`gabpbx`) only gets the new version string. Sofia-SIP stays at `v2.1.1`.
