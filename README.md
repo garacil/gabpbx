@@ -7,7 +7,7 @@ Website: **<https://gabpbx.org/>** · en español: **<https://gabpbx.org/es/>** 
 [Releases](https://github.com/garacil/gabpbx/releases) · [Wiki](https://github.com/garacil/gabpbx/wiki) ·
 [Changes](CHANGES)
 
-## GABPBX 1.9.33 — the star is `chan_sofia`
+## GABPBX 1.9.34 — the star is `chan_sofia`
 
 GABPBX keeps the Asterisk architecture as it is: modules, the PBX core, the dialplan, the AMI and the realtime engines
 (`extconfig.conf`, `sippeers`, `sipregs`). Its new work is in the SIP channel: **`chan_sofia`**, a SIP channel driver

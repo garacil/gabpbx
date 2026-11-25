@@ -1,3 +1,25 @@
+## 1.9.34 — a BLF or presence key watching an extension that has not registered since a restart gets its state
+
+`chan_sofia.so` changes; the core (`gabpbx`) only gets the new version string. Sofia-SIP stays at `v2.1.1`.
+
+### Fixed
+
+- **A `SUBSCRIBE` to an extension whose realtime account is not loaded yet is accepted.** The dialplan hint of a
+  realtime account (`regexten` in its `subscribecontext`, device `SIP/<name>`) exists only once the account has been
+  loaded, by a registration or a call, in `chan_sofia` as in `chan_sip`, and a restart empties the hints. Until the
+  watched extension registered again, a BLF or presence `SUBSCRIBE` to it was answered `404 Not Found`, which says the
+  user does not exist (RFC 3261 §21.4.5). Some phones never subscribe again after a `404` and their key stays dark;
+  others retry every few seconds for as long as the account stays unloaded. `chan_sofia` already loaded the watched
+  account on demand, but looked it up by the extension as a name, and an account's name need not be its extension.
+  It now also loads the realtime account whose `regexten` is the extension in the watcher's `subscribecontext`, the
+  two fields its hint is placed with, and answers `200 OK` with a `NOTIFY` of its current state, such as not
+  registered (RFC 6665 §4.2.1.1, §4.2.1.2). An extension of another `subscribecontext`, or of no account, is still
+  answered `404`. A `regexten` with several extensions (`ext1&ext2`) or an `@context` is not matched.
+
+### Upgrading
+
+Replace `chan_sofia.so` and `gabpbx`, and restart; there is nothing to configure.
+
 ## 1.9.33 — presence as in `chan_sip`: PIDF for a watcher that lists it, and `200` to its `SUBSCRIBE`
 
 `chan_sofia.so` changes; the core (`gabpbx`) only gets the new version string. Sofia-SIP stays at `v2.1.1`.
