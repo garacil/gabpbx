@@ -19144,6 +19144,69 @@ static int sofia_devicestate(void *data)
 	return res;
 }
 
+/* After a restart no realtime account has its hint until something loads it (a registration, a call), so a SUBSCRIBE
+ * to an extension that exists found no hint and was answered 404 (sqlite 236), and a phone that gets a 404 may never
+ * subscribe again (RFC 6665 §4.1.2.1: no subscription exists after it). The hint of a realtime account is
+ * <regexten>@<subscribecontext> -> SIP/<name> (sofia_create_peer_hint; chan_sip.c:5623-5630 places it with the same two
+ * fields), and the account's name need not be its extension: «office202», regexten 202, subscribecontext of its PBX.
+ * This loads the account whose hint the watcher asks for: the realtime row with regexten = <exten> and
+ * subscribecontext = <context> (the backend adds the box's root), built from that row as the by-address lookup does
+ * (sofia_find_peer_impl with the row: no second query), which links it and creates its hint; an account already in
+ * memory gets its hint made sure of. With several rows, the first one the backend returns (one hint names one
+ * account). A regexten of several tokens (ext1&ext2) or with an @context is not matched: one equality on the column,
+ * as chan_sip, which places the whole regexten as one extension. Returns 1 when the realtime backend could not be read
+ * (the caller answers 503), else 0. sofia_thread, no lock held (blocking realtime query). */
+static int sofia_load_hint_peer_by_regexten(const char *exten, const char *context)
+{
+	struct ast_config *cfg;
+	struct ast_variable *row, *v;
+	struct sofia_peer *peer;
+	const char *cat, *name = NULL;
+	char namebuf[80];
+	struct timeval started;
+
+	if (ast_strlen_zero(exten) || ast_strlen_zero(context) || !ast_check_realtime("sippeers")) {
+		return 0;
+	}
+	if (sofia_rt_held_off()) {
+		return 1;	/* the backend failed a moment ago: the same answer as the other lookups */
+	}
+	started = ast_tvnow();
+	cfg = ast_load_realtime_multientry("sippeers", "regexten", exten, "subscribecontext", context, SENTINEL);
+	if (!cfg) {
+		if (ast_realtime_last_lookup_failed()) {
+			sofia_rt_note_failure(started);
+			return 1;
+		}
+		return 0;	/* no such row */
+	}
+	cat = ast_category_browse(cfg, NULL);
+	row = cat ? ast_variable_browse(cfg, cat) : NULL;
+	for (v = row; v; v = v->next) {
+		if (!strcasecmp(v->name, "name")) {
+			name = v->value;
+			break;
+		}
+	}
+	if (ast_strlen_zero(name)) {
+		ast_config_destroy(cfg);
+		return 0;
+	}
+	ast_copy_string(namebuf, name, sizeof(namebuf));
+	peer = sofia_find_peer_impl(namebuf, row);	/* copy-only: the row stays cfg's */
+	ast_config_destroy(cfg);
+	if (!peer) {
+		return 0;
+	}
+	sofia_create_peer_hint(peer, "realtime");	/* idempotent; for an account already in memory without its hint */
+	ao2_ref(peer, -1);
+	if (sofia_debug) {
+		ast_verbose("Sofia presence: %s@%s is the regexten of realtime peer '%s': loaded for its hint\n",
+			exten, context, namebuf);
+	}
+	return 0;
+}
+
 /* Event: dialog / presence handler. Runs on sofia_thread. */
 static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 		struct sofia_pvt *op, sip_t const *sip, tagi_t tags[])
@@ -19287,7 +19350,9 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 	 * may be a configured (realtime) peer whose hint has not been created — it never registered/was
 	 * looked-up, or a mass-reboot SUBSCRIBE raced ahead of the peer build. Materialize it ON DEMAND so a
 	 * SUBSCRIBE to ANY configured target is accepted instead of 404 (phones do NOT retry a 404):
-	 * sofia_find_peer() resolves/builds the peer and sofia_create_peer_hint() adds its hint BY NAME into
+	 * sofia_find_peer() resolves/builds the peer named as the extension, else
+	 * sofia_load_hint_peer_by_regexten() the realtime account whose regexten it is in the watcher's hint
+	 * context (sqlite 236), and sofia_create_peer_hint() adds its hint BY NAME into
 	 * the existing dialplan context (ast_add_extension — no ast_context_find_or_create phantom-context
 	 * race), then re-check. Runs synchronously here on the single sofia_thread, so no cross-thread create
 	 * race. Only a genuinely unknown/unwatchable exten still 404s (a NORMAL condition, kept debug-only —
@@ -19315,6 +19380,11 @@ static void sofia_process_presence_subscribe(nua_t *nua, nua_handle_t *nh,
 				ao2_ref(target, -1);
 			} else {
 				target_rt_failed = sofia_peer_lookup_failed();
+			}
+			/* Not an account named as the extension: the realtime account whose regexten it is in the
+			 * watcher's hint context (sqlite 236). */
+			if (!target_rt_failed && !ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, l_context, watched)) {
+				target_rt_failed = sofia_load_hint_peer_by_regexten(watched, l_context);
 			}
 		}
 		if (target_rt_failed && !ast_get_hint(hint, sizeof(hint), NULL, 0, NULL, l_context, watched)) {
